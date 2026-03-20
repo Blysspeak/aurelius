@@ -1,0 +1,28 @@
+[package]
+name = "au"
+description = "Aurelius CLI"
+
+[package.version]
+workspace = true
+[package.edition]
+workspace = true
+[package.license]
+workspace = true
+[package.authors]
+workspace = true
+[package.repository]
+workspace = true
+
+[[bin]]
+name = "au"
+path = "src/main.rs"
+
+[dependencies]
+aurelius-core = { path = "../aurelius-core" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
