@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Aurelius git hook: captures commit messages as decision nodes.
+set -euo pipefail
+
+which au &>/dev/null || exit 0
+
+MSG=$(git log -1 --pretty=%s)
+BODY=$(git log -1 --pretty=%b)
+PROJECT=$(git rev-parse --show-toplevel 2>/dev/null | xargs basename 2>/dev/null || echo "unknown")
+
+# Skip merge commits and bumps
+[[ "$MSG" =~ ^(Merge|chore:|bump:|release:) ]] && exit 0
+
+FULL="$MSG"
+[ -n "$BODY" ] && FULL="$MSG — $BODY"
+
+au note "$FULL" --type decision --label "[$PROJECT] $MSG" 2>/dev/null || true
