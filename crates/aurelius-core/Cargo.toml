@@ -1,0 +1,23 @@
+[package]
+name = "aurelius-core"
+description = "Core types, graph storage, and FTS for Aurelius"
+
+[package.version]
+workspace = true
+[package.edition]
+workspace = true
+[package.license]
+workspace = true
+[package.authors]
+workspace = true
+[package.repository]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
