@@ -8,7 +8,12 @@ pub fn tool_definitions() -> serde_json::Value {
                 "description": "Full project snapshot for session start. Returns project structure, recent decisions with reasoning, open problems, solved problems, session history with summaries, and graph stats. Call this first in every new session.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": "Filter by project name (e.g. 'aurelius'). Shows only decisions, problems, sessions for this project."
+                        }
+                    },
                     "required": []
                 }
             },
@@ -249,6 +254,15 @@ pub fn tool_definitions() -> serde_json::Value {
                             "default": 50
                         }
                     },
+                    "required": []
+                }
+            },
+            {
+                "name": "memory_gc",
+                "description": "Garbage collection: removes duplicate edges, orphaned edges, and duplicate nodes (by content_hash). Run periodically to keep the graph clean.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
                     "required": []
                 }
             }

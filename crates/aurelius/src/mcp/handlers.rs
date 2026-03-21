@@ -20,24 +20,39 @@ fn open_db() -> Result<Connection> {
     db::open(&db_path())
 }
 
-pub fn memory_status() -> Result<serde_json::Value> {
+pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let project_filter = params.get("project").and_then(|p| p.as_str());
     let conn = open_db()?;
 
     let projects = graph::search_typed(&conn, "*", &NodeType::Project, 10)?;
-    let recent_decisions = graph::search_typed(&conn, "*", &NodeType::Decision, 10)?;
-    let problems = graph::get_unsolved_problems(&conn, 10)?;
-    let recent_sessions = graph::search_typed(&conn, "*", &NodeType::Session, 5)?;
     let crates = graph::search_typed(&conn, "*", &NodeType::Crate, 20)?;
-    let recent_solutions = graph::search_typed(&conn, "*", &NodeType::Solution, 10)?;
-
     let total_nodes = graph::count_nodes(&conn)?;
     let total_edges = graph::count_edges(&conn)?;
+
+    // If project filter is set, search within project scope using label prefix
+    let (recent_decisions, problems, recent_solutions, recent_sessions) = if let Some(proj) = project_filter {
+        let prefix = format!("[{}]", proj);
+        (
+            graph::search(&conn, &prefix, 10)?.into_iter().filter(|n| matches!(n.node_type, NodeType::Decision)).collect::<Vec<_>>(),
+            graph::search(&conn, &prefix, 20)?.into_iter().filter(|n| matches!(n.node_type, NodeType::Problem)).collect::<Vec<_>>(),
+            graph::search(&conn, &prefix, 10)?.into_iter().filter(|n| matches!(n.node_type, NodeType::Solution)).collect::<Vec<_>>(),
+            graph::search(&conn, &prefix, 5)?.into_iter().filter(|n| matches!(n.node_type, NodeType::Session)).collect::<Vec<_>>(),
+        )
+    } else {
+        (
+            graph::search_typed(&conn, "*", &NodeType::Decision, 10)?,
+            graph::get_unsolved_problems(&conn, 10)?,
+            graph::search_typed(&conn, "*", &NodeType::Solution, 10)?,
+            graph::search_typed(&conn, "*", &NodeType::Session, 5)?,
+        )
+    };
 
     Ok(json!({
         "summary": {
             "total_nodes": total_nodes,
             "total_edges": total_edges,
         },
+        "project_filter": project_filter,
         "projects": projects.iter().map(node_brief).collect::<Vec<_>>(),
         "crates": crates.iter().map(node_brief).collect::<Vec<_>>(),
         "recent_decisions": recent_decisions.iter().map(node_detail).collect::<Vec<_>>(),
@@ -409,6 +424,40 @@ pub fn memory_dump(params: &serde_json::Value) -> Result<serde_json::Value> {
         "total_edges": total_edges,
         "offset": offset,
         "limit": limit,
+    }))
+}
+
+pub fn memory_gc() -> Result<serde_json::Value> {
+    let conn = open_db()?;
+
+    // 1. Remove duplicate edges (keep oldest by created_at)
+    let dup_edges = conn.execute(
+        "DELETE FROM edges WHERE id NOT IN (
+            SELECT MIN(id) FROM edges GROUP BY from_id, to_id, relation
+        )",
+        [],
+    )?;
+
+    // 2. Remove orphaned edges (pointing to deleted nodes)
+    let orphan_edges = conn.execute(
+        "DELETE FROM edges WHERE
+            from_id NOT IN (SELECT id FROM nodes) OR
+            to_id NOT IN (SELECT id FROM nodes)",
+        [],
+    )?;
+
+    // 3. Remove duplicate nodes with same content_hash (keep oldest)
+    let dup_nodes = conn.execute(
+        "DELETE FROM nodes WHERE content_hash IS NOT NULL AND id NOT IN (
+            SELECT MIN(id) FROM nodes WHERE content_hash IS NOT NULL GROUP BY content_hash
+        )",
+        [],
+    )?;
+
+    Ok(json!({
+        "duplicate_edges_removed": dup_edges,
+        "orphan_edges_removed": orphan_edges,
+        "duplicate_nodes_removed": dup_nodes,
     }))
 }
 

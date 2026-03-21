@@ -104,7 +104,7 @@ async fn handle_tools_call(
     // Run handler in spawn_blocking since rusqlite isn't Send
     let tool_name = tool_name.to_owned();
     let result = tokio::task::spawn_blocking(move || match tool_name.as_str() {
-        "memory_status" => handlers::memory_status(),
+        "memory_status" => handlers::memory_status(&arguments),
         "memory_context" => handlers::memory_context(&arguments),
         "memory_search" => handlers::memory_search(&arguments),
         "memory_add" => handlers::memory_add(&arguments),
@@ -115,6 +115,7 @@ async fn handle_tools_call(
         "memory_session" => handlers::memory_session(&arguments),
         "memory_recall" => handlers::memory_recall(&arguments),
         "memory_dump" => handlers::memory_dump(&arguments),
+        "memory_gc" => handlers::memory_gc(),
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     })
     .await;
