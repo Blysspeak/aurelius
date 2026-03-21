@@ -429,10 +429,11 @@ fn parse_node_type(s: &str) -> NodeType {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_owned()
     } else {
-        format!("{}...", &s[..max.min(s.len())])
+        let truncated: String = s.chars().take(max).collect();
+        format!("{truncated}...")
     }
 }
 
