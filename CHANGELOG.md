@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0] — 2026-03-21
+
+### Added
+- **`memory_session`** — record session summaries with decisions, problems solved, and next steps; creates episodic Session node linked to project, plus Decision and Problem/Solution nodes with proper graph relations
+- **`memory_update`** — update existing node's note and/or data by UUID or label; enables enriching nodes with additional context after creation
+- **`memory_add` enhanced** — now accepts `data` (arbitrary JSON metadata) and `memory_kind` (semantic/episodic) parameters
+
+### Improved
+- **`memory_status`** — now returns recent solutions alongside problems, session details with full node info (not just brief), and uses lightweight count queries for stats
+- **`memory_add`** — uses `add_node_full` internally, supporting all node fields
+
+---
+
 ## [0.2.0] — 2026-03-21
 
 ### Improved

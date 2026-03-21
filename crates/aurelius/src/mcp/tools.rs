@@ -5,7 +5,7 @@ pub fn tool_definitions() -> serde_json::Value {
         "tools": [
             {
                 "name": "memory_status",
-                "description": "Full project snapshot for session start. Returns project structure, recent decisions, open problems, activity summary, and TimeForged sessions.",
+                "description": "Full project snapshot for session start. Returns project structure, recent decisions with reasoning, open problems, solved problems, session history with summaries, and graph stats. Call this first in every new session.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -52,7 +52,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_add",
-                "description": "Add a new knowledge node to the graph.",
+                "description": "Add a new knowledge node to the graph. Supports structured data and memory classification.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -73,6 +73,16 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "string",
                             "description": "Source of this knowledge (default: mcp)",
                             "default": "mcp"
+                        },
+                        "data": {
+                            "type": "object",
+                            "description": "Arbitrary JSON metadata (alternatives considered, related commits, context, etc.)"
+                        },
+                        "memory_kind": {
+                            "type": "string",
+                            "enum": ["semantic", "episodic"],
+                            "description": "Memory classification: semantic (facts, concepts) or episodic (events, sessions). Default: semantic",
+                            "default": "semantic"
                         }
                     },
                     "required": ["label"]
@@ -117,6 +127,72 @@ pub fn tool_definitions() -> serde_json::Value {
                         }
                     },
                     "required": ["path"]
+                }
+            },
+            {
+                "name": "memory_update",
+                "description": "Update an existing node's note and/or data. Use to enrich nodes with additional context, corrections, or structured metadata.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "UUID or label of the node to update"
+                        },
+                        "note": {
+                            "type": "string",
+                            "description": "New note text (replaces existing)"
+                        },
+                        "data": {
+                            "type": "object",
+                            "description": "New JSON metadata (replaces existing)"
+                        }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "memory_session",
+                "description": "Record a session summary with decisions made, problems solved, and next steps. Creates an episodic Session node linked to the project, plus Decision and Problem/Solution nodes. Call this at the end of a productive session to preserve cross-session context.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "Brief summary of what was accomplished this session"
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Project name (used for linking and labeling)"
+                        },
+                        "decisions": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "List of decisions made and their reasoning"
+                        },
+                        "problems_solved": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "problem": { "type": "string" },
+                                    "solution": { "type": "string" }
+                                }
+                            },
+                            "description": "List of problem/solution pairs encountered"
+                        },
+                        "next_steps": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "What should be done next (carried forward to future sessions)"
+                        },
+                        "key_files": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Key files that were modified or are relevant"
+                        }
+                    },
+                    "required": ["summary", "project"]
                 }
             },
             {
