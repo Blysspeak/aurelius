@@ -204,11 +204,11 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
         linkDirectionalArrowLength={0}
         linkCurvature={0.05}
         backgroundColor="#0c1018"
-        d3AlphaDecay={0.02}
-        d3VelocityDecay={0.4}
-        cooldownTicks={300}
+        d3AlphaDecay={0.01}
+        d3VelocityDecay={0.3}
+        cooldownTicks={Infinity}
         warmupTicks={100}
-        d3AlphaMin={0.005}
+        d3AlphaMin={0}
         enableNodeDrag={true}
         enableZoomInteraction={true}
         enablePanInteraction={true}

@@ -30,8 +30,8 @@ pub fn memory_status() -> Result<serde_json::Value> {
     let decisions = graph::get_nodes_by_type(&conn, &NodeType::Decision)?;
     let recent_decisions: Vec<_> = decisions.into_iter().take(10).collect();
 
-    // Open problems
-    let problems = graph::get_nodes_by_type(&conn, &NodeType::Problem)?;
+    // Open problems (only those without a linked solution)
+    let problems = graph::get_unsolved_problems(&conn)?;
 
     // Sessions (episodic)
     let sessions = graph::get_nodes_by_type(&conn, &NodeType::Session)?;
@@ -91,12 +91,19 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         .and_then(|q| q.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'query' parameter"))?;
     let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
+    let type_filter = params.get("type").and_then(|t| t.as_str());
 
     let conn = open_db()?;
-    let nodes = graph::search(&conn, query, limit)?;
+    let nodes = if let Some(type_str) = type_filter {
+        let node_type = parse_node_type(type_str);
+        graph::search_typed(&conn, query, &node_type, limit)?
+    } else {
+        graph::search(&conn, query, limit)?
+    };
 
     Ok(json!({
         "query": query,
+        "type": type_filter,
         "count": nodes.len(),
         "results": nodes.iter().map(node_detail).collect::<Vec<_>>(),
     }))
@@ -333,6 +340,51 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         "type": "session",
         "memory_kind": "episodic",
         "created": true,
+    }))
+}
+
+pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let topic = params
+        .get("topic")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'topic' parameter"))?;
+
+    let conn = open_db()?;
+
+    // 1. BFS context traversal (nodes + edges around the topic)
+    let (context_nodes, context_edges) = graph::context(&conn, topic, 2)?;
+
+    // 2. Separate by type for structured output
+    let mut decisions = vec![];
+    let mut problems = vec![];
+    let mut solutions = vec![];
+    let mut sessions = vec![];
+    let mut other = vec![];
+
+    for node in &context_nodes {
+        match &node.node_type {
+            NodeType::Decision => decisions.push(node_detail(node)),
+            NodeType::Problem => problems.push(node_detail(node)),
+            NodeType::Solution => solutions.push(node_detail(node)),
+            NodeType::Session => sessions.push(node_detail(node)),
+            _ => other.push(node_detail(node)),
+        }
+    }
+
+    // Touch accessed nodes
+    for node in &context_nodes {
+        graph::touch_node(&conn, node.id).ok();
+    }
+
+    Ok(json!({
+        "topic": topic,
+        "decisions": decisions,
+        "problems": problems,
+        "solutions": solutions,
+        "sessions": sessions,
+        "other_nodes": other,
+        "edges": context_edges.iter().map(edge_brief).collect::<Vec<_>>(),
+        "total_nodes": context_nodes.len(),
     }))
 }
 

@@ -33,13 +33,17 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_search",
-                "description": "Full-text search across the knowledge graph using FTS5. Use empty string or '*' to list recent nodes.",
+                "description": "Full-text search across the knowledge graph using FTS5. Use empty string or '*' to list recent nodes. Supports optional type filtering.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
                             "description": "FTS5 search query. Use empty string or '*' to list most recent nodes."
+                        },
+                        "type": {
+                            "type": "string",
+                            "description": "Filter by node type: decision, problem, solution, session, concept, project, crate, file, dependency"
                         },
                         "limit": {
                             "type": "integer",
@@ -193,6 +197,20 @@ pub fn tool_definitions() -> serde_json::Value {
                         }
                     },
                     "required": ["summary", "project"]
+                }
+            },
+            {
+                "name": "memory_recall",
+                "description": "Smart recall: get everything the knowledge graph knows about a topic. Combines FTS search with BFS traversal, returns results grouped by type (decisions, problems, solutions, sessions, other). Use this instead of separate search+context calls.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Topic to recall knowledge about"
+                        }
+                    },
+                    "required": ["topic"]
                 }
             },
             {
