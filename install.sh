@@ -101,27 +101,58 @@ if 'aurelius' not in mcp:
 else:
     print('  MCP server already configured', file=sys.stderr)
 
-# Hooks
+# --- Hooks ---
+# Claude Code hook format: [{matcher: 'string', hooks: [{type, command, timeout}]}]
 hooks = settings.setdefault('hooks', {})
-
-# Stop hook — reindex on session end
-stop_hooks = hooks.setdefault('Stop', [])
 reindex_cmd = '$HOOKS_DIR/aurelius-reindex.sh'
-if not any(h.get('command', '') == reindex_cmd for h in stop_hooks):
-    stop_hooks.append({'type': 'command', 'command': reindex_cmd, 'timeout': 15000})
-    print('  Added Stop hook: aurelius-reindex', file=sys.stderr)
-
-# PostToolUse hook — track file edits
-post_hooks = hooks.setdefault('PostToolUse', [])
 track_cmd = '$HOOKS_DIR/aurelius-track-edit.sh'
-if not any(h.get('command', '') == track_cmd for h in post_hooks):
-    post_hooks.append({
-        'type': 'command',
-        'command': track_cmd,
-        'timeout': 5000,
-        'matcher': {'toolName': ['Edit', 'Write']}
+
+def has_hook_cmd(hook_list, cmd):
+    \"\"\"Check if command already exists anywhere in the hook entries.\"\"\"
+    for entry in hook_list:
+        # New format: {matcher, hooks: [...]}
+        for h in entry.get('hooks', []):
+            if h.get('command', '') == cmd:
+                return True
+        # Bare format (shouldn't be used, but check anyway)
+        if entry.get('command', '') == cmd:
+            return True
+    return True if not hook_list else False  # skip if empty, we handle below
+
+def add_hook_to_group(hook_list, matcher, cmd, timeout):
+    \"\"\"Add a hook command to the correct matcher group, or create one.\"\"\"
+    # Check if command already exists in any entry
+    for entry in hook_list:
+        for h in entry.get('hooks', []):
+            if h.get('command', '') == cmd:
+                return False  # already exists
+    # Find existing entry with matching matcher
+    for entry in hook_list:
+        if entry.get('matcher', '') == matcher:
+            entry.setdefault('hooks', []).append({
+                'type': 'command', 'command': cmd, 'timeout': timeout
+            })
+            return True
+    # No matching group — create new entry
+    hook_list.append({
+        'matcher': matcher,
+        'hooks': [{'type': 'command', 'command': cmd, 'timeout': timeout}]
     })
+    return True
+
+# Stop hook — reindex on session end (matcher: '' = match all)
+stop_hooks = hooks.setdefault('Stop', [])
+if add_hook_to_group(stop_hooks, '', reindex_cmd, 15):
+    print('  Added Stop hook: aurelius-reindex', file=sys.stderr)
+else:
+    print('  Stop hook already configured', file=sys.stderr)
+
+# PostToolUse hook — track file edits (matcher: 'Edit|Write')
+post_hooks = hooks.setdefault('PostToolUse', [])
+if add_hook_to_group(post_hooks, 'Edit|Write', track_cmd, 5):
     print('  Added PostToolUse hook: aurelius-track-edit', file=sys.stderr)
+else:
+    print('  PostToolUse hook already configured', file=sys.stderr)
 
 with open('$tmp', 'w') as f:
     json.dump(settings, f, indent=2)
