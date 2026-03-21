@@ -40,6 +40,11 @@ git clone https://github.com/Blysspeak/aurelius && cd aurelius
 
 This builds binaries, installs to `~/.local/bin`, configures Claude Code MCP server and hooks, initializes the database, and indexes the project. Restart Claude Code and you're ready.
 
+```
+$ au --version
+au 1.0.0
+```
+
 ---
 
 ## MCP Tools (12)
@@ -75,7 +80,7 @@ Session end    →  memory_session(summary, decisions, problems_solved, next_ste
 
 ```bash
 au init                          # initialize database
-au note "chose X over Y"        # capture a decision
+au note "chose X over Y" -p app  # capture a decision → project
 au context beacon                # graph around a topic
 au search "redis"                # full-text search
 au reindex                       # index current project
@@ -144,7 +149,7 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 |------|-------|-------------|
 | `aurelius-reindex.sh` | Stop | Re-indexes project on session end |
 | `aurelius-track-edit.sh` | PostToolUse (Edit/Write) | Increments access_count on file nodes |
-| `post-commit` | git commit | Captures commit as Decision node |
+| `post-commit` | git commit | Captures commit as Decision node, linked to project via `belongs_to` |
 
 ---
 

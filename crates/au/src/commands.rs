@@ -18,7 +18,12 @@ pub async fn init() -> Result<()> {
     Ok(())
 }
 
-pub async fn note(text: &str, type_str: &str, label: Option<String>) -> Result<()> {
+pub async fn note(
+    text: &str,
+    type_str: &str,
+    label: Option<String>,
+    project: Option<String>,
+) -> Result<()> {
     let conn = db::open(&db_path())?;
     let node_type = match type_str {
         "concept" => NodeType::Concept,
@@ -38,7 +43,31 @@ pub async fn note(text: &str, type_str: &str, label: Option<String>) -> Result<(
         "manual",
         serde_json::json!({}),
     )?;
-    println!("✓ Saved: [{}] {}", node.id, node.label);
+
+    // Link to project if specified
+    if let Some(proj_name) = project {
+        let project_node = match graph::find_node_by_label(&conn, &proj_name)? {
+            Some(n) => n,
+            None => graph::add_node(
+                &conn,
+                NodeType::Project,
+                &proj_name,
+                None,
+                "auto",
+                serde_json::json!({}),
+            )?,
+        };
+        graph::add_edge(
+            &conn,
+            node.id,
+            project_node.id,
+            aurelius_core::models::Relation::BelongsTo,
+            1.0,
+        )?;
+        println!("✓ Saved: [{}] {} → {}", node.id, node.label, proj_name);
+    } else {
+        println!("✓ Saved: [{}] {}", node.id, node.label);
+    }
     Ok(())
 }
 

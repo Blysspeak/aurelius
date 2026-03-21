@@ -67,7 +67,7 @@ Aurelius is a self-hosted knowledge graph memory for developers and AI agents. I
 ### contrib/
 
 - `claude-code/` — hooks for Claude Code: session capture (Stop), file access tracking (PostToolUse), project reindex (Stop)
-- `git-hooks/` — post-commit hook that captures commit messages as decision nodes (skips merge/chore/bump/release commits)
+- `git-hooks/` — post-commit hook that captures commit messages as decision nodes linked to their project via `belongs_to` edge (skips merge/chore/bump/release commits)
 
 ### Web UI
 

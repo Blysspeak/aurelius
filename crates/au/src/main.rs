@@ -25,6 +25,9 @@ enum Commands {
         /// Label (short name). Defaults to first 50 chars of text.
         #[arg(short, long)]
         label: Option<String>,
+        /// Link to a project node (find or create by name)
+        #[arg(short, long)]
+        project: Option<String>,
     },
     /// Show knowledge graph context around a topic
     Context {
@@ -72,7 +75,8 @@ async fn main() -> Result<()> {
             text,
             r#type,
             label,
-        } => commands::note(&text, &r#type, label).await,
+            project,
+        } => commands::note(&text, &r#type, label, project).await,
         Commands::Context { topic, depth } => commands::context(&topic, depth).await,
         Commands::Search { query } => commands::search(&query).await,
         Commands::Sync => commands::sync().await,
