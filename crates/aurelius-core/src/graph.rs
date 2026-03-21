@@ -145,6 +145,54 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
     Ok(nodes)
 }
 
+pub fn search_typed(conn: &Connection, query: &str, node_type: &NodeType, limit: usize) -> Result<Vec<Node>> {
+    let type_str = serde_json::to_string(node_type)?;
+    let trimmed = query.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        let mut stmt = conn.prepare(
+            "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                    memory_kind, last_accessed_at, access_count, content_hash
+             FROM nodes WHERE node_type = ?1 ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let nodes = stmt
+            .query_map(params![type_str, limit as i64], row_to_node)?
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(nodes);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
+                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash
+         FROM nodes_fts
+         JOIN nodes n ON nodes_fts.rowid = n.rowid
+         WHERE nodes_fts MATCH ?1 AND n.node_type = ?2
+         LIMIT ?3",
+    )?;
+    let nodes = stmt
+        .query_map(params![trimmed, type_str, limit as i64], row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nodes)
+}
+
+pub fn get_unsolved_problems(conn: &Connection) -> Result<Vec<Node>> {
+    // Problems that have NO edge where a solution node "solves" them
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
+                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash
+         FROM nodes n
+         WHERE n.node_type = '\"problem\"'
+           AND NOT EXISTS (
+             SELECT 1 FROM edges e
+             JOIN nodes sol ON sol.id = e.from_id AND sol.node_type = '\"solution\"'
+             WHERE e.to_id = n.id AND e.relation = 'solves'
+           )
+         ORDER BY n.created_at DESC",
+    )?;
+    let nodes = stmt
+        .query_map([], row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nodes)
+}
+
 pub fn get_recent_nodes(conn: &Connection, limit: usize) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
