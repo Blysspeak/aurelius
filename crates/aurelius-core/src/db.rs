@@ -137,6 +137,14 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
 }
 
 fn migrate_v3(conn: &Connection) -> Result<()> {
+    // Clean up duplicate edges BEFORE creating unique index
+    conn.execute(
+        "DELETE FROM edges WHERE id NOT IN (
+            SELECT MIN(id) FROM edges GROUP BY from_id, to_id, relation
+        )",
+        [],
+    )?;
+
     conn.execute_batch(
         "
         -- Edge dedup: prevent duplicate (from, to, relation) triples
