@@ -201,13 +201,18 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_recall",
-                "description": "Smart recall: get everything the knowledge graph knows about a topic. Combines FTS search with BFS traversal, returns results grouped by type (decisions, problems, solutions, sessions, other). Use this instead of separate search+context calls.",
+                "description": "Smart recall: get everything the knowledge graph knows about a topic. Combines FTS search with BFS traversal, returns only knowledge nodes (decisions, problems, solutions, sessions, concepts) grouped by type. Skips structural noise (files, deps). Use this instead of separate search+context calls.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "topic": {
                             "type": "string",
                             "description": "Topic to recall knowledge about"
+                        },
+                        "depth": {
+                            "type": "integer",
+                            "description": "BFS traversal depth (default: 1, increase for broader recall)",
+                            "default": 1
                         }
                     },
                     "required": ["topic"]
