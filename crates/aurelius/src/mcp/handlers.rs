@@ -23,28 +23,13 @@ fn open_db() -> Result<Connection> {
 pub fn memory_status() -> Result<serde_json::Value> {
     let conn = open_db()?;
 
-    // Project nodes
-    let projects = graph::get_nodes_by_type(&conn, &NodeType::Project)?;
+    let projects = graph::search_typed(&conn, "*", &NodeType::Project, 10)?;
+    let recent_decisions = graph::search_typed(&conn, "*", &NodeType::Decision, 10)?;
+    let problems = graph::get_unsolved_problems(&conn, 10)?;
+    let recent_sessions = graph::search_typed(&conn, "*", &NodeType::Session, 5)?;
+    let crates = graph::search_typed(&conn, "*", &NodeType::Crate, 20)?;
+    let recent_solutions = graph::search_typed(&conn, "*", &NodeType::Solution, 10)?;
 
-    // Recent decisions
-    let decisions = graph::get_nodes_by_type(&conn, &NodeType::Decision)?;
-    let recent_decisions: Vec<_> = decisions.into_iter().take(10).collect();
-
-    // Open problems (only those without a linked solution)
-    let problems = graph::get_unsolved_problems(&conn)?;
-
-    // Sessions (episodic)
-    let sessions = graph::get_nodes_by_type(&conn, &NodeType::Session)?;
-    let recent_sessions: Vec<_> = sessions.into_iter().take(5).collect();
-
-    // Crates
-    let crates = graph::get_nodes_by_type(&conn, &NodeType::Crate)?;
-
-    // Solutions (to pair with problems)
-    let solutions = graph::get_nodes_by_type(&conn, &NodeType::Solution)?;
-    let recent_solutions: Vec<_> = solutions.into_iter().take(10).collect();
-
-    // Stats
     let total_nodes = graph::count_nodes(&conn)?;
     let total_edges = graph::count_edges(&conn)?;
 
@@ -251,16 +236,33 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         .and_then(|p| p.as_str())
         .unwrap_or("unknown");
 
-    // Build structured session data
+    // Dedup: hash summary+project to prevent duplicate sessions
+    let content_hash = {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(project.as_bytes());
+        hasher.update(b"|");
+        hasher.update(summary.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+
+    let conn = open_db()?;
+
+    // Check for duplicate session
+    if let Some(existing) = graph::find_node_by_content_hash(&conn, &content_hash)? {
+        return Ok(json!({
+            "id": existing.id.to_string(),
+            "label": existing.label,
+            "type": "session",
+            "memory_kind": "episodic",
+            "duplicate": true,
+        }));
+    }
+
+    // Session data: only metadata not stored in child nodes
     let mut session_data = json!({
         "project": project,
     });
-    if let Some(decisions) = params.get("decisions") {
-        session_data["decisions"] = decisions.clone();
-    }
-    if let Some(problems) = params.get("problems_solved") {
-        session_data["problems_solved"] = problems.clone();
-    }
     if let Some(next) = params.get("next_steps") {
         session_data["next_steps"] = next.clone();
     }
@@ -268,9 +270,6 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         session_data["key_files"] = files.clone();
     }
 
-    let conn = open_db()?;
-
-    // Create session node (episodic memory)
     let session_label = format!("[{}] {}", project, chrono::Utc::now().format("%Y-%m-%d %H:%M"));
     let session = graph::add_node_full(
         &conn,
@@ -280,7 +279,7 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         "mcp",
         session_data,
         MemoryKind::Episodic,
-        None,
+        Some(&content_hash),
     )?;
 
     // Link session to project node if it exists

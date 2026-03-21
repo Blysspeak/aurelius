@@ -34,3 +34,4 @@ dirs-next = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
 chrono = { workspace = true }
+sha2 = { workspace = true }
