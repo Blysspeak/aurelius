@@ -51,6 +51,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(conn, 3)?;
     }
 
+    if current < 4 {
+        migrate_v4(conn)?;
+        set_schema_version(conn, 4)?;
+    }
+
     Ok(())
 }
 
@@ -133,6 +138,45 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    Ok(())
+}
+
+fn migrate_v4(conn: &Connection) -> Result<()> {
+    // Rebuild FTS5 without the `data` column — raw JSON creates search noise
+    conn.execute_batch(
+        "
+        DROP TRIGGER IF EXISTS nodes_ai;
+        DROP TRIGGER IF EXISTS nodes_ad;
+        DROP TRIGGER IF EXISTS nodes_au;
+        DROP TABLE IF EXISTS nodes_fts;
+
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(
+            label, note,
+            content='nodes',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER nodes_ai AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, label, note)
+            VALUES (new.rowid, new.label, new.note);
+        END;
+
+        CREATE TRIGGER nodes_ad AFTER DELETE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, label, note)
+            VALUES ('delete', old.rowid, old.label, old.note);
+        END;
+
+        CREATE TRIGGER nodes_au AFTER UPDATE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, label, note)
+            VALUES ('delete', old.rowid, old.label, old.note);
+            INSERT INTO nodes_fts(rowid, label, note)
+            VALUES (new.rowid, new.label, new.note);
+        END;
+
+        INSERT INTO nodes_fts(rowid, label, note)
+        SELECT rowid, label, note FROM nodes;
+    ",
+    )?;
     Ok(())
 }
 

@@ -50,6 +50,10 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "string",
                             "description": "Filter by node type: decision, problem, solution, session, concept, project, crate, file, dependency"
                         },
+                        "since": {
+                            "type": "string",
+                            "description": "Time filter: 'today', 'yesterday', '7d', '24h', or ISO 8601 datetime"
+                        },
                         "limit": {
                             "type": "integer",
                             "description": "Maximum results (default: 20)",
