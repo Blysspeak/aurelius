@@ -174,6 +174,16 @@ pub fn find_node_by_label(conn: &Connection, label: &str) -> Result<Option<Node>
     Ok(rows.next().transpose()?)
 }
 
+pub fn find_project_by_label(conn: &Connection, label: &str) -> Result<Option<Node>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                memory_kind, last_accessed_at, access_count, content_hash
+         FROM nodes WHERE label = ?1 AND node_type = 'project'",
+    )?;
+    let mut rows = stmt.query_map(params![label], row_to_node)?;
+    Ok(rows.next().transpose()?)
+}
+
 pub fn find_node_by_content_hash(conn: &Connection, hash: &str) -> Result<Option<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
