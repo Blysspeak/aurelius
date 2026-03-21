@@ -10,10 +10,10 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/v1.0.0-stable-a6e3a1?style=flat-square" alt="v1.0.0">
+  <img src="https://img.shields.io/badge/v1.1.0-stable-a6e3a1?style=flat-square" alt="v1.1.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
-  <img src="https://img.shields.io/badge/MCP-12_tools-a6e3a1?style=flat-square" alt="MCP">
+  <img src="https://img.shields.io/badge/MCP-14_tools-a6e3a1?style=flat-square" alt="MCP">
 </p>
 
 <p align="center">
@@ -42,14 +42,16 @@ This builds binaries, installs to `~/.local/bin`, configures Claude Code MCP ser
 
 ```
 $ au --version
-au 1.0.0
+au 1.1.0
 ```
 
 ---
 
-## MCP Tools (12)
+## MCP Tools (14)
 
 Aurelius runs as an MCP server over stdio. `install.sh` configures it automatically, or add manually via `/mcp` in Claude Code (`command: au`, `args: ["mcp"]`).
+
+### Knowledge Graph
 
 | Tool | Description |
 |------|-------------|
@@ -65,6 +67,15 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | `memory_gc` | Garbage collection — duplicate edges/nodes, orphans. |
 | `memory_dump` | Paginated graph export (offset/limit). |
 | `memory_index` | Index project structure from Cargo.toml. |
+
+### Web Search
+
+| Tool | Description |
+|------|-------------|
+| `search_web` | Brave Search API with SQLite cache. Repeat queries served from cache. Optional `save_to_graph`. |
+| `search_recall` | FTS search through cached web search results from past sessions. |
+
+Requires a [Brave Search API key](https://brave.com/search/api/) (free: 2000 queries/month). `install.sh` prompts for the key, or add manually: `echo 'YOUR_KEY' > ~/.config/aurelius/brave.key`.
 
 ### Session Lifecycle
 
@@ -112,14 +123,17 @@ Features: force-directed graph, color-coded node types, sidebar filters, node de
 crates/
   aurelius-core/
     src/graph/       — crud.rs, search.rs, traverse.rs
-    src/db.rs        — SQLite setup, migrations V1-V4
+    src/db.rs        — SQLite setup, migrations V1-V5
     src/models.rs    — Node, Edge, NodeType, Relation, MemoryKind
     src/indexer.rs   — Cargo.toml project indexer
   aurelius/
     src/mcp/
-      handlers/      — status.rs, session.rs, crud.rs
+      handlers/      — status.rs, session.rs, crud.rs, search.rs
       tools.rs       — MCP tool definitions (JSON schemas)
       mod.rs         — JSON-RPC 2.0 server
+    src/search/
+      brave.rs       — Brave Search API client
+      cache.rs       — SQLite search cache with FTS5
   au/                — CLI + web UI server
 ui/                  — React + TypeScript + Tailwind (graph visualization)
 contrib/
@@ -131,7 +145,7 @@ contrib/
 
 - **SQLite + WAL** — concurrent reads, single writer, local-first
 - **FTS5** — indexes label + note (not raw JSON), kept in sync via triggers
-- **4 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS
+- **5 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache
 - **Batch BFS** — `WHERE id IN (...)` per level, not N+1 per node
 - **Session dedup** — SHA-256 content hash on (project, summary)
 - **Edge dedup** — UNIQUE constraint on (from_id, to_id, relation)
@@ -161,7 +175,8 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 - [x] v0.4 — Smart recall, type-filtered search, problem lifecycle, always-live graph
 - [x] v0.5 — Query optimization, session dedup, no double storage
 - [x] v1.0 — Project scoping, batch BFS, GC, edge dedup, FTS cleanup, modular codebase, install.sh auto-config
-- [ ] Next — Semantic/embedding search, auto-session via Stop hook, git log connector
+- [x] v1.1 — Web search (Brave API + SQLite cache + graph integration), install.sh Brave key setup
+- [ ] Next — Context-ranked search results, git log connector, auto-session via Stop hook
 
 ---
 

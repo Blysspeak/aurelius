@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Aurelius v1.0.0 — one-command install
+# Aurelius v1.1.0 — one-command install
 # Usage: ./install.sh
 set -euo pipefail
 
@@ -21,7 +21,7 @@ cat << 'BANNER'
   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝ ╚═════╝ ╚══════╝
 BANNER
 echo -e "${RESET}"
-echo -e "  ${BOLD}v1.0.0${RESET} ${DIM}— Knowledge Graph Memory for AI Agents${RESET}"
+echo -e "  ${BOLD}v1.1.0${RESET} ${DIM}— Knowledge Graph Memory for AI Agents${RESET}"
 echo ""
 
 # --- 1. Check prerequisites ---
@@ -65,7 +65,31 @@ echo -e "${BOLD}Initializing database...${RESET}"
 "$INSTALL_DIR/au" init 2>/dev/null || true
 echo -e "${GREEN}✓${RESET} Database ready"
 
-# --- 5. Install Claude Code hooks ---
+# --- 5. Configure Brave Search API ---
+BRAVE_KEY_DIR="${HOME}/.config/aurelius"
+BRAVE_KEY_FILE="${BRAVE_KEY_DIR}/brave.key"
+mkdir -p "$BRAVE_KEY_DIR"
+
+if [ -f "$BRAVE_KEY_FILE" ] && [ -s "$BRAVE_KEY_FILE" ]; then
+    echo -e "${GREEN}✓${RESET} Brave Search API key already configured"
+else
+    echo ""
+    echo -e "${BOLD}Brave Search API ${DIM}(optional — enables search_web tool)${RESET}"
+    echo -e "  Free: 2000 queries/month at ${DIM}https://brave.com/search/api/${RESET}"
+    echo ""
+    read -rp "  Brave API key (Enter to skip): " BRAVE_KEY
+    if [ -n "$BRAVE_KEY" ]; then
+        echo "$BRAVE_KEY" > "$BRAVE_KEY_FILE"
+        chmod 600 "$BRAVE_KEY_FILE"
+        echo -e "${GREEN}✓${RESET} Brave API key saved to ${BRAVE_KEY_FILE}"
+    else
+        echo -e "${DIM}  Skipped — search_web will be unavailable until key is added${RESET}"
+        echo -e "${DIM}  Add later: echo 'YOUR_KEY' > ${BRAVE_KEY_FILE}${RESET}"
+    fi
+fi
+echo ""
+
+# --- 6. Install Claude Code hooks ---
 echo -e "${BOLD}Installing Claude Code hooks...${RESET}"
 HOOKS_DIR="${HOME}/.claude/hooks"
 mkdir -p "$HOOKS_DIR"
@@ -75,7 +99,7 @@ mkdir -p "$HOOKS_DIR"
 chmod +x "$HOOKS_DIR/aurelius-reindex.sh" "$HOOKS_DIR/aurelius-track-edit.sh"
 echo -e "${GREEN}✓${RESET} Hooks installed to ${HOOKS_DIR}"
 
-# --- 6. Auto-configure Claude Code settings ---
+# --- 7. Auto-configure Claude Code settings ---
 SETTINGS_FILE="${HOME}/.claude/settings.json"
 mkdir -p "${HOME}/.claude"
 
@@ -175,7 +199,7 @@ else
     echo -e "${DIM}  MCP: /mcp in Claude Code → command: au, args: [\"mcp\"]${RESET}"
 fi
 
-# --- 7. Install git hooks (for current repo) ---
+# --- 8. Install git hooks (for current repo) ---
 if [ -d .git ]; then
     echo -e "${BOLD}Installing git hooks...${RESET}"
     /usr/bin/cp -f contrib/git-hooks/post-commit .git/hooks/post-commit 2>/dev/null || cp -f contrib/git-hooks/post-commit .git/hooks/post-commit
@@ -183,17 +207,22 @@ if [ -d .git ]; then
     echo -e "${GREEN}✓${RESET} Git post-commit hook installed"
 fi
 
-# --- 8. Index current project ---
+# --- 9. Index current project ---
 echo -e "${BOLD}Indexing project...${RESET}"
 "$INSTALL_DIR/au" reindex --path "$SCRIPT_DIR" 2>/dev/null || true
 echo -e "${GREEN}✓${RESET} Project indexed"
 
 # --- Done ---
 echo ""
-echo -e "${GOLD}${BOLD}Aurelius v1.0.0 installed!${RESET}"
+echo -e "${GOLD}${BOLD}Aurelius v1.1.0 installed!${RESET}"
 echo ""
-echo "  12 MCP tools ready for Claude Code."
+echo "  14 MCP tools ready for Claude Code."
 echo "  Database: ~/.local/share/aurelius/aurelius.db"
+if [ -f "$BRAVE_KEY_FILE" ] && [ -s "$BRAVE_KEY_FILE" ]; then
+echo "  Brave Search: configured (2 search tools active)"
+else
+echo -e "  Brave Search: ${DIM}not configured (add key to enable)${RESET}"
+fi
 echo ""
 echo "  Commands:"
 echo "    au view        — open graph visualization"

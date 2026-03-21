@@ -56,6 +56,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(conn, 4)?;
     }
 
+    if current < 5 {
+        migrate_v5(conn)?;
+        set_schema_version(conn, 5)?;
+    }
+
     Ok(())
 }
 
@@ -175,6 +180,51 @@ fn migrate_v4(conn: &Connection) -> Result<()> {
 
         INSERT INTO nodes_fts(rowid, label, note)
         SELECT rowid, label, note FROM nodes;
+    ",
+    )?;
+    Ok(())
+}
+
+fn migrate_v5(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS search_cache (
+            id          TEXT PRIMARY KEY,
+            query       TEXT NOT NULL,
+            results     TEXT NOT NULL DEFAULT '[]',
+            source      TEXT NOT NULL DEFAULT 'brave',
+            created_at  TEXT NOT NULL,
+            expires_at  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_search_cache_query
+            ON search_cache(query);
+
+        CREATE INDEX IF NOT EXISTS idx_search_cache_expires
+            ON search_cache(expires_at);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+            query, results,
+            content='search_cache',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS search_cache_ai AFTER INSERT ON search_cache BEGIN
+            INSERT INTO search_fts(rowid, query, results)
+            VALUES (new.rowid, new.query, new.results);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS search_cache_ad AFTER DELETE ON search_cache BEGIN
+            INSERT INTO search_fts(search_fts, rowid, query, results)
+            VALUES ('delete', old.rowid, old.query, old.results);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS search_cache_au AFTER UPDATE ON search_cache BEGIN
+            INSERT INTO search_fts(search_fts, rowid, query, results)
+            VALUES ('delete', old.rowid, old.query, old.results);
+            INSERT INTO search_fts(rowid, query, results)
+            VALUES (new.rowid, new.query, new.results);
+        END;
     ",
     )?;
     Ok(())
