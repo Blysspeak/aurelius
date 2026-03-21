@@ -3,12 +3,17 @@ use aurelius_core::{db, graph};
 use axum::{
     extract::Query,
     http::{header, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+use rust_embed::Embed;
 use serde::Deserialize;
 use std::path::PathBuf;
+
+#[derive(Embed)]
+#[folder = "../../ui/dist/"]
+struct UiAssets;
 
 fn db_path() -> PathBuf {
     let base = dirs_next::data_dir()
@@ -24,7 +29,7 @@ pub async fn serve(port: u16, no_open: bool) -> Result<()> {
         .fallback(get(serve_static));
 
     let addr = format!("127.0.0.1:{port}");
-    let url = format!("http://{addr}");
+    let url = format!("http://localhost:{port}");
 
     println!("Aurelius UI starting at {url}");
 
@@ -84,49 +89,28 @@ async fn api_search(
     Ok(Json(result))
 }
 
-// Serve the built React app from ui/dist/ or embedded fallback
+// Serve the built React app embedded in the binary
 async fn serve_static(uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
-    // Try to find the built UI in several locations
-    let dist_dirs = [
-        // Relative to binary location
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.join("ui/dist")))
-            .unwrap_or_default(),
-        // Relative to CWD
-        PathBuf::from("ui/dist"),
-        // Project root (for development)
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/dist"),
-    ];
-
-    for dist_dir in &dist_dirs {
-        let file_path = dist_dir.join(path);
-        if file_path.exists() && file_path.is_file() {
-            if let Ok(content) = tokio::fs::read(&file_path).await {
-                let mime = mime_from_path(path);
-                return ([(header::CONTENT_TYPE, mime)], content).into_response();
-            }
-        }
+    if let Some(file) = UiAssets::get(path) {
+        let mime = mime_from_path(path);
+        return ([(header::CONTENT_TYPE, mime)], file.data.into_owned()).into_response();
     }
 
-    // If file not found, serve index.html for SPA routing
-    if path != "index.html" {
-        for dist_dir in &dist_dirs {
-            let index = dist_dir.join("index.html");
-            if index.exists() {
-                if let Ok(content) = tokio::fs::read_to_string(&index).await {
-                    return Html(content).into_response();
-                }
-            }
-        }
+    // SPA fallback: serve index.html for client-side routing
+    if let Some(index) = UiAssets::get("index.html") {
+        return (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            index.data.into_owned(),
+        )
+            .into_response();
     }
 
     (
         StatusCode::NOT_FOUND,
-        "UI not built. Run: cd ui && npm install && npm run build",
+        "UI assets not found. Rebuild with: cd ui && npm run build && cargo build",
     )
         .into_response()
 }
