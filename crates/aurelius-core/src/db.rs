@@ -46,6 +46,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(conn, 2)?;
     }
 
+    if current < 3 {
+        migrate_v3(conn)?;
+        set_schema_version(conn, 3)?;
+    }
+
     Ok(())
 }
 
@@ -128,5 +133,32 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    Ok(())
+}
+
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        -- Edge dedup: prevent duplicate (from, to, relation) triples
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique
+            ON edges(from_id, to_id, relation);
+
+        -- Fast unsolved problems query
+        CREATE INDEX IF NOT EXISTS idx_edges_to_relation
+            ON edges(to_id, relation);
+
+        -- Content hash lookup for dedup
+        CREATE INDEX IF NOT EXISTS idx_nodes_content_hash
+            ON nodes(content_hash) WHERE content_hash IS NOT NULL;
+
+        -- Project-scoped queries by type
+        CREATE INDEX IF NOT EXISTS idx_nodes_type_created
+            ON nodes(node_type, created_at DESC);
+
+        -- Source filtering (e.g. find all mcp-session nodes)
+        CREATE INDEX IF NOT EXISTS idx_nodes_source
+            ON nodes(source);
+    ",
+    )?;
     Ok(())
 }
