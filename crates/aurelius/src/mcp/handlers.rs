@@ -94,18 +94,28 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         .ok_or_else(|| anyhow::anyhow!("missing 'query' parameter"))?;
     let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
     let type_filter = params.get("type").and_then(|t| t.as_str());
+    let since = params.get("since").and_then(|s| s.as_str());
 
     let conn = open_db()?;
-    let nodes = if let Some(type_str) = type_filter {
+    let mut nodes = if let Some(type_str) = type_filter {
         let node_type = parse_node_type(type_str);
         graph::search_typed(&conn, query, &node_type, limit)?
     } else {
         graph::search(&conn, query, limit)?
     };
 
+    // Filter by date if `since` provided (ISO 8601 or "today", "yesterday", "7d", "30d")
+    if let Some(since_str) = since {
+        let cutoff = parse_since(since_str);
+        if let Some(cutoff_time) = cutoff {
+            nodes.retain(|n| n.created_at >= cutoff_time);
+        }
+    }
+
     Ok(json!({
         "query": query,
         "type": type_filter,
+        "since": since,
         "count": nodes.len(),
         "results": nodes.iter().map(node_detail).collect::<Vec<_>>(),
     }))
@@ -532,6 +542,24 @@ fn parse_node_type(s: &str) -> NodeType {
         "session" => NodeType::Session,
         "language" => NodeType::Language,
         other => NodeType::Custom(other.to_owned()),
+    }
+}
+
+fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let now = chrono::Utc::now();
+    match s.trim().to_lowercase().as_str() {
+        "today" => Some(now.date_naive().and_hms_opt(0, 0, 0)?.and_utc()),
+        "yesterday" => Some((now.date_naive() - chrono::Duration::days(1)).and_hms_opt(0, 0, 0)?.and_utc()),
+        s if s.ends_with('d') => {
+            let days: i64 = s.trim_end_matches('d').parse().ok()?;
+            Some(now - chrono::Duration::days(days))
+        }
+        s if s.ends_with('h') => {
+            let hours: i64 = s.trim_end_matches('h').parse().ok()?;
+            Some(now - chrono::Duration::hours(hours))
+        }
+        // Try ISO 8601 parse
+        other => other.parse().ok(),
     }
 }
 
