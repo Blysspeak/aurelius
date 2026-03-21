@@ -173,22 +173,24 @@ pub fn search_typed(conn: &Connection, query: &str, node_type: &NodeType, limit:
     Ok(nodes)
 }
 
-pub fn get_unsolved_problems(conn: &Connection) -> Result<Vec<Node>> {
-    // Problems that have NO edge where a solution node "solves" them
+pub fn get_unsolved_problems(conn: &Connection, limit: usize) -> Result<Vec<Node>> {
+    let problem_type = serde_json::to_string(&NodeType::Problem)?;
+    let solution_type = serde_json::to_string(&NodeType::Solution)?;
     let mut stmt = conn.prepare(
         "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
                 n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash
          FROM nodes n
-         WHERE n.node_type = '\"problem\"'
+         WHERE n.node_type = ?1
            AND NOT EXISTS (
              SELECT 1 FROM edges e
-             JOIN nodes sol ON sol.id = e.from_id AND sol.node_type = '\"solution\"'
+             JOIN nodes sol ON sol.id = e.from_id AND sol.node_type = ?2
              WHERE e.to_id = n.id AND e.relation = 'solves'
            )
-         ORDER BY n.created_at DESC",
+         ORDER BY n.created_at DESC
+         LIMIT ?3",
     )?;
     let nodes = stmt
-        .query_map([], row_to_node)?
+        .query_map(params![problem_type, solution_type, limit as i64], row_to_node)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(nodes)
 }
@@ -367,6 +369,16 @@ pub fn find_node_by_label(conn: &Connection, label: &str) -> Result<Option<Node>
          FROM nodes WHERE label = ?1",
     )?;
     let mut rows = stmt.query_map(params![label], row_to_node)?;
+    Ok(rows.next().transpose()?)
+}
+
+pub fn find_node_by_content_hash(conn: &Connection, hash: &str) -> Result<Option<Node>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                memory_kind, last_accessed_at, access_count, content_hash
+         FROM nodes WHERE content_hash = ?1",
+    )?;
+    let mut rows = stmt.query_map(params![hash], row_to_node)?;
     Ok(rows.next().transpose()?)
 }
 
