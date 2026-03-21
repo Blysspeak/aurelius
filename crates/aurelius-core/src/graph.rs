@@ -111,7 +111,7 @@ pub fn add_edge(
         created_at: Utc::now(),
     };
     conn.execute(
-        "INSERT INTO edges (id, from_id, to_id, relation, weight, created_at)
+        "INSERT OR IGNORE INTO edges (id, from_id, to_id, relation, weight, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             edge.id.to_string(),
@@ -131,12 +131,14 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
     if trimmed.is_empty() || trimmed == "*" {
         return get_recent_nodes(conn, limit);
     }
+    // Rank by FTS relevance + access_count boost + recency
     let mut stmt = conn.prepare(
         "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
                 n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash
          FROM nodes_fts
          JOIN nodes n ON nodes_fts.rowid = n.rowid
          WHERE nodes_fts MATCH ?1
+         ORDER BY rank + (n.access_count * 0.1) DESC
          LIMIT ?2",
     )?;
     let nodes = stmt
@@ -221,29 +223,28 @@ pub fn context(conn: &Connection, topic: &str, depth: u32) -> Result<(Vec<Node>,
         all_nodes.push(node.clone());
     }
     for _ in 0..depth {
-        let mut next_queue = vec![];
-        for node_id in &queue {
-            let edges = get_edges(conn, node_id)?;
-            for edge in edges {
-                let neighbor_id = if edge.from_id.to_string() == *node_id {
-                    edge.to_id.to_string()
-                } else {
-                    edge.from_id.to_string()
-                };
-                if !visited_nodes.contains(&neighbor_id) {
-                    visited_nodes.insert(neighbor_id.clone());
-                    if let Some(n) = get_node(conn, &neighbor_id)? {
-                        all_nodes.push(n);
-                        next_queue.push(neighbor_id);
-                    }
-                }
-                all_edges.push(edge);
-            }
-        }
-        queue = next_queue;
         if queue.is_empty() {
             break;
         }
+        // Batch: fetch all edges for current level in one query
+        let edges = get_edges_batch(conn, &queue)?;
+        let mut neighbor_ids = vec![];
+        for edge in edges {
+            let neighbor_id = if queue.contains(&edge.from_id.to_string()) {
+                edge.to_id.to_string()
+            } else {
+                edge.from_id.to_string()
+            };
+            if !visited_nodes.contains(&neighbor_id) {
+                visited_nodes.insert(neighbor_id.clone());
+                neighbor_ids.push(neighbor_id);
+            }
+            all_edges.push(edge);
+        }
+        // Batch: fetch all neighbor nodes in one query
+        let neighbors = get_nodes_batch(conn, &neighbor_ids)?;
+        queue = neighbors.iter().map(|n| n.id.to_string()).collect();
+        all_nodes.extend(neighbors);
     }
     Ok((all_nodes, all_edges))
 }
@@ -406,16 +407,53 @@ pub fn get_nodes_by_type(conn: &Connection, node_type: &NodeType) -> Result<Vec<
     Ok(nodes)
 }
 
-fn get_edges(conn: &Connection, node_id: &str) -> Result<Vec<Edge>> {
-    let mut stmt = conn.prepare(
+fn get_edges_batch(conn: &Connection, node_ids: &[String]) -> Result<Vec<Edge>> {
+    if node_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders: Vec<String> = (1..=node_ids.len()).map(|i| format!("?{i}")).collect();
+    let ph = placeholders.join(",");
+    let sql = format!(
         "SELECT id, from_id, to_id, relation, weight, created_at FROM edges
-         WHERE from_id = ?1 OR to_id = ?1",
-    )?;
+         WHERE from_id IN ({ph}) OR to_id IN ({ph})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    // Bind each node_id twice (once for from_id IN, once for to_id IN)
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    for id in node_ids {
+        param_values.push(Box::new(id.clone()));
+    }
+    for id in node_ids {
+        param_values.push(Box::new(id.clone()));
+    }
+    let params: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
     let edges = stmt
-        .query_map(params![node_id], row_to_edge)?
+        .query_map(params.as_slice(), row_to_edge)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(edges)
 }
+
+fn get_nodes_batch(conn: &Connection, ids: &[String]) -> Result<Vec<Node>> {
+    if ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!(
+        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                memory_kind, last_accessed_at, access_count, content_hash
+         FROM nodes WHERE id IN ({})",
+        placeholders.join(",")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let param_values: Vec<Box<dyn rusqlite::types::ToSql>> = ids.iter().map(|id| Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+    let nodes = stmt
+        .query_map(params.as_slice(), row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nodes)
+}
+
+
 
 pub fn get_node(conn: &Connection, id: &str) -> Result<Option<Node>> {
     let mut stmt = conn.prepare(
