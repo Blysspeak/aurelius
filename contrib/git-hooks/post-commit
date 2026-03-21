@@ -14,4 +14,4 @@ PROJECT=$(git rev-parse --show-toplevel 2>/dev/null | xargs basename 2>/dev/null
 FULL="$MSG"
 [ -n "$BODY" ] && FULL="$MSG — $BODY"
 
-au note "$FULL" --type decision --label "[$PROJECT] $MSG" 2>/dev/null || true
+au note "$FULL" --type decision --label "[$PROJECT] $MSG" --project "$PROJECT" 2>/dev/null || true

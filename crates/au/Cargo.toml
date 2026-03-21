@@ -31,3 +31,4 @@ dirs-next = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
 open = { workspace = true }
+rust-embed = { workspace = true }
