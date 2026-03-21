@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.0] — 2026-03-21
+
+### Improved
+- **`memory_search`** — empty query (`""`) or wildcard (`"*"`) now returns most recent nodes instead of FTS5 error
+- **`memory_dump`** — added pagination with `offset` and `limit` parameters (default: 50 items) to prevent exceeding MCP token limits; response includes `total_nodes`/`total_edges` counts for navigation
+
+### Added
+- `get_recent_nodes()` — fetch N most recent nodes by creation date
+- `get_nodes_paginated()` / `get_edges_paginated()` — paginated graph queries
+- `count_nodes()` / `count_edges()` — lightweight count queries
+
+---
+
 ## [0.1.0] — 2026-03-21
 
 ### Added

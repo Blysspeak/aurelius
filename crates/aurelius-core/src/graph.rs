@@ -126,6 +126,11 @@ pub fn add_edge(
 }
 
 pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>> {
+    let trimmed = query.trim();
+    // Empty or wildcard query → return most recent nodes
+    if trimmed.is_empty() || trimmed == "*" {
+        return get_recent_nodes(conn, limit);
+    }
     let mut stmt = conn.prepare(
         "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
                 n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash
@@ -135,7 +140,19 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
          LIMIT ?2",
     )?;
     let nodes = stmt
-        .query_map(params![query, limit as i64], row_to_node)?
+        .query_map(params![trimmed, limit as i64], row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nodes)
+}
+
+pub fn get_recent_nodes(conn: &Connection, limit: usize) -> Result<Vec<Node>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                memory_kind, last_accessed_at, access_count, content_hash
+         FROM nodes ORDER BY created_at DESC LIMIT ?1",
+    )?;
+    let nodes = stmt
+        .query_map(params![limit as i64], row_to_node)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(nodes)
 }
@@ -207,6 +224,36 @@ pub fn get_all_edges(conn: &Connection) -> Result<Vec<Edge>> {
         .query_map([], row_to_edge)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(edges)
+}
+
+pub fn get_nodes_paginated(conn: &Connection, offset: usize, limit: usize) -> Result<Vec<Node>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                memory_kind, last_accessed_at, access_count, content_hash
+         FROM nodes ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+    )?;
+    let nodes = stmt
+        .query_map(params![limit as i64, offset as i64], row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nodes)
+}
+
+pub fn get_edges_paginated(conn: &Connection, offset: usize, limit: usize) -> Result<Vec<Edge>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, from_id, to_id, relation, weight, created_at FROM edges ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+    )?;
+    let edges = stmt
+        .query_map(params![limit as i64, offset as i64], row_to_edge)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(edges)
+}
+
+pub fn count_nodes(conn: &Connection) -> Result<usize> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, usize>(0))?)
+}
+
+pub fn count_edges(conn: &Connection) -> Result<usize> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get::<_, usize>(0))?)
 }
 
 pub fn touch_node(conn: &Connection, id: Uuid) -> Result<()> {
