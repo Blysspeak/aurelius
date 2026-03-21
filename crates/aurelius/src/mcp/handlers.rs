@@ -33,9 +33,10 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
     let (recent_decisions, problems, recent_solutions, recent_sessions) = if let Some(proj) = project_filter {
         // FTS5 requires quoting tokens with special chars like brackets
         let fts_query = format!("\"[{}]\"", proj);
+        let prefix = format!("[{}]", proj);
         (
             graph::search(&conn, &fts_query, 30)?.into_iter().filter(|n| matches!(n.node_type, NodeType::Decision)).take(10).collect::<Vec<_>>(),
-            graph::search(&conn, &fts_query, 30)?.into_iter().filter(|n| matches!(n.node_type, NodeType::Problem)).take(10).collect::<Vec<_>>(),
+            graph::get_unsolved_problems(&conn, 50)?.into_iter().filter(|n| n.label.starts_with(&prefix)).take(10).collect::<Vec<_>>(),
             graph::search(&conn, &fts_query, 30)?.into_iter().filter(|n| matches!(n.node_type, NodeType::Solution)).take(10).collect::<Vec<_>>(),
             graph::search(&conn, &fts_query, 10)?.into_iter().filter(|n| matches!(n.node_type, NodeType::Session)).take(5).collect::<Vec<_>>(),
         )
