@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0] — 2026-03-21
+
+### Optimized
+- **`memory_status`** — uses SQL LIMIT instead of fetching all nodes and truncating in Rust; 6x fewer rows deserialized
+- **`get_unsolved_problems`** — parameterized node types (no hardcoded JSON strings), added LIMIT
+- **`memory_session`** — deduplication via SHA-256 content_hash; duplicate calls return existing session instead of creating duplicates
+- **`memory_session`** — removed double storage: decisions/problems no longer stored in Session node's `data` JSON (they're already separate graph nodes)
+
+### Added
+- `find_node_by_content_hash()` — lookup nodes by content hash for dedup
+
+---
+
 ## [0.4.0] — 2026-03-21
 
 ### Added
