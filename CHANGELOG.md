@@ -1,17 +1,30 @@
 # Changelog
 
-## [0.6.0] — 2026-03-21
+## [1.0.0] — 2026-03-21
 
 ### Added
 - **`memory_gc`** — garbage collection: removes duplicate edges, orphaned edges, and duplicate nodes (by content_hash)
-- **`memory_status` project filter** — optional `project` parameter to show only decisions, problems, sessions for a specific project
+- **`memory_status` project filter** — optional `project` parameter to scope decisions, problems, sessions to a specific project
+- **`memory_search` since filter** — optional `since` parameter for time-based queries (`today`, `yesterday`, `7d`, `24h`, ISO 8601)
 - **Batch BFS** — context traversal uses batch queries (`WHERE id IN (...)`) instead of N+1 per-node queries
-- **Relevance-ranked search** — FTS results boosted by access_count for frequently accessed nodes
+- **Relevance-ranked search** — FTS results boosted by `access_count` for frequently accessed nodes
 - **V3 migration** — composite indexes: `edges(to_id, relation)`, unique `edges(from_id, to_id, relation)`, `nodes(content_hash)`, `nodes(node_type, created_at)`
+- **V4 migration** — rebuilt FTS5 index without `data` column to eliminate JSON key noise in search results
 - **Edge deduplication** — `INSERT OR IGNORE` prevents duplicate edges on same `(from_id, to_id, relation)` triple
+
+### Refactored
+- **`graph.rs`** (531 lines) → `graph/{crud, search, traverse}.rs` — modular graph operations
+- **`handlers.rs`** (594 lines) → `handlers/{crud, session, status}.rs` — modular MCP handlers
+
+### Fixed
+- Project-scoped `memory_status` now uses `search_typed` for proper SQL-level type+FTS filtering
+- Project-scoped `open_problems` uses `get_unsolved_problems` with label prefix filter
+- FTS5 bracket escaping for `[project]` prefix queries
+- V3 migration cleans duplicate edges before creating UNIQUE index
 
 ### Removed
 - Dead code: unused `get_edges` single-node query (replaced by batch version)
+- TimeForged sync — evaluated and rejected (time data not useful for AI memory)
 
 ---
 
