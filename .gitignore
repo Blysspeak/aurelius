@@ -3,3 +3,7 @@
 **/*.db-wal
 **/*.db-shm
 .env
+
+# UI
+ui/node_modules/
+ui/dist/

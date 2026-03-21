@@ -1,4 +1,5 @@
 mod commands;
+mod view;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -36,6 +37,26 @@ enum Commands {
     Search { query: String },
     /// Sync from all connectors (git, beads, timeforged, beacon)
     Sync,
+    /// Re-index current project (auto-detects project root)
+    Reindex {
+        /// Project root path (defaults to git root or cwd)
+        #[arg(short, long)]
+        path: Option<String>,
+    },
+    /// Open interactive graph visualization in browser
+    View {
+        /// Port to serve on
+        #[arg(short = 'P', long, default_value = "7175")]
+        port: u16,
+        /// Don't open browser automatically
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// Touch a file node — increment access_count (used by hooks)
+    Touch {
+        /// Path to the file
+        path: String,
+    },
     /// Export full graph to JSON
     Export,
     /// Start MCP server (used by Claude Code)
@@ -47,10 +68,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init => commands::init().await,
-        Commands::Note { text, r#type, label } => commands::note(&text, &r#type, label).await,
+        Commands::Note {
+            text,
+            r#type,
+            label,
+        } => commands::note(&text, &r#type, label).await,
         Commands::Context { topic, depth } => commands::context(&topic, depth).await,
         Commands::Search { query } => commands::search(&query).await,
         Commands::Sync => commands::sync().await,
+        Commands::Reindex { path } => commands::reindex(path).await,
+        Commands::View { port, no_open } => view::serve(port, no_open).await,
+        Commands::Touch { path } => commands::touch(&path).await,
         Commands::Export => commands::export().await,
         Commands::Mcp => commands::mcp().await,
     }
