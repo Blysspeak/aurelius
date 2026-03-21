@@ -1,0 +1,99 @@
+.sidebar {
+  position: fixed;
+  top: 52px;
+  left: 0;
+  bottom: 0;
+  width: 220px;
+  background: #101720;
+  border-right: 1px solid #1e2a38;
+  overflow-y: auto;
+  z-index: 90;
+  padding: 12px 0;
+}
+
+.section {
+  padding: 0 12px;
+  margin-bottom: 24px;
+}
+
+.sectionTitle {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #6b7b8e;
+  margin-bottom: 8px;
+  padding: 0 8px;
+}
+
+.filterItem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s;
+  color: #8b949e;
+  font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+}
+
+.filterItem:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: #c9d1d9;
+}
+
+.filterItem.active {
+  background: rgba(197, 164, 78, 0.08);
+  color: #e6edf3;
+}
+
+.filterDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.filterLabel {
+  flex: 1;
+}
+
+.filterCount {
+  font-size: 11px;
+  color: #4a5568;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.shortcuts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.shortcut {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #6b7b8e;
+  padding: 0 8px;
+}
+
+.kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid #2a3a4e;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+  color: #8b949e;
+  background: #0c1018;
+  min-width: 24px;
+  text-align: center;
+}

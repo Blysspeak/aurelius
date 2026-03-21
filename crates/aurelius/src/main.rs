@@ -1,5 +1,3 @@
-mod mcp;
-
 use anyhow::Result;
 use tracing::info;
 
@@ -7,5 +5,5 @@ use tracing::info;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     info!("Aurelius daemon starting");
-    mcp::serve().await
+    aurelius::mcp::serve().await
 }
