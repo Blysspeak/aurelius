@@ -1,7 +1,7 @@
 use anyhow::Result;
 use aurelius_core::{
     db, graph, indexer,
-    models::{NodeType, Relation},
+    models::{MemoryKind, NodeType, Relation},
 };
 use rusqlite::Connection;
 use serde_json::json;
@@ -40,20 +40,25 @@ pub fn memory_status() -> Result<serde_json::Value> {
     // Crates
     let crates = graph::get_nodes_by_type(&conn, &NodeType::Crate)?;
 
+    // Solutions (to pair with problems)
+    let solutions = graph::get_nodes_by_type(&conn, &NodeType::Solution)?;
+    let recent_solutions: Vec<_> = solutions.into_iter().take(10).collect();
+
     // Stats
-    let all_nodes = graph::get_all_nodes(&conn)?;
-    let all_edges = graph::get_all_edges(&conn)?;
+    let total_nodes = graph::count_nodes(&conn)?;
+    let total_edges = graph::count_edges(&conn)?;
 
     Ok(json!({
         "summary": {
-            "total_nodes": all_nodes.len(),
-            "total_edges": all_edges.len(),
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
         },
         "projects": projects.iter().map(node_brief).collect::<Vec<_>>(),
         "crates": crates.iter().map(node_brief).collect::<Vec<_>>(),
         "recent_decisions": recent_decisions.iter().map(node_detail).collect::<Vec<_>>(),
         "open_problems": problems.iter().map(node_detail).collect::<Vec<_>>(),
-        "recent_sessions": recent_sessions.iter().map(node_brief).collect::<Vec<_>>(),
+        "recent_solutions": recent_solutions.iter().map(node_detail).collect::<Vec<_>>(),
+        "recent_sessions": recent_sessions.iter().map(node_detail).collect::<Vec<_>>(),
     }))
 }
 
@@ -111,16 +116,25 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         .get("source")
         .and_then(|s| s.as_str())
         .unwrap_or("mcp");
+    let data = params
+        .get("data")
+        .cloned()
+        .unwrap_or(json!({}));
+    let memory_kind = match params.get("memory_kind").and_then(|m| m.as_str()) {
+        Some("episodic") => MemoryKind::Episodic,
+        _ => MemoryKind::Semantic,
+    };
 
     let node_type = parse_node_type(type_str);
 
     let conn = open_db()?;
-    let node = graph::add_node(&conn, node_type, label, note, source, json!({}))?;
+    let node = graph::add_node_full(&conn, node_type, label, note, source, data, memory_kind, None)?;
 
     Ok(json!({
         "id": node.id.to_string(),
         "label": node.label,
         "type": type_str,
+        "memory_kind": node.memory_kind,
         "created": true,
     }))
 }
@@ -194,6 +208,131 @@ pub fn memory_forget(params: &serde_json::Value) -> Result<serde_json::Value> {
     Ok(json!({
         "id": id_str,
         "deleted": deleted,
+    }))
+}
+
+pub fn memory_update(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let identifier = params
+        .get("id")
+        .and_then(|i| i.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'id' parameter (UUID or label)"))?;
+    let note = params.get("note").and_then(|n| n.as_str());
+    let data = params.get("data").cloned();
+
+    if note.is_none() && data.is_none() {
+        anyhow::bail!("at least one of 'note' or 'data' must be provided");
+    }
+
+    let conn = open_db()?;
+    let node = resolve_node(&conn, identifier)?;
+    let updated = graph::update_node(&conn, node.id, note, data)?;
+
+    Ok(json!({
+        "id": node.id.to_string(),
+        "label": node.label,
+        "updated": updated,
+    }))
+}
+
+pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let summary = params
+        .get("summary")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'summary' parameter"))?;
+    let project = params
+        .get("project")
+        .and_then(|p| p.as_str())
+        .unwrap_or("unknown");
+
+    // Build structured session data
+    let mut session_data = json!({
+        "project": project,
+    });
+    if let Some(decisions) = params.get("decisions") {
+        session_data["decisions"] = decisions.clone();
+    }
+    if let Some(problems) = params.get("problems_solved") {
+        session_data["problems_solved"] = problems.clone();
+    }
+    if let Some(next) = params.get("next_steps") {
+        session_data["next_steps"] = next.clone();
+    }
+    if let Some(files) = params.get("key_files") {
+        session_data["key_files"] = files.clone();
+    }
+
+    let conn = open_db()?;
+
+    // Create session node (episodic memory)
+    let session_label = format!("[{}] {}", project, chrono::Utc::now().format("%Y-%m-%d %H:%M"));
+    let session = graph::add_node_full(
+        &conn,
+        NodeType::Session,
+        &session_label,
+        Some(summary),
+        "mcp",
+        session_data,
+        MemoryKind::Episodic,
+        None,
+    )?;
+
+    // Link session to project node if it exists
+    if let Ok(proj_node) = resolve_node(&conn, project) {
+        graph::add_edge(&conn, session.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
+    }
+
+    // Create decision nodes from the session and link them
+    if let Some(decisions) = params.get("decisions").and_then(|d| d.as_array()) {
+        for decision in decisions {
+            if let Some(text) = decision.as_str() {
+                let dec_node = graph::add_node(
+                    &conn,
+                    NodeType::Decision,
+                    &format!("[{}] {}", project, truncate(text, 60)),
+                    Some(text),
+                    "mcp-session",
+                    json!({"session_id": session.id.to_string()}),
+                )?;
+                graph::add_edge(&conn, session.id, dec_node.id, Relation::Contains, 1.0).ok();
+            }
+        }
+    }
+
+    // Create problem+solution pairs
+    if let Some(problems) = params.get("problems_solved").and_then(|p| p.as_array()) {
+        for problem in problems {
+            let prob_text = problem.get("problem").and_then(|p| p.as_str());
+            let sol_text = problem.get("solution").and_then(|s| s.as_str());
+            if let (Some(prob), Some(sol)) = (prob_text, sol_text) {
+                let prob_node = graph::add_node(
+                    &conn,
+                    NodeType::Problem,
+                    &format!("[{}] {}", project, truncate(prob, 60)),
+                    Some(prob),
+                    "mcp-session",
+                    json!({"session_id": session.id.to_string()}),
+                )?;
+                let sol_node = graph::add_node(
+                    &conn,
+                    NodeType::Solution,
+                    &format!("[{}] {}", project, truncate(sol, 60)),
+                    Some(sol),
+                    "mcp-session",
+                    json!({"session_id": session.id.to_string()}),
+                )?;
+                graph::add_edge(&conn, sol_node.id, prob_node.id, Relation::Solves, 1.0).ok();
+                graph::add_edge(&conn, session.id, prob_node.id, Relation::Contains, 1.0).ok();
+                graph::add_edge(&conn, session.id, sol_node.id, Relation::Contains, 1.0).ok();
+            }
+        }
+    }
+
+    Ok(json!({
+        "id": session.id.to_string(),
+        "label": session.label,
+        "type": "session",
+        "memory_kind": "episodic",
+        "created": true,
     }))
 }
 
@@ -286,6 +425,14 @@ fn parse_node_type(s: &str) -> NodeType {
         "session" => NodeType::Session,
         "language" => NodeType::Language,
         other => NodeType::Custom(other.to_owned()),
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_owned()
+    } else {
+        format!("{}...", &s[..max.min(s.len())])
     }
 }
 
