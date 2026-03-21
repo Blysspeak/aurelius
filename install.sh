@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Aurelius v1.1.0 — one-command install
+# Aurelius v1.2.0 — one-command install
 # Usage: ./install.sh
 set -euo pipefail
 
@@ -21,7 +21,7 @@ cat << 'BANNER'
   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝ ╚═════╝ ╚══════╝
 BANNER
 echo -e "${RESET}"
-echo -e "  ${BOLD}v1.1.0${RESET} ${DIM}— Knowledge Graph Memory for AI Agents${RESET}"
+echo -e "  ${BOLD}v1.2.0${RESET} ${DIM}— Knowledge Graph Memory for AI Agents${RESET}"
 echo ""
 
 # --- 1. Check prerequisites ---
@@ -214,7 +214,7 @@ echo -e "${GREEN}✓${RESET} Project indexed"
 
 # --- Done ---
 echo ""
-echo -e "${GOLD}${BOLD}Aurelius v1.1.0 installed!${RESET}"
+echo -e "${GOLD}${BOLD}Aurelius v1.2.0 installed!${RESET}"
 echo ""
 echo "  14 MCP tools ready for Claude Code."
 echo "  Database: ~/.local/share/aurelius/aurelius.db"

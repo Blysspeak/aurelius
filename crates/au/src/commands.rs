@@ -46,7 +46,7 @@ pub async fn note(
 
     // Link to project if specified
     if let Some(proj_name) = project {
-        let project_node = match graph::find_node_by_label(&conn, &proj_name)? {
+        let project_node = match graph::find_project_by_label(&conn, &proj_name)? {
             Some(n) => n,
             None => graph::add_node(
                 &conn,

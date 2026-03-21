@@ -1,4 +1,4 @@
-import { useRef, useCallback, useEffect, useMemo } from 'react'
+import { useRef, useCallback, useEffect, useMemo, useState } from 'react'
 import ForceGraph2D from 'react-force-graph-2d'
 import type { AureliusNode, AureliusEdge } from '../../types'
 import { parseNodeType } from '../../types'
@@ -14,19 +14,39 @@ interface GraphCanvasProps {
   onSelectNode: (node: AureliusNode | null) => void
 }
 
+// ─── Position persistence (only manually dragged nodes) ─────────────
+const POSITIONS_KEY = 'aurelius-node-positions'
+
+function loadPositions(): Record<string, { x: number; y: number }> {
+  try {
+    return JSON.parse(localStorage.getItem(POSITIONS_KEY) || '{}')
+  } catch { return {} }
+}
+
+function savePositionFor(id: string, x: number, y: number) {
+  const positions = loadPositions()
+  positions[id] = { x, y }
+  localStorage.setItem(POSITIONS_KEY, JSON.stringify(positions))
+}
+
+// ─── Component ──────────────────────────────────────────────────────
 export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: GraphCanvasProps) {
   const fgRef = useRef<any>(null)
+  const savedPositions = useRef(loadPositions())
+  // Hover state kept local — no parent re-renders
+  const [hoveredId, setHoveredId] = useState<string | null>(null)
 
-  // Build a lookup map for original nodes
   const nodeMap = useMemo(() => new Map(nodes.map(n => [n.id, n])), [nodes])
 
-  // Build graph data with extra rendering info
+  // Build graph data with pinned positions for previously dragged nodes
   const graphData = useMemo(() => {
     const nodeIds = new Set(nodes.map(n => n.id))
+    const positions = savedPositions.current
 
     return {
       nodes: nodes.map(n => {
         const type = parseNodeType(n.node_type)
+        const pos = positions[n.id]
         return {
           id: n.id,
           label: n.label,
@@ -34,6 +54,7 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
           _color: getNodeColor(type),
           _size: getNodeSize(type),
           _note: n.note,
+          ...(pos ? { x: pos.x, y: pos.y, fx: pos.x, fy: pos.y } : {}),
         }
       }),
       links: edges
@@ -46,33 +67,40 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
     }
   }, [nodes, edges])
 
-  // Connected node IDs for highlighting
-  const connectedIds = useMemo(() => {
-    if (!selectedNodeId) return null
-    const ids = new Set<string>([selectedNodeId])
+  // Active highlight: selected OR hovered + neighbors
+  const activeId = selectedNodeId || hoveredId
+  const highlightIds = useMemo(() => {
+    if (!activeId) return null
+    const ids = new Set<string>([activeId])
     for (const e of edges) {
-      if (e.from_id === selectedNodeId) ids.add(e.to_id)
-      if (e.to_id === selectedNodeId) ids.add(e.from_id)
+      if (e.from_id === activeId) ids.add(e.to_id)
+      if (e.to_id === activeId) ids.add(e.from_id)
     }
     return ids
-  }, [selectedNodeId, edges])
+  }, [activeId, edges])
 
   const handleNodeClick = useCallback((node: any) => {
-    const orig = nodeMap.get(node.id)
-    onSelectNode(orig || null)
+    onSelectNode(nodeMap.get(node.id) || null)
   }, [onSelectNode, nodeMap])
 
+  const handleNodeHover = useCallback((node: any) => {
+    setHoveredId(node?.id || null)
+  }, [])
+
+  // ─── Custom node renderer ────────────────────────────────────────
   const paintNode = useCallback((node: any, ctx: CanvasRenderingContext2D, globalScale: number) => {
     const { x, y, _color: color, _size: baseSize, _type: type, label, id } = node
     if (x == null || y == null) return
 
     const isSelected = id === selectedNodeId
-    const isConnected = connectedIds ? connectedIds.has(id) : true
-    const dimmed = connectedIds && !isConnected
-    const size = isSelected ? baseSize * 1.6 : baseSize
+    const isHovered = id === hoveredId
+    const isFocused = isSelected || isHovered
+    const isHighlighted = highlightIds ? highlightIds.has(id) : true
+    const dimmed = highlightIds && !isHighlighted
+    const size = isFocused ? baseSize * 1.6 : baseSize
 
-    // Outer glow for selected node
-    if (isSelected) {
+    // Outer glow for focused node
+    if (isFocused) {
       const gradient = ctx.createRadialGradient(x, y, size * 0.5, x, y, size * 3)
       gradient.addColorStop(0, `${color}40`)
       gradient.addColorStop(1, `${color}00`)
@@ -82,8 +110,8 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
       ctx.fill()
     }
 
-    // Connected glow
-    if (connectedIds && isConnected && !isSelected) {
+    // Neighbor glow
+    if (highlightIds && isHighlighted && !isFocused) {
       ctx.beginPath()
       ctx.arc(x, y, size + 2, 0, 2 * Math.PI)
       ctx.fillStyle = `${color}20`
@@ -101,32 +129,36 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
       ctx.strokeStyle = '#c5a44e'
       ctx.lineWidth = 2 / globalScale
       ctx.stroke()
+    } else if (isHovered) {
+      ctx.strokeStyle = `${color}90`
+      ctx.lineWidth = 1.5 / globalScale
+      ctx.stroke()
     }
 
-    // Label
-    const showLabel = globalScale > 0.6 || type === 'project' || type === 'crate' || isSelected
-    if (showLabel && !dimmed) {
-      const truncated = label.length > 22 ? label.slice(0, 20) + '…' : label
-      const fontSize = isSelected
+    // Labels: always for projects, on hover/select for focused + neighbors
+    const showLabel = type === 'project' || isFocused || (highlightIds && isHighlighted)
+    if (showLabel) {
+      const truncated = label.length > 28 ? label.slice(0, 26) + '…' : label
+      const fontSize = isFocused
         ? Math.max(14 / globalScale, 4)
         : type === 'project'
           ? Math.max(12 / globalScale, 3.5)
           : Math.max(10 / globalScale, 3)
 
-      ctx.font = `${isSelected ? 600 : type === 'project' ? 500 : 400} ${fontSize}px Inter, -apple-system, sans-serif`
+      ctx.font = `${isFocused ? 600 : type === 'project' ? 500 : 400} ${fontSize}px Inter, -apple-system, sans-serif`
       ctx.textAlign = 'center'
       ctx.textBaseline = 'top'
 
-      // Text shadow for readability
+      // Shadow
       ctx.fillStyle = '#0c1018'
       ctx.fillText(truncated, x + 0.5, y + size + 3.5)
       ctx.fillText(truncated, x - 0.5, y + size + 2.5)
 
       // Text
-      ctx.fillStyle = isSelected ? '#e6edf3' : dimmed ? '#4a556830' : '#8b949ecc'
+      ctx.fillStyle = isFocused ? '#e6edf3' : dimmed ? '#4a556830' : '#8b949ecc'
       ctx.fillText(truncated, x, y + size + 3)
     }
-  }, [selectedNodeId, connectedIds])
+  }, [selectedNodeId, hoveredId, highlightIds])
 
   const paintNodeArea = useCallback((node: any, color: string, ctx: CanvasRenderingContext2D) => {
     const { x, y, _size: size } = node
@@ -138,50 +170,36 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
   }, [])
 
   const getLinkColor = useCallback((link: any) => {
-    if (!connectedIds) return '#1e2a3860'
+    if (!highlightIds) return '#1e2a3860'
     const srcId = typeof link.source === 'string' ? link.source : link.source?.id
     const tgtId = typeof link.target === 'string' ? link.target : link.target?.id
-    const srcConnected = connectedIds.has(srcId)
-    const tgtConnected = connectedIds.has(tgtId)
-    if (srcConnected && tgtConnected) return '#c5a44e50'
+    if (highlightIds.has(srcId) && highlightIds.has(tgtId)) return '#c5a44e50'
     return '#1e2a3815'
-  }, [connectedIds])
+  }, [highlightIds])
 
   const getLinkWidth = useCallback((link: any) => {
-    if (!connectedIds) return 0.5
+    if (!highlightIds) return 0.5
     const srcId = typeof link.source === 'string' ? link.source : link.source?.id
     const tgtId = typeof link.target === 'string' ? link.target : link.target?.id
-    if (connectedIds.has(srcId) && connectedIds.has(tgtId)) return 1.5
+    if (highlightIds.has(srcId) && highlightIds.has(tgtId)) return 1.5
     return 0.2
-  }, [connectedIds])
+  }, [highlightIds])
 
-  // Obsidian-style physics: spring links, gentle repulsion, no fixed center
+  // Physics
   useEffect(() => {
     const fg = fgRef.current
     if (!fg) return
-
-    // Spring-like links: connected nodes attract
-    fg.d3Force('link')
-      ?.distance(40)
-      .strength(0.7)
-
-    // Gentle repulsion between all nodes
+    fg.d3Force('link')?.distance(40).strength(0.7)
     fg.d3Force('charge')?.strength(-120).distanceMax(300)
-
-    // Soft centering (keeps graph from drifting, not pinning)
     fg.d3Force('center')?.strength(0.03)
-
-    // Collision to prevent overlap
     fg.d3Force('collision', null)
-
     fg.d3ReheatSimulation?.()
   }, [graphData])
 
-  // Zoom to fit on load
+  // Zoom to fit on first load (skip if positions exist)
   useEffect(() => {
-    const timer = setTimeout(() => {
-      fgRef.current?.zoomToFit?.(600, 80)
-    }, 800)
+    if (Object.keys(savedPositions.current).length > 0) return
+    const timer = setTimeout(() => fgRef.current?.zoomToFit?.(600, 80), 800)
     return () => clearTimeout(timer)
   }, [nodes.length])
 
@@ -193,10 +211,11 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
         nodeCanvasObject={paintNode}
         nodePointerAreaPaint={paintNodeArea}
         onNodeClick={handleNodeClick}
+        onNodeHover={handleNodeHover}
         onNodeDragEnd={(node: any) => {
-          // Release node — let it float naturally (Obsidian behavior)
-          node.fx = undefined
-          node.fy = undefined
+          node.fx = node.x
+          node.fy = node.y
+          savePositionFor(node.id, node.x, node.y)
         }}
         onBackgroundClick={() => onSelectNode(null)}
         linkColor={getLinkColor}
