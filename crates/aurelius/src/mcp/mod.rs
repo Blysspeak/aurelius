@@ -116,6 +116,8 @@ async fn handle_tools_call(
         "memory_recall" => handlers::memory_recall(&arguments),
         "memory_dump" => handlers::memory_dump(&arguments),
         "memory_gc" => handlers::memory_gc(),
+        "search_web" => handlers::search_web(&arguments),
+        "search_recall" => handlers::search_recall(&arguments),
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     })
     .await;

@@ -1,8 +1,10 @@
 mod crud;
+mod search;
 mod session;
 mod status;
 
 pub use crud::*;
+pub use search::*;
 pub use session::*;
 pub use status::*;
 

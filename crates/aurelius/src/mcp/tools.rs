@@ -269,6 +269,54 @@ pub fn tool_definitions() -> serde_json::Value {
                     "properties": {},
                     "required": []
                 }
+            },
+            {
+                "name": "search_web",
+                "description": "Search the web via Brave Search API. Results are cached locally in SQLite — repeat queries don't burn API quota. Optionally saves results to the knowledge graph for future recall.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query"
+                        },
+                        "count": {
+                            "type": "integer",
+                            "description": "Number of results (default: 5, max: 20)",
+                            "default": 5
+                        },
+                        "cache_days": {
+                            "type": "integer",
+                            "description": "How many days to cache results (default: 7)",
+                            "default": 7
+                        },
+                        "save_to_graph": {
+                            "type": "boolean",
+                            "description": "Save results as a concept node in the knowledge graph (default: false)",
+                            "default": false
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "search_recall",
+                "description": "Search through previously cached web search results via FTS. Use this to find information from past searches without hitting the API again.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "FTS query to search through cached results"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum results (default: 10)",
+                            "default": 10
+                        }
+                    },
+                    "required": ["query"]
+                }
             }
         ]
     })
