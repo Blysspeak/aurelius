@@ -10,7 +10,14 @@ RED='\033[31m'
 DIM='\033[2m'
 RESET='\033[0m'
 
-echo -e "${GOLD}${BOLD}Aurelius v1.0.0${RESET} — Knowledge Graph Memory for AI Agents"
+echo ""
+echo -e "${GOLD}${BOLD}"
+cat << 'BANNER'
+    ▄▀█ █ █ █▀█ █▀▀ █   █ █ █ █▀
+    █▀█ █▄█ █▀▄ ██▄ █▄▄ █ █▄█ ▄█
+BANNER
+echo -e "${RESET}"
+echo -e "    ${BOLD}v1.0.0${RESET} ${DIM}· Knowledge Graph Memory for AI Agents${RESET}"
 echo ""
 
 # --- 1. Check prerequisites ---
