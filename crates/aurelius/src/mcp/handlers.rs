@@ -197,16 +197,23 @@ pub fn memory_forget(params: &serde_json::Value) -> Result<serde_json::Value> {
     }))
 }
 
-pub fn memory_dump() -> Result<serde_json::Value> {
+pub fn memory_dump(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+
     let conn = open_db()?;
-    let nodes = graph::get_all_nodes(&conn)?;
-    let edges = graph::get_all_edges(&conn)?;
+    let total_nodes = graph::count_nodes(&conn)?;
+    let total_edges = graph::count_edges(&conn)?;
+    let nodes = graph::get_nodes_paginated(&conn, offset, limit)?;
+    let edges = graph::get_edges_paginated(&conn, offset, limit)?;
 
     Ok(json!({
         "nodes": nodes.iter().map(node_detail).collect::<Vec<_>>(),
         "edges": edges.iter().map(edge_brief).collect::<Vec<_>>(),
-        "total_nodes": nodes.len(),
-        "total_edges": edges.len(),
+        "total_nodes": total_nodes,
+        "total_edges": total_edges,
+        "offset": offset,
+        "limit": limit,
     }))
 }
 

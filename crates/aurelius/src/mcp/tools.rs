@@ -33,13 +33,13 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_search",
-                "description": "Full-text search across the knowledge graph using FTS5.",
+                "description": "Full-text search across the knowledge graph using FTS5. Use empty string or '*' to list recent nodes.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "FTS5 search query"
+                            "description": "FTS5 search query. Use empty string or '*' to list most recent nodes."
                         },
                         "limit": {
                             "type": "integer",
@@ -135,10 +135,21 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_dump",
-                "description": "Export the full knowledge graph as JSON (all nodes and edges).",
+                "description": "Export the knowledge graph as JSON with pagination. Returns nodes and edges sorted by creation date (newest first).",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "offset": {
+                            "type": "integer",
+                            "description": "Number of items to skip (default: 0)",
+                            "default": 0
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum items to return (default: 50)",
+                            "default": 50
+                        }
+                    },
                     "required": []
                 }
             }
