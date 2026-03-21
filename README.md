@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="aurelius-logo.png" width="200" alt="Aurelius" />
+  <img src="logo.png" width="200" alt="Aurelius" />
 </p>
 
 <h1 align="center">Aurelius</h1>
@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <em>Captures decisions, projects, and context automatically.<br>
+  <em>Every AI session starts with full project context.<br>
   Self-hosted alternative to Mem0 and Zep — free, private, extensible.</em>
 </p>
 
@@ -24,23 +24,9 @@
 
 ## The Problem
 
-Every AI session starts from zero. You re-explain your projects, your past decisions, your architecture. Context is lost between conversations, between tools, between days.
+Every AI session starts from zero. You re-explain your projects, your past decisions, your architecture.
 
-**With Aurelius:** pull one node — get the entire web of related knowledge.
-
-```
-git commit → decision captured
-bd close   → solution linked to problem
-tf session → project context updated
-au note    → instant knowledge node
-           ↓
-     Claude Code asks:
-   "What's the context for Beacon?"
-           ↓
-  Aurelius returns: project + decisions +
-  related concepts + recent deploys +
-  open tasks — all in one shot
-```
+**With Aurelius:** index once → graph lives and grows through hooks → `memory_status` gives the full picture.
 
 ---
 
@@ -48,75 +34,69 @@ au note    → instant knowledge node
 
 ```bash
 git clone https://github.com/Blysspeak/aurelius && cd aurelius
-cargo build --release
-./target/release/au init
+./install.sh
 ```
 
-Then tell Claude Code to use it:
+This builds everything, installs binaries to `~/.local/bin`, sets up hooks, and initializes the database.
 
 ```bash
-bash contrib/claude-code/install.sh
+au reindex                  # index your project
+au view                     # open graph visualization
+au mcp                      # start MCP server for Claude Code
 ```
-
----
-
-## How It Works
-
-Aurelius maintains a **local knowledge graph** in SQLite — nodes (projects, decisions, concepts, problems) connected by typed edges (uses, solves, inspired_by, conflicts_with).
-
-Data flows in automatically from your existing tools:
-
-| Source | What's captured |
-|--------|----------------|
-| `git log` | Decisions, file changes, project activity |
-| `beads` | Tasks, epics, dependencies |
-| `TimeForged` | Active projects, time, languages |
-| `Beacon` | Failed deploys → problem nodes |
-| Claude Code | Terms and concepts from dialogs |
-| `au note` | Manual decisions and observations |
 
 ---
 
 ## CLI
 
 ```bash
-au init                          # initialize graph
-au note "why I chose X over Y"   # capture a decision
+au init                          # initialize database
+au note "chose X over Y"        # capture a decision
 au context beacon                # graph around a topic
 au search "redis"                # full-text search
-au graph                         # open web visualization
-au sync                          # pull from all connectors
-au profile work                  # switch memory profile
-au export > backup.json          # export full graph
-au import --from obsidian ~/vault
+au reindex                       # index current project
+au sync                          # pull from TimeForged
+au view                          # open web graph UI
+au touch path/to/file            # track file access
+au export                        # export full graph as JSON
+au mcp                           # start MCP server
 ```
 
 ---
 
-## MCP Integration (Claude Code)
+## MCP Tools (Claude Code Integration)
 
-Aurelius runs as an MCP server. Claude can query your memory directly:
+Aurelius runs as an MCP server over stdio. Add to Claude Code via `/mcp`:
 
-```json
-{
-  "mcpServers": {
-    "aurelius": {
-      "command": "au",
-      "args": ["mcp"]
-    }
-  }
-}
 ```
-
-Available tools:
+Command: au
+Args: mcp
+```
 
 | Tool | Description |
 |------|-------------|
-| `memory_context(topic, depth)` | Graph around a topic |
-| `memory_search(query)` | Full-text search |
-| `memory_add(label, type, note)` | Add a node |
-| `memory_relate(a, b, relation)` | Link two nodes |
-| `memory_dump()` | Full snapshot for new chat |
+| `memory_status` | Full project snapshot for session start |
+| `memory_context` | BFS context around a topic |
+| `memory_search` | FTS5 full-text search |
+| `memory_add` | Add a knowledge node |
+| `memory_relate` | Create typed edge between nodes |
+| `memory_index` | Index a project directory |
+| `memory_forget` | Delete a node |
+| `memory_dump` | Export full graph |
+
+---
+
+## Web UI
+
+Interactive knowledge graph visualization with Obsidian-style physics.
+
+```bash
+au view            # opens browser at localhost:7175
+au view -P 8080    # custom port
+au view --no-open  # don't open browser
+```
+
+Features: force-directed graph, color-coded node types, sidebar filters, node detail panel, search, drag interaction.
 
 ---
 
@@ -124,42 +104,43 @@ Available tools:
 
 ```
 crates/
-  aurelius-core/     # types, SQLite, graph ops, FTS5
-  aurelius/          # daemon + MCP server (stdio)
-  au/                # CLI
+  aurelius-core/     — domain models, SQLite, graph ops, FTS5, indexer, connectors
+  aurelius/          — daemon + MCP server (JSON-RPC 2.0 stdio)
+  au/                — CLI + web UI server
+ui/                  — React + TypeScript + Tailwind (graph visualization)
 contrib/
-  claude-code/       # hooks for automatic capture
-  git-hooks/         # post-commit parser
-  waybar/            # status bar widget
-  beads/             # beads connector
-  timeforged/        # TimeForged connector
+  claude-code/       — session hooks (reindex, track edits)
+  git-hooks/         — post-commit (captures decisions)
 ```
+
+### Key Design
+
+- **SQLite + WAL** — concurrent reads, single writer, local-first
+- **FTS5** — full-text search kept in sync via triggers
+- **Versioned migrations** — `schema_version` table, v1 base + v2 extended fields
+- **Connector trait** — `async fn pull() -> Vec<RawEvent>` for data sources
+- **Graph traversal** — BFS from FTS seed nodes, depth-limited expansion
+- **Content hashing** — SHA256 for incremental re-indexing
 
 ---
 
-## Connectors
+## Hooks (Auto-Capture)
 
-Aurelius uses a simple connector trait — anyone can build one:
-
-```rust
-trait Connector {
-    fn name(&self) -> &str;
-    fn pull(&self) -> anyhow::Result<Vec<RawEvent>>;
-}
-```
-
-Official connectors: `git`, `beads`, `timeforged`, `beacon`
-Community connectors: anything you want.
+| Hook | Event | What it does |
+|------|-------|-------------|
+| `aurelius-reindex.sh` | Stop | Re-indexes project on session end |
+| `aurelius-track-edit.sh` | PostToolUse (Edit/Write) | Increments access_count on file nodes |
+| `post-commit` | git commit | Captures commit as Decision node |
 
 ---
 
 ## Roadmap
 
-- [ ] v0.1 — Core: SQLite graph, CLI, MCP server, git hook
-- [ ] v0.2 — Dev ecosystem: beads, TimeForged, Beacon connectors, Waybar
-- [ ] v0.3 — Universal: Obsidian import, Telegram connector, web UI
-- [ ] v0.4 — Platform: Connector SDK, HTTP API
-- [ ] v1.0 — Cloud: sync, team plans
+- [x] v0.1 — Core graph, CLI, MCP server, project indexer, web UI, TimeForged connector
+- [ ] v0.2 — Git connector, beads integration, Beacon connector
+- [ ] v0.3 — Obsidian import, temporal decay scoring, 3D graph view
+- [ ] v0.4 — Connector SDK, HTTP API, Tauri desktop app
+- [ ] v1.0 — Multi-project sync, team features
 
 ---
 

@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 aurelius-core = { path = "../aurelius-core" }
+aurelius = { path = "../aurelius" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,3 +27,7 @@ tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+dirs-next = { workspace = true }
+chrono = { workspace = true }
+axum = { workspace = true }
+open = { workspace = true }

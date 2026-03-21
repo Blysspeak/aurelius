@@ -1,0 +1,12 @@
+.canvas {
+  position: fixed;
+  top: 52px;
+  left: 220px;
+  right: 0;
+  bottom: 0;
+  overflow: hidden;
+}
+
+.canvas canvas {
+  outline: none;
+}
