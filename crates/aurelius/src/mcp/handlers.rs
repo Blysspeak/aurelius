@@ -348,18 +348,19 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         .get("topic")
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'topic' parameter"))?;
+    let depth = params.get("depth").and_then(|d| d.as_u64()).unwrap_or(1) as u32;
 
     let conn = open_db()?;
 
-    // 1. BFS context traversal (nodes + edges around the topic)
-    let (context_nodes, context_edges) = graph::context(&conn, topic, 2)?;
+    // BFS context traversal (depth 1 by default to avoid graph explosion)
+    let (context_nodes, _context_edges) = graph::context(&conn, topic, depth)?;
 
-    // 2. Separate by type for structured output
+    // Separate by type — only knowledge nodes, skip structural noise
     let mut decisions = vec![];
     let mut problems = vec![];
     let mut solutions = vec![];
     let mut sessions = vec![];
-    let mut other = vec![];
+    let mut concepts = vec![];
 
     for node in &context_nodes {
         match &node.node_type {
@@ -367,14 +368,18 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
             NodeType::Problem => problems.push(node_detail(node)),
             NodeType::Solution => solutions.push(node_detail(node)),
             NodeType::Session => sessions.push(node_detail(node)),
-            _ => other.push(node_detail(node)),
+            NodeType::Concept | NodeType::Project => concepts.push(node_detail(node)),
+            // Skip structural nodes (files, deps, crates) — AI can derive these
+            _ => {}
         }
     }
 
-    // Touch accessed nodes
+    // Touch accessed knowledge nodes
     for node in &context_nodes {
         graph::touch_node(&conn, node.id).ok();
     }
+
+    let knowledge_count = decisions.len() + problems.len() + solutions.len() + sessions.len() + concepts.len();
 
     Ok(json!({
         "topic": topic,
@@ -382,9 +387,9 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         "problems": problems,
         "solutions": solutions,
         "sessions": sessions,
-        "other_nodes": other,
-        "edges": context_edges.iter().map(edge_brief).collect::<Vec<_>>(),
-        "total_nodes": context_nodes.len(),
+        "concepts": concepts,
+        "total_knowledge_nodes": knowledge_count,
+        "total_graph_nodes": context_nodes.len(),
     }))
 }
 
