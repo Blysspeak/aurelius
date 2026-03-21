@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] — 2026-03-21
+
+### Added
+- **`memory_recall`** — smart topic recall: combines FTS search with BFS traversal, returns results grouped by type (decisions, problems, solutions, sessions, other). One call instead of separate search+context
+- **`memory_search` type filter** — optional `type` parameter to filter results by node type (e.g. `type: "decision"`)
+- **`get_unsolved_problems()`** — SQL query that finds problems without a linked solution (via `solves` edge)
+- **`search_typed()`** — FTS search with node type filter in core
+
+### Improved
+- **`memory_status`** — `open_problems` now shows only unsolved problems (those without a `solves` edge from a Solution node), not all problems
+- **Web UI** — graph physics now always active (`cooldownTicks=Infinity`, `d3AlphaMin=0`), Obsidian-like behavior
+
+### Fixed
+- Graph visualization froze after 5-10 seconds due to d3-force simulation cooling down
+
+---
+
 ## [0.3.0] — 2026-03-21
 
 ### Added
