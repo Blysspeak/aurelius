@@ -4,7 +4,7 @@ import { Sidebar } from './components/sidebar/sidebar'
 import { GraphCanvas } from './components/graphCanvas/graphCanvas'
 import { NodeDetail } from './components/nodeDetail/nodeDetail'
 import { fetchGraph } from './api'
-import { parseNodeType } from './types'
+import { parseNodeType, extractProject } from './types'
 import type { AureliusNode, AureliusEdge } from './types'
 
 export function App() {
@@ -13,6 +13,7 @@ export function App() {
   const [selectedNode, setSelectedNode] = useState<AureliusNode | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [activeFilters, setActiveFilters] = useState<Set<string>>(new Set())
+  const [activeProject, setActiveProject] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
@@ -44,13 +45,21 @@ export function App() {
     return acc
   }, {})
 
+  const projectCounts = nodes.reduce<Record<string, number>>((acc, n) => {
+    const proj = extractProject(n.label)
+    if (proj) acc[proj] = (acc[proj] || 0) + 1
+    return acc
+  }, {})
+
   const filteredNodes = nodes.filter(n => {
     const type = parseNodeType(n.node_type)
     const matchFilter = activeFilters.size === 0 || activeFilters.has(type)
+    const isProjectNode = parseNodeType(n.node_type) === 'project' && n.label === activeProject
+    const matchProject = !activeProject || extractProject(n.label) === activeProject || isProjectNode
     const matchSearch = !searchQuery ||
       n.label.toLowerCase().includes(searchQuery.toLowerCase()) ||
       (n.note && n.note.toLowerCase().includes(searchQuery.toLowerCase()))
-    return matchFilter && matchSearch
+    return matchFilter && matchProject && matchSearch
   })
 
   const handleToggleFilter = useCallback((type: string) => {
@@ -64,6 +73,10 @@ export function App() {
 
   const handleClearFilters = useCallback(() => {
     setActiveFilters(new Set())
+  }, [])
+
+  const handleSelectProject = useCallback((proj: string | null) => {
+    setActiveProject(prev => prev === proj ? null : proj)
   }, [])
 
   const handleSelectNode = useCallback((node: AureliusNode | null) => {
@@ -106,6 +119,9 @@ export function App() {
         activeFilters={activeFilters}
         onToggleFilter={handleToggleFilter}
         onClearFilters={handleClearFilters}
+        projectCounts={projectCounts}
+        activeProject={activeProject}
+        onSelectProject={handleSelectProject}
       />
 
       <GraphCanvas

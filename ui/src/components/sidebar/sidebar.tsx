@@ -6,13 +6,42 @@ interface SidebarProps {
   activeFilters: Set<string>
   onToggleFilter: (type: string) => void
   onClearFilters: () => void
+  projectCounts: Record<string, number>
+  activeProject: string | null
+  onSelectProject: (project: string | null) => void
 }
 
-export function Sidebar({ typeCounts, activeFilters, onToggleFilter, onClearFilters }: SidebarProps) {
+export function Sidebar({ typeCounts, activeFilters, onToggleFilter, onClearFilters, projectCounts, activeProject, onSelectProject }: SidebarProps) {
   const types = Object.entries(typeCounts).sort((a, b) => b[1] - a[1])
+  const projects = Object.entries(projectCounts).sort((a, b) => b[1] - a[1])
 
   return (
     <aside className={styles.sidebar}>
+      {projects.length > 0 && (
+        <div className={styles.section}>
+          <h3 className={styles.sectionTitle}>Projects</h3>
+          <button
+            className={`${styles.filterItem} ${!activeProject ? styles.active : ''}`}
+            onClick={() => onSelectProject(null)}
+          >
+            <span className={styles.filterDot} style={{ background: '#c5a44e' }} />
+            <span className={styles.filterLabel}>All</span>
+            <span className={styles.filterCount}>{Object.values(projectCounts).reduce((a, b) => a + b, 0)}</span>
+          </button>
+          {projects.map(([proj, count]) => (
+            <button
+              key={proj}
+              className={`${styles.filterItem} ${activeProject === proj ? styles.active : ''}`}
+              onClick={() => onSelectProject(proj)}
+            >
+              <span className={styles.filterDot} style={{ background: '#c5a44e' }} />
+              <span className={styles.filterLabel}>{proj}</span>
+              <span className={styles.filterCount}>{count}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className={styles.section}>
         <h3 className={styles.sectionTitle}>Node Types</h3>
         <button
