@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/v1.2.0-stable-a6e3a1?style=flat-square" alt="v1.2.0">
+  <img src="https://img.shields.io/badge/v1.3.0-stable-a6e3a1?style=flat-square" alt="v1.3.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
   <img src="https://img.shields.io/badge/MCP-14_tools-a6e3a1?style=flat-square" alt="MCP">
@@ -56,7 +56,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | Tool | Description |
 |------|-------------|
 | `memory_status` | Session start — full project snapshot. Optional `project` filter. |
-| `memory_session` | Session end — save decisions, problems/solutions, next steps. SHA-256 dedup. |
+| `memory_session` | Session end — save decisions, problems/solutions, next steps. Auto-creates project hub node. SHA-256 dedup. |
 | `memory_recall` | Smart topic recall — FTS + BFS, grouped by type, skips structural noise. |
 | `memory_search` | Full-text search with `type`, `since`, and `limit` filters. `*` for recent. |
 | `memory_context` | Raw BFS graph traversal from FTS seed nodes. |
@@ -105,7 +105,7 @@ au mcp                           # start MCP server
 
 ## Web UI
 
-Interactive knowledge graph visualization with always-live Obsidian-style physics.
+Interactive knowledge graph visualization with Obsidian-style physics.
 
 ```bash
 au view            # opens browser at localhost:7175
@@ -113,7 +113,13 @@ au view -P 8080    # custom port
 au view --no-open  # don't open browser
 ```
 
-Features: force-directed graph, color-coded node types, sidebar filters, node detail panel, search, drag interaction.
+Features:
+- **Obsidian-style physics** — gentle forces, no pinning, drag follows neighbors naturally
+- **Project hub nodes** — central nodes that connect all sessions, decisions, problems, solutions
+- **Clean labels** — only project names visible by default, details on hover/select
+- **Project filter** — sidebar scoping by project (extracts from `[project-name]` label prefix)
+- **Node type filter** — filter by decision, solution, problem, session, project
+- Color-coded node types, node detail panel, keyboard shortcuts (/, Esc, Scroll)
 
 ---
 
@@ -152,6 +158,8 @@ contrib/
 - **Problem lifecycle** — unsolved = no Solution node with `solves` edge
 - **Relevance ranking** — FTS results boosted by access_count
 - **Content hashing** — SHA-256 for incremental re-indexing
+- **Project hub nodes** — `memory_session` auto-creates project nodes and links all children via `belongs_to`
+- **Label convention** — child nodes prefixed `[project-name] description`, project nodes use plain names
 
 ---
 
@@ -176,7 +184,9 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 - [x] v0.5 — Query optimization, session dedup, no double storage
 - [x] v1.0 — Project scoping, batch BFS, GC, edge dedup, FTS cleanup, modular codebase, install.sh auto-config
 - [x] v1.1 — Web search (Brave API + SQLite cache + graph integration), install.sh Brave key setup
-- [ ] Next — Context-ranked search results, git log connector, auto-session via Stop hook
+- [x] v1.2 — UI overhaul, project-scoped linking, indexer fix
+- [x] v1.3 — Obsidian-style graph physics, project hub nodes, session auto-linking, project sidebar filter
+- [ ] Next — `au repair` (auto-fix orphan nodes), context-ranked search, git log connector
 
 ---
 
