@@ -14,39 +14,20 @@ interface GraphCanvasProps {
   onSelectNode: (node: AureliusNode | null) => void
 }
 
-// ─── Position persistence (only manually dragged nodes) ─────────────
-const POSITIONS_KEY = 'aurelius-node-positions'
-
-function loadPositions(): Record<string, { x: number; y: number }> {
-  try {
-    return JSON.parse(localStorage.getItem(POSITIONS_KEY) || '{}')
-  } catch { return {} }
-}
-
-function savePositionFor(id: string, x: number, y: number) {
-  const positions = loadPositions()
-  positions[id] = { x, y }
-  localStorage.setItem(POSITIONS_KEY, JSON.stringify(positions))
-}
-
 // ─── Component ──────────────────────────────────────────────────────
 export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: GraphCanvasProps) {
   const fgRef = useRef<any>(null)
-  const savedPositions = useRef(loadPositions())
   // Hover state kept local — no parent re-renders
   const [hoveredId, setHoveredId] = useState<string | null>(null)
 
   const nodeMap = useMemo(() => new Map(nodes.map(n => [n.id, n])), [nodes])
 
-  // Build graph data with pinned positions for previously dragged nodes
   const graphData = useMemo(() => {
     const nodeIds = new Set(nodes.map(n => n.id))
-    const positions = savedPositions.current
 
     return {
       nodes: nodes.map(n => {
         const type = parseNodeType(n.node_type)
-        const pos = positions[n.id]
         return {
           id: n.id,
           label: n.label,
@@ -54,7 +35,6 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
           _color: getNodeColor(type),
           _size: getNodeSize(type),
           _note: n.note,
-          ...(pos ? { x: pos.x, y: pos.y, fx: pos.x, fy: pos.y } : {}),
         }
       }),
       links: edges
@@ -135,7 +115,7 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
       ctx.stroke()
     }
 
-    // Labels: always for projects, on hover/select for focused + neighbors
+    // Labels: only project nodes by default, others on hover/select + neighbors
     const showLabel = type === 'project' || isFocused || (highlightIds && isHighlighted)
     if (showLabel) {
       const truncated = label.length > 28 ? label.slice(0, 26) + '…' : label
@@ -143,7 +123,7 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
         ? Math.max(14 / globalScale, 4)
         : type === 'project'
           ? Math.max(12 / globalScale, 3.5)
-          : Math.max(10 / globalScale, 3)
+          : Math.max(10 / globalScale, 2.5)
 
       ctx.font = `${isFocused ? 600 : type === 'project' ? 500 : 400} ${fontSize}px Inter, -apple-system, sans-serif`
       ctx.textAlign = 'center'
@@ -170,35 +150,33 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
   }, [])
 
   const getLinkColor = useCallback((link: any) => {
-    if (!highlightIds) return '#1e2a3860'
+    if (!highlightIds) return '#2a3a4c30'
     const srcId = typeof link.source === 'string' ? link.source : link.source?.id
     const tgtId = typeof link.target === 'string' ? link.target : link.target?.id
-    if (highlightIds.has(srcId) && highlightIds.has(tgtId)) return '#c5a44e50'
-    return '#1e2a3815'
+    if (highlightIds.has(srcId) && highlightIds.has(tgtId)) return '#c5a44e70'
+    return '#1e2a3812'
   }, [highlightIds])
 
   const getLinkWidth = useCallback((link: any) => {
-    if (!highlightIds) return 0.5
+    if (!highlightIds) return 0.6
     const srcId = typeof link.source === 'string' ? link.source : link.source?.id
     const tgtId = typeof link.target === 'string' ? link.target : link.target?.id
-    if (highlightIds.has(srcId) && highlightIds.has(tgtId)) return 1.5
-    return 0.2
+    if (highlightIds.has(srcId) && highlightIds.has(tgtId)) return 1.8
+    return 0.3
   }, [highlightIds])
 
   // Physics
   useEffect(() => {
     const fg = fgRef.current
     if (!fg) return
-    fg.d3Force('link')?.distance(40).strength(0.7)
-    fg.d3Force('charge')?.strength(-120).distanceMax(300)
-    fg.d3Force('center')?.strength(0.03)
-    fg.d3Force('collision', null)
+    fg.d3Force('link')?.distance(30).strength(1.0)
+    fg.d3Force('charge')?.strength(-100).distanceMax(300)
+    fg.d3Force('center')?.strength(0.05)
     fg.d3ReheatSimulation?.()
   }, [graphData])
 
-  // Zoom to fit on first load (skip if positions exist)
+  // Zoom to fit on first load
   useEffect(() => {
-    if (Object.keys(savedPositions.current).length > 0) return
     const timer = setTimeout(() => fgRef.current?.zoomToFit?.(600, 80), 800)
     return () => clearTimeout(timer)
   }, [nodes.length])
@@ -213,9 +191,9 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
         onNodeClick={handleNodeClick}
         onNodeHover={handleNodeHover}
         onNodeDragEnd={(node: any) => {
-          node.fx = node.x
-          node.fy = node.y
-          savePositionFor(node.id, node.x, node.y)
+          // Obsidian-style: release node back into simulation
+          node.fx = undefined
+          node.fy = undefined
         }}
         onBackgroundClick={() => onSelectNode(null)}
         linkColor={getLinkColor}
@@ -223,8 +201,8 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
         linkDirectionalArrowLength={0}
         linkCurvature={0.05}
         backgroundColor="#0c1018"
-        d3AlphaDecay={0.01}
-        d3VelocityDecay={0.3}
+        d3AlphaDecay={0.05}
+        d3VelocityDecay={0.5}
         cooldownTicks={Infinity}
         warmupTicks={100}
         d3AlphaMin={0}
