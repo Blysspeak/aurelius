@@ -5,7 +5,7 @@ use aurelius_core::{
 };
 use serde_json::json;
 
-use super::{node_detail, open_db, resolve_node, truncate};
+use super::{node_detail, open_db, truncate};
 
 pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
     let summary = params
@@ -60,10 +60,19 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         Some(&content_hash),
     )?;
 
-    // Link session to project node if it exists
-    if let Ok(proj_node) = resolve_node(&conn, project) {
-        graph::add_edge(&conn, session.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
-    }
+    // Link session to project node — create if it doesn't exist
+    let proj_node = match graph::find_project_by_label(&conn, project) {
+        Ok(Some(n)) => n,
+        _ => graph::add_node(
+            &conn,
+            NodeType::Project,
+            project,
+            None,
+            "mcp-session",
+            json!({"auto_created": true}),
+        )?,
+    };
+    graph::add_edge(&conn, session.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
 
     // Create decision nodes
     if let Some(decisions) = params.get("decisions").and_then(|d| d.as_array()) {
@@ -78,6 +87,7 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
                     json!({"session_id": session.id.to_string()}),
                 )?;
                 graph::add_edge(&conn, session.id, dec_node.id, Relation::Contains, 1.0).ok();
+                graph::add_edge(&conn, dec_node.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
             }
         }
     }
@@ -107,6 +117,8 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
                 graph::add_edge(&conn, sol_node.id, prob_node.id, Relation::Solves, 1.0).ok();
                 graph::add_edge(&conn, session.id, prob_node.id, Relation::Contains, 1.0).ok();
                 graph::add_edge(&conn, session.id, sol_node.id, Relation::Contains, 1.0).ok();
+                graph::add_edge(&conn, prob_node.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
+                graph::add_edge(&conn, sol_node.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
             }
         }
     }

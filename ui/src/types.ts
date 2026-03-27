@@ -43,3 +43,9 @@ export function parseRelation(rel: string | Record<string, string>): string {
   if (typeof rel === 'string') return rel.replace(/"/g, '')
   return Object.keys(rel)[0] || 'related'
 }
+
+/** Extract project name from label like "[my-project] Some text" */
+export function extractProject(label: string): string | null {
+  const m = label.match(/^\[([^\]]+)\]/)
+  return m ? m[1] : null
+}

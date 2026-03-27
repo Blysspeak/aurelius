@@ -18,17 +18,18 @@ export const nodeColors: Record<string, string> = {
 export const defaultNodeColor = '#6b7b8e'
 
 export const nodeSizes: Record<string, number> = {
-  project:    8,
-  crate:      6,
-  decision:   5,
-  concept:    4.5,
-  problem:    5,
-  solution:   5,
-  file:       3,
-  dependency: 2.5,
+  project:    6,
+  crate:      4,
+  decision:   3,
+  concept:    3.5,
+  problem:    3,
+  solution:   3,
+  session:    4,
+  file:       2,
+  dependency: 2,
 }
 
-export const defaultNodeSize = 4
+export const defaultNodeSize = 3
 
 export function getNodeColor(type: string): string {
   return nodeColors[type] || defaultNodeColor

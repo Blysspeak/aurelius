@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.3.0] — 2026-03-28
+
+### Fixed
+- **`memory_session` auto-creates project nodes** — sessions now create their project hub node if it doesn't exist, and link all child nodes (decisions, problems, solutions) to it via `belongs_to` edges. Previously, sessions silently skipped project linking when the project node was missing, leaving the graph fragmented.
+- **Project filter includes hub node** — sidebar project filter now includes the project node itself, keeping the graph connected when filtering by project.
+
+### Improved
+- **Obsidian-style graph physics** — reworked force simulation: no node pinning after drag (nodes release back into simulation), gentle center force, stronger link forces for cluster cohesion. Drag a node and its neighbors follow naturally.
+- **Cleaner graph labels** — only project nodes show labels by default; other nodes reveal labels on hover/select with neighbor highlighting.
+- **Softer link styling** — links are subtle by default, brighten on highlight (Obsidian-inspired).
+- **Smaller node sizes** — reduced node radii for cleaner visualization at scale.
+- **Project navigation in sidebar** — new "Projects" section extracts project names from `[project-name]` label prefix, allows one-click project scoping.
+
+### Removed
+- Position persistence (localStorage pinning) — graph recalculates layout each session, matching Obsidian behavior.
+
+---
+
 ## [1.0.0] — 2026-03-21
 
 ### Added
