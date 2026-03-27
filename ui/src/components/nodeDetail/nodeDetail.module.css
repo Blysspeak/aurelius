@@ -86,6 +86,16 @@
   color: #c9d1d9;
   line-height: 1.6;
   word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.panelClosing {
+  animation: slideOut 0.2s ease-in forwards;
+}
+
+@keyframes slideOut {
+  from { transform: translateX(0); opacity: 1; }
+  to { transform: translateX(100%); opacity: 0; }
 }
 
 .fieldValueMono {

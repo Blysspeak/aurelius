@@ -1,11 +1,14 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { Header } from './components/header/header'
 import { Sidebar } from './components/sidebar/sidebar'
 import { GraphCanvas } from './components/graphCanvas/graphCanvas'
 import { NodeDetail } from './components/nodeDetail/nodeDetail'
+import { Minimap } from './components/minimap/minimap'
 import { fetchGraph } from './api'
 import { parseNodeType, extractProject } from './types'
 import type { AureliusNode, AureliusEdge } from './types'
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
 export function App() {
   const [nodes, setNodes] = useState<AureliusNode[]>([])
@@ -14,7 +17,9 @@ export function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [activeFilters, setActiveFilters] = useState<Set<string>>(new Set())
   const [activeProject, setActiveProject] = useState<string | null>(null)
+  const [timeFilter, setTimeFilter] = useState<'all' | 'today' | '7d' | '30d'>('all')
   const [loading, setLoading] = useState(true)
+  const graphRef = useRef<any>(null)
 
   useEffect(() => {
     fetchGraph()
@@ -51,15 +56,33 @@ export function App() {
     return acc
   }, {})
 
+  // Time cutoff
+  const timeCutoff = useMemo(() => {
+    if (timeFilter === 'all') return null
+    const now = Date.now()
+    const ms: Record<string, number> = { today: 86400000, '7d': 7 * 86400000, '30d': 30 * 86400000 }
+    return new Date(now - ms[timeFilter]).toISOString()
+  }, [timeFilter])
+
+  // Search match IDs (highlight, not filter)
+  const searchMatchIds = useMemo(() => {
+    if (!searchQuery) return null
+    const q = searchQuery.toLowerCase()
+    return new Set(
+      nodes.filter(n =>
+        n.label.toLowerCase().includes(q) ||
+        (n.note && n.note.toLowerCase().includes(q))
+      ).map(n => n.id)
+    )
+  }, [nodes, searchQuery])
+
   const filteredNodes = nodes.filter(n => {
     const type = parseNodeType(n.node_type)
     const matchFilter = activeFilters.size === 0 || activeFilters.has(type)
-    const isProjectNode = parseNodeType(n.node_type) === 'project' && n.label === activeProject
+    const isProjectNode = type === 'project' && n.label === activeProject
     const matchProject = !activeProject || extractProject(n.label) === activeProject || isProjectNode
-    const matchSearch = !searchQuery ||
-      n.label.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (n.note && n.note.toLowerCase().includes(searchQuery.toLowerCase()))
-    return matchFilter && matchProject && matchSearch
+    const matchTime = !timeCutoff || n.created_at >= timeCutoff
+    return matchFilter && matchProject && matchTime
   })
 
   const handleToggleFilter = useCallback((type: string) => {
@@ -122,13 +145,24 @@ export function App() {
         projectCounts={projectCounts}
         activeProject={activeProject}
         onSelectProject={handleSelectProject}
+        timeFilter={timeFilter}
+        onTimeFilterChange={setTimeFilter}
       />
 
       <GraphCanvas
+        graphRef={graphRef}
         nodes={filteredNodes}
         edges={edges}
         selectedNodeId={selectedNode?.id || null}
+        searchMatchIds={searchMatchIds}
+        zoomToProject={activeProject}
         onSelectNode={handleSelectNode}
+      />
+
+      <Minimap
+        graphRef={graphRef}
+        selectedNodeId={selectedNode?.id || null}
+        hasDetailPanel={!!selectedNode}
       />
 
       {selectedNode && (
