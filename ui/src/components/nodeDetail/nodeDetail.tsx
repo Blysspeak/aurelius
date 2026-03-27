@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { X, Clock, Hash, Database, Link2 } from 'lucide-react'
 import type { AureliusNode, AureliusEdge } from '../../types'
 import { parseNodeType, parseRelation } from '../../types'
@@ -12,7 +13,21 @@ interface NodeDetailProps {
   onSelectNode: (id: string) => void
 }
 
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime()
+  const mins = Math.floor(diff / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days < 30) return `${days}d ago`
+  const months = Math.floor(days / 30)
+  return `${months}mo ago`
+}
+
 export function NodeDetail({ node, edges, allNodes, onClose, onSelectNode }: NodeDetailProps) {
+  const [isClosing, setIsClosing] = useState(false)
   const type = parseNodeType(node.node_type)
   const color = getNodeColor(type)
   const nodeMap = new Map(allNodes.map(n => [n.id, n]))
@@ -21,9 +36,14 @@ export function NodeDetail({ node, edges, allNodes, onClose, onSelectNode }: Nod
     e => e.from_id === node.id || e.to_id === node.id
   )
 
+  const handleClose = () => {
+    setIsClosing(true)
+    setTimeout(onClose, 200)
+  }
+
   return (
-    <div className={styles.panel}>
-      <button className={styles.closeBtn} onClick={onClose}>
+    <div className={`${styles.panel} ${isClosing ? styles.panelClosing : ''}`}>
+      <button className={styles.closeBtn} onClick={handleClose}>
         <X size={16} />
       </button>
 
@@ -57,9 +77,9 @@ export function NodeDetail({ node, edges, allNodes, onClose, onSelectNode }: Nod
           <Hash size={12} />
           <span>{node.memory_kind || 'semantic'}</span>
         </div>
-        <div className={styles.metaItem}>
+        <div className={styles.metaItem} title={new Date(node.created_at).toLocaleString()}>
           <Clock size={12} />
-          <span>{new Date(node.created_at).toLocaleDateString()}</span>
+          <span>{relativeTime(node.created_at)}</span>
         </div>
         <div className={styles.metaItem}>
           <Link2 size={12} />

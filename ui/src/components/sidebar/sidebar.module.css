@@ -70,6 +70,36 @@
   font-family: 'JetBrains Mono', monospace;
 }
 
+.timeFilters {
+  display: flex;
+  gap: 4px;
+  padding: 0 8px;
+}
+
+.timeBtn {
+  flex: 1;
+  padding: 4px 0;
+  border: 1px solid #1e2a38;
+  background: transparent;
+  border-radius: 6px;
+  color: #6b7b8e;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s;
+}
+
+.timeBtn:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: #c9d1d9;
+}
+
+.timeBtn.active {
+  background: rgba(197, 164, 78, 0.08);
+  color: #c5a44e;
+  border-color: rgba(197, 164, 78, 0.25);
+}
+
 .shortcuts {
   display: flex;
   flex-direction: column;

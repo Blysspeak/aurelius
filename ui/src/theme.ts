@@ -38,3 +38,10 @@ export function getNodeColor(type: string): string {
 export function getNodeSize(type: string): number {
   return nodeSizes[type] || defaultNodeSize
 }
+
+/** Dynamic size based on connection count — more connections = bigger, capped below project */
+export function getNodeSizeDynamic(type: string, degree: number): number {
+  const base = getNodeSize(type)
+  if (type === 'project') return base + Math.log2(degree + 1) * 0.5
+  return Math.min(base + Math.log2(degree + 1) * 0.8, (nodeSizes.project || 6) - 0.5)
+}

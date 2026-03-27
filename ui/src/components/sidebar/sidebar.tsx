@@ -9,9 +9,15 @@ interface SidebarProps {
   projectCounts: Record<string, number>
   activeProject: string | null
   onSelectProject: (project: string | null) => void
+  timeFilter: 'all' | 'today' | '7d' | '30d'
+  onTimeFilterChange: (filter: 'all' | 'today' | '7d' | '30d') => void
 }
 
-export function Sidebar({ typeCounts, activeFilters, onToggleFilter, onClearFilters, projectCounts, activeProject, onSelectProject }: SidebarProps) {
+export function Sidebar({
+  typeCounts, activeFilters, onToggleFilter, onClearFilters,
+  projectCounts, activeProject, onSelectProject,
+  timeFilter, onTimeFilterChange,
+}: SidebarProps) {
   const types = Object.entries(typeCounts).sort((a, b) => b[1] - a[1])
   const projects = Object.entries(projectCounts).sort((a, b) => b[1] - a[1])
 
@@ -67,6 +73,21 @@ export function Sidebar({ typeCounts, activeFilters, onToggleFilter, onClearFilt
             <span className={styles.filterCount}>{count}</span>
           </button>
         ))}
+      </div>
+
+      <div className={styles.section}>
+        <h3 className={styles.sectionTitle}>Time Range</h3>
+        <div className={styles.timeFilters}>
+          {(['all', 'today', '7d', '30d'] as const).map(t => (
+            <button
+              key={t}
+              className={`${styles.timeBtn} ${timeFilter === t ? styles.active : ''}`}
+              onClick={() => onTimeFilterChange(t)}
+            >
+              {t === 'all' ? 'All' : t === 'today' ? 'Today' : t}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className={styles.section}>
