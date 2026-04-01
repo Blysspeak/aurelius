@@ -107,7 +107,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "au"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "aurelius",
@@ -129,7 +129,7 @@ dependencies = [
 
 [[package]]
 name = "aurelius"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "aurelius-core",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "aurelius-core"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "async-trait",

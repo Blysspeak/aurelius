@@ -1,5 +1,15 @@
 # Changelog
 
+## [v1.4.1] — 2026-04-01
+
+### Added
+- Auto-index project on first use — no manual `au init`/`au reindex` needed (73afe86)
+
+### Documentation
+- Update README to v1.4.0 — task management, 19 tools, new sections (32da52e)
+
+---
+
 ## [v1.4.0] — 2026-04-01
 
 ### Added
