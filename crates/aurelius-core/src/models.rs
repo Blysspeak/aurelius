@@ -19,6 +19,8 @@ pub enum NodeType {
     Config,
     Session,
     Language,
+    Task,
+    WorkLog,
     Custom(String),
 }
 
@@ -41,6 +43,8 @@ pub enum Relation {
     Implements,
     Configures,
     TrackedBy,
+    SubtaskOf,
+    Blocks,
 }
 
 impl std::fmt::Display for Relation {

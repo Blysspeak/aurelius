@@ -12,6 +12,68 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+pub enum TaskAction {
+    /// Create a new task
+    New {
+        /// Task title
+        title: String,
+        /// Project name
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Priority: critical, high, medium, low
+        #[arg(long, default_value = "medium")]
+        priority: String,
+        /// Acceptance criteria (can be specified multiple times)
+        #[arg(short = 'c', long = "criteria")]
+        criteria: Vec<String>,
+        /// Description
+        #[arg(short, long)]
+        description: Option<String>,
+    },
+    /// List tasks
+    List {
+        /// Filter by project
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Filter by status (comma-separated)
+        #[arg(short, long)]
+        status: Option<String>,
+        /// Filter by priority
+        #[arg(long)]
+        priority: Option<String>,
+    },
+    /// Show full task details with work log branch
+    Show {
+        /// Task UUID or label
+        id: String,
+    },
+    /// Log work done on a task
+    Log {
+        /// Task UUID or label
+        id: String,
+        /// Description of work done
+        text: String,
+    },
+    /// Mark task as done
+    Done {
+        /// Task UUID or label
+        id: String,
+    },
+    /// Block a task with a reason
+    Block {
+        /// Task UUID or label
+        id: String,
+        /// Reason for blocking
+        reason: String,
+    },
+    /// Activate a task (set status to active)
+    Activate {
+        /// Task UUID or label
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Initialize Aurelius in current environment
     Init,
@@ -62,6 +124,11 @@ enum Commands {
     },
     /// Export full graph to JSON
     Export,
+    /// Task management — create, track, and log work on tasks
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
     /// Start MCP server (used by Claude Code)
     Mcp,
 }
@@ -84,6 +151,7 @@ async fn main() -> Result<()> {
         Commands::View { port, no_open } => view::serve(port, no_open).await,
         Commands::Touch { path } => commands::touch(&path).await,
         Commands::Export => commands::export().await,
+        Commands::Task { action } => commands::task(action).await,
         Commands::Mcp => commands::mcp().await,
     }
 }

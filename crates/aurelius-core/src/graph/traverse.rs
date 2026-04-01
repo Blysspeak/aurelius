@@ -42,15 +42,60 @@ pub fn context(conn: &Connection, topic: &str, depth: u32) -> Result<(Vec<Node>,
     Ok((all_nodes, all_edges))
 }
 
+/// BFS traversal from a specific node ID (no FTS search — starts from a known node).
+pub fn context_from_id(conn: &Connection, node_id: &str, depth: u32) -> Result<(Vec<Node>, Vec<Edge>)> {
+    let seed = super::crud::get_node(conn, node_id)?;
+    let seed = match seed {
+        Some(n) => n,
+        None => return Ok((vec![], vec![])),
+    };
+
+    let mut visited_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_nodes: Vec<Node> = vec![];
+    let mut all_edges: Vec<Edge> = vec![];
+    let mut queue: Vec<String> = vec![seed.id.to_string()];
+
+    visited_nodes.insert(seed.id.to_string());
+    all_nodes.push(seed);
+
+    for _ in 0..depth {
+        if queue.is_empty() {
+            break;
+        }
+        let edges = get_edges_batch(conn, &queue)?;
+        let mut neighbor_ids = vec![];
+        for edge in edges {
+            let neighbor_id = if queue.contains(&edge.from_id.to_string()) {
+                edge.to_id.to_string()
+            } else {
+                edge.from_id.to_string()
+            };
+            if !visited_nodes.contains(&neighbor_id) {
+                visited_nodes.insert(neighbor_id.clone());
+                neighbor_ids.push(neighbor_id);
+            }
+            all_edges.push(edge);
+        }
+        let neighbors = get_nodes_batch(conn, &neighbor_ids)?;
+        queue = neighbors.iter().map(|n| n.id.to_string()).collect();
+        all_nodes.extend(neighbors);
+    }
+
+    Ok((all_nodes, all_edges))
+}
+
 fn get_edges_batch(conn: &Connection, node_ids: &[String]) -> Result<Vec<Edge>> {
     if node_ids.is_empty() {
         return Ok(vec![]);
     }
-    let placeholders: Vec<String> = (1..=node_ids.len()).map(|i| format!("?{i}")).collect();
-    let ph = placeholders.join(",");
+    let n = node_ids.len();
+    let ph1: Vec<String> = (1..=n).map(|i| format!("?{i}")).collect();
+    let ph2: Vec<String> = (n + 1..=2 * n).map(|i| format!("?{i}")).collect();
     let sql = format!(
         "SELECT id, from_id, to_id, relation, weight, created_at FROM edges
-         WHERE from_id IN ({ph}) OR to_id IN ({ph})"
+         WHERE from_id IN ({}) OR to_id IN ({})",
+        ph1.join(","),
+        ph2.join(",")
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
