@@ -16,6 +16,32 @@ pub struct IndexResult {
     pub nodes_removed: usize,
 }
 
+/// Auto-index the project at `path` if it hasn't been indexed yet.
+/// Returns true if indexing was performed, false if project already existed.
+pub fn ensure_indexed(conn: &rusqlite::Connection, path: &Path) -> Result<bool> {
+    let path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return Ok(false),
+    };
+    let project_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    // Already indexed?
+    if graph::find_project_by_label(conn, project_name)?.is_some() {
+        return Ok(false);
+    }
+
+    // Has Cargo.toml or package.json? If not, not a project root — skip.
+    if !path.join("Cargo.toml").exists() && !path.join("package.json").exists() {
+        return Ok(false);
+    }
+
+    index_project(conn, &path)?;
+    Ok(true)
+}
+
 pub fn index_project(conn: &rusqlite::Connection, path: &Path) -> Result<IndexResult> {
     let path = path
         .canonicalize()
