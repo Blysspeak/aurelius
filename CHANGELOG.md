@@ -1,5 +1,21 @@
 # Changelog
 
+## [v1.4.0] — 2026-04-01
+
+### Added
+- **Task management system** — 5 MCP tools (`task_create`, `task_update`, `task_list`, `task_log`, `task_view`) + full CLI (`au task`) (6857f8f)
+- New node types: `Task`, `WorkLog`; new relations: `SubtaskOf`, `Blocks`
+- Tasks as hub nodes: collect work logs, decisions, problems, solutions via `contains` edges
+- Acceptance criteria, priority-based sorting, auto-activation on first log
+- `memory_status` shows active tasks; `memory_session` accepts `tasks` param and returns active hints
+- `memory_recall` includes tasks in grouped results
+
+### Other
+- Verify post-commit hook links to project (31b55e5)
+- Clean test commits (6ea8c12)
+
+---
+
 ## [1.3.0] — 2026-03-28
 
 ### Fixed
