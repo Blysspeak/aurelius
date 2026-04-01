@@ -1,5 +1,5 @@
 use anyhow::Result;
-use aurelius_core::{graph, models::NodeType};
+use aurelius_core::{graph, indexer, models::NodeType};
 use serde_json::json;
 
 use super::{node_brief, node_detail, open_db};
@@ -7,6 +7,11 @@ use super::{node_brief, node_detail, open_db};
 pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
     let project_filter = params.get("project").and_then(|p| p.as_str());
     let conn = open_db()?;
+
+    // Auto-index current working directory if not yet indexed
+    if let Ok(cwd) = std::env::current_dir() {
+        indexer::ensure_indexed(&conn, &cwd).ok();
+    }
 
     let projects = graph::search_typed(&conn, "*", &NodeType::Project, 10)?;
     let crates = graph::search_typed(&conn, "*", &NodeType::Crate, 20)?;

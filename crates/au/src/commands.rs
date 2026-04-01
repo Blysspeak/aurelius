@@ -13,10 +13,36 @@ fn db_path() -> PathBuf {
     base.join("aurelius.db")
 }
 
+/// Open DB and auto-index current project if not yet indexed.
+fn open_and_ensure(path: &std::path::Path) -> Result<rusqlite::Connection> {
+    let conn = db::open(path)?;
+    if let Ok(cwd) = std::env::current_dir() {
+        if indexer::ensure_indexed(&conn, &cwd)? {
+            let name = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            eprintln!("✓ Auto-indexed project '{name}'");
+        }
+    }
+    Ok(conn)
+}
+
 pub async fn init() -> Result<()> {
     let path = db_path();
-    let _conn = db::open(&path)?;
-    println!("✓ Aurelius initialized at {}", path.display());
+    let conn = db::open(&path)?;
+    // Auto-index current project
+    if let Ok(cwd) = std::env::current_dir() {
+        match indexer::ensure_indexed(&conn, &cwd) {
+            Ok(true) => {
+                let name = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                println!("✓ Aurelius initialized at {}", path.display());
+                println!("  Auto-indexed project '{name}'");
+            }
+            _ => {
+                println!("✓ Aurelius initialized at {}", path.display());
+            }
+        }
+    } else {
+        println!("✓ Aurelius initialized at {}", path.display());
+    }
     println!("  Run 'au mcp' to start the MCP server for Claude Code.");
     Ok(())
 }
@@ -27,7 +53,7 @@ pub async fn note(
     label: Option<String>,
     project: Option<String>,
 ) -> Result<()> {
-    let conn = db::open(&db_path())?;
+    let conn = open_and_ensure(&db_path())?;
     let node_type = match type_str {
         "concept" => NodeType::Concept,
         "problem" => NodeType::Problem,
@@ -75,7 +101,7 @@ pub async fn note(
 }
 
 pub async fn context(topic: &str, depth: u32) -> Result<()> {
-    let conn = db::open(&db_path())?;
+    let conn = open_and_ensure(&db_path())?;
     let (nodes, edges) = graph::context(&conn, topic, depth)?;
     if nodes.is_empty() {
         println!("No nodes found for '{}'", topic);
@@ -99,7 +125,7 @@ pub async fn context(topic: &str, depth: u32) -> Result<()> {
 }
 
 pub async fn search(query: &str) -> Result<()> {
-    let conn = db::open(&db_path())?;
+    let conn = open_and_ensure(&db_path())?;
     let nodes = graph::search(&conn, query, 20)?;
     if nodes.is_empty() {
         println!("No results for '{}'", query);
@@ -219,7 +245,7 @@ pub async fn export() -> Result<()> {
 }
 
 pub async fn task(action: TaskAction) -> Result<()> {
-    let conn = db::open(&db_path())?;
+    let conn = open_and_ensure(&db_path())?;
 
     match action {
         TaskAction::New {
