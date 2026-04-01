@@ -2,11 +2,13 @@ mod crud;
 mod search;
 mod session;
 mod status;
+mod task;
 
 pub use crud::*;
 pub use search::*;
 pub use session::*;
 pub use status::*;
+pub use task::*;
 
 use aurelius_core::{db, graph, models::NodeType, models::Relation};
 use rusqlite::Connection;
@@ -45,6 +47,16 @@ pub(crate) fn node_detail(node: &aurelius_core::models::Node) -> serde_json::Val
         "created_at": node.created_at.to_rfc3339(),
         "memory_kind": node.memory_kind,
         "access_count": node.access_count,
+    })
+}
+
+pub(crate) fn node_compact(node: &aurelius_core::models::Node) -> serde_json::Value {
+    json!({
+        "id": node.id.to_string(),
+        "type": node.node_type,
+        "label": node.label,
+        "note": node.note,
+        "created_at": node.created_at.to_rfc3339(),
     })
 }
 
@@ -89,6 +101,8 @@ pub(crate) fn parse_node_type(s: &str) -> NodeType {
         "config" => NodeType::Config,
         "session" => NodeType::Session,
         "language" => NodeType::Language,
+        "task" => NodeType::Task,
+        "work_log" | "worklog" => NodeType::WorkLog,
         other => NodeType::Custom(other.to_owned()),
     }
 }
@@ -111,6 +125,8 @@ pub(crate) fn parse_relation(s: &str) -> anyhow::Result<Relation> {
         "implements" => Relation::Implements,
         "configures" => Relation::Configures,
         "tracked_by" => Relation::TrackedBy,
+        "subtask_of" => Relation::SubtaskOf,
+        "blocks" => Relation::Blocks,
         _ => anyhow::bail!("unknown relation: {s}"),
     })
 }

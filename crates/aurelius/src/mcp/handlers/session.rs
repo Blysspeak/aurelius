@@ -5,7 +5,7 @@ use aurelius_core::{
 };
 use serde_json::json;
 
-use super::{node_detail, open_db, truncate};
+use super::{node_compact, open_db, resolve_node, truncate};
 
 pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
     let summary = params
@@ -123,12 +123,48 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         }
     }
 
+    // Link session to tasks if specified
+    let mut linked_tasks = vec![];
+    if let Some(tasks) = params.get("tasks").and_then(|t| t.as_array()) {
+        for task_ref in tasks {
+            if let Some(task_id) = task_ref.as_str() {
+                if let Ok(task_node) = resolve_node(&conn, task_id) {
+                    graph::add_edge(&conn, session.id, task_node.id, Relation::RelatedTo, 1.0).ok();
+                    linked_tasks.push(json!({
+                        "id": task_node.id.to_string(),
+                        "label": task_node.label,
+                        "status": task_node.data.get("status"),
+                    }));
+                }
+            }
+        }
+    }
+
+    // Always show active tasks for this project as a hint
+    let active_tasks: Vec<serde_json::Value> = graph::get_tasks_filtered(
+        &conn,
+        Some(project),
+        Some("active,blocked"),
+        None,
+        5,
+    )?
+    .iter()
+    .map(|t| json!({
+        "id": t.id.to_string(),
+        "label": t.label,
+        "status": t.data.get("status"),
+        "priority": t.data.get("priority"),
+    }))
+    .collect();
+
     Ok(json!({
         "id": session.id.to_string(),
         "label": session.label,
         "type": "session",
         "memory_kind": "episodic",
         "created": true,
+        "linked_tasks": linked_tasks,
+        "active_tasks_hint": active_tasks,
     }))
 }
 
@@ -147,14 +183,16 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
     let mut solutions = vec![];
     let mut sessions = vec![];
     let mut concepts = vec![];
+    let mut tasks = vec![];
 
     for node in &context_nodes {
         match &node.node_type {
-            NodeType::Decision => decisions.push(node_detail(node)),
-            NodeType::Problem => problems.push(node_detail(node)),
-            NodeType::Solution => solutions.push(node_detail(node)),
-            NodeType::Session => sessions.push(node_detail(node)),
-            NodeType::Concept | NodeType::Project => concepts.push(node_detail(node)),
+            NodeType::Decision => decisions.push(node_compact(node)),
+            NodeType::Problem => problems.push(node_compact(node)),
+            NodeType::Solution => solutions.push(node_compact(node)),
+            NodeType::Session => sessions.push(node_compact(node)),
+            NodeType::Task => tasks.push(node_compact(node)),
+            NodeType::Concept | NodeType::Project => concepts.push(node_compact(node)),
             _ => {}
         }
     }
@@ -163,7 +201,7 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         graph::touch_node(&conn, node.id).ok();
     }
 
-    let knowledge_count = decisions.len() + problems.len() + solutions.len() + sessions.len() + concepts.len();
+    let knowledge_count = decisions.len() + problems.len() + solutions.len() + sessions.len() + concepts.len() + tasks.len();
 
     Ok(json!({
         "topic": topic,
@@ -171,6 +209,7 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         "problems": problems,
         "solutions": solutions,
         "sessions": sessions,
+        "tasks": tasks,
         "concepts": concepts,
         "total_knowledge_nodes": knowledge_count,
         "total_graph_nodes": context_nodes.len(),
