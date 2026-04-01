@@ -43,19 +43,49 @@ pub fn memory_context(params: &serde_json::Value) -> Result<serde_json::Value> {
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'topic' parameter"))?;
     let depth = params.get("depth").and_then(|d| d.as_u64()).unwrap_or(2) as u32;
+    let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
 
     let conn = open_db()?;
     let (nodes, edges) = graph::context(&conn, topic, depth)?;
 
-    for node in &nodes {
+    let total = nodes.len();
+    let capped_nodes: Vec<_> = nodes.iter().take(limit).collect();
+
+    for node in &capped_nodes {
         graph::touch_node(&conn, node.id).ok();
     }
+
+    let compact_nodes: Vec<serde_json::Value> = capped_nodes
+        .iter()
+        .map(|n| {
+            json!({
+                "id": n.id.to_string(),
+                "type": n.node_type,
+                "label": n.label,
+                "note": n.note,
+            })
+        })
+        .collect();
+
+    // Only include edges between nodes in the capped set
+    let node_ids: std::collections::HashSet<String> =
+        capped_nodes.iter().map(|n| n.id.to_string()).collect();
+    let relevant_edges: Vec<serde_json::Value> = edges
+        .iter()
+        .filter(|e| {
+            node_ids.contains(&e.from_id.to_string())
+                && node_ids.contains(&e.to_id.to_string())
+        })
+        .map(|e| edge_brief(e))
+        .collect();
 
     Ok(json!({
         "topic": topic,
         "depth": depth,
-        "nodes": nodes.iter().map(node_detail).collect::<Vec<_>>(),
-        "edges": edges.iter().map(edge_brief).collect::<Vec<_>>(),
+        "nodes": compact_nodes,
+        "edges": relevant_edges,
+        "returned": capped_nodes.len(),
+        "total": total,
     }))
 }
 

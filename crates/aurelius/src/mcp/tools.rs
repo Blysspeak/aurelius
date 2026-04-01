@@ -31,6 +31,11 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "integer",
                             "description": "BFS traversal depth (default: 2)",
                             "default": 2
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max nodes to return (default: 50). Seeds first, then by BFS depth.",
+                            "default": 50
                         }
                     },
                     "required": ["topic"]
@@ -166,7 +171,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_session",
-                "description": "Record a session summary with decisions made, problems solved, and next steps. Creates an episodic Session node linked to the project, plus Decision and Problem/Solution nodes. Call this at the end of a productive session to preserve cross-session context.",
+                "description": "Record a session summary with decisions made, problems solved, and next steps. Creates an episodic Session node linked to the project, plus Decision and Problem/Solution nodes. Optionally links to tasks. Returns active tasks for the project as a hint. Call this at the end of a productive session.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -203,6 +208,11 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Key files that were modified or are relevant"
+                        },
+                        "tasks": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "UUIDs or labels of tasks worked on during this session (creates related_to edges)"
                         }
                     },
                     "required": ["summary", "project"]
@@ -268,6 +278,160 @@ pub fn tool_definitions() -> serde_json::Value {
                     "type": "object",
                     "properties": {},
                     "required": []
+                }
+            },
+            {
+                "name": "task_create",
+                "description": "Create a well-structured task with title, description, acceptance criteria, and priority. Auto-links to project. Supports subtask hierarchy and blocking relations.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Short, actionable task title"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Detailed description — what needs to be done and why"
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Project name (auto-creates if missing). Default: 'unknown'"
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["critical", "high", "medium", "low"],
+                            "description": "Task priority (default: medium)",
+                            "default": "medium"
+                        },
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Definition of Done checklist — what must be true for this task to be complete"
+                        },
+                        "parent": {
+                            "type": "string",
+                            "description": "UUID or label of parent task (creates subtask_of edge)"
+                        },
+                        "blocks": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "UUIDs or labels of tasks that this task blocks"
+                        }
+                    },
+                    "required": ["title"]
+                }
+            },
+            {
+                "name": "task_update",
+                "description": "Update task status, priority, or acceptance criteria. Supports status transitions: backlog → active → done/blocked/cancelled. Auto-tracks started_at and completed_at timestamps.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "UUID or label of the task to update"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["backlog", "active", "blocked", "done", "cancelled"],
+                            "description": "New task status"
+                        },
+                        "priority": {
+                            "type": "string",
+                            "enum": ["critical", "high", "medium", "low"],
+                            "description": "New priority"
+                        },
+                        "blocked_by": {
+                            "type": "string",
+                            "description": "Reason for blocking (auto-sets status to 'blocked')"
+                        },
+                        "note": {
+                            "type": "string",
+                            "description": "Update task description/notes"
+                        },
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Replace acceptance criteria checklist"
+                        }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "task_list",
+                "description": "List tasks with filters by project, status, and priority. Sorted by priority (critical first), then by creation date. Shows work log count per task.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": "Filter by project name"
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "Filter by status (comma-separated: 'active,blocked')"
+                        },
+                        "priority": {
+                            "type": "string",
+                            "description": "Filter by priority level"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max results (default: 20)",
+                            "default": 20
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "task_log",
+                "description": "Record work done on a task. Creates a WorkLog node linked to the task. Optionally records decisions made and problems solved during the work. Auto-activates backlog tasks on first log entry.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "UUID or label of the task"
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Description of work done"
+                        },
+                        "decisions": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Decisions made during this work"
+                        },
+                        "problems_solved": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "problem": { "type": "string" },
+                                    "solution": { "type": "string" }
+                                }
+                            },
+                            "description": "Problem/solution pairs encountered"
+                        }
+                    },
+                    "required": ["task", "text"]
+                }
+            },
+            {
+                "name": "task_view",
+                "description": "Full task overview with its entire knowledge branch: work logs (as timeline), decisions, problems, solutions, and subtasks. Shows acceptance criteria and current status.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "UUID or label of the task"
+                        }
+                    },
+                    "required": ["id"]
                 }
             },
             {
