@@ -18,7 +18,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#mcp-tools-19">MCP Tools</a> ·
+  <a href="#mcp-tools-21">MCP Tools</a> ·
   <a href="#task-management">Tasks</a> ·
   <a href="#web-ui">Graph UI</a> ·
   <a href="doc/README-ru.md">Русский</a>
@@ -50,7 +50,7 @@ au 1.4.0
 
 ---
 
-## MCP Tools (19)
+## MCP Tools (21)
 
 Aurelius runs as an MCP server over stdio. `install.sh` configures it automatically, or add manually via `/mcp` in Claude Code (`command: au`, `args: ["mcp"]`).
 
@@ -68,6 +68,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | `memory_relate` | Create typed edge. INSERT OR IGNORE for dedup. |
 | `memory_forget` | Delete node by UUID (cascades to edges). |
 | `memory_gc` | Garbage collection — duplicate edges/nodes, orphans. |
+| `memory_merge` | Merge two near-duplicate nodes — rewires edges, merges notes, deletes source. |
 | `memory_dump` | Paginated graph export (offset/limit). |
 | `memory_index` | Index project structure from Cargo.toml. |
 
@@ -80,6 +81,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | `task_list` | Filter by project, status, priority. Sorted by priority, shows work log count. |
 | `task_log` | Record work done — creates WorkLog + optional Decision/Problem/Solution nodes. Auto-activates backlog tasks. |
 | `task_view` | Full task branch — timeline of work logs, decisions, problems, solutions, subtasks. |
+| `task_stats` | Task analytics — counts by status/priority, completion rate, avg/median duration, blocked count, oldest active. |
 
 ### Web Search
 
