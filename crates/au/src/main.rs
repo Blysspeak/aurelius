@@ -71,6 +71,15 @@ pub enum TaskAction {
         /// Task UUID or label
         id: String,
     },
+    /// Show task analytics (completion rate, avg duration, blocked, etc.)
+    Stats {
+        /// Filter by project
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Window in days for "done_in_window" metric
+        #[arg(long)]
+        since_days: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -129,6 +138,13 @@ enum Commands {
         #[command(subcommand)]
         action: TaskAction,
     },
+    /// Merge two duplicate nodes — rewires edges from source to target, deletes source
+    Merge {
+        /// Source node (UUID or label) — will be deleted
+        source: String,
+        /// Target node (UUID or label) — survives with merged edges
+        target: String,
+    },
     /// Start MCP server (used by Claude Code)
     Mcp,
 }
@@ -152,6 +168,7 @@ async fn main() -> Result<()> {
         Commands::Touch { path } => commands::touch(&path).await,
         Commands::Export => commands::export().await,
         Commands::Task { action } => commands::task(action).await,
+        Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Mcp => commands::mcp().await,
     }
 }

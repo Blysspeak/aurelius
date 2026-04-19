@@ -145,6 +145,72 @@ pub fn delete_node(conn: &Connection, id: Uuid) -> Result<bool> {
     Ok(affected > 0)
 }
 
+#[derive(Debug, Default)]
+pub struct MergeStats {
+    pub edges_rewired: usize,
+    pub self_loops_removed: usize,
+    pub duplicate_edges_removed: usize,
+    pub note_merged: bool,
+}
+
+/// Merge `source` into `target`: rewires all edges from/to source onto target,
+/// removes self-loops and duplicate edges created by the rewire, optionally
+/// appends source's note to target's, then deletes source.
+pub fn merge_nodes(conn: &Connection, source: Uuid, target: Uuid) -> Result<MergeStats> {
+    if source == target {
+        anyhow::bail!("source and target are the same node");
+    }
+    let src_str = source.to_string();
+    let tgt_str = target.to_string();
+
+    let src_node = get_node(conn, &src_str)?
+        .ok_or_else(|| anyhow::anyhow!("source node not found: {src_str}"))?;
+    let tgt_node = get_node(conn, &tgt_str)?
+        .ok_or_else(|| anyhow::anyhow!("target node not found: {tgt_str}"))?;
+
+    let mut stats = MergeStats::default();
+
+    let rewired_from = conn.execute(
+        "UPDATE edges SET from_id = ?1 WHERE from_id = ?2",
+        params![&tgt_str, &src_str],
+    )?;
+    let rewired_to = conn.execute(
+        "UPDATE edges SET to_id = ?1 WHERE to_id = ?2",
+        params![&tgt_str, &src_str],
+    )?;
+    stats.edges_rewired = rewired_from + rewired_to;
+
+    stats.self_loops_removed = conn.execute(
+        "DELETE FROM edges WHERE from_id = to_id",
+        [],
+    )?;
+
+    stats.duplicate_edges_removed = conn.execute(
+        "DELETE FROM edges WHERE id NOT IN (
+            SELECT MIN(id) FROM edges GROUP BY from_id, to_id, relation
+        )",
+        [],
+    )?;
+
+    // Merge notes: append source note to target if target has none, or both present
+    if let Some(src_note) = src_node.note.as_deref() {
+        let merged = match tgt_node.note.as_deref() {
+            None => Some(src_note.to_owned()),
+            Some(tgt_note) if !tgt_note.contains(src_note) => {
+                Some(format!("{tgt_note}\n\n---\n{src_note}"))
+            }
+            _ => None,
+        };
+        if let Some(note) = merged {
+            update_node(conn, target, Some(&note), None)?;
+            stats.note_merged = true;
+        }
+    }
+
+    delete_node(conn, source)?;
+    Ok(stats)
+}
+
 pub fn touch_node(conn: &Connection, id: Uuid) -> Result<()> {
     let now = Utc::now();
     conn.execute(

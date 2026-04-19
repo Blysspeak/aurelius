@@ -465,8 +465,103 @@ pub async fn task(action: TaskAction) -> Result<()> {
             graph::update_node(&conn, task.id, None, Some(data))?;
             println!("▶ Task activated: {}", task.label);
         }
+
+        TaskAction::Stats { project, since_days } => {
+            task_stats_cli(&conn, project.as_deref(), since_days)?;
+        }
     }
 
+    Ok(())
+}
+
+fn task_stats_cli(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+    since_days: Option<u64>,
+) -> Result<()> {
+    let tasks = graph::get_tasks_filtered(conn, project, None, None, 100_000)?;
+    if tasks.is_empty() {
+        println!("No tasks found.");
+        return Ok(());
+    }
+
+    let mut by_status: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut by_priority: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut completion_hours: Vec<f64> = Vec::new();
+    let mut blocked = 0usize;
+    let mut oldest_active: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut done_in_window = 0usize;
+
+    let now = chrono::Utc::now();
+    let cutoff = since_days.map(|d| now - chrono::Duration::days(d as i64));
+
+    for t in &tasks {
+        let status = t.data.get("status").and_then(|s| s.as_str()).unwrap_or("backlog");
+        let priority = t.data.get("priority").and_then(|p| p.as_str()).unwrap_or("medium");
+        *by_status.entry(status.to_string()).or_insert(0) += 1;
+        *by_priority.entry(priority.to_string()).or_insert(0) += 1;
+        if status == "blocked" { blocked += 1; }
+
+        let started = t.data.get("started_at").and_then(|s| s.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let completed = t.data.get("completed_at").and_then(|s| s.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        if let (Some(s), Some(c)) = (started, completed) {
+            let h = (c - s).num_seconds() as f64 / 3600.0;
+            if h >= 0.0 { completion_hours.push(h); }
+            match cutoff {
+                Some(cut) if c >= cut => done_in_window += 1,
+                None if status == "done" => done_in_window += 1,
+                _ => {}
+            }
+        }
+
+        if status == "active" {
+            if let Some(s) = started {
+                oldest_active = Some(oldest_active.map_or(s, |cur| cur.min(s)));
+            }
+        }
+    }
+
+    completion_hours.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let avg = if completion_hours.is_empty() { None } else {
+        Some(completion_hours.iter().sum::<f64>() / completion_hours.len() as f64)
+    };
+    let median = if completion_hours.is_empty() { None } else {
+        let mid = completion_hours.len() / 2;
+        Some(if completion_hours.len() % 2 == 0 {
+            (completion_hours[mid - 1] + completion_hours[mid]) / 2.0
+        } else { completion_hours[mid] })
+    };
+
+    let total = tasks.len();
+    let done = by_status.get("done").copied().unwrap_or(0);
+    let rate = done as f64 / total as f64 * 100.0;
+
+    println!("Task stats{}:", project.map(|p| format!(" — {p}")).unwrap_or_default());
+    println!("  total:           {total}");
+    println!("  completion rate: {rate:.1}% ({done}/{total})");
+    print!("  by status:      ");
+    for (k, v) in &by_status { print!(" {k}={v}"); }
+    println!();
+    print!("  by priority:    ");
+    for k in ["critical", "high", "medium", "low"] {
+        if let Some(v) = by_priority.get(k) { print!(" {k}={v}"); }
+    }
+    println!();
+    if let Some(a) = avg { println!("  avg duration:    {a:.1}h"); }
+    if let Some(m) = median { println!("  median duration: {m:.1}h"); }
+    println!("  currently blocked: {blocked}");
+    if let Some(s) = oldest_active {
+        let days = (now - s).num_hours() as f64 / 24.0;
+        println!("  oldest active:    {days:.1}d");
+    }
+    if since_days.is_some() {
+        println!("  done in window:   {done_in_window}");
+    }
     Ok(())
 }
 
@@ -491,4 +586,45 @@ fn find_task(conn: &rusqlite::Connection, id: &str) -> Result<aurelius_core::mod
 
 pub async fn mcp() -> Result<()> {
     aurelius::mcp::serve().await
+}
+
+pub async fn merge(source: &str, target: &str) -> Result<()> {
+    let conn = open_and_ensure(&db_path())?;
+    let src = resolve_node_any(&conn, source)?;
+    let tgt = resolve_node_any(&conn, target)?;
+
+    if src.id == tgt.id {
+        anyhow::bail!("source and target resolved to the same node");
+    }
+
+    println!("Merging:");
+    println!("  source: {} ({})", src.label, src.id);
+    println!("  target: {} ({})", tgt.label, tgt.id);
+
+    let stats = graph::merge_nodes(&conn, src.id, tgt.id)?;
+
+    println!("✓ Merged");
+    println!("  edges rewired:           {}", stats.edges_rewired);
+    println!("  self-loops removed:      {}", stats.self_loops_removed);
+    println!("  duplicate edges removed: {}", stats.duplicate_edges_removed);
+    if stats.note_merged {
+        println!("  notes merged");
+    }
+    Ok(())
+}
+
+fn resolve_node_any(conn: &rusqlite::Connection, id: &str) -> Result<aurelius_core::models::Node> {
+    if let Ok(uuid) = id.parse::<uuid::Uuid>() {
+        if let Some(node) = graph::get_node(conn, &uuid.to_string())? {
+            return Ok(node);
+        }
+    }
+    if let Some(node) = graph::find_node_by_label(conn, id)? {
+        return Ok(node);
+    }
+    let results = graph::search(conn, id, 1)?;
+    results
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("node not found: {id}"))
 }

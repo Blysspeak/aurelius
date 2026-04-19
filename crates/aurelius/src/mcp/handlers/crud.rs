@@ -211,6 +211,27 @@ pub fn memory_dump(params: &serde_json::Value) -> Result<serde_json::Value> {
     }))
 }
 
+pub fn memory_merge(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let source = params.get("source").and_then(|s| s.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'source' parameter"))?;
+    let target = params.get("target").and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'target' parameter"))?;
+
+    let conn = open_db()?;
+    let src_node = resolve_node(&conn, source)?;
+    let tgt_node = resolve_node(&conn, target)?;
+    let stats = graph::merge_nodes(&conn, src_node.id, tgt_node.id)?;
+
+    Ok(json!({
+        "source": { "id": src_node.id.to_string(), "label": src_node.label },
+        "target": { "id": tgt_node.id.to_string(), "label": tgt_node.label },
+        "edges_rewired": stats.edges_rewired,
+        "self_loops_removed": stats.self_loops_removed,
+        "duplicate_edges_removed": stats.duplicate_edges_removed,
+        "note_merged": stats.note_merged,
+    }))
+}
+
 pub fn memory_gc() -> Result<serde_json::Value> {
     let conn = open_db()?;
 
