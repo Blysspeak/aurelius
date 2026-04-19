@@ -1,5 +1,16 @@
 # Changelog
 
+## [v1.5.0] — 2026-04-19
+
+### Added
+- `memory_merge` — merge two duplicate/related nodes into one: rewires all edges from source to target, removes self-loops and duplicate edges, appends source's note to target, deletes source. CLI: `au merge <source> <target>` (909b06d)
+- `task_stats` — analytics over tasks: counts by status/priority, completion rate, avg/median active→done duration, currently blocked count, oldest active age, done-in-window. CLI: `au task stats [--project] [--since-days]` (909b06d)
+
+### Documentation
+- Update tool count 19→21 in README and CLAUDE.md (238792c)
+
+---
+
 ## [v1.4.1] — 2026-04-01
 
 ### Added
