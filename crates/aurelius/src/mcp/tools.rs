@@ -272,6 +272,24 @@ pub fn tool_definitions() -> serde_json::Value {
                 }
             },
             {
+                "name": "memory_merge",
+                "description": "Merge two duplicate or related nodes into one. Rewires all edges from 'source' onto 'target', removes self-loops and duplicate edges, optionally appends source's note to target, then deletes source. Use for deduplication of near-duplicates that memory_gc can't catch (different content_hash but same meaning).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "description": "UUID or label of the node to merge FROM (will be deleted)"
+                        },
+                        "target": {
+                            "type": "string",
+                            "description": "UUID or label of the node to merge INTO (survives)"
+                        }
+                    },
+                    "required": ["source", "target"]
+                }
+            },
+            {
                 "name": "memory_gc",
                 "description": "Garbage collection: removes duplicate edges, orphaned edges, and duplicate nodes (by content_hash). Run periodically to keep the graph clean.",
                 "inputSchema": {
@@ -418,6 +436,24 @@ pub fn tool_definitions() -> serde_json::Value {
                         }
                     },
                     "required": ["task", "text"]
+                }
+            },
+            {
+                "name": "task_stats",
+                "description": "Analytics over tasks: counts by status and priority, completion rate, average/median time from active to done (hours), currently blocked count, oldest active task age, and tasks closed in the window. Filter by project and time window.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": "Filter by project name"
+                        },
+                        "since_days": {
+                            "type": "integer",
+                            "description": "Window size in days for 'done_in_window' metric (default: all time)"
+                        }
+                    },
+                    "required": []
                 }
             },
             {
