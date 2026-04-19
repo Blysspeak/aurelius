@@ -318,6 +318,106 @@ pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
     }))
 }
 
+pub fn task_stats(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let project = params.get("project").and_then(|p| p.as_str());
+    let since_days = params.get("since_days").and_then(|d| d.as_u64());
+
+    let conn = open_db()?;
+    let tasks = graph::get_tasks_filtered(&conn, project, None, None, 100_000)?;
+
+    let mut by_status: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut by_priority: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut completion_hours: Vec<f64> = Vec::new();
+    let mut currently_blocked = 0usize;
+    let mut oldest_active: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut done_in_window = 0usize;
+
+    let now = chrono::Utc::now();
+    let window_cutoff = since_days.map(|d| now - chrono::Duration::days(d as i64));
+
+    for t in &tasks {
+        let status = t.data.get("status").and_then(|s| s.as_str()).unwrap_or("backlog");
+        let priority = t.data.get("priority").and_then(|p| p.as_str()).unwrap_or("medium");
+        *by_status.entry(status.to_string()).or_insert(0) += 1;
+        *by_priority.entry(priority.to_string()).or_insert(0) += 1;
+
+        if status == "blocked" {
+            currently_blocked += 1;
+        }
+
+        let started = t.data.get("started_at").and_then(|s| s.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let completed = t.data.get("completed_at").and_then(|s| s.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        if let (Some(s), Some(c)) = (started, completed) {
+            let hours = (c - s).num_seconds() as f64 / 3600.0;
+            if hours >= 0.0 {
+                completion_hours.push(hours);
+            }
+            if let Some(cutoff) = window_cutoff {
+                if c >= cutoff {
+                    done_in_window += 1;
+                }
+            } else if status == "done" {
+                done_in_window += 1;
+            }
+        }
+
+        if status == "active" {
+            if let Some(s) = started {
+                oldest_active = Some(oldest_active.map_or(s, |cur| cur.min(s)));
+            }
+        }
+    }
+
+    completion_hours.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let avg = if completion_hours.is_empty() {
+        None
+    } else {
+        Some(completion_hours.iter().sum::<f64>() / completion_hours.len() as f64)
+    };
+    let median = if completion_hours.is_empty() {
+        None
+    } else {
+        let mid = completion_hours.len() / 2;
+        Some(if completion_hours.len() % 2 == 0 {
+            (completion_hours[mid - 1] + completion_hours[mid]) / 2.0
+        } else {
+            completion_hours[mid]
+        })
+    };
+
+    let total = tasks.len();
+    let done_count = by_status.get("done").copied().unwrap_or(0);
+    let cancelled_count = by_status.get("cancelled").copied().unwrap_or(0);
+    let closed = done_count + cancelled_count;
+    let completion_rate = if total > 0 {
+        Some(done_count as f64 / total as f64)
+    } else {
+        None
+    };
+
+    let oldest_active_days = oldest_active.map(|s| (now - s).num_hours() as f64 / 24.0);
+
+    Ok(json!({
+        "project": project,
+        "window_days": since_days,
+        "total": total,
+        "closed": closed,
+        "by_status": by_status,
+        "by_priority": by_priority,
+        "completion_rate": completion_rate,
+        "avg_active_to_done_hours": avg,
+        "median_active_to_done_hours": median,
+        "currently_blocked": currently_blocked,
+        "oldest_active_age_days": oldest_active_days,
+        "done_in_window": done_in_window,
+    }))
+}
+
 pub fn task_view(params: &serde_json::Value) -> Result<serde_json::Value> {
     let id = params
         .get("id")
