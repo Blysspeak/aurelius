@@ -3,6 +3,7 @@ import ForceGraph2D from 'react-force-graph-2d'
 import type { AureliusNode, AureliusEdge } from '../../types'
 import { parseNodeType, parseRelation } from '../../types'
 import { getNodeColor, getNodeSizeDynamic } from '../../theme'
+import { applyForces, PHYSICS } from './physics'
 import styles from './graphCanvas.module.css'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -236,15 +237,23 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, searchMatchIds, zoom
     if (fgRef.current) (window as any).__aurelius_fg = fgRef.current
   })
 
-  // Physics
+  // Physics setup — runs once on mount. Force config lives in physics.ts.
+  // applyForces is idempotent; safe to re-run.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     const fg = fgRef.current
     if (!fg) return
-    fg.d3Force('link')?.distance(30).strength(1.0)
-    fg.d3Force('charge')?.strength(-100).distanceMax(300)
-    fg.d3Force('center')?.strength(0.05)
+    applyForces(fg)
+  }, [])
+
+  // Re-heat only when the structural set of nodes/edges changes —
+  // never on filter, search, or selection prop churn (FR-005, FR-006).
+  useEffect(() => {
+    const fg = fgRef.current
+    if (!fg) return
+    applyForces(fg)
     fg.d3ReheatSimulation?.()
-  }, [graphData])
+  }, [nodes.length, edges.length])
 
   // Zoom to fit on first load
   useEffect(() => {
@@ -288,11 +297,11 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, searchMatchIds, zoom
         linkCanvasObject={paintLink}
         linkCurvature={0.05}
         backgroundColor="#0c1018"
-        d3AlphaDecay={0.05}
-        d3VelocityDecay={0.5}
-        cooldownTicks={Infinity}
-        warmupTicks={100}
-        d3AlphaMin={0}
+        d3AlphaDecay={PHYSICS.sim.alphaDecay}
+        d3VelocityDecay={PHYSICS.sim.velocityDecay}
+        cooldownTicks={PHYSICS.sim.cooldownTicks}
+        warmupTicks={PHYSICS.sim.warmupTicks}
+        d3AlphaMin={PHYSICS.sim.alphaMin}
         enableNodeDrag={true}
         enableZoomInteraction={true}
         enablePanInteraction={true}
