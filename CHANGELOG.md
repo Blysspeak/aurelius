@@ -1,5 +1,22 @@
 # Changelog
 
+## [v1.6.0] — 2026-06-21
+
+### Added
+- **Skills subsystem** — reusable procedural "how-to" cards with progressive disclosure. 4 MCP tools:
+  - `skill_save` — create/update a skill (upsert by name). Trigger → FTS-indexed note (discoverable); body + tags → `data` (not keyword-indexed, so the body never pollutes search).
+  - `skill_list` — cheap index (name + trigger + tags + uses), ranked by usage. Optional FTS `query` / `tag` filter.
+  - `skill_get` — full markdown body by name, with fuzzy FTS fallback + `other_matches` for disambiguation. Bumps `access_count`.
+  - `skill_remove` — delete a skill by name.
+- New node type `Skill`.
+- Skills surface automatically in `memory_recall` (new `skills` bucket) and `memory_status` (top skills by usage).
+- **SessionStart hook** (`aurelius-skills.sh` / `au skills --hook`) injects the skill index into context every session via `hookSpecificOutput.additionalContext`.
+
+### Changed
+- CLI: new `au skills [--hook]` command.
+
+---
+
 ## [v1.5.0] — 2026-04-19
 
 ### Added

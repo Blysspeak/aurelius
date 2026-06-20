@@ -145,6 +145,12 @@ enum Commands {
         /// Target node (UUID or label) — survives with merged edges
         target: String,
     },
+    /// Print the skill index (name + trigger) — used by the SessionStart hook
+    Skills {
+        /// Emit Claude Code SessionStart hook JSON instead of plain text
+        #[arg(long)]
+        hook: bool,
+    },
     /// Start MCP server (used by Claude Code)
     Mcp,
 }
@@ -169,6 +175,7 @@ async fn main() -> Result<()> {
         Commands::Export => commands::export().await,
         Commands::Task { action } => commands::task(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
+        Commands::Skills { hook } => commands::skills(hook).await,
         Commands::Mcp => commands::mcp().await,
     }
 }

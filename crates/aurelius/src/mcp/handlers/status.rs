@@ -15,6 +15,8 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     let projects = graph::search_typed(&conn, "*", &NodeType::Project, 10)?;
     let crates = graph::search_typed(&conn, "*", &NodeType::Crate, 20)?;
+    let mut skills = graph::get_nodes_by_type(&conn, &NodeType::Skill)?;
+    skills.sort_by(|a, b| b.access_count.cmp(&a.access_count));
     let total_nodes = graph::count_nodes(&conn)?;
     let total_edges = graph::count_edges(&conn)?;
 
@@ -60,6 +62,11 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
         "project_filter": project_filter,
         "projects": projects.iter().map(node_brief).collect::<Vec<_>>(),
         "crates": crates.iter().map(node_brief).collect::<Vec<_>>(),
+        "skills": skills.iter().take(30).map(|n| json!({
+            "name": n.label,
+            "trigger": n.note,
+            "uses": n.access_count,
+        })).collect::<Vec<_>>(),
         "active_tasks": active_tasks_json,
         "recent_decisions": recent_decisions.iter().map(node_detail).collect::<Vec<_>>(),
         "open_problems": problems.iter().map(node_detail).collect::<Vec<_>>(),
