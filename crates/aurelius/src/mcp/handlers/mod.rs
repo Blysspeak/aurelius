@@ -1,12 +1,14 @@
 mod crud;
 mod search;
 mod session;
+mod skill;
 mod status;
 mod task;
 
 pub use crud::*;
 pub use search::*;
 pub use session::*;
+pub use skill::*;
 pub use status::*;
 pub use task::*;
 
@@ -103,6 +105,7 @@ pub(crate) fn parse_node_type(s: &str) -> NodeType {
         "language" => NodeType::Language,
         "task" => NodeType::Task,
         "work_log" | "worklog" => NodeType::WorkLog,
+        "skill" => NodeType::Skill,
         other => NodeType::Custom(other.to_owned()),
     }
 }

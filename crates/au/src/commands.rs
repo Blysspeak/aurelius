@@ -584,6 +584,49 @@ fn find_task(conn: &rusqlite::Connection, id: &str) -> Result<aurelius_core::mod
         .ok_or_else(|| anyhow::anyhow!("task not found: {id}"))
 }
 
+/// Print the skill index. Plain text by default; with `hook=true` emits the
+/// Claude Code SessionStart hook JSON that injects the index into context.
+pub async fn skills(hook: bool) -> Result<()> {
+    let conn = db::open(&db_path())?;
+    let mut skills = graph::get_nodes_by_type(&conn, &NodeType::Skill)?;
+    // Most-used first — the index leads with battle-tested skills.
+    skills.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+
+    if skills.is_empty() {
+        if !hook {
+            println!("No skills stored yet. Use skill_save (MCP) to add one.");
+        }
+        return Ok(());
+    }
+
+    let mut text = format!(
+        "Aurelius skills ({}) — reusable how-to cards. Call skill_get <name> for the full body.\n",
+        skills.len()
+    );
+    for n in &skills {
+        let trigger = n.note.as_deref().unwrap_or("");
+        let tags: Vec<&str> = n.data.get("tags")
+            .and_then(|t| t.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let tag_suffix = if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) };
+        text.push_str(&format!("- {}: {}{}\n", n.label, trigger, tag_suffix));
+    }
+
+    if hook {
+        let out = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": text,
+            }
+        });
+        println!("{}", serde_json::to_string(&out)?);
+    } else {
+        print!("{text}");
+    }
+    Ok(())
+}
+
 pub async fn mcp() -> Result<()> {
     aurelius::mcp::serve().await
 }

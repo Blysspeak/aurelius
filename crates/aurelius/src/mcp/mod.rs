@@ -125,6 +125,10 @@ async fn handle_tools_call(
         "task_stats" => handlers::task_stats(&arguments),
         "search_web" => handlers::search_web(&arguments),
         "search_recall" => handlers::search_recall(&arguments),
+        "skill_list" => handlers::skill_list(&arguments),
+        "skill_get" => handlers::skill_get(&arguments),
+        "skill_save" => handlers::skill_save(&arguments),
+        "skill_remove" => handlers::skill_remove(&arguments),
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     })
     .await;
