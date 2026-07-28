@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/v1.7.0-stable-a6e3a1?style=flat-square" alt="v1.7.0">
+  <img src="https://img.shields.io/badge/v1.8.0-stable-a6e3a1?style=flat-square" alt="v1.8.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
   <img src="https://img.shields.io/badge/MCP-25_tools-a6e3a1?style=flat-square" alt="MCP">
@@ -45,7 +45,7 @@ This builds binaries, installs to `~/.local/bin`, configures Claude Code MCP ser
 
 ```
 $ au --version
-au 1.7.0
+au 1.8.0
 ```
 
 ---
@@ -162,7 +162,7 @@ au touch path/to/file              # track file access
 au export                          # export full graph as JSON
 au mcp                             # start MCP server
 au skills                          # print the skill index
-au db check                        # verify integrity (read-only)
+au db check [PATH]                 # verify integrity (read-only); PATH verifies a snapshot
 au db backup                       # safe snapshot via VACUUM INTO
 ```
 
@@ -183,6 +183,7 @@ au task activate <id>              # resume blocked task
 ```bash
 au db check          # quick integrity report; exits non-zero when damaged
 au db check --full   # exhaustive check, every table
+au db check FILE     # verify a snapshot — a snapshot is an ordinary database
 au db backup         # snapshot → aurelius-<UTC timestamp>.db next to the database
 ```
 
@@ -190,7 +191,9 @@ Snapshots are taken automatically: `install.sh` registers a SessionStart hook th
 a rolling set in `<data-dir>/aurelius/backups/`. Cadence follows activity rather than the
 clock — the graph only changes when Claude Code, the CLI or the git hooks touch it, so an
 idle machine does not accumulate identical copies. Several sessions in a day cost one
-snapshot; ~50 ms for an 8 MB graph.
+snapshot; ~50 ms for an 8 MB graph. Each snapshot is verified with `au db check` right
+after it is written — one that fails is renamed to `.FAILED-CHECK` so it can never be
+mistaken for a good backup, and kept, because a bad snapshot is evidence worth reading.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -317,6 +320,7 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 - [x] v1.5 — `memory_merge`, `task_stats`, semantic cluster graph layout
 - [x] v1.6 — Skills subsystem (4 MCP tools + `au skills`), session auto-injection
 - [x] v1.7 — DB hardening: busy timeout, atomic migrations, integrity gate, `au db check` / `au db backup`
+- [x] v1.8 — `au db check [PATH]` — self-verifying rolling backups
 - [ ] Next — npm distribution, `au repair`, context-ranked search, git log connector
 
 ---

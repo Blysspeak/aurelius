@@ -722,17 +722,20 @@ pub async fn merge(source: &str, target: &str) -> Result<()> {
 }
 
 pub async fn db(action: DbAction) -> Result<()> {
-    let path = db_path();
-    if !path.exists() {
-        anyhow::bail!("no database at {}", path.display());
-    }
     match action {
-        DbAction::Check { full } => db_check_cli(&path, full),
-        DbAction::Backup { out } => db_backup_cli(&path, out),
+        // A snapshot is an ordinary database, so verifying one is the same
+        // command pointed at a different file.
+        DbAction::Check { path, full } => {
+            db_check_cli(&path.map_or_else(db_path, PathBuf::from), full)
+        }
+        DbAction::Backup { out } => db_backup_cli(&db_path(), out),
     }
 }
 
 fn db_check_cli(path: &std::path::Path, full: bool) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("no database at {}", path.display());
+    }
     let report = db::check(path, full)?;
 
     println!("Database: {}", path.display());
@@ -772,6 +775,9 @@ fn db_check_cli(path: &std::path::Path, full: bool) -> Result<()> {
 }
 
 fn db_backup_cli(path: &std::path::Path, out: Option<String>) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("no database at {}", path.display());
+    }
     let dest = match out {
         Some(p) => PathBuf::from(p),
         None => path.with_file_name(format!(
