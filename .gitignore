@@ -9,3 +9,7 @@ ui/node_modules/
 ui/dist/
 *.tsbuildinfo
 CLAUDE.md
+
+# Local tooling
+.playwright-mcp/
+.claude/settings.local.json

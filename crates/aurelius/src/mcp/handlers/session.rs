@@ -19,7 +19,7 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     // Dedup: hash summary+project to prevent duplicate sessions
     let content_hash = {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(project.as_bytes());
         hasher.update(b"|");
@@ -48,7 +48,11 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         session_data["key_files"] = files.clone();
     }
 
-    let session_label = format!("[{}] {}", project, chrono::Utc::now().format("%Y-%m-%d %H:%M"));
+    let session_label = format!(
+        "[{}] {}",
+        project,
+        chrono::Utc::now().format("%Y-%m-%d %H:%M")
+    );
     let session = graph::add_node_full(
         &conn,
         NodeType::Session,
@@ -72,7 +76,7 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
             json!({"auto_created": true}),
         )?,
     };
-    graph::add_edge(&conn, session.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
+    graph::add_edge(&conn, session.id, proj_node.id, Relation::BelongsTo, 1.0)?;
 
     // Create decision nodes
     if let Some(decisions) = params.get("decisions").and_then(|d| d.as_array()) {
@@ -86,8 +90,8 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
                     "mcp-session",
                     json!({"session_id": session.id.to_string()}),
                 )?;
-                graph::add_edge(&conn, session.id, dec_node.id, Relation::Contains, 1.0).ok();
-                graph::add_edge(&conn, dec_node.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
+                graph::add_edge(&conn, session.id, dec_node.id, Relation::Contains, 1.0)?;
+                graph::add_edge(&conn, dec_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
             }
         }
     }
@@ -114,11 +118,11 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
                     "mcp-session",
                     json!({"session_id": session.id.to_string()}),
                 )?;
-                graph::add_edge(&conn, sol_node.id, prob_node.id, Relation::Solves, 1.0).ok();
-                graph::add_edge(&conn, session.id, prob_node.id, Relation::Contains, 1.0).ok();
-                graph::add_edge(&conn, session.id, sol_node.id, Relation::Contains, 1.0).ok();
-                graph::add_edge(&conn, prob_node.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
-                graph::add_edge(&conn, sol_node.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
+                graph::add_edge(&conn, sol_node.id, prob_node.id, Relation::Solves, 1.0)?;
+                graph::add_edge(&conn, session.id, prob_node.id, Relation::Contains, 1.0)?;
+                graph::add_edge(&conn, session.id, sol_node.id, Relation::Contains, 1.0)?;
+                graph::add_edge(&conn, prob_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
+                graph::add_edge(&conn, sol_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
             }
         }
     }
@@ -129,7 +133,7 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         for task_ref in tasks {
             if let Some(task_id) = task_ref.as_str() {
                 if let Ok(task_node) = resolve_node(&conn, task_id) {
-                    graph::add_edge(&conn, session.id, task_node.id, Relation::RelatedTo, 1.0).ok();
+                    graph::add_edge(&conn, session.id, task_node.id, Relation::RelatedTo, 1.0)?;
                     linked_tasks.push(json!({
                         "id": task_node.id.to_string(),
                         "label": task_node.label,
@@ -141,21 +145,18 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
     }
 
     // Always show active tasks for this project as a hint
-    let active_tasks: Vec<serde_json::Value> = graph::get_tasks_filtered(
-        &conn,
-        Some(project),
-        Some("active,blocked"),
-        None,
-        5,
-    )?
-    .iter()
-    .map(|t| json!({
-        "id": t.id.to_string(),
-        "label": t.label,
-        "status": t.data.get("status"),
-        "priority": t.data.get("priority"),
-    }))
-    .collect();
+    let active_tasks: Vec<serde_json::Value> =
+        graph::get_tasks_filtered(&conn, Some(project), Some("active,blocked"), None, 5)?
+            .iter()
+            .map(|t| {
+                json!({
+                    "id": t.id.to_string(),
+                    "label": t.label,
+                    "status": t.data.get("status"),
+                    "priority": t.data.get("priority"),
+                })
+            })
+            .collect();
 
     Ok(json!({
         "id": session.id.to_string(),
@@ -200,10 +201,19 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
     }
 
     for node in &context_nodes {
-        graph::touch_node(&conn, node.id).ok();
+        // Best effort by design: an access counter must never fail a read.
+        if let Err(e) = graph::touch_node(&conn, node.id) {
+            tracing::warn!("could not record access for {}: {e}", node.id);
+        }
     }
 
-    let knowledge_count = decisions.len() + problems.len() + solutions.len() + sessions.len() + concepts.len() + tasks.len() + skills.len();
+    let knowledge_count = decisions.len()
+        + problems.len()
+        + solutions.len()
+        + sessions.len()
+        + concepts.len()
+        + tasks.len()
+        + skills.len();
 
     Ok(json!({
         "topic": topic,
