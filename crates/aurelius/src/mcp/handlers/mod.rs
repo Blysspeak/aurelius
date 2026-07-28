@@ -13,19 +13,12 @@ pub use task::*;
 use aurelius_core::{db, graph, models::NodeType, models::Relation};
 use rusqlite::Connection;
 use serde_json::json;
-use std::path::PathBuf;
 use uuid::Uuid;
 
-pub(crate) fn db_path() -> PathBuf {
-    let base = dirs_next::data_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("aurelius");
-    std::fs::create_dir_all(&base).ok();
-    base.join("aurelius.db")
-}
+pub(crate) use aurelius_core::db::db_path;
 
 pub(crate) fn open_db() -> anyhow::Result<Connection> {
-    db::open(&db_path())
+    Ok(db::open(&db_path())?)
 }
 
 pub(crate) fn node_brief(node: &aurelius_core::models::Node) -> serde_json::Value {
@@ -69,7 +62,10 @@ pub(crate) fn edge_brief(edge: &aurelius_core::models::Edge) -> serde_json::Valu
     })
 }
 
-pub(crate) fn resolve_node(conn: &Connection, identifier: &str) -> anyhow::Result<aurelius_core::models::Node> {
+pub(crate) fn resolve_node(
+    conn: &Connection,
+    identifier: &str,
+) -> anyhow::Result<aurelius_core::models::Node> {
     if let Ok(uuid) = identifier.parse::<Uuid>() {
         if let Some(node) = graph::get_node(conn, &uuid.to_string())? {
             return Ok(node);
@@ -144,7 +140,11 @@ pub(crate) fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let now = chrono::Utc::now();
     match s.trim().to_lowercase().as_str() {
         "today" => Some(now.date_naive().and_hms_opt(0, 0, 0)?.and_utc()),
-        "yesterday" => Some((now.date_naive() - chrono::Duration::days(1)).and_hms_opt(0, 0, 0)?.and_utc()),
+        "yesterday" => Some(
+            (now.date_naive() - chrono::Duration::days(1))
+                .and_hms_opt(0, 0, 0)?
+                .and_utc(),
+        ),
         s if s.ends_with('d') => {
             let days: i64 = s.trim_end_matches('d').parse().ok()?;
             Some(now - chrono::Duration::days(days))

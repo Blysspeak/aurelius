@@ -24,7 +24,12 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
     Ok(nodes)
 }
 
-pub fn search_typed(conn: &Connection, query: &str, node_type: &NodeType, limit: usize) -> Result<Vec<Node>> {
+pub fn search_typed(
+    conn: &Connection,
+    query: &str,
+    node_type: &NodeType,
+    limit: usize,
+) -> Result<Vec<Node>> {
     let type_str = serde_json::to_string(node_type)?;
     let trimmed = query.trim();
     if trimmed.is_empty() || trimmed == "*" {
@@ -69,7 +74,10 @@ pub fn get_unsolved_problems(conn: &Connection, limit: usize) -> Result<Vec<Node
          LIMIT ?3",
     )?;
     let nodes = stmt
-        .query_map(params![problem_type, solution_type, limit as i64], row_to_node)?
+        .query_map(
+            params![problem_type, solution_type, limit as i64],
+            row_to_node,
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(nodes)
 }
@@ -143,7 +151,8 @@ pub fn get_tasks_filtered(
 
     params_vec.push(Box::new(limit as i64));
 
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn.prepare(&sql)?;
     let nodes = stmt

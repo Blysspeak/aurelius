@@ -10,10 +10,10 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/v1.4.0-stable-a6e3a1?style=flat-square" alt="v1.4.0">
+  <img src="https://img.shields.io/badge/v1.7.0-stable-a6e3a1?style=flat-square" alt="v1.7.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
-  <img src="https://img.shields.io/badge/MCP-19_tools-a6e3a1?style=flat-square" alt="MCP">
+  <img src="https://img.shields.io/badge/MCP-21_tools-a6e3a1?style=flat-square" alt="MCP">
 </p>
 
 <p align="center">
@@ -45,7 +45,7 @@ This builds binaries, installs to `~/.local/bin`, configures Claude Code MCP ser
 
 ```
 $ au --version
-au 1.4.0
+au 1.7.0
 ```
 
 ---
@@ -150,6 +150,8 @@ au view                            # open web graph UI
 au touch path/to/file              # track file access
 au export                          # export full graph as JSON
 au mcp                             # start MCP server
+au db check                        # verify integrity (read-only)
+au db backup                       # safe snapshot via VACUUM INTO
 ```
 
 ### Task Commands
@@ -163,6 +165,27 @@ au task done <id>                  # mark complete
 au task block <id> "waiting on API keys"
 au task activate <id>              # resume blocked task
 ```
+
+### Backups
+
+```bash
+au db check          # quick integrity report; exits non-zero when damaged
+au db check --full   # exhaustive check, every table
+au db backup         # snapshot → aurelius-<UTC timestamp>.db next to the database
+```
+
+> **Never copy, move or restore `aurelius.db` with `cp`/`mv`/`rsync`, a file manager or a
+> backup agent while `au` or an MCP server is running.** In WAL mode, cross-process cache
+> coherency runs through the `-shm` WAL-index rather than the database header, so replacing
+> the file underneath open connections lets a live process keep flushing its cached pages
+> into the new file — producing a database whose header describes 181 pages while its body
+> holds 1781. `au db backup` uses SQLite's own `VACUUM INTO` and is the only safe way to
+> copy a live database.
+
+To restore a snapshot: stop everything that touches the database (every `au mcp`, `au view`,
+any editor with hooks), move the current database and its `-wal`/`-shm` aside, copy the
+snapshot into place, run `au db check`, then restart. The "stop everything" step is why this
+is a documented procedure and not a command — `au` cannot stop processes it did not start.
 
 ---
 
@@ -222,9 +245,9 @@ contrib/
 
 ### Key Design
 
-- **SQLite + WAL** — concurrent reads, single writer, local-first
+- **SQLite + WAL** — concurrent reads, single writer, local-first. Every connection sets a busy timeout, verifies that WAL mode actually took effect, and checks the file header against the file size before use
 - **FTS5** — indexes label + note (not raw JSON), kept in sync via triggers
-- **5 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache
+- **5 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache. Applied atomically in a single `BEGIN IMMEDIATE` transaction
 - **Batch BFS** — `WHERE id IN (...)` per level, not N+1 per node
 - **Session dedup** — SHA-256 content hash on (project, summary)
 - **Edge dedup** — UNIQUE constraint on (from_id, to_id, relation)
@@ -268,6 +291,8 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 - [x] v1.2 — UI overhaul, project-scoped linking, indexer fix
 - [x] v1.3 — Obsidian-style graph physics, project hub nodes, session auto-linking
 - [x] v1.4 — Task management (5 MCP tools + CLI), work branches, acceptance criteria
+- [x] v1.5 — `memory_merge`, `task_stats`, semantic cluster graph layout
+- [x] v1.7 — DB hardening: busy timeout, atomic migrations, integrity gate, `au db check` / `au db backup`
 - [ ] Next — npm distribution, `au repair`, context-ranked search, git log connector
 
 ---
