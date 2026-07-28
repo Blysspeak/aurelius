@@ -96,7 +96,8 @@ mkdir -p "$HOOKS_DIR"
 
 /usr/bin/cp -f contrib/claude-code/aurelius-reindex.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-reindex.sh "$HOOKS_DIR/"
 /usr/bin/cp -f contrib/claude-code/aurelius-track-edit.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-track-edit.sh "$HOOKS_DIR/"
-chmod +x "$HOOKS_DIR/aurelius-reindex.sh" "$HOOKS_DIR/aurelius-track-edit.sh"
+/usr/bin/cp -f contrib/claude-code/aurelius-skills.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-skills.sh "$HOOKS_DIR/"
+chmod +x "$HOOKS_DIR/aurelius-reindex.sh" "$HOOKS_DIR/aurelius-track-edit.sh" "$HOOKS_DIR/aurelius-skills.sh"
 echo -e "${GREEN}✓${RESET} Hooks installed to ${HOOKS_DIR}"
 
 # --- 7. Auto-configure Claude Code settings ---
@@ -130,6 +131,7 @@ else:
 hooks = settings.setdefault('hooks', {})
 reindex_cmd = '$HOOKS_DIR/aurelius-reindex.sh'
 track_cmd = '$HOOKS_DIR/aurelius-track-edit.sh'
+skills_cmd = '$HOOKS_DIR/aurelius-skills.sh'
 
 def has_hook_cmd(hook_list, cmd):
     \"\"\"Check if command already exists anywhere in the hook entries.\"\"\"
@@ -177,6 +179,13 @@ if add_hook_to_group(post_hooks, 'Edit|Write', track_cmd, 5):
     print('  Added PostToolUse hook: aurelius-track-edit', file=sys.stderr)
 else:
     print('  PostToolUse hook already configured', file=sys.stderr)
+
+# SessionStart hook — inject the skill index into context (matcher: '' = all)
+session_hooks = hooks.setdefault('SessionStart', [])
+if add_hook_to_group(session_hooks, '', skills_cmd, 10):
+    print('  Added SessionStart hook: aurelius-skills', file=sys.stderr)
+else:
+    print('  SessionStart hook already configured', file=sys.stderr)
 
 with open('$tmp', 'w') as f:
     json.dump(settings, f, indent=2)
