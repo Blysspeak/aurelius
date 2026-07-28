@@ -11,10 +11,7 @@ pub fn search_web(params: &serde_json::Value) -> Result<serde_json::Value> {
         .and_then(|q| q.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'query' parameter"))?;
 
-    let count = params
-        .get("count")
-        .and_then(|c| c.as_u64())
-        .unwrap_or(5) as usize;
+    let count = params.get("count").and_then(|c| c.as_u64()).unwrap_or(5) as usize;
 
     let cache_days = params
         .get("cache_days")
@@ -63,10 +60,7 @@ pub fn search_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         .and_then(|q| q.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'query' parameter"))?;
 
-    let limit = params
-        .get("limit")
-        .and_then(|l| l.as_u64())
-        .unwrap_or(10) as usize;
+    let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
 
     let conn = open_db()?;
     let results = cache::recall(&conn, query, limit)?;

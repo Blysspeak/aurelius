@@ -83,6 +83,22 @@ pub enum TaskAction {
 }
 
 #[derive(Subcommand)]
+pub enum DbAction {
+    /// Verify database integrity (read-only — never migrates, never writes)
+    Check {
+        /// Report every problem instead of stopping at the first
+        #[arg(long)]
+        full: bool,
+    },
+    /// Safe snapshot via SQLite VACUUM INTO — the only correct way to copy a live database
+    Backup {
+        /// Destination file (default: aurelius-<UTC timestamp>.db next to the database)
+        #[arg(short, long)]
+        out: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Initialize Aurelius in current environment
     Init,
@@ -145,6 +161,11 @@ enum Commands {
         /// Target node (UUID or label) — survives with merged edges
         target: String,
     },
+    /// Database maintenance — integrity check and safe backup
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
     /// Start MCP server (used by Claude Code)
     Mcp,
 }
@@ -169,6 +190,7 @@ async fn main() -> Result<()> {
         Commands::Export => commands::export().await,
         Commands::Task { action } => commands::task(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
+        Commands::Db { action } => commands::db(action).await,
         Commands::Mcp => commands::mcp().await,
     }
 }

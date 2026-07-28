@@ -1,4 +1,5 @@
 use anyhow::Result;
+use aurelius_core::db::db_path;
 use aurelius_core::{db, graph};
 use axum::{
     extract::Query,
@@ -9,18 +10,10 @@ use axum::{
 };
 use rust_embed::Embed;
 use serde::Deserialize;
-use std::path::PathBuf;
 
 #[derive(Embed)]
 #[folder = "../../ui/dist/"]
 struct UiAssets;
-
-fn db_path() -> PathBuf {
-    let base = dirs_next::data_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-        .join("aurelius");
-    base.join("aurelius.db")
-}
 
 pub async fn serve(port: u16, no_open: bool) -> Result<()> {
     let app = Router::new()

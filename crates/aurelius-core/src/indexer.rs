@@ -349,9 +349,16 @@ fn index_generic_files(
         // Index key config/doc files (skip Cargo.toml — this is a non-Rust project)
         let is_key = matches!(
             fname,
-            "package.json" | "pyproject.toml" | "go.mod" | "Makefile" | "Dockerfile"
-                | "tsconfig.json" | "docker-compose.yml" | "docker-compose.yaml"
-        ) || (matches!(ext, "toml" | "json" | "yaml" | "yml") && fname != "Cargo.toml");
+            "package.json"
+                | "pyproject.toml"
+                | "go.mod"
+                | "Makefile"
+                | "Dockerfile"
+                | "tsconfig.json"
+                | "docker-compose.yml"
+                | "docker-compose.yaml"
+        ) || (matches!(ext, "toml" | "json" | "yaml" | "yml")
+            && fname != "Cargo.toml");
 
         if is_key {
             index_file(conn, path, project_id, result)?;

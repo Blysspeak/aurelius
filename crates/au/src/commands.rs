@@ -1,17 +1,15 @@
 use anyhow::Result;
-use aurelius_core::{db, graph, indexer, models::{MemoryKind, NodeType, Relation}, timeforged};
+use aurelius_core::{
+    db, graph, indexer,
+    models::{MemoryKind, NodeType, Relation},
+    timeforged,
+};
 use serde_json::json;
 use std::path::PathBuf;
 
-use crate::TaskAction;
+use crate::{DbAction, TaskAction};
 
-fn db_path() -> PathBuf {
-    let base = dirs_next::data_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-        .join("aurelius");
-    std::fs::create_dir_all(&base).ok();
-    base.join("aurelius.db")
-}
+use aurelius_core::db::db_path;
 
 /// Open DB and auto-index current project if not yet indexed.
 fn open_and_ensure(path: &std::path::Path) -> Result<rusqlite::Connection> {
@@ -320,7 +318,11 @@ pub async fn task(action: TaskAction) -> Result<()> {
             println!("{} tasks:", tasks.len());
             for t in &tasks {
                 let st = t.data.get("status").and_then(|s| s.as_str()).unwrap_or("?");
-                let pri = t.data.get("priority").and_then(|p| p.as_str()).unwrap_or("?");
+                let pri = t
+                    .data
+                    .get("priority")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("?");
                 let icon = match st {
                     "active" => "▶",
                     "blocked" => "⛔",
@@ -335,8 +337,16 @@ pub async fn task(action: TaskAction) -> Result<()> {
 
         TaskAction::Show { id } => {
             let task = find_task(&conn, &id)?;
-            let st = task.data.get("status").and_then(|s| s.as_str()).unwrap_or("?");
-            let pri = task.data.get("priority").and_then(|p| p.as_str()).unwrap_or("?");
+            let st = task
+                .data
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let pri = task
+                .data
+                .get("priority")
+                .and_then(|p| p.as_str())
+                .unwrap_or("?");
 
             println!("Task: {}", task.label);
             println!("  ID:       {}", task.id);
@@ -347,7 +357,11 @@ pub async fn task(action: TaskAction) -> Result<()> {
             }
 
             // Acceptance criteria
-            if let Some(criteria) = task.data.get("acceptance_criteria").and_then(|c| c.as_array()) {
+            if let Some(criteria) = task
+                .data
+                .get("acceptance_criteria")
+                .and_then(|c| c.as_array())
+            {
                 if !criteria.is_empty() {
                     println!("\n  Acceptance criteria:");
                     for c in criteria {
@@ -406,7 +420,11 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 .unwrap_or("unknown");
 
             // Auto-activate
-            let status = task.data.get("status").and_then(|s| s.as_str()).unwrap_or("backlog");
+            let status = task
+                .data
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("backlog");
             if status == "backlog" {
                 let mut data = task.data.clone();
                 data["status"] = json!("active");
@@ -466,7 +484,10 @@ pub async fn task(action: TaskAction) -> Result<()> {
             println!("▶ Task activated: {}", task.label);
         }
 
-        TaskAction::Stats { project, since_days } => {
+        TaskAction::Stats {
+            project,
+            since_days,
+        } => {
             task_stats_cli(&conn, project.as_deref(), since_days)?;
         }
     }
@@ -496,22 +517,40 @@ fn task_stats_cli(
     let cutoff = since_days.map(|d| now - chrono::Duration::days(d as i64));
 
     for t in &tasks {
-        let status = t.data.get("status").and_then(|s| s.as_str()).unwrap_or("backlog");
-        let priority = t.data.get("priority").and_then(|p| p.as_str()).unwrap_or("medium");
+        let status = t
+            .data
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("backlog");
+        let priority = t
+            .data
+            .get("priority")
+            .and_then(|p| p.as_str())
+            .unwrap_or("medium");
         *by_status.entry(status.to_string()).or_insert(0) += 1;
         *by_priority.entry(priority.to_string()).or_insert(0) += 1;
-        if status == "blocked" { blocked += 1; }
+        if status == "blocked" {
+            blocked += 1;
+        }
 
-        let started = t.data.get("started_at").and_then(|s| s.as_str())
+        let started = t
+            .data
+            .get("started_at")
+            .and_then(|s| s.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc));
-        let completed = t.data.get("completed_at").and_then(|s| s.as_str())
+        let completed = t
+            .data
+            .get("completed_at")
+            .and_then(|s| s.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc));
 
         if let (Some(s), Some(c)) = (started, completed) {
             let h = (c - s).num_seconds() as f64 / 3600.0;
-            if h >= 0.0 { completion_hours.push(h); }
+            if h >= 0.0 {
+                completion_hours.push(h);
+            }
             match cutoff {
                 Some(cut) if c >= cut => done_in_window += 1,
                 None if status == "done" => done_in_window += 1,
@@ -527,33 +566,50 @@ fn task_stats_cli(
     }
 
     completion_hours.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let avg = if completion_hours.is_empty() { None } else {
+    let avg = if completion_hours.is_empty() {
+        None
+    } else {
         Some(completion_hours.iter().sum::<f64>() / completion_hours.len() as f64)
     };
-    let median = if completion_hours.is_empty() { None } else {
+    let median = if completion_hours.is_empty() {
+        None
+    } else {
         let mid = completion_hours.len() / 2;
-        Some(if completion_hours.len() % 2 == 0 {
+        Some(if completion_hours.len().is_multiple_of(2) {
             (completion_hours[mid - 1] + completion_hours[mid]) / 2.0
-        } else { completion_hours[mid] })
+        } else {
+            completion_hours[mid]
+        })
     };
 
     let total = tasks.len();
     let done = by_status.get("done").copied().unwrap_or(0);
     let rate = done as f64 / total as f64 * 100.0;
 
-    println!("Task stats{}:", project.map(|p| format!(" — {p}")).unwrap_or_default());
+    println!(
+        "Task stats{}:",
+        project.map(|p| format!(" — {p}")).unwrap_or_default()
+    );
     println!("  total:           {total}");
     println!("  completion rate: {rate:.1}% ({done}/{total})");
     print!("  by status:      ");
-    for (k, v) in &by_status { print!(" {k}={v}"); }
+    for (k, v) in &by_status {
+        print!(" {k}={v}");
+    }
     println!();
     print!("  by priority:    ");
     for k in ["critical", "high", "medium", "low"] {
-        if let Some(v) = by_priority.get(k) { print!(" {k}={v}"); }
+        if let Some(v) = by_priority.get(k) {
+            print!(" {k}={v}");
+        }
     }
     println!();
-    if let Some(a) = avg { println!("  avg duration:    {a:.1}h"); }
-    if let Some(m) = median { println!("  median duration: {m:.1}h"); }
+    if let Some(a) = avg {
+        println!("  avg duration:    {a:.1}h");
+    }
+    if let Some(m) = median {
+        println!("  median duration: {m:.1}h");
+    }
     println!("  currently blocked: {blocked}");
     if let Some(s) = oldest_active {
         let days = (now - s).num_hours() as f64 / 24.0;
@@ -606,10 +662,84 @@ pub async fn merge(source: &str, target: &str) -> Result<()> {
     println!("✓ Merged");
     println!("  edges rewired:           {}", stats.edges_rewired);
     println!("  self-loops removed:      {}", stats.self_loops_removed);
-    println!("  duplicate edges removed: {}", stats.duplicate_edges_removed);
+    println!(
+        "  duplicate edges removed: {}",
+        stats.duplicate_edges_removed
+    );
     if stats.note_merged {
         println!("  notes merged");
     }
+    Ok(())
+}
+
+pub async fn db(action: DbAction) -> Result<()> {
+    let path = db_path();
+    if !path.exists() {
+        anyhow::bail!("no database at {}", path.display());
+    }
+    match action {
+        DbAction::Check { full } => db_check_cli(&path, full),
+        DbAction::Backup { out } => db_backup_cli(&path, out),
+    }
+}
+
+fn db_check_cli(path: &std::path::Path, full: bool) -> Result<()> {
+    let report = db::check(path, full)?;
+
+    println!("Database: {}", path.display());
+    println!(
+        "  size:     {} bytes ({} pages × {})",
+        report.file_bytes, report.page_count, report.page_size
+    );
+    if report.wal_bytes > 0 {
+        println!("  wal:      {} bytes", report.wal_bytes);
+    }
+    match (report.nodes, report.edges) {
+        (Some(nodes), Some(edges)) => println!("  content:  {nodes} nodes, {edges} edges"),
+        _ => println!("  content:  unreadable"),
+    }
+
+    let mode = if full {
+        "integrity_check"
+    } else {
+        "quick_check"
+    };
+    if report.ok {
+        println!("✓ Integrity OK ({mode})");
+        return Ok(());
+    }
+
+    println!("✗ Integrity FAILED");
+    for problem in &report.problems {
+        for line in problem.lines() {
+            println!("    {line}");
+        }
+    }
+    println!("  Next: `au db backup` to snapshot what is still readable.");
+    anyhow::bail!(
+        "integrity check failed ({} problem(s))",
+        report.problems.len()
+    )
+}
+
+fn db_backup_cli(path: &std::path::Path, out: Option<String>) -> Result<()> {
+    let dest = match out {
+        Some(p) => PathBuf::from(p),
+        None => path.with_file_name(format!(
+            "aurelius-{}.db",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        )),
+    };
+    if dest.exists() {
+        anyhow::bail!("destination already exists: {}", dest.display());
+    }
+
+    let bytes = db::backup_into(path, &dest)?;
+
+    println!("✓ Backup written");
+    println!("  source: {}", path.display());
+    println!("  dest:   {}", dest.display());
+    println!("  size:   {bytes} bytes");
     Ok(())
 }
 
