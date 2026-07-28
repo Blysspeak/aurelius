@@ -86,6 +86,8 @@ pub enum TaskAction {
 pub enum DbAction {
     /// Verify database integrity (read-only — never migrates, never writes)
     Check {
+        /// Database to check (default: the knowledge graph). Use it to verify a snapshot.
+        path: Option<String>,
         /// Report every problem instead of stopping at the first
         #[arg(long)]
         full: bool,

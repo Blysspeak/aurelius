@@ -8,9 +8,16 @@
 ## Command tree
 
 ```text
-au db check  [--full]
+au db check  [PATH] [--full]
 au db backup [--out PATH]
 ```
+
+> **Amended in v1.8.0.** `check` gained an optional positional `PATH`. The original
+> contract argued against it ("pointing these commands at an arbitrary file is not a use
+> case the incident motivates"), and that was wrong: the rolling backup hook added in
+> v1.7.x needs to verify the snapshot it just wrote, and without a path it could only
+> trust that `au db backup` had not lied. An unverified backup is a guess. `backup` still
+> takes no source argument — there is exactly one knowledge graph to snapshot.
 
 Nested exactly like the existing `au task <action>`
 ([main.rs:137-140](../../../crates/au/src/main.rs)):
@@ -46,13 +53,16 @@ incident motivates, and adding it would be speculative (Principle IV).
 
 ---
 
-## `au db check [--full]`
+## `au db check [PATH] [--full]`
 
-**Purpose**: read-only verdict on the database's structural integrity.
+**Purpose**: read-only verdict on the structural integrity of a database — the knowledge
+graph by default, or any database file given as `PATH` (typically a snapshot).
 
 **Guarantees**
 
 - Opens the file `SQLITE_OPEN_READ_ONLY`. Never migrates. Never writes a page.
+- A missing `PATH` is reported as `no database at <path>` with a non-zero exit, rather
+  than surfacing an engine error.
 - Works on a database older than the current schema, newer than it, or damaged.
 - Default mode stops at the first problem (`quick_check(1)`); `--full` reports all
   (`integrity_check`).
