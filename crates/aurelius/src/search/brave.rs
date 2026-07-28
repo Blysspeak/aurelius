@@ -63,8 +63,12 @@ pub fn search(query: &str, count: usize) -> Result<Vec<SearchResult>> {
     }
 
     let body = resp.text()?;
-    let data: BraveResponse = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("Failed to parse Brave response: {e}\nBody: {}", &body[..body.len().min(500)]))?;
+    let data: BraveResponse = serde_json::from_str(&body).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to parse Brave response: {e}\nBody: {}",
+            &body[..body.len().min(500)]
+        )
+    })?;
 
     let results = data
         .web
