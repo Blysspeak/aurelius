@@ -97,7 +97,8 @@ mkdir -p "$HOOKS_DIR"
 /usr/bin/cp -f contrib/claude-code/aurelius-reindex.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-reindex.sh "$HOOKS_DIR/"
 /usr/bin/cp -f contrib/claude-code/aurelius-track-edit.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-track-edit.sh "$HOOKS_DIR/"
 /usr/bin/cp -f contrib/claude-code/aurelius-skills.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-skills.sh "$HOOKS_DIR/"
-chmod +x "$HOOKS_DIR/aurelius-reindex.sh" "$HOOKS_DIR/aurelius-track-edit.sh" "$HOOKS_DIR/aurelius-skills.sh"
+/usr/bin/cp -f contrib/claude-code/aurelius-backup.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-backup.sh "$HOOKS_DIR/"
+chmod +x "$HOOKS_DIR/aurelius-reindex.sh" "$HOOKS_DIR/aurelius-track-edit.sh" "$HOOKS_DIR/aurelius-skills.sh" "$HOOKS_DIR/aurelius-backup.sh"
 echo -e "${GREEN}✓${RESET} Hooks installed to ${HOOKS_DIR}"
 
 # --- 7. Auto-configure Claude Code settings ---
@@ -132,6 +133,7 @@ hooks = settings.setdefault('hooks', {})
 reindex_cmd = '$HOOKS_DIR/aurelius-reindex.sh'
 track_cmd = '$HOOKS_DIR/aurelius-track-edit.sh'
 skills_cmd = '$HOOKS_DIR/aurelius-skills.sh'
+backup_cmd = '$HOOKS_DIR/aurelius-backup.sh'
 
 def has_hook_cmd(hook_list, cmd):
     \"\"\"Check if command already exists anywhere in the hook entries.\"\"\"
@@ -186,6 +188,12 @@ if add_hook_to_group(session_hooks, '', skills_cmd, 10):
     print('  Added SessionStart hook: aurelius-skills', file=sys.stderr)
 else:
     print('  SessionStart hook already configured', file=sys.stderr)
+
+# SessionStart hook — rolling database snapshot (throttled to one a day)
+if add_hook_to_group(session_hooks, '', backup_cmd, 30):
+    print('  Added SessionStart hook: aurelius-backup', file=sys.stderr)
+else:
+    print('  Backup hook already configured', file=sys.stderr)
 
 with open('$tmp', 'w') as f:
     json.dump(settings, f, indent=2)
