@@ -14,7 +14,16 @@ pub fn add_node(
     source: &str,
     data: serde_json::Value,
 ) -> Result<Node> {
-    add_node_full(conn, node_type, label, note, source, data, MemoryKind::Semantic, None)
+    add_node_full(
+        conn,
+        node_type,
+        label,
+        note,
+        source,
+        data,
+        MemoryKind::Semantic,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -180,10 +189,7 @@ pub fn merge_nodes(conn: &Connection, source: Uuid, target: Uuid) -> Result<Merg
     )?;
     stats.edges_rewired = rewired_from + rewired_to;
 
-    stats.self_loops_removed = conn.execute(
-        "DELETE FROM edges WHERE from_id = to_id",
-        [],
-    )?;
+    stats.self_loops_removed = conn.execute("DELETE FROM edges WHERE from_id = to_id", [])?;
 
     stats.duplicate_edges_removed = conn.execute(
         "DELETE FROM edges WHERE id NOT IN (

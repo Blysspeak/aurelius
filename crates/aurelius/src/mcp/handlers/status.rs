@@ -10,35 +10,43 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     // Auto-index current working directory if not yet indexed
     if let Ok(cwd) = std::env::current_dir() {
-        indexer::ensure_indexed(&conn, &cwd).ok();
+        // Opportunistic: a failed auto-index must not fail the status call.
+        if let Err(e) = indexer::ensure_indexed(&conn, &cwd) {
+            tracing::warn!("could not auto-index {}: {e}", cwd.display());
+        }
     }
 
     let projects = graph::search_typed(&conn, "*", &NodeType::Project, 10)?;
     let crates = graph::search_typed(&conn, "*", &NodeType::Crate, 20)?;
     let mut skills = graph::get_nodes_by_type(&conn, &NodeType::Skill)?;
-    skills.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+    skills.sort_by_key(|s| std::cmp::Reverse(s.access_count));
     let total_nodes = graph::count_nodes(&conn)?;
     let total_edges = graph::count_edges(&conn)?;
 
-    let (recent_decisions, problems, recent_solutions, recent_sessions, active_tasks) = if let Some(proj) = project_filter {
-        let fts_query = format!("\"[{}]\"", proj);
-        let prefix = format!("[{}]", proj);
-        (
-            graph::search_typed(&conn, &fts_query, &NodeType::Decision, 10)?,
-            graph::get_unsolved_problems(&conn, 50)?.into_iter().filter(|n| n.label.starts_with(&prefix)).take(10).collect::<Vec<_>>(),
-            graph::search_typed(&conn, &fts_query, &NodeType::Solution, 10)?,
-            graph::search_typed(&conn, &fts_query, &NodeType::Session, 5)?,
-            graph::get_tasks_filtered(&conn, Some(proj), Some("active,blocked"), None, 10)?,
-        )
-    } else {
-        (
-            graph::search_typed(&conn, "*", &NodeType::Decision, 10)?,
-            graph::get_unsolved_problems(&conn, 10)?,
-            graph::search_typed(&conn, "*", &NodeType::Solution, 10)?,
-            graph::search_typed(&conn, "*", &NodeType::Session, 5)?,
-            graph::get_tasks_filtered(&conn, None, Some("active,blocked"), None, 10)?,
-        )
-    };
+    let (recent_decisions, problems, recent_solutions, recent_sessions, active_tasks) =
+        if let Some(proj) = project_filter {
+            let fts_query = format!("\"[{}]\"", proj);
+            let prefix = format!("[{}]", proj);
+            (
+                graph::search_typed(&conn, &fts_query, &NodeType::Decision, 10)?,
+                graph::get_unsolved_problems(&conn, 50)?
+                    .into_iter()
+                    .filter(|n| n.label.starts_with(&prefix))
+                    .take(10)
+                    .collect::<Vec<_>>(),
+                graph::search_typed(&conn, &fts_query, &NodeType::Solution, 10)?,
+                graph::search_typed(&conn, &fts_query, &NodeType::Session, 5)?,
+                graph::get_tasks_filtered(&conn, Some(proj), Some("active,blocked"), None, 10)?,
+            )
+        } else {
+            (
+                graph::search_typed(&conn, "*", &NodeType::Decision, 10)?,
+                graph::get_unsolved_problems(&conn, 10)?,
+                graph::search_typed(&conn, "*", &NodeType::Solution, 10)?,
+                graph::search_typed(&conn, "*", &NodeType::Session, 5)?,
+                graph::get_tasks_filtered(&conn, None, Some("active,blocked"), None, 10)?,
+            )
+        };
 
     let active_tasks_json: Vec<serde_json::Value> = active_tasks
         .iter()
