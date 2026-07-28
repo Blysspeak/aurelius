@@ -56,6 +56,19 @@ dest="$BACKUP_DIR/aurelius-$(date -u +%Y%m%dT%H%M%SZ).db"
 # damaged source, so a file appearing here means the source was readable.
 "$AU" db backup --out "$dest" >/dev/null 2>&1 || exit 0
 
+# Verify the snapshot itself. An unverified backup is a guess; this is the whole
+# reason `au db check` takes a path. A snapshot that fails is renamed out of the
+# `aurelius-*.db` pattern so it can never be mistaken for a good backup, and is
+# kept rather than deleted — a bad snapshot is evidence worth looking at.
+if ! "$AU" db check "$dest" >/dev/null 2>&1; then
+    mv -f "$dest" "$dest.FAILED-CHECK" 2>/dev/null
+    # Opening a WAL database read-only leaves empty -wal/-shm siblings behind.
+    # A healthy snapshot never has them (VACUUM INTO writes a rollback-journal
+    # database), so this only fires on the damaged path.
+    rm -f "$dest-wal" "$dest-shm" 2>/dev/null
+    exit 0
+fi
+
 # Retention: keep the newest KEEP snapshots, drop the rest.
 ls -1t "$BACKUP_DIR"/aurelius-*.db 2>/dev/null | tail -n "+$((KEEP + 1))" | while IFS= read -r old; do
     rm -f "$old"
