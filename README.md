@@ -13,12 +13,12 @@
   <img src="https://img.shields.io/badge/v1.7.0-stable-a6e3a1?style=flat-square" alt="v1.7.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
-  <img src="https://img.shields.io/badge/MCP-21_tools-a6e3a1?style=flat-square" alt="MCP">
+  <img src="https://img.shields.io/badge/MCP-25_tools-a6e3a1?style=flat-square" alt="MCP">
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#mcp-tools-21">MCP Tools</a> ·
+  <a href="#mcp-tools-25">MCP Tools</a> ·
   <a href="#task-management">Tasks</a> ·
   <a href="#web-ui">Graph UI</a> ·
   <a href="doc/README-ru.md">Русский</a>
@@ -50,7 +50,7 @@ au 1.7.0
 
 ---
 
-## MCP Tools (21)
+## MCP Tools (25)
 
 Aurelius runs as an MCP server over stdio. `install.sh` configures it automatically, or add manually via `/mcp` in Claude Code (`command: au`, `args: ["mcp"]`).
 
@@ -82,6 +82,17 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | `task_log` | Record work done — creates WorkLog + optional Decision/Problem/Solution nodes. Auto-activates backlog tasks. |
 | `task_view` | Full task branch — timeline of work logs, decisions, problems, solutions, subtasks. |
 | `task_stats` | Task analytics — counts by status/priority, completion rate, avg/median duration, blocked count, oldest active. |
+
+### Skills
+
+Reusable procedural "how-to" cards with progressive disclosure — the trigger is FTS-indexed (discoverable), the full markdown body is fetched on demand. The index auto-injects every session via a SessionStart hook, and skills surface in `memory_recall`/`memory_status`.
+
+| Tool | Description |
+|------|-------------|
+| `skill_save` | Create/update a skill (upsert by name). Trigger → indexed note; body + tags → data. |
+| `skill_list` | Cheap index (name + trigger + tags + uses), ranked by usage. Optional FTS `query`/`tag`. |
+| `skill_get` | Full markdown body by name, with fuzzy FTS fallback + disambiguation. Bumps usage. |
+| `skill_remove` | Delete a skill by name. |
 
 ### Web Search
 
@@ -150,6 +161,7 @@ au view                            # open web graph UI
 au touch path/to/file              # track file access
 au export                          # export full graph as JSON
 au mcp                             # start MCP server
+au skills                          # print the skill index
 au db check                        # verify integrity (read-only)
 au db backup                       # safe snapshot via VACUUM INTO
 ```
@@ -292,6 +304,7 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 - [x] v1.3 — Obsidian-style graph physics, project hub nodes, session auto-linking
 - [x] v1.4 — Task management (5 MCP tools + CLI), work branches, acceptance criteria
 - [x] v1.5 — `memory_merge`, `task_stats`, semantic cluster graph layout
+- [x] v1.6 — Skills subsystem (4 MCP tools + `au skills`), session auto-injection
 - [x] v1.7 — DB hardening: busy timeout, atomic migrations, integrity gate, `au db check` / `au db backup`
 - [ ] Next — npm distribution, `au repair`, context-ranked search, git log connector
 
