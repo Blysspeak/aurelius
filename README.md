@@ -186,6 +186,17 @@ au db check --full   # exhaustive check, every table
 au db backup         # snapshot → aurelius-<UTC timestamp>.db next to the database
 ```
 
+Snapshots are taken automatically: `install.sh` registers a SessionStart hook that keeps
+a rolling set in `<data-dir>/aurelius/backups/`. Cadence follows activity rather than the
+clock — the graph only changes when Claude Code, the CLI or the git hooks touch it, so an
+idle machine does not accumulate identical copies. Several sessions in a day cost one
+snapshot; ~50 ms for an 8 MB graph.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AURELIUS_BACKUP_KEEP` | `7` | snapshots retained |
+| `AURELIUS_BACKUP_MIN_HOURS` | `24` | minimum age of the newest snapshot before a new one is taken |
+
 > **Never copy, move or restore `aurelius.db` with `cp`/`mv`/`rsync`, a file manager or a
 > backup agent while `au` or an MCP server is running.** In WAL mode, cross-process cache
 > coherency runs through the `-shm` WAL-index rather than the database header, so replacing
