@@ -185,6 +185,7 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
     let mut sessions = vec![];
     let mut concepts = vec![];
     let mut tasks = vec![];
+    let mut skills = vec![];
 
     for node in &context_nodes {
         match &node.node_type {
@@ -194,6 +195,7 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
             NodeType::Session => sessions.push(node_compact(node)),
             NodeType::Task => tasks.push(node_compact(node)),
             NodeType::Concept | NodeType::Project => concepts.push(node_compact(node)),
+            NodeType::Skill => skills.push(node_compact(node)),
             _ => {}
         }
     }
@@ -210,7 +212,8 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         + solutions.len()
         + sessions.len()
         + concepts.len()
-        + tasks.len();
+        + tasks.len()
+        + skills.len();
 
     Ok(json!({
         "topic": topic,
@@ -220,6 +223,8 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         "sessions": sessions,
         "tasks": tasks,
         "concepts": concepts,
+        "skills": skills,
+        "skills_hint": if skills.is_empty() { serde_json::Value::Null } else { json!("Relevant skill cards found — call skill_get <name> for full instructions.") },
         "total_knowledge_nodes": knowledge_count,
         "total_graph_nodes": context_nodes.len(),
     }))

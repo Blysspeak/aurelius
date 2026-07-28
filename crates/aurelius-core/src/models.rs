@@ -21,6 +21,7 @@ pub enum NodeType {
     Language,
     Task,
     WorkLog,
+    Skill,
     Custom(String),
 }
 

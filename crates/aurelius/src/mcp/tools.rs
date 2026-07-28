@@ -517,6 +517,84 @@ pub fn tool_definitions() -> serde_json::Value {
                     },
                     "required": ["query"]
                 }
+            },
+            {
+                "name": "skill_list",
+                "description": "Cheap skill index — returns only name + trigger + tags (never the body) for every stored skill card. This is the progressive-disclosure index: scan it to see what reusable how-to knowledge exists, then call skill_get to read the full body. Optional FTS query / tag filter.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Optional FTS filter over skill name/trigger. Omit to list all skills."
+                        },
+                        "tag": {
+                            "type": "string",
+                            "description": "Optional: only skills carrying this tag"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max skills to return (default: 200)",
+                            "default": 200
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "skill_get",
+                "description": "Fetch one skill card's full markdown body by name. Use after skill_list (or memory_search) surfaces a relevant skill. Bumps the skill's access_count.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Exact skill name (the label shown by skill_list)"
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "skill_save",
+                "description": "Create or update a skill card (upsert by name). A skill is reusable procedural knowledge — a 'how to do X' card. The trigger is a short 'when to apply this' line (FTS-indexed, so it's discoverable); the body is the full markdown instructions (stored verbatim, not keyword-indexed). Save a skill whenever you work out a repeatable procedure worth reusing across sessions.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Unique skill name, kebab-case (e.g. 'patch-shaiya-pe'). Used as the lookup key."
+                        },
+                        "trigger": {
+                            "type": "string",
+                            "description": "When to apply this skill — one or two sentences. This is what search matches on."
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Full markdown instructions: steps, commands, gotchas, examples."
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional tags for grouping/filtering (e.g. ['shaiya', 'reverse'])"
+                        }
+                    },
+                    "required": ["name", "trigger", "body"]
+                }
+            },
+            {
+                "name": "skill_remove",
+                "description": "Delete a skill card by name. Use when a skill is obsolete or wrong.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Exact skill name to delete"
+                        }
+                    },
+                    "required": ["name"]
+                }
             }
         ]
     })
