@@ -3,11 +3,11 @@
 ## [v1.8.0] — 2026-07-29
 
 ### Added
-- `au db check [PATH]` — the check now takes an optional path, so a snapshot can be verified. A snapshot is an ordinary database, so verifying one is the same command pointed at a different file (<hash>)
-- The rolling backup hook verifies every snapshot it writes. An unverified backup is a guess. A snapshot that fails the check is renamed to `.FAILED-CHECK` — out of the `aurelius-*.db` pattern, so it can never be mistaken for a good backup nor counted by retention — and kept rather than deleted, because a bad snapshot is evidence worth reading (<hash>)
+- `au db check [PATH]` — the check now takes an optional path, so a snapshot can be verified. A snapshot is an ordinary database, so verifying one is the same command pointed at a different file (a22d373)
+- The rolling backup hook verifies every snapshot it writes. An unverified backup is a guess. A snapshot that fails the check is renamed to `.FAILED-CHECK` — out of the `aurelius-*.db` pattern, so it can never be mistaken for a good backup nor counted by retention — and kept rather than deleted, because a bad snapshot is evidence worth reading (a22d373)
 
 ### Fixed
-- `au db backup` reports a missing database instead of failing inside the snapshot call (<hash>)
+- `au db backup` reports a missing database instead of failing inside the snapshot call (a22d373)
 
 ---
 
