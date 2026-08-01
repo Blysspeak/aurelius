@@ -1,5 +1,32 @@
 # Changelog
 
+## [v1.9.0] — 2026-08-02
+
+### Added
+- **Two-way project sync between Aurelius instances.** A project owner can opt a single project into sync with personally-invited collaborators through a self-hosted `aurelius-sync-server`; every participant runs one command, `au share <server> <token>`, and gets that project's full existing history — decisions, tasks, sessions — with no manual export/import (92872ba, 36c5382)
+- `au share issue <project> --for "Name <email>" --server <host>` / `au share revoke` — admin-side token issuance and revocation. `issue` requires the project to already exist locally (rather than silently creating one on a typo) and lists existing project labels when it doesn't match (36c5382, f2cc833)
+- `au share push [project]` / `au share pull [project]` / `au share list` / `au share disable <project>` — manual sync controls; `push`/`pull` with no project act on every project with sync enabled. Sync also runs automatically at session boundaries (pull on `memory_status`, push on `memory_session`, and the Stop hook) — best-effort, so a temporarily unreachable server never blocks local work (36c5382, d92ff92)
+- `au identity set --name <name> --email <email>` — a durable, git-style identity stamped as `created_by`/`updated_by` on every node and edge a person creates or updates, visible wherever synced data is shown (36c5382, d92ff92)
+- Deletions propagate as tombstones (soft `deleted_at`) instead of disappearing locally and resurrecting from a peer's still-live copy; concurrent edits to the same node resolve by last-writer-wins with the losing edit retained under `data._sync_conflict`, visible via `au context <project> -v` (2f033b0)
+- `deploy/aurelius-sync-server/` — a generic, copy-pasteable Docker template (`.env.example` + `docker-compose.yml`) for self-hosting a private sync server; not tied to any specific host (92872ba, f2cc833)
+- Migration V6 — `created_by`/`updated_by`/`deleted_at`/`sync_seq` on `nodes` and `edges`, plus `sync_config` (client-side, per-project opt-in) and `collaborator_grants` (server-side, token-hash keyed) tables (92872ba)
+
+### Fixed
+- `memory_forget` (and any future CLI equivalent) now bumps `updated_at` in lockstep with `deleted_at` — without this, a tombstone with an otherwise-unchanged `updated_at` would lose to the server's existing live copy under last-writer-wins, and the deletion would silently never propagate (2f033b0)
+
+### Documentation
+- Spec-kit feature `002-project-sync` — specification, plan, research, data model, sync API contract, quickstart, task list (d5af9e5, be9f6f3, 4bdcbd7)
+- README: Project Sync section, `au identity`/`au share` command reference, migration V6 (a18b124)
+
+### Notes
+- The credential model went through several iterations during design (a public id + secret pair, then a single opaque token) before landing on a single per-collaborator token, hashed server-side and never stored in plaintext (ac2ef98, b711fda)
+- `au share` was chosen over `au sync` specifically because `au sync` already exists for an unrelated feature (pulling from git/beads/timeforged/beacon connectors) — collision caught and renamed before it shipped (ab025cf)
+- This branch was in flight while v1.7.0/v1.8.0's database-durability work landed on `main`; merging required moving migration V6 inside the new atomic single-transaction migration chain and centralizing `db_path()` per that work's refactor (1133a1b)
+- `specs/002-project-sync/quickstart.md` was executed end-to-end against a locally-run server; two of its ten steps (deletion and conflict propagation, driven by `au forget`/`au note-update`) can't run as literally written yet, since those exist today only as MCP tools (`memory_forget`/`memory_update`), not `au` CLI subcommands — the underlying tombstone/conflict mechanics they'd exercise are already covered by other tests, so this is a CLI-surface gap rather than a functional one
+- Deploying the sync server for this project's own use (the `boostix` VPS, `aurelius.boostix.space`) is intentionally not part of this release — that's an owner-run deployment step, documented as a runbook in `deploy/aurelius-sync-server/README.md`
+
+---
+
 ## [v1.8.0] — 2026-07-29
 
 ### Added
