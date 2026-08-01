@@ -9,3 +9,6 @@ ui/node_modules/
 ui/dist/
 *.tsbuildinfo
 CLAUDE.md
+
+# Claude Code local settings (per-machine permissions, not shared)
+.claude/settings.local.json
