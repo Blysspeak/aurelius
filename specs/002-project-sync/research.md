@@ -115,20 +115,24 @@ server later. This directly satisfies FR-010.
 
 ## 8. Authentication
 
-**Decision**: A per-collaborator credential pair — a public `uuid` and a
-`secret` — issued manually by the project owner (no self-service signup, no
-OAuth). The server stores only a hash of the secret. Both values are handed
-to the collaborator out of band, who runs a single connect command,
-`au sync {server} {uuid} {secret}`, to attach a project — no separate
-project name to type, since the credential alone resolves to exactly one
+**Decision**: A single per-collaborator token, issued manually by the
+project owner (no self-service signup, no OAuth). The server stores only
+`sha256(token)`, never the plaintext, and looks up a request's token by its
+hash directly. The token is handed to the collaborator out of band, who runs
+one connect command, `au sync {server} {token}`, to attach a project — no
+separate project name to type, since the token alone resolves to exactly one
 `(project, person)`.
 
 **Rationale**: Matches FR-014 and the "not for the masses" constraint —
 this serves the owner and a small number of personally-invited collaborators.
-Splitting the credential into a public id + secret (rather than one opaque
-bearer string) follows the common access-key/secret-key pattern and lets the
-server avoid ever persisting the plaintext secret. Credential issuance and
-revocation are owner-administered, out of band.
+A single opaque token (rather than a public-id/secret pair) is the simplest
+credential shape that still lets the server avoid persisting anything
+usable on its own — hashing a single random token is exactly as safe as
+hashing a secret half of a pair, with one fewer value for a collaborator to
+copy around. Considered and rejected a split id+secret pair (more standard
+for high-volume public APIs, e.g. AWS-style access-key/secret-key) as
+unjustified complexity here. Token issuance and revocation are
+owner-administered, out of band.
 
 ## 9. Deployment
 
