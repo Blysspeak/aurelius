@@ -59,15 +59,42 @@ impl Identity {
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }
+
+    /// Falls back to `git config --global user.name`/`user.email` — most
+    /// machines already have this set, so `au identity set` becomes an
+    /// override for when you want a different identity for Aurelius
+    /// specifically, not a mandatory first step.
+    fn from_git_config() -> Option<Self> {
+        let name = git_config_value("user.name")?;
+        let email = git_config_value("user.email")?;
+        Some(Self { name, email })
+    }
+}
+
+fn git_config_value(key: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--global", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 static CURRENT: OnceLock<Option<Identity>> = OnceLock::new();
 
 /// Cached lookup of the local identity config, read from disk at most once
-/// per process. Returns `None` if identity has not been configured — callers
-/// fall back to unattributed local operation rather than failing.
+/// per process — `au identity set` if present, else `git config --global
+/// user.name`/`user.email`. Returns `None` if neither is configured —
+/// callers fall back to unattributed local operation rather than failing.
 pub fn current() -> Option<Identity> {
     CURRENT
-        .get_or_init(|| Identity::load().unwrap_or(None))
+        .get_or_init(|| {
+            Identity::load()
+                .unwrap_or(None)
+                .or_else(Identity::from_git_config)
+        })
         .clone()
 }
