@@ -115,12 +115,20 @@ server later. This directly satisfies FR-010.
 
 ## 8. Authentication
 
-**Decision**: A per-collaborator bearer token, issued manually by the project
-owner (no self-service signup, no OAuth).
+**Decision**: A per-collaborator credential pair — a public `uuid` and a
+`secret` — issued manually by the project owner (no self-service signup, no
+OAuth). The server stores only a hash of the secret. Both values are handed
+to the collaborator out of band, who runs a single connect command,
+`au sync {server} {uuid} {secret}`, to attach a project — no separate
+project name to type, since the credential alone resolves to exactly one
+`(project, person)`.
 
 **Rationale**: Matches FR-014 and the "not for the masses" constraint —
 this serves the owner and a small number of personally-invited collaborators.
-Token issuance and revocation are owner-administered, out of band.
+Splitting the credential into a public id + secret (rather than one opaque
+bearer string) follows the common access-key/secret-key pattern and lets the
+server avoid ever persisting the plaintext secret. Credential issuance and
+revocation are owner-administered, out of band.
 
 ## 9. Deployment
 

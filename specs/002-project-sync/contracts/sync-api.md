@@ -1,29 +1,39 @@
 # Contract: Sync Server HTTP API
 
 Exposed by `aurelius-sync-server`, mounted under `/sync` (deployed at
-`https://aurelius.boostix.space/sync`). JSON over HTTPS. All endpoints
-require `Authorization: Bearer <token>`; the token maps to exactly one
-`(project_label, person)` via `CollaboratorGrant` (see data-model.md).
+`https://aurelius.boostix.space/sync`). JSON over HTTPS.
+
+## Authentication
+
+Every push/pull request carries `Authorization: Bearer {uuid}:{secret}`,
+where `uuid`/`secret` are a `CollaboratorGrant` credential pair (see
+data-model.md). The server splits on the first `:`, looks up the grant by
+`uuid`, hashes the supplied `secret` and compares to the stored
+`secret_hash`, and checks `revoked_at IS NULL`. A valid credential
+unambiguously identifies exactly one `(project_label, person)` — **the
+project is never a separate client-supplied parameter**; it's always derived
+from the credential. This is what lets the client-side flow be a single
+`au sync {server} {uuid} {secret}` command with no project name to type.
+
+**Errors** (both endpoints): `401` (unknown uuid, wrong secret, or revoked).
 
 ## `POST /sync/push`
 
-Client sends everything new/changed locally since its last successful push
-for this project.
+Client sends everything new/changed locally since its last successful push.
 
 **Request body**:
 
 ```json
 {
-  "project": "aurelius",
   "nodes": [ { "...": "full Node, per data-model.md" } ],
   "edges": [ { "...": "full Edge, per data-model.md" } ]
 }
 ```
 
-- `project` MUST match the token's granted `project_label`; mismatch → `403`.
 - Every node/edge MUST already carry `created_by`; server rejects (`422`) any
   item missing attribution.
-- Server upserts each node/edge by `id`:
+- Server upserts each node/edge by `id`, into the project the credential
+  resolves to:
   - New `id` → insert, assign `sync_seq`.
   - Existing `id` with a newer `updated_at` than the server's stored copy →
     overwrite, preserve the losing version per the conflict rule in
@@ -43,37 +53,65 @@ for this project.
   client pushed (see data-model.md conflict bookkeeping) — informational,
   not an error.
 
-**Errors**: `401` (bad/unknown token), `403` (token/project mismatch), `422`
-(malformed payload or missing attribution).
+**Errors**: `401`, `422` (malformed payload or missing attribution).
 
-## `GET /sync/pull?project={label}&since={seq}`
+## `GET /sync/pull?since={seq}`
 
 - `since` omitted or `0` → full bootstrap: every live and tombstoned
-  node/edge for the project (satisfies FR-004).
+  node/edge for the credential's project (satisfies FR-004), plus that
+  project's label so a first-time client can create/attach its local project
+  under the same name without having to already know it.
 - `since={seq}` → only items with `sync_seq > seq`.
-- `project` MUST match the token's granted `project_label`; mismatch → `403`.
 
 **Response** `200`:
 
 ```json
 {
+  "project": "aurelius",
   "nodes": [ { "...": "Node, including deleted_at for tombstones" } ],
   "edges": [ { "...": "Edge" } ],
   "server_seq": 1181
 }
 ```
 
-- Client persists `server_seq` as its new `SyncConfig.last_seq` after
-  successfully applying the response.
+- Client persists `server_seq` as its new `SyncConfig.last_seq`, and
+  `project` as `SyncConfig.project_label`, after successfully applying the
+  response.
 - An empty `nodes`/`edges` array with an unchanged `server_seq` means
   "nothing new" — not an error.
 
-**Errors**: `401`, `403`.
+**Errors**: `401`.
 
-## Failure semantics (applies to both endpoints)
+## `POST /sync/grants` (admin-only, credential issuance)
+
+Used by `au sync issue <project> --for "Name <email>"` (owner-side) to mint a
+new collaborator credential. Protected by a separate admin credential (the
+`AURELIUS_SYNC_ADMIN_TOKEN` the server was started with), not a
+`CollaboratorGrant` — issuing access to a project is an administrative act,
+not a synced-data operation.
+
+**Request headers**: `Authorization: Bearer {admin_token}`
+
+**Request body**:
+
+```json
+{ "project": "aurelius", "person_name": "Tester", "person_email": "tester@example.com" }
+```
+
+**Response** `200` (the secret is returned exactly once — the server only
+ever stores its hash):
+
+```json
+{ "uuid": "b3f1...", "secret": "9c2a..." }
+```
+
+**Errors**: `401` (bad/missing admin token), `422` (malformed payload).
+
+## Failure semantics (push/pull)
 
 - Network failure, timeout, or `5xx`: caller (client) logs a warning and
   proceeds with normal local operation — sync is best-effort at session
   boundaries (FR-006, FR-011). No retry loop blocks the caller.
-- A revoked token (`CollaboratorGrant.revoked_at IS NOT NULL`) is rejected
-  with `401` on every call, indistinguishable from an unknown token.
+- A revoked credential (`CollaboratorGrant.revoked_at IS NOT NULL`) is
+  rejected with `401` on every call, indistinguishable from an unknown
+  credential.

@@ -272,15 +272,17 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS sync_config (
             project_label   TEXT PRIMARY KEY,
             server_url      TEXT NOT NULL,
-            token           TEXT NOT NULL,
+            grant_uuid      TEXT NOT NULL,
+            grant_secret    TEXT NOT NULL,
             enabled         BOOLEAN NOT NULL DEFAULT 0,
             last_seq        INTEGER NOT NULL DEFAULT 0,
             updated_at      TEXT NOT NULL
         );
 
-        -- Server-side, one row per issued collaborator token.
+        -- Server-side, one row per issued collaborator credential (uuid + hashed secret).
         CREATE TABLE IF NOT EXISTS collaborator_grants (
-            token           TEXT PRIMARY KEY,
+            uuid            TEXT PRIMARY KEY,
+            secret_hash     TEXT NOT NULL,
             person_name     TEXT NOT NULL,
             person_email    TEXT NOT NULL,
             project_label   TEXT NOT NULL,
