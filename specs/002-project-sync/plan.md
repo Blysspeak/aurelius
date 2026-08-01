@@ -90,13 +90,13 @@ crates/
 │   └── src/
 │       ├── main.rs             # axum app bootstrap, config (port, db path)
 │       ├── routes.rs           # POST /sync/push, GET /sync/pull
-│       └── auth.rs             # {uuid}:{secret} -> CollaboratorGrant lookup, + admin-token check for /sync/grants
+│       └── auth.rs             # Bearer token -> hash -> CollaboratorGrant lookup, + admin-token check for /sync/grants
 ├── aurelius/
 │   └── src/
 │       └── mcp/handlers/status.rs, session.rs   # memory_status triggers pull; memory_session triggers push, for shared projects only
 └── au/
     └── src/
-        └── commands.rs          # + `au identity set`, `au sync issue|<server> <uuid> <secret>|disable|push|pull` subcommands
+        └── commands.rs          # + `au identity set`, `au sync issue|<server> <token>|disable|push|pull` subcommands
 contrib/
 └── claude-code/
     └── aurelius-reindex.sh      # extended: push after reindex, for projects with sync enabled

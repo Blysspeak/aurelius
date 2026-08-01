@@ -45,19 +45,19 @@
 
 ## Phase 3: User Story 1 - Share a project and bootstrap a collaborator (Priority: P1) 🎯 MVP
 
-**Goal**: Owner issues a collaborator a `uuid`+`secret` credential; the collaborator (or the owner, for their own project) runs one command, `au sync <server> <uuid> <secret>`, and that instance receives the full existing history.
+**Goal**: Owner issues a collaborator a single token; the collaborator (or the owner, for their own project) runs one command, `au sync <server> <token>`, and that instance receives the full existing history.
 
 **Independent Test**: Run quickstart.md steps 1-4.
 
 ### Implementation for User Story 1
 
-- [ ] T011 [P] [US1] Implement `POST /sync/push`, `GET /sync/pull`, and `POST /sync/grants` handlers in `crates/aurelius-sync-server/src/routes.rs`, delegating push/pull to `sync::merge` (depends on T008, T007). `push`/`pull` derive their project from the authenticated grant (no client-supplied `project` field); `grants` issues a new `collaborator_grants` row (uuid + sha256 secret_hash) for a project, protected separately (see T012).
-- [ ] T012 [P] [US1] Implement auth in `crates/aurelius-sync-server/src/auth.rs`: for `push`/`pull`, parse `Authorization: Bearer {uuid}:{secret}`, look up `collaborator_grants` by `uuid`, hash the supplied secret and compare to `secret_hash`, check `revoked_at IS NULL`, resolve `project_label` from the grant; for `grants`, check `Authorization: Bearer {admin_token}` against the `AURELIUS_SYNC_ADMIN_TOKEN` env var the server was started with. Return `401`/`422` per contracts/sync-api.md.
+- [ ] T011 [P] [US1] Implement `POST /sync/push`, `GET /sync/pull`, and `POST /sync/grants` handlers in `crates/aurelius-sync-server/src/routes.rs`, delegating push/pull to `sync::merge` (depends on T008, T007). `push`/`pull` derive their project from the authenticated token (no client-supplied `project` field); `grants` issues a new `collaborator_grants` row (random token, stored only as its sha256 `token_hash`) for a project, protected separately (see T012).
+- [ ] T012 [P] [US1] Implement auth in `crates/aurelius-sync-server/src/auth.rs`: for `push`/`pull`, parse `Authorization: Bearer {token}`, hash it and look up `collaborator_grants` by `token_hash`, check `revoked_at IS NULL`, resolve `project_label` from the grant; for `grants`, check `Authorization: Bearer {admin_token}` against the `AURELIUS_SYNC_ADMIN_TOKEN` env var the server was started with. Return `401`/`422` per contracts/sync-api.md.
 - [ ] T013 [US1] Wire `routes.rs` + `auth.rs` into the `Router` in `crates/aurelius-sync-server/src/main.rs` (depends on T011, T012)
 - [ ] T014 [P] [US1] Add `au identity set --name <name> --email <email>` subcommand: `crates/au/src/main.rs` (clap variant) + implementation in `crates/au/src/commands.rs` (depends on T006)
 - [ ] T015 [US1] Add two subcommands in `crates/au/src/main.rs` + `crates/au/src/commands.rs`:
-  - `au sync issue <project> --for "Name <email>" --server <host-or-url>` (owner side): calls `POST /sync/grants` using `AURELIUS_SYNC_ADMIN_TOKEN` from the environment, prints the returned `uuid`/`secret` for the owner to hand off out of band.
-  - `au sync <server> <uuid> <secret>` (every participant, owner included, runs this once per project): normalizes `server` (bare host → `https://{host}/sync`; already-a-URL passed through as-is), performs an initial `GET /sync/pull?since=0` using that credential, reads the `project` field from the response to learn the project's name, creates/updates the local project and its `sync_config` row (`server_url`, `grant_uuid`, `grant_secret`, `enabled=true`, `last_seq` from the response), and applies the bootstrapped nodes/edges.
+  - `au sync issue <project> --for "Name <email>" --server <host-or-url>` (owner side): calls `POST /sync/grants` using `AURELIUS_SYNC_ADMIN_TOKEN` from the environment, prints the returned `token` for the owner to hand off out of band.
+  - `au sync <server> <token>` (every participant, owner included, runs this once per project): normalizes `server` (bare host → `https://{host}/sync`; already-a-URL passed through as-is), performs an initial `GET /sync/pull?since=0` using that token, reads the `project` field from the response to learn the project's name, creates/updates the local project and its `sync_config` row (`server_url`, `token`, `enabled=true`, `last_seq` from the response), and applies the bootstrapped nodes/edges.
   (depends on T004, T007, T013)
 - [ ] T016 [US1] Add `au sync push [project]` / `au sync pull [project]` subcommands performing the HTTP round-trip via `reqwest` against the project's `sync_config` row — `crates/au/src/commands.rs` (depends on T007, T013, T015)
 - [ ] T017 [P] [US1] Integration test in `crates/aurelius-sync-server/tests/push_pull.rs`: start the server against a temp SQLite file, push a node/edge from a fake "owner" payload, pull with `since=0` from a fake "collaborator" and assert full history round-trips (depends on T011-T016)

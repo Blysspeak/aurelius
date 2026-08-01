@@ -27,7 +27,7 @@ AURELIUS_HOME=$AURELIUS_HOME_B au identity set --name "Tester" --email "tester@e
 cargo run -p aurelius-sync-server -- --port 8181 --db /tmp/aurelius-sync-server.db
 ```
 
-## 3. Seed the owner's project and issue a collaborator credential (User Story 1)
+## 3. Seed the owner's project and issue a collaborator token (User Story 1)
 
 ```bash
 AURELIUS_HOME=$AURELIUS_HOME_A au note "chose axum for the sync API" -p demo
@@ -36,16 +36,16 @@ AURELIUS_HOME=$AURELIUS_HOME_A au task new "Ship v1" -p demo --priority high
 # owner-side admin action against the server:
 AURELIUS_SYNC_ADMIN_TOKEN=<set-when-starting-the-server> \
   AURELIUS_HOME=$AURELIUS_HOME_A au sync issue demo --for "Tester <tester@example.com>" --server localhost:8181
-# prints a uuid + secret; hand both to the collaborator out of band
+# prints a token; hand it to the collaborator out of band
 
 # the owner also connects their own project, same command every participant uses:
-AURELIUS_HOME=$AURELIUS_HOME_A au sync localhost:8181 <owner-uuid-from-a-self-issued-grant> <owner-secret>
+AURELIUS_HOME=$AURELIUS_HOME_A au sync localhost:8181 <owner-token-from-a-self-issued-grant>
 ```
 
 ## 4. Bootstrap the collaborator (User Story 1)
 
 ```bash
-AURELIUS_HOME=$AURELIUS_HOME_B au sync localhost:8181 <uuid-from-step-3> <secret-from-step-3>
+AURELIUS_HOME=$AURELIUS_HOME_B au sync localhost:8181 <token-from-step-3>
 AURELIUS_HOME=$AURELIUS_HOME_B au context demo
 ```
 
