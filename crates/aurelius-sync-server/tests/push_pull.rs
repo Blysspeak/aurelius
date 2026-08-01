@@ -192,6 +192,129 @@ async fn push_then_pull_round_trips_full_history() {
     assert_eq!(pulled_edge.to_id, project_node.id);
 }
 
+/// T025: a deletion propagated through the real HTTP `push`/`pull` routes
+/// (not just `sync::merge::apply_push` directly) — the tombstone mirrors
+/// what `aurelius_core::graph::delete_node` now produces (`deleted_at` and
+/// `updated_at` bumped to the same instant, see its doc comment) — must
+/// stick on the peer and must not be resurrected by a later stale push of
+/// the pre-delete "live" version (FR-010, spec.md User Story 4).
+#[tokio::test]
+async fn delete_propagates_as_tombstone_and_does_not_resurrect() {
+    let base_url = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    let project_label = "tombstone-demo";
+    let token = issue_grant(&client, &base_url, project_label).await;
+
+    let author = "Owner <owner@example.com>";
+    let project_node = make_project_node(project_label, author);
+    let decision_node = make_decision_node("obsolete decision", "no longer relevant", author);
+    let edge = make_belongs_to_edge(decision_node.id, project_node.id, author);
+
+    let push1 = SyncPushRequest {
+        nodes: vec![project_node.clone(), decision_node.clone()],
+        edges: vec![edge.clone()],
+    };
+    let resp = client
+        .post(format!("{base_url}/push"))
+        .bearer_auth(&token)
+        .json(&push1)
+        .send()
+        .await
+        .expect("initial push request");
+    assert_eq!(resp.status(), 200);
+    let push1_resp: SyncPushResponse = resp.json().await.expect("push1 response json");
+    assert_eq!(push1_resp.accepted, 3);
+
+    // Locally soft-delete the decision: `deleted_at` and a freshly bumped
+    // `updated_at` set to the same instant.
+    let delete_time = Utc::now();
+    let mut tombstoned = decision_node.clone();
+    tombstoned.deleted_at = Some(delete_time);
+    tombstoned.updated_at = delete_time;
+    let mut tombstoned_edge = edge.clone();
+    tombstoned_edge.deleted_at = Some(delete_time);
+
+    let push2 = SyncPushRequest {
+        nodes: vec![tombstoned.clone()],
+        edges: vec![tombstoned_edge.clone()],
+    };
+    let resp = client
+        .post(format!("{base_url}/push"))
+        .bearer_auth(&token)
+        .json(&push2)
+        .send()
+        .await
+        .expect("tombstone push request");
+    assert_eq!(resp.status(), 200);
+    let push2_resp: SyncPushResponse = resp.json().await.expect("push2 response json");
+    assert_eq!(
+        push2_resp.accepted, 2,
+        "the tombstoned node and edge must be accepted, not lost to a conflict"
+    );
+    assert_eq!(push2_resp.conflicts, 0);
+
+    // A fresh collaborator bootstrapping now must see the deletion, not a
+    // live copy.
+    let resp = client
+        .get(format!("{base_url}/pull?since=0"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("bootstrap pull request");
+    let pull_resp: SyncPullResponse = resp.json().await.expect("pull response json");
+    let pulled_node = pull_resp
+        .nodes
+        .iter()
+        .find(|n| n.id == decision_node.id)
+        .expect("tombstoned node still present (as a tombstone) in the bootstrap pull");
+    assert!(
+        pulled_node.deleted_at.is_some(),
+        "the deletion must propagate to the peer"
+    );
+    let pulled_edge = pull_resp
+        .edges
+        .iter()
+        .find(|e| e.id == edge.id)
+        .expect("tombstoned edge present in the bootstrap pull");
+    assert!(pulled_edge.deleted_at.is_some());
+
+    // A later push of the stale pre-delete "live" version must not
+    // resurrect it.
+    let resp = client
+        .post(format!("{base_url}/push"))
+        .bearer_auth(&token)
+        .json(&SyncPushRequest {
+            nodes: vec![decision_node.clone()],
+            edges: vec![],
+        })
+        .send()
+        .await
+        .expect("stale live push request");
+    let resurrect_resp: SyncPushResponse = resp.json().await.expect("resurrect response json");
+    assert_eq!(
+        resurrect_resp.accepted, 0,
+        "a stale live push must not resurrect a tombstoned node"
+    );
+
+    let resp = client
+        .get(format!("{base_url}/pull?since=0"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("second pull request");
+    let pull_resp2: SyncPullResponse = resp.json().await.expect("pull2 response json");
+    let still_gone = pull_resp2
+        .nodes
+        .iter()
+        .find(|n| n.id == decision_node.id)
+        .expect("node still present as a tombstone");
+    assert!(
+        still_gone.deleted_at.is_some(),
+        "the deletion must never reappear from a later sync"
+    );
+}
+
 #[tokio::test]
 async fn revoked_token_is_rejected_on_subsequent_push_and_pull() {
     let base_url = spawn_server().await;

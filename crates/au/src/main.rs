@@ -168,6 +168,9 @@ enum Commands {
         /// Graph traversal depth
         #[arg(short, long, default_value = "2")]
         depth: u32,
+        /// Show sync conflict details (data._sync_conflict) when present
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Search the knowledge graph
     Search { query: String },
@@ -238,7 +241,11 @@ async fn main() -> Result<()> {
             label,
             project,
         } => commands::note(&text, &r#type, label, project).await,
-        Commands::Context { topic, depth } => commands::context(&topic, depth).await,
+        Commands::Context {
+            topic,
+            depth,
+            verbose,
+        } => commands::context(&topic, depth, verbose).await,
         Commands::Search { query } => commands::search(&query).await,
         Commands::Sync => commands::sync().await,
         Commands::Reindex { path } => commands::reindex(path).await,
