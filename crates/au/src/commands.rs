@@ -888,7 +888,7 @@ pub async fn share(action: ShareAction) -> Result<()> {
             project,
             for_,
             server,
-        } => share_issue(&project, &for_, &server).await,
+        } => share_issue(&project, for_.as_deref(), &server).await,
         ShareAction::Revoke {
             project,
             for_,
@@ -948,9 +948,19 @@ fn admin_token() -> Result<String> {
 
 /// [ADMIN] Issues a collaborator token for an EXISTING local project — never
 /// find-or-create, so a typo can't mint access to the wrong/a new project.
-async fn share_issue(project: &str, for_: &str, server: &str) -> Result<()> {
+async fn share_issue(project: &str, for_: Option<&str>, server: &str) -> Result<()> {
     let admin_token = admin_token()?;
-    let (person_name, person_email) = parse_person(for_)?;
+    let (person_name, person_email) = match for_ {
+        Some(spec) => parse_person(spec)?,
+        None => {
+            let identity = aurelius_core::identity::current().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no --for given and no local identity set — run `au identity set --name <name> --email <email>` first, or pass --for \"Name <email>\" to issue for someone else"
+                )
+            })?;
+            (identity.name, identity.email)
+        }
+    };
 
     let conn = db::open(&db_path())?;
     let project_node = match graph::find_project_by_label(&conn, project)? {
