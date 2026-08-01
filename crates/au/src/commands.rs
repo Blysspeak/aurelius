@@ -338,6 +338,15 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 };
                 println!("  {icon} [{pri}] {} — {st}", t.label);
                 println!("    id: {}", t.id);
+                if let Some(created_by) = &t.created_by {
+                    print!("    by: {created_by}");
+                    match &t.updated_by {
+                        Some(updated_by) if updated_by != created_by => {
+                            println!(" (last: {updated_by})")
+                        }
+                        _ => println!(),
+                    }
+                }
             }
         }
 
@@ -358,6 +367,12 @@ pub async fn task(action: TaskAction) -> Result<()> {
             println!("  ID:       {}", task.id);
             println!("  Status:   {st}");
             println!("  Priority: {pri}");
+            if let Some(created_by) = &task.created_by {
+                println!("  Created by: {created_by}");
+            }
+            if let Some(updated_by) = &task.updated_by {
+                println!("  Last actor: {updated_by}");
+            }
             if let Some(note) = &task.note {
                 println!("  Note:     {note}");
             }
