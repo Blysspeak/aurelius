@@ -167,6 +167,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurelius-sync-server"
+version = "1.6.0"
+dependencies = [
+ "anyhow",
+ "aurelius-core",
+ "axum",
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
