@@ -1,0 +1,22 @@
+# Local/self-hosted deployment unit for aurelius-sync-server.
+#
+#   docker compose -f deploy/aurelius-sync-server/docker-compose.yml up -d --build
+#
+# Run from the repository root (or any cwd) — the build context below is
+# pinned to the workspace root regardless of where this file is invoked
+# from, since aurelius-sync-server needs the whole workspace to build.
+services:
+  aurelius-sync-server:
+    build:
+      context: ../..
+      dockerfile: deploy/aurelius-sync-server/Dockerfile
+    image: aurelius-sync-server:latest
+    restart: unless-stopped
+    ports:
+      - "8181:8181"
+    volumes:
+      - aurelius-sync-data:/data
+    command: ["--port", "8181", "--db", "/data/aurelius-sync-server.db"]
+
+volumes:
+  aurelius-sync-data:

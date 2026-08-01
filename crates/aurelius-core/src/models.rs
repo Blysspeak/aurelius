@@ -88,6 +88,22 @@ pub struct Node {
     pub last_accessed_at: DateTime<Utc>,
     pub access_count: i64,
     pub content_hash: Option<String>,
+    /// Git-style `"Name <email>"`, stamped from the local identity config at
+    /// creation. `None` for nodes created before sync (migration V6).
+    #[serde(default)]
+    pub created_by: Option<String>,
+    /// Same format as `created_by`; overwritten on every update.
+    #[serde(default)]
+    pub updated_by: Option<String>,
+    /// Soft-delete tombstone set by `memory_forget` instead of a real `DELETE`.
+    /// `None` = live.
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// Set only by the sync server on upsert (monotonic, shared across all
+    /// synced projects on that server). `None` on a client's own local rows
+    /// until they've round-tripped through a sync.
+    #[serde(default)]
+    pub sync_seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +114,15 @@ pub struct Edge {
     pub relation: Relation,
     pub weight: f32,
     pub created_at: DateTime<Utc>,
+    /// Same format as `Node.created_by`.
+    #[serde(default)]
+    pub created_by: Option<String>,
+    /// Set in lockstep when either endpoint `Node` is soft-deleted (cascade).
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// Same semantics as `Node.sync_seq`.
+    #[serde(default)]
+    pub sync_seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

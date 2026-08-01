@@ -43,7 +43,11 @@ pub fn context(conn: &Connection, topic: &str, depth: u32) -> Result<(Vec<Node>,
 }
 
 /// BFS traversal from a specific node ID (no FTS search — starts from a known node).
-pub fn context_from_id(conn: &Connection, node_id: &str, depth: u32) -> Result<(Vec<Node>, Vec<Edge>)> {
+pub fn context_from_id(
+    conn: &Connection,
+    node_id: &str,
+    depth: u32,
+) -> Result<(Vec<Node>, Vec<Edge>)> {
     let seed = super::crud::get_node(conn, node_id)?;
     let seed = match seed {
         Some(n) => n,
@@ -92,8 +96,9 @@ fn get_edges_batch(conn: &Connection, node_ids: &[String]) -> Result<Vec<Edge>> 
     let ph1: Vec<String> = (1..=n).map(|i| format!("?{i}")).collect();
     let ph2: Vec<String> = (n + 1..=2 * n).map(|i| format!("?{i}")).collect();
     let sql = format!(
-        "SELECT id, from_id, to_id, relation, weight, created_at FROM edges
-         WHERE from_id IN ({}) OR to_id IN ({})",
+        "SELECT id, from_id, to_id, relation, weight, created_at, created_by, deleted_at, sync_seq
+         FROM edges
+         WHERE (from_id IN ({}) OR to_id IN ({})) AND deleted_at IS NULL",
         ph1.join(","),
         ph2.join(",")
     );
@@ -105,7 +110,8 @@ fn get_edges_batch(conn: &Connection, node_ids: &[String]) -> Result<Vec<Edge>> 
     for id in node_ids {
         param_values.push(Box::new(id.clone()));
     }
-    let params: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
     let edges = stmt
         .query_map(params.as_slice(), row_to_edge)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -119,13 +125,18 @@ fn get_nodes_batch(conn: &Connection, ids: &[String]) -> Result<Vec<Node>> {
     let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash
-         FROM nodes WHERE id IN ({})",
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE id IN ({}) AND deleted_at IS NULL",
         placeholders.join(",")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let param_values: Vec<Box<dyn rusqlite::types::ToSql>> = ids.iter().map(|id| Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>).collect();
-    let params: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+    let param_values: Vec<Box<dyn rusqlite::types::ToSql>> = ids
+        .iter()
+        .map(|id| Box::new(id.clone()) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
     let nodes = stmt
         .query_map(params.as_slice(), row_to_node)?
         .collect::<Result<Vec<_>, _>>()?;

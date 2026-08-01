@@ -11,10 +11,11 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
     }
     let mut stmt = conn.prepare(
         "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
-                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash
+                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash,
+                n.created_by, n.updated_by, n.deleted_at, n.sync_seq
          FROM nodes_fts
          JOIN nodes n ON nodes_fts.rowid = n.rowid
-         WHERE nodes_fts MATCH ?1
+         WHERE nodes_fts MATCH ?1 AND n.deleted_at IS NULL
          ORDER BY rank + (n.access_count * 0.1) DESC
          LIMIT ?2",
     )?;
@@ -24,14 +25,20 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
     Ok(nodes)
 }
 
-pub fn search_typed(conn: &Connection, query: &str, node_type: &NodeType, limit: usize) -> Result<Vec<Node>> {
+pub fn search_typed(
+    conn: &Connection,
+    query: &str,
+    node_type: &NodeType,
+    limit: usize,
+) -> Result<Vec<Node>> {
     let type_str = serde_json::to_string(node_type)?;
     let trimmed = query.trim();
     if trimmed.is_empty() || trimmed == "*" {
         let mut stmt = conn.prepare(
             "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                    memory_kind, last_accessed_at, access_count, content_hash
-             FROM nodes WHERE node_type = ?1 ORDER BY created_at DESC LIMIT ?2",
+                    memory_kind, last_accessed_at, access_count, content_hash,
+                    created_by, updated_by, deleted_at, sync_seq
+             FROM nodes WHERE node_type = ?1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?2",
         )?;
         let nodes = stmt
             .query_map(params![type_str, limit as i64], row_to_node)?
@@ -40,10 +47,11 @@ pub fn search_typed(conn: &Connection, query: &str, node_type: &NodeType, limit:
     }
     let mut stmt = conn.prepare(
         "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
-                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash
+                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash,
+                n.created_by, n.updated_by, n.deleted_at, n.sync_seq
          FROM nodes_fts
          JOIN nodes n ON nodes_fts.rowid = n.rowid
-         WHERE nodes_fts MATCH ?1 AND n.node_type = ?2
+         WHERE nodes_fts MATCH ?1 AND n.node_type = ?2 AND n.deleted_at IS NULL
          LIMIT ?3",
     )?;
     let nodes = stmt
@@ -57,19 +65,24 @@ pub fn get_unsolved_problems(conn: &Connection, limit: usize) -> Result<Vec<Node
     let solution_type = serde_json::to_string(&NodeType::Solution)?;
     let mut stmt = conn.prepare(
         "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
-                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash
+                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash,
+                n.created_by, n.updated_by, n.deleted_at, n.sync_seq
          FROM nodes n
          WHERE n.node_type = ?1
+           AND n.deleted_at IS NULL
            AND NOT EXISTS (
              SELECT 1 FROM edges e
              JOIN nodes sol ON sol.id = e.from_id AND sol.node_type = ?2
-             WHERE e.to_id = n.id AND e.relation = 'solves'
+             WHERE e.to_id = n.id AND e.relation = 'solves' AND e.deleted_at IS NULL
            )
          ORDER BY n.created_at DESC
          LIMIT ?3",
     )?;
     let nodes = stmt
-        .query_map(params![problem_type, solution_type, limit as i64], row_to_node)?
+        .query_map(
+            params![problem_type, solution_type, limit as i64],
+            row_to_node,
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(nodes)
 }
@@ -84,7 +97,10 @@ pub fn get_tasks_filtered(
     limit: usize,
 ) -> Result<Vec<Node>> {
     let task_type = serde_json::to_string(&NodeType::Task)?;
-    let mut conditions = vec!["n.node_type = ?1".to_string()];
+    let mut conditions = vec![
+        "n.node_type = ?1".to_string(),
+        "n.deleted_at IS NULL".to_string(),
+    ];
     let mut param_idx = 2u32;
 
     // We'll build dynamic SQL with positional params
@@ -124,7 +140,8 @@ pub fn get_tasks_filtered(
 
     let sql = format!(
         "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
-                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash
+                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash,
+                n.created_by, n.updated_by, n.deleted_at, n.sync_seq
          FROM nodes n
          WHERE {}
          ORDER BY
@@ -143,7 +160,8 @@ pub fn get_tasks_filtered(
 
     params_vec.push(Box::new(limit as i64));
 
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(|p| p.as_ref()).collect();
 
     let mut stmt = conn.prepare(&sql)?;
     let nodes = stmt
@@ -155,8 +173,9 @@ pub fn get_tasks_filtered(
 pub fn get_recent_nodes(conn: &Connection, limit: usize) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash
-         FROM nodes ORDER BY created_at DESC LIMIT ?1",
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT ?1",
     )?;
     let nodes = stmt
         .query_map(params![limit as i64], row_to_node)?

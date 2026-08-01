@@ -3,6 +3,7 @@ members = [
     "crates/aurelius-core",
     "crates/aurelius",
     "crates/au",
+    "crates/aurelius-sync-server",
 ]
 resolver = "2"
 
