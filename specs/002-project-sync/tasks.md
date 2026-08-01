@@ -45,7 +45,7 @@
 
 ## Phase 3: User Story 1 - Share a project and bootstrap a collaborator (Priority: P1) 🎯 MVP
 
-**Goal**: Owner issues a collaborator a single token; the collaborator (or the owner, for their own project) runs one command, `au sync <server> <token>`, and that instance receives the full existing history.
+**Goal**: Owner issues a collaborator a single token; the collaborator (or the owner, for their own project) runs one command, `au share <server> <token>`, and that instance receives the full existing history.
 
 **Independent Test**: Run quickstart.md steps 1-4.
 
@@ -56,10 +56,10 @@
 - [ ] T013 [US1] Wire `routes.rs` + `auth.rs` into the `Router` in `crates/aurelius-sync-server/src/main.rs` (depends on T011, T012)
 - [ ] T014 [P] [US1] Add `au identity set --name <name> --email <email>` subcommand: `crates/au/src/main.rs` (clap variant) + implementation in `crates/au/src/commands.rs` (depends on T006)
 - [ ] T015 [US1] Add two subcommands in `crates/au/src/main.rs` + `crates/au/src/commands.rs`:
-  - `au sync issue <project> --for "Name <email>" --server <host-or-url>` (owner side): calls `POST /sync/grants` using `AURELIUS_SYNC_ADMIN_TOKEN` from the environment, prints the returned `token` for the owner to hand off out of band.
-  - `au sync <server> <token>` (every participant, owner included, runs this once per project): normalizes `server` (bare host → `https://{host}/sync`; already-a-URL passed through as-is), performs an initial `GET /sync/pull?since=0` using that token, reads the `project` field from the response to learn the project's name, creates/updates the local project and its `sync_config` row (`server_url`, `token`, `enabled=true`, `last_seq` from the response), and applies the bootstrapped nodes/edges.
+  - `au share issue <project> --for "Name <email>" --server <host-or-url>` (owner side): **`<project>` MUST already exist locally — look it up with the existing `find_project_by_label` (do NOT find-or-create, unlike `au note -p`; minting access to the wrong/a brand-new empty project by typo is a real mistake, not a harmless label).** If no project matches, error out AND list existing project labels (via the existing `get_nodes_by_type(conn, &NodeType::Project)`) so the owner can immediately see the correct name to retype, e.g. `error: no project named "demoo" — did you mean one of: demo, aurelius, boostix?`. On a match, call `POST /sync/grants` using `AURELIUS_SYNC_ADMIN_TOKEN` from the environment, prints the returned `token` for the owner to hand off out of band.
+  - `au share <server> <token>` (every participant, owner included, runs this once per project): normalizes `server` (bare host → `https://{host}/sync`; already-a-URL passed through as-is), performs an initial `GET /sync/pull?since=0` using that token, reads the `project` field from the response to learn the project's name — this is intentionally the ONLY place the project name comes from on the connecting side, so there's no separate project selection step or typo risk here at all — creates/updates the local project and its `sync_config` row (`server_url`, `token`, `enabled=true`, `last_seq` from the response), and applies the bootstrapped nodes/edges. If a local project with that exact name already exists and is NOT already this same `sync_config` row, still proceed (attach sync to it) but print a one-line notice so the owner/collaborator notices an existing local project is now becoming a synced one, rather than silently merging without any signal.
   (depends on T004, T007, T013)
-- [ ] T016 [US1] Add `au sync push [project]` / `au sync pull [project]` subcommands performing the HTTP round-trip via `reqwest` against the project's `sync_config` row — `crates/au/src/commands.rs` (depends on T007, T013, T015)
+- [ ] T016 [US1] Add `au share push [project]` / `au share pull [project]` subcommands performing the HTTP round-trip via `reqwest` against the project's `sync_config` row — `crates/au/src/commands.rs` (depends on T007, T013, T015)
 - [ ] T017 [P] [US1] Integration test in `crates/aurelius-sync-server/tests/push_pull.rs`: start the server against a temp SQLite file, push a node/edge from a fake "owner" payload, pull with `since=0` from a fake "collaborator" and assert full history round-trips (depends on T011-T016)
 
 **Checkpoint**: US1 works end-to-end per quickstart.md steps 1-4.
@@ -76,7 +76,7 @@
 
 - [ ] T018 [US2] In `crates/aurelius/src/mcp/handlers/status.rs`, before building the `memory_status` response for a project with `sync_config.enabled`, call the sync pull path from T016 (depends on T016)
 - [ ] T019 [US2] In `crates/aurelius/src/mcp/handlers/session.rs`, after a `memory_session` write completes for a project with `sync_config.enabled`, call the sync push path from T016 (depends on T016)
-- [ ] T020 [P] [US2] Extend `contrib/claude-code/aurelius-reindex.sh` (Stop hook) to also invoke `au sync push` for any project with sync enabled, as the CLI-level equivalent of T019 for non-MCP flows (depends on T016)
+- [ ] T020 [P] [US2] Extend `contrib/claude-code/aurelius-reindex.sh` (Stop hook) to also invoke `au share push` for any project with sync enabled, as the CLI-level equivalent of T019 for non-MCP flows (depends on T016)
 - [ ] T021 [P] [US2] Surface `created_by`/`updated_by` in the output built by `crates/aurelius/src/mcp/handlers/search.rs`, `status.rs`, and `task.rs` (depends on T005)
 - [ ] T022 [US2] Make push/pull failures non-blocking: catch and `tracing::warn!` rather than propagate, at every call site from T018-T020 (depends on T018, T019, T020)
 
@@ -120,7 +120,7 @@
 **Purpose**: Deployment readiness, documentation, and workspace-wide quality gates.
 
 - [ ] T028 [P] Finalize `deploy/aurelius-sync-server/Dockerfile` and add `deploy/aurelius-sync-server/README.md` with boostix VPS deploy/runbook notes (image build, `docker compose up -d`, reverse-proxy target `aurelius.boostix.space/sync`) — **runbook only; do not execute against the real boostix host as part of this task list** (see note below)
-- [ ] T029 [P] Update `README.md`: document the sync feature, `au identity` / `au sync` commands, and migration V6, following the existing "Key Design" / "CLI" section conventions
+- [ ] T029 [P] Update `README.md`: document the sync feature, `au identity` / `au share` commands, and migration V6, following the existing "Key Design" / "CLI" section conventions
 - [ ] T030 Run `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` across the workspace; fix all findings
 - [ ] T031 Run `cargo test --workspace`; fix any failures
 - [ ] T032 Execute `quickstart.md` end-to-end (all 10 steps) against a locally-run `aurelius-sync-server`; fix any gaps found
@@ -181,8 +181,8 @@ Task: "Add `au identity set` subcommand"
 ### Incremental Delivery
 
 1. Setup + Foundational → foundation ready, nothing user-visible yet.
-2. US1 → collaborators can be bootstrapped and manually `au sync push/pull` (MVP).
-3. US2 → sync becomes automatic at session boundaries; no more manual `au sync push/pull` needed day-to-day.
+2. US1 → collaborators can be bootstrapped and manually `au share push/pull` (MVP).
+3. US2 → sync becomes automatic at session boundaries; no more manual `au share push/pull` needed day-to-day.
 4. US3 → validates the actual motivating workflow (bug report → tracked task) end-to-end.
 5. US4 → hardens deletion and conflict handling.
 6. Polish → deployable image, docs, workspace-wide `fmt`/`clippy`/`test` gate.

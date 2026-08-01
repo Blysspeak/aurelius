@@ -119,7 +119,7 @@ server later. This directly satisfies FR-010.
 project owner (no self-service signup, no OAuth). The server stores only
 `sha256(token)`, never the plaintext, and looks up a request's token by its
 hash directly. The token is handed to the collaborator out of band, who runs
-one connect command, `au sync {server} {token}`, to attach a project — no
+one connect command, `au share {server} {token}`, to attach a project — no
 separate project name to type, since the token alone resolves to exactly one
 `(project, person)`.
 
