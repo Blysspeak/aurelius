@@ -531,4 +531,172 @@ mod tests {
         let stored = fetch_node(&conn, &node.id.to_string()).unwrap().unwrap();
         assert!(stored.deleted_at.is_some());
     }
+
+    // --- T026: races called out in spec.md's Edge Cases / User Story 4 ---
+
+    /// Simultaneous update-vs-update: the owner and a collaborator each edit
+    /// their own local copy of the same node before either has synced with
+    /// the other (spec.md: "both the owner and the collaborator modify the
+    /// same record before either has synced the other's change"). Whichever
+    /// edit carries the later `updated_at` wins deterministically once both
+    /// have been pushed — regardless of push order — and the losing edit is
+    /// retained under `data._sync_conflict` rather than discarded (FR-012).
+    #[test]
+    fn simultaneous_update_vs_update_retains_losing_edit_regardless_of_push_order() {
+        let conn = setup();
+        let t_create = Utc::now() - chrono::Duration::seconds(30);
+        let base = make_node("shared-decision", "original", t_create);
+        apply_push(&conn, "proj", std::slice::from_ref(&base), &[]).expect("base push ok");
+
+        // Owner and collaborator both branch off `base` while offline, and
+        // owner happens to sync first — but the collaborator's edit is the
+        // later one in wall-clock time.
+        let t_owner = Utc::now() - chrono::Duration::seconds(10);
+        let t_collab = Utc::now() - chrono::Duration::seconds(5);
+        assert!(t_collab > t_owner);
+
+        let mut owner_edit = base.clone();
+        owner_edit.note = Some("owner's edit".to_string());
+        owner_edit.data = json!({"from": "owner"});
+        owner_edit.updated_by = Some("Owner <owner@example.com>".to_string());
+        owner_edit.updated_at = t_owner;
+
+        let mut collab_edit = base.clone();
+        collab_edit.note = Some("collaborator's edit".to_string());
+        collab_edit.data = json!({"from": "collaborator"});
+        collab_edit.updated_by = Some("Collab <collab@example.com>".to_string());
+        collab_edit.updated_at = t_collab;
+
+        let owner_resp = apply_push(&conn, "proj", std::slice::from_ref(&owner_edit), &[])
+            .expect("owner push ok");
+        assert_eq!(owner_resp.accepted, 1, "owner syncs first, no conflict yet");
+        assert_eq!(owner_resp.conflicts, 0);
+
+        let collab_resp = apply_push(&conn, "proj", std::slice::from_ref(&collab_edit), &[])
+            .expect("collaborator push ok");
+        assert_eq!(
+            collab_resp.accepted, 1,
+            "collaborator's edit is chronologically newer, so it wins even though it pushed second"
+        );
+        assert_eq!(collab_resp.conflicts, 0);
+
+        let stored = fetch_node(&conn, &base.id.to_string()).unwrap().unwrap();
+        assert_eq!(
+            stored.note.as_deref(),
+            Some("collaborator's edit"),
+            "the newer edit is current"
+        );
+
+        let conflict = stored
+            .data
+            .get("_sync_conflict")
+            .expect("owner's overwritten edit must be retained, not discarded");
+        assert_eq!(
+            conflict.get("note").and_then(|v| v.as_str()),
+            Some("owner's edit"),
+            "the losing (owner's) edit is recoverable from the winning row"
+        );
+        assert_eq!(
+            conflict.get("updated_by").and_then(|v| v.as_str()),
+            Some("Owner <owner@example.com>")
+        );
+    }
+
+    /// Update-vs-tombstone: the owner edits the node while, offline, a
+    /// collaborator deletes their own (older) local copy of it. The owner's
+    /// edit is chronologically newer, so it wins deterministically — the
+    /// node stays live — and the collaborator's delete attempt is retained
+    /// as a recoverable conflict rather than silently winning or vanishing.
+    #[test]
+    fn newer_update_beats_older_concurrent_delete() {
+        let conn = setup();
+        let t_create = Utc::now() - chrono::Duration::seconds(30);
+        let base = make_node("shared-decision", "original", t_create);
+        apply_push(&conn, "proj", std::slice::from_ref(&base), &[]).expect("base push ok");
+
+        let t_delete = Utc::now() - chrono::Duration::seconds(10);
+        let t_update = Utc::now() - chrono::Duration::seconds(5);
+        assert!(t_update > t_delete);
+
+        let mut owner_update = base.clone();
+        owner_update.note = Some("owner kept working on this".to_string());
+        owner_update.updated_by = Some("Owner <owner@example.com>".to_string());
+        owner_update.updated_at = t_update;
+        let update_resp = apply_push(&conn, "proj", std::slice::from_ref(&owner_update), &[])
+            .expect("owner update push ok");
+        assert_eq!(update_resp.accepted, 1);
+
+        let mut collab_delete = base.clone();
+        collab_delete.deleted_at = Some(t_delete);
+        collab_delete.updated_by = Some("Collab <collab@example.com>".to_string());
+        collab_delete.updated_at = t_delete;
+        let delete_resp = apply_push(&conn, "proj", std::slice::from_ref(&collab_delete), &[])
+            .expect("collaborator delete push ok");
+        assert_eq!(
+            delete_resp.accepted, 0,
+            "the delete is older than the update already on the server"
+        );
+        assert_eq!(delete_resp.conflicts, 1);
+
+        let stored = fetch_node(&conn, &base.id.to_string()).unwrap().unwrap();
+        assert!(
+            stored.deleted_at.is_none(),
+            "the newer update wins — the node must stay live"
+        );
+        assert_eq!(stored.note.as_deref(), Some("owner kept working on this"));
+        assert!(
+            stored.data.get("_sync_conflict").is_some(),
+            "the losing delete attempt must be recoverable, not silently dropped"
+        );
+    }
+
+    /// Update-vs-tombstone, reversed: the collaborator's delete is
+    /// chronologically newer than the owner's concurrent update, so the
+    /// delete wins deterministically and the node tombstones — with the
+    /// owner's overwritten edit retained as a recoverable conflict.
+    #[test]
+    fn newer_concurrent_delete_beats_older_update_and_tombstones_it() {
+        let conn = setup();
+        let t_create = Utc::now() - chrono::Duration::seconds(30);
+        let base = make_node("shared-decision", "original", t_create);
+        apply_push(&conn, "proj", std::slice::from_ref(&base), &[]).expect("base push ok");
+
+        let t_update = Utc::now() - chrono::Duration::seconds(10);
+        let t_delete = Utc::now() - chrono::Duration::seconds(5);
+        assert!(t_delete > t_update);
+
+        let mut owner_update = base.clone();
+        owner_update.note = Some("owner kept working on this".to_string());
+        owner_update.updated_by = Some("Owner <owner@example.com>".to_string());
+        owner_update.updated_at = t_update;
+        let update_resp = apply_push(&conn, "proj", std::slice::from_ref(&owner_update), &[])
+            .expect("owner update push ok");
+        assert_eq!(update_resp.accepted, 1);
+
+        let mut collab_delete = base.clone();
+        collab_delete.deleted_at = Some(t_delete);
+        collab_delete.updated_by = Some("Collab <collab@example.com>".to_string());
+        collab_delete.updated_at = t_delete;
+        let delete_resp = apply_push(&conn, "proj", std::slice::from_ref(&collab_delete), &[])
+            .expect("collaborator delete push ok");
+        assert_eq!(
+            delete_resp.accepted, 1,
+            "the delete is newer than the update already on the server"
+        );
+        assert_eq!(delete_resp.conflicts, 0);
+
+        let stored = fetch_node(&conn, &base.id.to_string()).unwrap().unwrap();
+        assert!(
+            stored.deleted_at.is_some(),
+            "the newer delete wins — the node must be tombstoned"
+        );
+        let conflict = stored
+            .data
+            .get("_sync_conflict")
+            .expect("owner's overwritten update must be retained, not discarded");
+        assert_eq!(
+            conflict.get("note").and_then(|v| v.as_str()),
+            Some("owner kept working on this")
+        );
+    }
 }

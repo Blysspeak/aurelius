@@ -104,7 +104,7 @@ pub async fn note(
     Ok(())
 }
 
-pub async fn context(topic: &str, depth: u32) -> Result<()> {
+pub async fn context(topic: &str, depth: u32, verbose: bool) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
     let (nodes, edges) = graph::context(&conn, topic, depth)?;
     if nodes.is_empty() {
@@ -124,8 +124,36 @@ pub async fn context(topic: &str, depth: u32) -> Result<()> {
         if let Some(note) = &node.note {
             println!("    → {note}");
         }
+        if verbose {
+            print_sync_conflict(node);
+        }
     }
     Ok(())
+}
+
+/// T027: surfaces `data._sync_conflict` (see data-model.md's conflict
+/// bookkeeping) — the losing edit a sync conflict retained on this node —
+/// when `au context -v/--verbose` is passed.
+fn print_sync_conflict(node: &aurelius_core::models::Node) {
+    let Some(conflict) = node.data.get("_sync_conflict") else {
+        return;
+    };
+    println!("    ⚠ sync conflict — a losing edit was retained:");
+    if let Some(updated_by) = conflict.get("updated_by").and_then(|v| v.as_str()) {
+        println!("      from: {updated_by}");
+    }
+    if let Some(updated_at) = conflict.get("updated_at").and_then(|v| v.as_str()) {
+        println!("      at:   {updated_at}");
+    }
+    if let Some(note) = conflict.get("note").and_then(|v| v.as_str()) {
+        println!("      note: {note}");
+    }
+    match conflict.get("data") {
+        Some(data) if !data.is_null() && *data != json!({}) => {
+            println!("      data: {data}");
+        }
+        _ => {}
+    }
 }
 
 pub async fn search(query: &str) -> Result<()> {
