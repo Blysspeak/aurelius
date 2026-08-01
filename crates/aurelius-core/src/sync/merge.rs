@@ -94,6 +94,7 @@ pub fn pull_since(conn: &Connection, project: &str, since_seq: i64) -> Result<Sy
         Some(p) => p,
         None => {
             return Ok(SyncPullResponse {
+                project: project.to_string(),
                 nodes: vec![],
                 edges: vec![],
                 server_seq,
@@ -141,6 +142,7 @@ pub fn pull_since(conn: &Connection, project: &str, since_seq: i64) -> Result<Sy
         .collect::<rusqlite::Result<Vec<Edge>>>()?;
 
     Ok(SyncPullResponse {
+        project: project.to_string(),
         nodes,
         edges,
         server_seq,

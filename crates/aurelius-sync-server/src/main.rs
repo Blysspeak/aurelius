@@ -1,12 +1,12 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use aurelius_sync_server::{build_router, AppState};
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
 
 /// Aurelius project sync server — hub-and-spoke push/pull endpoint for
 /// two-way project sync between Aurelius instances (see
-/// specs/002-project-sync/). Routes are wired up in a later phase (US1);
-/// this binary currently just validates its database and starts listening.
+/// specs/002-project-sync/).
 #[derive(Parser)]
 #[command(
     name = "aurelius-sync-server",
@@ -33,9 +33,16 @@ async fn main() -> Result<()> {
     let conn = aurelius_core::db::open(&cli.db)?;
     drop(conn);
 
-    // Placeholder router — POST /sync/push and GET /sync/pull land in
-    // routes.rs during User Story 1 implementation.
-    let app = axum::Router::new();
+    let admin_token = std::env::var("AURELIUS_SYNC_ADMIN_TOKEN").context(
+        "AURELIUS_SYNC_ADMIN_TOKEN environment variable must be set (guards /sync/grants*)",
+    )?;
+
+    let state = AppState {
+        db_path: cli.db.clone(),
+        admin_token,
+    };
+
+    let app = build_router(state);
 
     let addr = format!("0.0.0.0:{}", cli.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

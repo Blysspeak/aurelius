@@ -13,6 +13,10 @@ workspace = true
 [package.repository]
 workspace = true
 
+[lib]
+name = "aurelius_sync_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "aurelius-sync-server"
 path = "src/main.rs"
@@ -27,3 +31,10 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }

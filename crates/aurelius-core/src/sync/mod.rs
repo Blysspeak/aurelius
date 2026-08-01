@@ -7,10 +7,11 @@ pub mod merge;
 use crate::models::{Edge, Node};
 use serde::{Deserialize, Serialize};
 
-/// `POST /sync/push` request body.
+/// `POST /sync/push` request body. No `project` field — per
+/// `contracts/sync-api.md`, the project is always resolved server-side from
+/// the authenticated token, never supplied by the client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncPushRequest {
-    pub project: String,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
 }
@@ -29,6 +30,10 @@ pub struct SyncPushResponse {
 /// `GET /sync/pull` response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncPullResponse {
+    /// The token-resolved project's label, so a first-time client can
+    /// create/attach its local project under the same name without already
+    /// knowing it (see `contracts/sync-api.md`).
+    pub project: String,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     pub server_seq: i64,

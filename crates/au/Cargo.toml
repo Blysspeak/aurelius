@@ -34,3 +34,4 @@ rusqlite = { workspace = true }
 axum = { workspace = true }
 open = { workspace = true }
 rust-embed = { workspace = true }
+reqwest = { workspace = true }
