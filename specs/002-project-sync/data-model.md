@@ -40,8 +40,7 @@ Not a graph node — operational config, local to a client instance.
 |---|---|---|
 | `project_label` | `TEXT` (PK) | Matches the existing project label convention. Learned from the server's response during connect (see below), not typed in advance by a collaborator. |
 | `server_url` | `TEXT` | Normalized to `https://{host}/sync`; e.g. given host `aurelius.boostix.space`, stored as `https://aurelius.boostix.space/sync`. |
-| `grant_uuid` | `TEXT` | This client's credential ID for that project. |
-| `grant_secret` | `TEXT` | This client's credential secret for that project. |
+| `token` | `TEXT` | This client's single credential for that project — the token itself resolves to exactly one `(project_label, person)` server-side (see `CollaboratorGrant`), so no separate project id/name is ever transmitted alongside it. |
 | `enabled` | `BOOLEAN` | Sync on/off for this project; opt-in, defaults off. |
 | `last_seq` | `INTEGER` | Highest `sync_seq` this client has pulled for this project. Drives incremental `GET /sync/pull`. |
 | `updated_at` | `TEXT` | Bookkeeping. |
@@ -49,18 +48,11 @@ Not a graph node — operational config, local to a client instance.
 A project with no `SyncConfig` row, or `enabled = false`, is never touched by
 sync — satisfies FR-001/FR-002.
 
-## New: `CollaboratorGrant` (server-side only, one row per issued credential)
-
-A grant is identified by a public `uuid` and authenticated with a `secret`
-that only ever exists in plaintext at issuance time and on the holder's own
-machine — the server stores a salted hash, never the plaintext (matches the
-`AccessKeyId`/`SecretAccessKey`-style pattern of public-id + private-secret,
-rather than one opaque bearer string).
+## New: `CollaboratorGrant` (server-side only, one row per issued token)
 
 | Field | Type | Notes |
 |---|---|---|
-| `uuid` | `TEXT` (PK) | Public credential ID, handed to a collaborator out of band along with the secret. Safe to reference/log. |
-| `secret_hash` | `TEXT` | SHA-256 of the secret (workspace already depends on `sha2`, used elsewhere for `content_hash`). The plaintext secret is shown once at issuance and never stored server-side. |
+| `token_hash` | `TEXT` (PK) | SHA-256 of the plaintext token (workspace already depends on `sha2`, used elsewhere for `content_hash`). Looked up directly by hash — an incoming request's token is hashed and matched against this column, so the plaintext is never stored server-side; it's shown once at issuance and lives only on the holder's own machine. |
 | `person_name` | `TEXT` | For audit/logging on the server side; the actual attribution on synced data comes from each node/edge's own `created_by`/`updated_by`, not from this table. |
 | `person_email` | `TEXT` | |
 | `project_label` | `TEXT` | Which single shared project this credential may push/pull. A collaborator with access to two projects holds two credentials. |

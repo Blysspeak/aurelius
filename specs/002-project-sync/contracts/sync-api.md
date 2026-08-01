@@ -5,17 +5,17 @@ Exposed by `aurelius-sync-server`, mounted under `/sync` (deployed at
 
 ## Authentication
 
-Every push/pull request carries `Authorization: Bearer {uuid}:{secret}`,
-where `uuid`/`secret` are a `CollaboratorGrant` credential pair (see
-data-model.md). The server splits on the first `:`, looks up the grant by
-`uuid`, hashes the supplied `secret` and compares to the stored
-`secret_hash`, and checks `revoked_at IS NULL`. A valid credential
-unambiguously identifies exactly one `(project_label, person)` — **the
-project is never a separate client-supplied parameter**; it's always derived
-from the credential. This is what lets the client-side flow be a single
-`au sync {server} {uuid} {secret}` command with no project name to type.
+Every push/pull request carries `Authorization: Bearer {token}`. The token
+is a single opaque credential (see data-model.md's `CollaboratorGrant`) that
+unambiguously resolves to exactly one `(project_label, person)` — **the
+project is never a separate client-supplied parameter**; it's always
+resolved server-side from the token. This is what lets the client-side flow
+be a single `au sync {server} {token}` command with no project name to type.
+The server never stores the plaintext token, only `sha256(token)`; an
+incoming request is authenticated by hashing the supplied token and matching
+it against `collaborator_grants.token_hash`.
 
-**Errors** (both endpoints): `401` (unknown uuid, wrong secret, or revoked).
+**Errors** (both endpoints): `401` (unknown token or revoked).
 
 ## `POST /sync/push`
 
@@ -32,7 +32,7 @@ Client sends everything new/changed locally since its last successful push.
 
 - Every node/edge MUST already carry `created_by`; server rejects (`422`) any
   item missing attribution.
-- Server upserts each node/edge by `id`, into the project the credential
+- Server upserts each node/edge by `id`, into the project the token
   resolves to:
   - New `id` → insert, assign `sync_seq`.
   - Existing `id` with a newer `updated_at` than the server's stored copy →
@@ -58,9 +58,9 @@ Client sends everything new/changed locally since its last successful push.
 ## `GET /sync/pull?since={seq}`
 
 - `since` omitted or `0` → full bootstrap: every live and tombstoned
-  node/edge for the credential's project (satisfies FR-004), plus that
-  project's label so a first-time client can create/attach its local project
-  under the same name without having to already know it.
+  node/edge for the token's project (satisfies FR-004), plus that project's
+  label so a first-time client can create/attach its local project under the
+  same name without having to already know it.
 - `since={seq}` → only items with `sync_seq > seq`.
 
 **Response** `200`:
@@ -82,10 +82,10 @@ Client sends everything new/changed locally since its last successful push.
 
 **Errors**: `401`.
 
-## `POST /sync/grants` (admin-only, credential issuance)
+## `POST /sync/grants` (admin-only, token issuance)
 
 Used by `au sync issue <project> --for "Name <email>"` (owner-side) to mint a
-new collaborator credential. Protected by a separate admin credential (the
+new collaborator token. Protected by a separate admin credential (the
 `AURELIUS_SYNC_ADMIN_TOKEN` the server was started with), not a
 `CollaboratorGrant` — issuing access to a project is an administrative act,
 not a synced-data operation.
@@ -98,11 +98,11 @@ not a synced-data operation.
 { "project": "aurelius", "person_name": "Tester", "person_email": "tester@example.com" }
 ```
 
-**Response** `200` (the secret is returned exactly once — the server only
+**Response** `200` (the token is returned exactly once — the server only
 ever stores its hash):
 
 ```json
-{ "uuid": "b3f1...", "secret": "9c2a..." }
+{ "token": "9c2a1e7b3f4d5c6a8b9e0f1a2b3c4d5e" }
 ```
 
 **Errors**: `401` (bad/missing admin token), `422` (malformed payload).
@@ -112,6 +112,5 @@ ever stores its hash):
 - Network failure, timeout, or `5xx`: caller (client) logs a warning and
   proceeds with normal local operation — sync is best-effort at session
   boundaries (FR-006, FR-011). No retry loop blocks the caller.
-- A revoked credential (`CollaboratorGrant.revoked_at IS NOT NULL`) is
-  rejected with `401` on every call, indistinguishable from an unknown
-  credential.
+- A revoked token (`CollaboratorGrant.revoked_at IS NOT NULL`) is rejected
+  with `401` on every call, indistinguishable from an unknown token.
