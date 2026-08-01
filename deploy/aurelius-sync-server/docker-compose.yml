@@ -1,5 +1,8 @@
-# Local/self-hosted deployment unit for aurelius-sync-server.
+# Generic, self-hostable deployment unit for aurelius-sync-server — anyone
+# can copy this directory and run their own private instance, no code
+# changes needed. Configure via .env (copy .env.example) before first run.
 #
+#   cp deploy/aurelius-sync-server/.env.example deploy/aurelius-sync-server/.env
 #   docker compose -f deploy/aurelius-sync-server/docker-compose.yml up -d --build
 #
 # Run from the repository root (or any cwd) — the build context below is
@@ -13,7 +16,11 @@ services:
     image: aurelius-sync-server:latest
     restart: unless-stopped
     ports:
-      - "8181:8181"
+      - "${AURELIUS_SYNC_PORT:-8181}:8181"
+    environment:
+      # Required — protects POST /sync/grants and /sync/grants/revoke.
+      # Generate your own, e.g.: openssl rand -hex 32
+      - AURELIUS_SYNC_ADMIN_TOKEN=${AURELIUS_SYNC_ADMIN_TOKEN:?set AURELIUS_SYNC_ADMIN_TOKEN in .env}
     volumes:
       - aurelius-sync-data:/data
     command: ["--port", "8181", "--db", "/data/aurelius-sync-server.db"]
