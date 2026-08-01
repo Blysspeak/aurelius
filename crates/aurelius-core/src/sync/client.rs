@@ -93,6 +93,24 @@ pub fn set_sync_enabled(conn: &Connection, project: &str, enabled: bool) -> Resu
     Ok(affected > 0)
 }
 
+/// Looks up a previously stored admin token for `server_url` (from
+/// `au share admin-set`) — lets `au share issue`/`revoke` skip
+/// AURELIUS_SYNC_ADMIN_TOKEN entirely after the first setup.
+pub fn get_admin_token(conn: &Connection, server_url: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT token FROM admin_tokens WHERE server_url = ?1")?;
+    let mut rows = stmt.query_map(params![server_url], |r| r.get::<_, String>(0))?;
+    Ok(rows.next().transpose()?)
+}
+
+pub fn upsert_admin_token(conn: &Connection, server_url: &str, token: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO admin_tokens (server_url, token, saved_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(server_url) DO UPDATE SET token = excluded.token, saved_at = excluded.saved_at",
+        params![server_url, token, chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
 /// Resolves which sync configs a push/pull should target: a specific
 /// project (must be connected and enabled) or every enabled project.
 pub fn resolve_sync_targets(conn: &Connection, project: Option<&str>) -> Result<Vec<SyncConfig>> {

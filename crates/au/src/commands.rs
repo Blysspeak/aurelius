@@ -884,6 +884,7 @@ use aurelius_core::sync::SyncPullResponse;
 
 pub async fn share(action: ShareAction) -> Result<()> {
     match action {
+        ShareAction::AdminSet { server, token } => share_admin_set(&server, &token).await,
         ShareAction::Issue {
             project,
             for_,
@@ -938,18 +939,38 @@ fn parse_person(input: &str) -> Result<(String, String)> {
     Ok((name, email))
 }
 
-fn admin_token() -> Result<String> {
-    std::env::var("AURELIUS_SYNC_ADMIN_TOKEN").map_err(|_| {
+/// Resolves the admin token for `server`: an explicit AURELIUS_SYNC_ADMIN_TOKEN
+/// env var wins (useful for scripting/CI), otherwise falls back to a token
+/// previously stored via `au share admin-set`.
+fn admin_token(server: &str) -> Result<String> {
+    if let Ok(token) = std::env::var("AURELIUS_SYNC_ADMIN_TOKEN") {
+        return Ok(token);
+    }
+    let base_url = normalize_server(server);
+    let conn = db::open(&db_path())?;
+    sync_client::get_admin_token(&conn, &base_url)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "AURELIUS_SYNC_ADMIN_TOKEN must be set in the environment for admin commands (au share issue/revoke)"
+            "no admin token for {base_url} — run `au share admin-set {base_url} <token>` once (the AURELIUS_SYNC_ADMIN_TOKEN the server was started with), or set AURELIUS_SYNC_ADMIN_TOKEN in the environment for this one call"
         )
     })
+}
+
+/// [ADMIN] Stores this machine's admin token for `server` so `issue`/`revoke`
+/// don't need AURELIUS_SYNC_ADMIN_TOKEN re-exported every session.
+async fn share_admin_set(server: &str, token: &str) -> Result<()> {
+    let base_url = normalize_server(server);
+    let conn = db::open(&db_path())?;
+    sync_client::upsert_admin_token(&conn, &base_url, token)?;
+    println!(
+        "✓ Stored admin token for {base_url} — `au share issue`/`revoke` will use it automatically"
+    );
+    Ok(())
 }
 
 /// [ADMIN] Issues a collaborator token for an EXISTING local project — never
 /// find-or-create, so a typo can't mint access to the wrong/a new project.
 async fn share_issue(project: &str, for_: Option<&str>, server: &str) -> Result<()> {
-    let admin_token = admin_token()?;
+    let admin_token = admin_token(server)?;
     let (person_name, person_email) = match for_ {
         Some(spec) => parse_person(spec)?,
         None => {
@@ -1018,7 +1039,7 @@ async fn share_issue(project: &str, for_: Option<&str>, server: &str) -> Result<
 
 /// [ADMIN] Revokes a collaborator's access; does not retract data already delivered.
 async fn share_revoke(project: &str, email: &str, server: &str) -> Result<()> {
-    let admin_token = admin_token()?;
+    let admin_token = admin_token(server)?;
     let base_url = normalize_server(server);
     let client = reqwest::Client::new();
     let resp = client
