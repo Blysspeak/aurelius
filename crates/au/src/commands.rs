@@ -7,23 +7,9 @@ use aurelius_core::{
 use serde_json::json;
 use std::path::PathBuf;
 
-use crate::{IdentityAction, ShareAction, TaskAction};
+use crate::{DbAction, IdentityAction, ShareAction, TaskAction};
 
-fn db_path() -> PathBuf {
-    // AURELIUS_HOME override (test/dev use — see quickstart.md): when set, the
-    // DB lives directly under it instead of the real OS data dir. Unset means
-    // 100% unchanged default behavior.
-    if let Ok(home) = std::env::var("AURELIUS_HOME") {
-        let base = PathBuf::from(home);
-        std::fs::create_dir_all(&base).ok();
-        return base.join("aurelius.db");
-    }
-    let base = dirs_next::data_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
-        .join("aurelius");
-    std::fs::create_dir_all(&base).ok();
-    base.join("aurelius.db")
-}
+use aurelius_core::db::db_path;
 
 /// Open DB and auto-index current project if not yet indexed.
 fn open_and_ensure(path: &std::path::Path) -> Result<rusqlite::Connection> {
@@ -703,7 +689,7 @@ pub async fn skills(hook: bool) -> Result<()> {
     let conn = db::open(&db_path())?;
     let mut skills = graph::get_nodes_by_type(&conn, &NodeType::Skill)?;
     // Most-used first — the index leads with battle-tested skills.
-    skills.sort_by_key(|n| std::cmp::Reverse(n.access_count));
+    skills.sort_by_key(|s| std::cmp::Reverse(s.access_count));
 
     if skills.is_empty() {
         if !hook {
@@ -775,6 +761,83 @@ pub async fn merge(source: &str, target: &str) -> Result<()> {
     if stats.note_merged {
         println!("  notes merged");
     }
+    Ok(())
+}
+
+pub async fn db(action: DbAction) -> Result<()> {
+    match action {
+        // A snapshot is an ordinary database, so verifying one is the same
+        // command pointed at a different file.
+        DbAction::Check { path, full } => {
+            db_check_cli(&path.map_or_else(db_path, PathBuf::from), full)
+        }
+        DbAction::Backup { out } => db_backup_cli(&db_path(), out),
+    }
+}
+
+fn db_check_cli(path: &std::path::Path, full: bool) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("no database at {}", path.display());
+    }
+    let report = db::check(path, full)?;
+
+    println!("Database: {}", path.display());
+    println!(
+        "  size:     {} bytes ({} pages × {})",
+        report.file_bytes, report.page_count, report.page_size
+    );
+    if report.wal_bytes > 0 {
+        println!("  wal:      {} bytes", report.wal_bytes);
+    }
+    match (report.nodes, report.edges) {
+        (Some(nodes), Some(edges)) => println!("  content:  {nodes} nodes, {edges} edges"),
+        _ => println!("  content:  unreadable"),
+    }
+
+    let mode = if full {
+        "integrity_check"
+    } else {
+        "quick_check"
+    };
+    if report.ok {
+        println!("✓ Integrity OK ({mode})");
+        return Ok(());
+    }
+
+    println!("✗ Integrity FAILED");
+    for problem in &report.problems {
+        for line in problem.lines() {
+            println!("    {line}");
+        }
+    }
+    println!("  Next: `au db backup` to snapshot what is still readable.");
+    anyhow::bail!(
+        "integrity check failed ({} problem(s))",
+        report.problems.len()
+    )
+}
+
+fn db_backup_cli(path: &std::path::Path, out: Option<String>) -> Result<()> {
+    if !path.exists() {
+        anyhow::bail!("no database at {}", path.display());
+    }
+    let dest = match out {
+        Some(p) => PathBuf::from(p),
+        None => path.with_file_name(format!(
+            "aurelius-{}.db",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        )),
+    };
+    if dest.exists() {
+        anyhow::bail!("destination already exists: {}", dest.display());
+    }
+
+    let bytes = db::backup_into(path, &dest)?;
+
+    println!("✓ Backup written");
+    println!("  source: {}", path.display());
+    println!("  dest:   {}", dest.display());
+    println!("  size:   {bytes} bytes");
     Ok(())
 }
 

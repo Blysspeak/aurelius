@@ -97,6 +97,24 @@ pub enum IdentityAction {
 }
 
 #[derive(Subcommand)]
+pub enum DbAction {
+    /// Verify database integrity (read-only — never migrates, never writes)
+    Check {
+        /// Database to check (default: the knowledge graph). Use it to verify a snapshot.
+        path: Option<String>,
+        /// Report every problem instead of stopping at the first
+        #[arg(long)]
+        full: bool,
+    },
+    /// Safe snapshot via SQLite VACUUM INTO — the only correct way to copy a live database
+    Backup {
+        /// Destination file (default: aurelius-<UTC timestamp>.db next to the database)
+        #[arg(short, long)]
+        out: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ShareAction {
     /// [ADMIN] Issue a collaborator a token for an existing local project
     /// (requires AURELIUS_SYNC_ADMIN_TOKEN in the environment)
@@ -226,6 +244,11 @@ enum Commands {
         #[command(subcommand)]
         action: ShareAction,
     },
+    /// Database maintenance — integrity check and safe backup
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
     /// Start MCP server (used by Claude Code)
     Mcp,
 }
@@ -257,6 +280,7 @@ async fn main() -> Result<()> {
         Commands::Skills { hook } => commands::skills(hook).await,
         Commands::Identity { action } => commands::identity(action).await,
         Commands::Share { action } => commands::share(action).await,
+        Commands::Db { action } => commands::db(action).await,
         Commands::Mcp => commands::mcp().await,
     }
 }
