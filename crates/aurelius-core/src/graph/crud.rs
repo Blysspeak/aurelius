@@ -165,13 +165,19 @@ pub fn update_node(
 
 /// Soft-delete: sets `deleted_at` (rather than issuing a `DELETE`) so the
 /// tombstone can propagate through sync, and cascades the same timestamp
-/// onto the node's edges instead of deleting them.
+/// onto the node's edges instead of deleting them. Also bumps `updated_at`
+/// (and stamps `updated_by`) to the same instant: `sync::merge::apply_push`
+/// picks a winner by comparing `updated_at`, so without this a delete of a
+/// node whose `updated_at` hasn't otherwise changed since its last push
+/// would lose to the server's existing "live" copy instead of propagating.
 pub fn delete_node(conn: &Connection, id: Uuid) -> Result<bool> {
     let now_str = Utc::now().to_rfc3339();
     let id_str = id.to_string();
+    let author = identity::current().map(|i| i.as_author());
     let affected = conn.execute(
-        "UPDATE nodes SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL",
-        params![now_str, id_str],
+        "UPDATE nodes SET deleted_at = ?1, updated_at = ?1, updated_by = ?2
+         WHERE id = ?3 AND deleted_at IS NULL",
+        params![now_str, author, id_str],
     )?;
     if affected > 0 {
         conn.execute(
@@ -388,4 +394,60 @@ pub fn get_nodes_by_type(conn: &Connection, node_type: &NodeType) -> Result<Vec<
         .query_map(params![type_str], row_to_node)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(nodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    fn setup() -> Connection {
+        db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    }
+
+    /// T025: `memory_forget` (MCP) and any future CLI equivalent both go
+    /// through this function. `sync::merge::apply_push` picks a winner by
+    /// comparing `updated_at`, so a delete that leaves `updated_at`
+    /// unchanged from creation would silently lose to the server's existing
+    /// live copy on the next push instead of propagating (see doc comment
+    /// on `delete_node`).
+    #[test]
+    fn delete_node_bumps_updated_at_in_lockstep_with_deleted_at() {
+        let conn = setup();
+        let node = add_node(
+            &conn,
+            NodeType::Decision,
+            "obsolete decision",
+            Some("no longer relevant"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let deleted = delete_node(&conn, node.id).expect("delete node");
+        assert!(deleted);
+
+        // get_node filters `deleted_at IS NULL`, so read the raw row.
+        let (deleted_at, updated_at): (Option<String>, String) = conn
+            .query_row(
+                "SELECT deleted_at, updated_at FROM nodes WHERE id = ?1",
+                params![node.id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row exists");
+
+        assert!(deleted_at.is_some(), "deleted_at must be set");
+        assert_eq!(
+            deleted_at.as_deref(),
+            Some(updated_at.as_str()),
+            "updated_at must be bumped to the same instant as deleted_at, \
+             so a subsequent push is recognized as the newest change"
+        );
+
+        let updated_at: chrono::DateTime<Utc> = updated_at.parse().expect("valid timestamp");
+        assert!(
+            updated_at >= node.updated_at,
+            "updated_at must not move backward from the pre-delete value"
+        );
+    }
 }
