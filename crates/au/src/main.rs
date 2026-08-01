@@ -115,6 +115,7 @@ pub enum DbAction {
 }
 
 #[derive(Subcommand)]
+#[command(after_help = "The most common command has no subcommand name — it's just:\n\n    au share <SERVER> <TOKEN>\n\nRun that once per project to connect it (using a token from `au share issue`,\nor one someone else gave you). This attaches the project sync learns the\nname from the server, so there's nothing else to type.")]
 pub enum ShareAction {
     /// [ADMIN] Issue a collaborator a token for an existing local project
     /// (requires AURELIUS_SYNC_ADMIN_TOKEN in the environment)
