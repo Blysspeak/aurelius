@@ -21,6 +21,12 @@ impl Identity {
     }
 
     fn config_path() -> Result<PathBuf> {
+        // AURELIUS_HOME override (test/dev use — see quickstart.md): when set,
+        // identity.toml lives directly under it instead of the real OS config
+        // dir. Unset means 100% unchanged default behavior.
+        if let Ok(home) = std::env::var("AURELIUS_HOME") {
+            return Ok(PathBuf::from(home).join("identity.toml"));
+        }
         let dir = dirs_next::config_dir()
             .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?
             .join("aurelius");
