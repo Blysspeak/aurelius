@@ -89,6 +89,7 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
         "priority": priority,
         "project": project,
         "created": true,
+        "created_by": task.created_by,
     }))
 }
 
@@ -140,6 +141,7 @@ pub fn task_update(params: &serde_json::Value) -> Result<serde_json::Value> {
         "status": data["status"],
         "priority": data["priority"],
         "updated": true,
+        "updated_by": aurelius_core::identity::current().map(|i| i.as_author()),
     }))
 }
 
@@ -175,6 +177,8 @@ pub fn task_list(params: &serde_json::Value) -> Result<serde_json::Value> {
                 "work_logs": log_count,
                 "created_at": t.created_at.to_rfc3339(),
                 "note": t.note,
+                "created_by": t.created_by,
+                "updated_by": t.updated_by,
             })
         })
         .collect();
@@ -223,11 +227,7 @@ pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
     }
 
     // Create WorkLog node
-    let log_label = format!(
-        "[{}] {}",
-        project,
-        truncate(text, 60)
-    );
+    let log_label = format!("[{}] {}", project, truncate(text, 60));
     let log_node = graph::add_node_full(
         &conn,
         NodeType::WorkLog,
@@ -336,8 +336,16 @@ pub fn task_stats(params: &serde_json::Value) -> Result<serde_json::Value> {
     let window_cutoff = since_days.map(|d| now - chrono::Duration::days(d as i64));
 
     for t in &tasks {
-        let status = t.data.get("status").and_then(|s| s.as_str()).unwrap_or("backlog");
-        let priority = t.data.get("priority").and_then(|p| p.as_str()).unwrap_or("medium");
+        let status = t
+            .data
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("backlog");
+        let priority = t
+            .data
+            .get("priority")
+            .and_then(|p| p.as_str())
+            .unwrap_or("medium");
         *by_status.entry(status.to_string()).or_insert(0) += 1;
         *by_priority.entry(priority.to_string()).or_insert(0) += 1;
 
@@ -345,10 +353,16 @@ pub fn task_stats(params: &serde_json::Value) -> Result<serde_json::Value> {
             currently_blocked += 1;
         }
 
-        let started = t.data.get("started_at").and_then(|s| s.as_str())
+        let started = t
+            .data
+            .get("started_at")
+            .and_then(|s| s.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc));
-        let completed = t.data.get("completed_at").and_then(|s| s.as_str())
+        let completed = t
+            .data
+            .get("completed_at")
+            .and_then(|s| s.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc));
 

@@ -2,6 +2,7 @@
 //! `specs/002-project-sync/contracts/sync-api.md`. Used by both
 //! `aurelius-sync-server` (server side) and `au`/`aurelius` (client side).
 
+pub mod client;
 pub mod merge;
 
 use crate::models::{Edge, Node};
