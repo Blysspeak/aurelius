@@ -72,7 +72,7 @@ email = "blysspeak@gmail.com"
 
 Read once per process start; every node/edge a client creates or updates is
 stamped `"{name} <{email}>"` into `created_by`/`updated_by`. Required before
-`au sync` can be used to connect a project (fails fast with a clear error if
+`au share` can be used to connect a project (fails fast with a clear error if
 unset), but is independent of sync itself — it's the durable identity
 referenced by FR-007.
 
@@ -82,8 +82,8 @@ referenced by FR-007.
   soft-deleted row is never revived by sync; a client that still has an old
   live copy will receive the tombstone on next pull and soft-delete its own
   copy to match.
-- **SyncConfig.enabled**: `off` → `on` (via `au sync <server> <uuid> <secret>`)
-  triggers a full bootstrap pull (FR-004); `on` → `off` (`au sync disable
+- **SyncConfig.enabled**: `off` → `on` (via `au share <server> <uuid> <secret>`)
+  triggers a full bootstrap pull (FR-004); `on` → `off` (`au share disable
   <project>`) stops future sync but does not delete already-synced local data.
 - **CollaboratorGrant**: `active` (`revoked_at IS NULL`) → `revoked`. Checked
   on every push/pull request; a revoked credential is rejected.

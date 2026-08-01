@@ -35,17 +35,17 @@ AURELIUS_HOME=$AURELIUS_HOME_A au task new "Ship v1" -p demo --priority high
 
 # owner-side admin action against the server:
 AURELIUS_SYNC_ADMIN_TOKEN=<set-when-starting-the-server> \
-  AURELIUS_HOME=$AURELIUS_HOME_A au sync issue demo --for "Tester <tester@example.com>" --server localhost:8181
+  AURELIUS_HOME=$AURELIUS_HOME_A au share issue demo --for "Tester <tester@example.com>" --server localhost:8181
 # prints a token; hand it to the collaborator out of band
 
 # the owner also connects their own project, same command every participant uses:
-AURELIUS_HOME=$AURELIUS_HOME_A au sync localhost:8181 <owner-token-from-a-self-issued-grant>
+AURELIUS_HOME=$AURELIUS_HOME_A au share localhost:8181 <owner-token-from-a-self-issued-grant>
 ```
 
 ## 4. Bootstrap the collaborator (User Story 1)
 
 ```bash
-AURELIUS_HOME=$AURELIUS_HOME_B au sync localhost:8181 <token-from-step-3>
+AURELIUS_HOME=$AURELIUS_HOME_B au share localhost:8181 <token-from-step-3>
 AURELIUS_HOME=$AURELIUS_HOME_B au context demo
 ```
 
@@ -56,7 +56,7 @@ from step 3, with `created_by: Owner <owner@example.com>`.
 
 ```bash
 AURELIUS_HOME=$AURELIUS_HOME_B au note "found a login timeout bug" -p demo
-AURELIUS_HOME=$AURELIUS_HOME_A au sync pull demo
+AURELIUS_HOME=$AURELIUS_HOME_A au share pull demo
 AURELIUS_HOME=$AURELIUS_HOME_A au context demo
 ```
 
@@ -67,13 +67,13 @@ AURELIUS_HOME=$AURELIUS_HOME_A au context demo
 
 ```bash
 AURELIUS_HOME=$AURELIUS_HOME_B au task new "Fix login timeout" -p demo --priority high
-AURELIUS_HOME=$AURELIUS_HOME_B au sync push demo
-AURELIUS_HOME=$AURELIUS_HOME_A au sync pull demo
+AURELIUS_HOME=$AURELIUS_HOME_B au share push demo
+AURELIUS_HOME=$AURELIUS_HOME_A au share pull demo
 AURELIUS_HOME=$AURELIUS_HOME_A au task list --project demo   # shows task, filed by Tester
 AURELIUS_HOME=$AURELIUS_HOME_A au task log <id> "fixed session TTL"
 AURELIUS_HOME=$AURELIUS_HOME_A au task done <id>
-AURELIUS_HOME=$AURELIUS_HOME_A au sync push demo
-AURELIUS_HOME=$AURELIUS_HOME_B au sync pull demo
+AURELIUS_HOME=$AURELIUS_HOME_A au share push demo
+AURELIUS_HOME=$AURELIUS_HOME_B au share pull demo
 AURELIUS_HOME=$AURELIUS_HOME_B au task show <id>   # done, completed by Owner
 ```
 
@@ -81,8 +81,8 @@ AURELIUS_HOME=$AURELIUS_HOME_B au task show <id>   # done, completed by Owner
 
 ```bash
 AURELIUS_HOME=$AURELIUS_HOME_A au forget <some-node-id>
-AURELIUS_HOME=$AURELIUS_HOME_A au sync push demo
-AURELIUS_HOME=$AURELIUS_HOME_B au sync pull demo
+AURELIUS_HOME=$AURELIUS_HOME_A au share push demo
+AURELIUS_HOME=$AURELIUS_HOME_B au share pull demo
 AURELIUS_HOME=$AURELIUS_HOME_B au context demo   # node is gone, does not reappear on a later pull
 ```
 
@@ -90,13 +90,13 @@ AURELIUS_HOME=$AURELIUS_HOME_B au context demo   # node is gone, does not reappe
 
 ```bash
 # Both sides edit the same node before either syncs
-AURELIUS_HOME=$AURELIUS_HOME_A au sync pull demo   # both start from the same baseline first
-AURELIUS_HOME=$AURELIUS_HOME_B au sync pull demo
+AURELIUS_HOME=$AURELIUS_HOME_A au share pull demo   # both start from the same baseline first
+AURELIUS_HOME=$AURELIUS_HOME_B au share pull demo
 AURELIUS_HOME=$AURELIUS_HOME_A au note-update <node-id> "owner's edit"
 AURELIUS_HOME=$AURELIUS_HOME_B au note-update <node-id> "tester's edit"
-AURELIUS_HOME=$AURELIUS_HOME_A au sync push demo
-AURELIUS_HOME=$AURELIUS_HOME_B au sync push demo   # loses the race, gets a 200 with conflicts:1
-AURELIUS_HOME=$AURELIUS_HOME_A au sync pull demo
+AURELIUS_HOME=$AURELIUS_HOME_A au share push demo
+AURELIUS_HOME=$AURELIUS_HOME_B au share push demo   # loses the race, gets a 200 with conflicts:1
+AURELIUS_HOME=$AURELIUS_HOME_A au share pull demo
 AURELIUS_HOME=$AURELIUS_HOME_A au context demo -v   # winning note visible; loser visible under data._sync_conflict
 ```
 
@@ -104,8 +104,8 @@ AURELIUS_HOME=$AURELIUS_HOME_A au context demo -v   # winning note visible; lose
 
 ```bash
 AURELIUS_HOME=$AURELIUS_HOME_A au note "unrelated private thought" -p personal
-AURELIUS_HOME=$AURELIUS_HOME_A au sync push demo
-AURELIUS_HOME=$AURELIUS_HOME_B au sync pull demo
+AURELIUS_HOME=$AURELIUS_HOME_A au share push demo
+AURELIUS_HOME=$AURELIUS_HOME_B au share pull demo
 AURELIUS_HOME=$AURELIUS_HOME_B au context personal   # empty — never shared, never sent
 ```
 
@@ -114,7 +114,7 @@ AURELIUS_HOME=$AURELIUS_HOME_B au context personal   # empty — never shared, n
 ```bash
 # stop the sync server process, then:
 AURELIUS_HOME=$AURELIUS_HOME_A au note "still works offline" -p demo
-AURELIUS_HOME=$AURELIUS_HOME_A au sync push demo   # warns, does not fail the shell exit code
+AURELIUS_HOME=$AURELIUS_HOME_A au share push demo   # warns, does not fail the shell exit code
 ```
 
 See `contracts/sync-api.md` for the exact request/response shapes and
