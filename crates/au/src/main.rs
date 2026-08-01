@@ -3,6 +3,7 @@ mod view;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 
 #[derive(Parser)]
 #[command(name = "au", about = "Aurelius — personal knowledge graph", version)]
@@ -83,6 +84,19 @@ pub enum TaskAction {
 }
 
 #[derive(Subcommand)]
+pub enum IdentityAction {
+    /// Set your name and email — stamped as "Name <email>" on every node/edge
+    /// you create or update. Required once per machine before `au share
+    /// <server> <token>` can be used.
+    Set {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        email: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum DbAction {
     /// Verify database integrity (read-only — never migrates, never writes)
     Check {
@@ -98,6 +112,54 @@ pub enum DbAction {
         #[arg(short, long)]
         out: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum ShareAction {
+    /// [ADMIN] Issue a collaborator a token for an existing local project
+    /// (requires AURELIUS_SYNC_ADMIN_TOKEN in the environment)
+    Issue {
+        /// Project label — must already exist locally
+        project: String,
+        /// Collaborator identity, e.g. "Tester <tester@example.com>"
+        #[arg(long = "for")]
+        for_: String,
+        /// Sync server host or URL, e.g. aurelius.boostix.space or http://localhost:8181/sync
+        #[arg(long)]
+        server: String,
+    },
+    /// [ADMIN] Revoke a collaborator's access to a project
+    /// (requires AURELIUS_SYNC_ADMIN_TOKEN in the environment)
+    Revoke {
+        /// Project label
+        project: String,
+        /// Collaborator email
+        #[arg(long = "for")]
+        for_: String,
+        /// Sync server host or URL
+        #[arg(long)]
+        server: String,
+    },
+    /// Push local changes to the sync server
+    Push {
+        /// Project to push (default: every project with sync enabled)
+        project: Option<String>,
+    },
+    /// Pull changes from the sync server
+    Pull {
+        /// Project to pull (default: every project with sync enabled)
+        project: Option<String>,
+    },
+    /// List every project connected to sync
+    List,
+    /// Disable sync for a project (local only — does not delete synced data)
+    Disable {
+        /// Project label
+        project: String,
+    },
+    /// Connect a project to a sync server, once per project: `au share <server> <token>`
+    #[command(external_subcommand)]
+    Connect(Vec<OsString>),
 }
 
 #[derive(Subcommand)]
@@ -124,6 +186,9 @@ enum Commands {
         /// Graph traversal depth
         #[arg(short, long, default_value = "2")]
         depth: u32,
+        /// Show sync conflict details (data._sync_conflict) when present
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Search the knowledge graph
     Search { query: String },
@@ -169,6 +234,16 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
+    /// Configure your personal identity for sync attribution
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
+    /// Share a project with another Aurelius instance over a sync server
+    Share {
+        #[command(subcommand)]
+        action: ShareAction,
+    },
     /// Database maintenance — integrity check and safe backup
     Db {
         #[command(subcommand)]
@@ -189,7 +264,11 @@ async fn main() -> Result<()> {
             label,
             project,
         } => commands::note(&text, &r#type, label, project).await,
-        Commands::Context { topic, depth } => commands::context(&topic, depth).await,
+        Commands::Context {
+            topic,
+            depth,
+            verbose,
+        } => commands::context(&topic, depth, verbose).await,
         Commands::Search { query } => commands::search(&query).await,
         Commands::Sync => commands::sync().await,
         Commands::Reindex { path } => commands::reindex(path).await,
@@ -199,6 +278,8 @@ async fn main() -> Result<()> {
         Commands::Task { action } => commands::task(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,
+        Commands::Identity { action } => commands::identity(action).await,
+        Commands::Share { action } => commands::share(action).await,
         Commands::Db { action } => commands::db(action).await,
         Commands::Mcp => commands::mcp().await,
     }

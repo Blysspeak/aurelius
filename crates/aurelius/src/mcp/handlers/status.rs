@@ -2,7 +2,7 @@ use anyhow::Result;
 use aurelius_core::{graph, indexer, models::NodeType};
 use serde_json::json;
 
-use super::{node_brief, node_detail, open_db};
+use super::{node_brief, node_detail, open_db, sync_pull_if_enabled};
 
 pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
     let project_filter = params.get("project").and_then(|p| p.as_str());
@@ -15,6 +15,11 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
             tracing::warn!("could not auto-index {}: {e}", cwd.display());
         }
     }
+
+    // US2: pull any pending sync updates for a shared project before reading
+    // the graph below, so the response reflects the peer's latest work.
+    // Best-effort — never fails memory_status (T022).
+    sync_pull_if_enabled(&conn, project_filter);
 
     let projects = graph::search_typed(&conn, "*", &NodeType::Project, 10)?;
     let crates = graph::search_typed(&conn, "*", &NodeType::Crate, 20)?;
@@ -58,6 +63,8 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
                 "priority": t.data.get("priority"),
                 "note": t.note,
                 "created_at": t.created_at.to_rfc3339(),
+                "created_by": t.created_by,
+                "updated_by": t.updated_by,
             })
         })
         .collect();

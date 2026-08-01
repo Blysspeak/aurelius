@@ -117,6 +117,7 @@ dependencies = [
  "clap",
  "dirs-next",
  "open",
+ "reqwest",
  "rusqlite",
  "rust-embed",
  "serde",
@@ -164,6 +165,26 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "aurelius-sync-server"
+version = "1.8.0"
+dependencies = [
+ "anyhow",
+ "aurelius-core",
+ "axum",
+ "chrono",
+ "clap",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

@@ -1,3 +1,4 @@
+use crate::identity;
 use crate::models::{Edge, MemoryKind, Node, NodeType, Relation};
 use anyhow::Result;
 use chrono::Utc;
@@ -38,6 +39,7 @@ pub fn add_node_full(
     content_hash: Option<&str>,
 ) -> Result<Node> {
     let now = Utc::now();
+    let author = identity::current().map(|i| i.as_author());
     let node = Node {
         id: Uuid::new_v4(),
         node_type,
@@ -51,10 +53,14 @@ pub fn add_node_full(
         last_accessed_at: now,
         access_count: 0,
         content_hash: content_hash.map(str::to_owned),
+        created_by: author.clone(),
+        updated_by: author,
+        deleted_at: None,
+        sync_seq: None,
     };
     conn.execute(
-        "INSERT INTO nodes (id, node_type, label, note, source, data, created_at, updated_at, memory_kind, last_accessed_at, access_count, content_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO nodes (id, node_type, label, note, source, data, created_at, updated_at, memory_kind, last_accessed_at, access_count, content_hash, created_by, updated_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             node.id.to_string(),
             serde_json::to_string(&node.node_type)?,
@@ -68,6 +74,8 @@ pub fn add_node_full(
             node.last_accessed_at.to_rfc3339(),
             node.access_count,
             node.content_hash,
+            node.created_by,
+            node.updated_by,
         ],
     )?;
     Ok(node)
@@ -87,10 +95,13 @@ pub fn add_edge(
         relation,
         weight,
         created_at: Utc::now(),
+        created_by: identity::current().map(|i| i.as_author()),
+        deleted_at: None,
+        sync_seq: None,
     };
     conn.execute(
-        "INSERT OR IGNORE INTO edges (id, from_id, to_id, relation, weight, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO edges (id, from_id, to_id, relation, weight, created_at, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             edge.id.to_string(),
             edge.from_id.to_string(),
@@ -98,6 +109,7 @@ pub fn add_edge(
             edge.relation.to_string(),
             edge.weight,
             edge.created_at.to_rfc3339(),
+            edge.created_by,
         ],
     )?;
     Ok(edge)
@@ -110,8 +122,9 @@ pub fn update_node(
     data: Option<serde_json::Value>,
 ) -> Result<bool> {
     let now = Utc::now();
-    let mut updates = vec!["updated_at = ?1".to_string()];
-    let mut param_idx = 2;
+    let author = identity::current().map(|i| i.as_author());
+    let mut updates = vec!["updated_at = ?1".to_string(), "updated_by = ?2".to_string()];
+    let mut param_idx = 3;
 
     if note.is_some() {
         updates.push(format!("note = ?{param_idx}"));
@@ -134,7 +147,8 @@ pub fn update_node(
     let note_str = note.map(str::to_owned);
     let data_str = data.map(|d| serde_json::to_string(&d).unwrap_or_default());
 
-    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now_str)];
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(now_str), Box::new(author)];
     if let Some(n) = note_str {
         param_values.push(Box::new(n));
     }
@@ -149,8 +163,29 @@ pub fn update_node(
     Ok(affected > 0)
 }
 
+/// Soft-delete: sets `deleted_at` (rather than issuing a `DELETE`) so the
+/// tombstone can propagate through sync, and cascades the same timestamp
+/// onto the node's edges instead of deleting them. Also bumps `updated_at`
+/// (and stamps `updated_by`) to the same instant: `sync::merge::apply_push`
+/// picks a winner by comparing `updated_at`, so without this a delete of a
+/// node whose `updated_at` hasn't otherwise changed since its last push
+/// would lose to the server's existing "live" copy instead of propagating.
 pub fn delete_node(conn: &Connection, id: Uuid) -> Result<bool> {
-    let affected = conn.execute("DELETE FROM nodes WHERE id = ?1", params![id.to_string()])?;
+    let now_str = Utc::now().to_rfc3339();
+    let id_str = id.to_string();
+    let author = identity::current().map(|i| i.as_author());
+    let affected = conn.execute(
+        "UPDATE nodes SET deleted_at = ?1, updated_at = ?1, updated_by = ?2
+         WHERE id = ?3 AND deleted_at IS NULL",
+        params![now_str, author, id_str],
+    )?;
+    if affected > 0 {
+        conn.execute(
+            "UPDATE edges SET deleted_at = ?1
+             WHERE (from_id = ?2 OR to_id = ?2) AND deleted_at IS NULL",
+            params![now_str, id_str],
+        )?;
+    }
     Ok(affected > 0)
 }
 
@@ -229,8 +264,9 @@ pub fn touch_node(conn: &Connection, id: Uuid) -> Result<()> {
 pub fn get_node(conn: &Connection, id: &str) -> Result<Option<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash
-         FROM nodes WHERE id = ?1",
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE id = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query_map(params![id], row_to_node)?;
     Ok(rows.next().transpose()?)
@@ -239,8 +275,9 @@ pub fn get_node(conn: &Connection, id: &str) -> Result<Option<Node>> {
 pub fn find_node_by_label(conn: &Connection, label: &str) -> Result<Option<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash
-         FROM nodes WHERE label = ?1",
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE label = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query_map(params![label], row_to_node)?;
     Ok(rows.next().transpose()?)
@@ -249,8 +286,10 @@ pub fn find_node_by_label(conn: &Connection, label: &str) -> Result<Option<Node>
 pub fn find_project_by_label(conn: &Connection, label: &str) -> Result<Option<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash
-         FROM nodes WHERE label = ?1 AND (node_type = 'project' OR node_type = '\"project\"')",
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE label = ?1 AND (node_type = 'project' OR node_type = '\"project\"')
+           AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query_map(params![label], row_to_node)?;
     Ok(rows.next().transpose()?)
@@ -259,8 +298,9 @@ pub fn find_project_by_label(conn: &Connection, label: &str) -> Result<Option<No
 pub fn find_node_by_content_hash(conn: &Connection, hash: &str) -> Result<Option<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash
-         FROM nodes WHERE content_hash = ?1",
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE content_hash = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query_map(params![hash], row_to_node)?;
     Ok(rows.next().transpose()?)
@@ -269,8 +309,9 @@ pub fn find_node_by_content_hash(conn: &Connection, hash: &str) -> Result<Option
 pub fn find_node_by_data_field(conn: &Connection, key: &str, value: &str) -> Result<Option<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash
-         FROM nodes WHERE json_extract(data, ?1) = ?2",
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE json_extract(data, ?1) = ?2 AND deleted_at IS NULL",
     )?;
     let json_path = format!("$.{key}");
     let mut rows = stmt.query_map(params![json_path, value], row_to_node)?;
@@ -280,8 +321,9 @@ pub fn find_node_by_data_field(conn: &Connection, key: &str, value: &str) -> Res
 pub fn get_all_nodes(conn: &Connection) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash
-         FROM nodes ORDER BY created_at DESC",
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE deleted_at IS NULL ORDER BY created_at DESC",
     )?;
     let nodes = stmt
         .query_map([], row_to_node)?
@@ -291,7 +333,8 @@ pub fn get_all_nodes(conn: &Connection) -> Result<Vec<Node>> {
 
 pub fn get_all_edges(conn: &Connection) -> Result<Vec<Edge>> {
     let mut stmt = conn.prepare(
-        "SELECT id, from_id, to_id, relation, weight, created_at FROM edges ORDER BY created_at DESC",
+        "SELECT id, from_id, to_id, relation, weight, created_at, created_by, deleted_at, sync_seq
+         FROM edges WHERE deleted_at IS NULL ORDER BY created_at DESC",
     )?;
     let edges = stmt
         .query_map([], row_to_edge)?
@@ -302,8 +345,9 @@ pub fn get_all_edges(conn: &Connection) -> Result<Vec<Edge>> {
 pub fn get_nodes_paginated(conn: &Connection, offset: usize, limit: usize) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash
-         FROM nodes ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
     )?;
     let nodes = stmt
         .query_map(params![limit as i64, offset as i64], row_to_node)?
@@ -313,7 +357,8 @@ pub fn get_nodes_paginated(conn: &Connection, offset: usize, limit: usize) -> Re
 
 pub fn get_edges_paginated(conn: &Connection, offset: usize, limit: usize) -> Result<Vec<Edge>> {
     let mut stmt = conn.prepare(
-        "SELECT id, from_id, to_id, relation, weight, created_at FROM edges ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+        "SELECT id, from_id, to_id, relation, weight, created_at, created_by, deleted_at, sync_seq
+         FROM edges WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
     )?;
     let edges = stmt
         .query_map(params![limit as i64, offset as i64], row_to_edge)?
@@ -322,22 +367,115 @@ pub fn get_edges_paginated(conn: &Connection, offset: usize, limit: usize) -> Re
 }
 
 pub fn count_nodes(conn: &Connection) -> Result<usize> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get::<_, usize>(0))?)
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM nodes WHERE deleted_at IS NULL",
+        [],
+        |r| r.get::<_, usize>(0),
+    )?)
 }
 
 pub fn count_edges(conn: &Connection) -> Result<usize> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get::<_, usize>(0))?)
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM edges WHERE deleted_at IS NULL",
+        [],
+        |r| r.get::<_, usize>(0),
+    )?)
 }
 
 pub fn get_nodes_by_type(conn: &Connection, node_type: &NodeType) -> Result<Vec<Node>> {
     let type_str = serde_json::to_string(node_type)?;
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash
-         FROM nodes WHERE node_type = ?1 ORDER BY created_at DESC",
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE node_type = ?1 AND deleted_at IS NULL ORDER BY created_at DESC",
     )?;
     let nodes = stmt
         .query_map(params![type_str], row_to_node)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(nodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    /// A real temp-file database, not `:memory:` — SQLite's in-memory mode
+    /// can never report journal_mode=WAL, and `db::open`'s `ensure_wal` gate
+    /// now hard-rejects anything else. Kept alive for the test's duration so
+    /// the file isn't removed out from under the open `Connection`; cleans
+    /// up its `-wal`/`-shm` siblings on drop.
+    struct TmpDb(std::path::PathBuf);
+
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "aurelius-crud-test-{tag}-{}.db",
+                uuid::Uuid::new_v4()
+            )))
+        }
+    }
+
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+            }
+        }
+    }
+
+    fn setup() -> (TmpDb, Connection) {
+        let tmp = TmpDb::new("setup");
+        let conn = db::open(&tmp.0).expect("open temp db");
+        (tmp, conn)
+    }
+
+    /// T025: `memory_forget` (MCP) and any future CLI equivalent both go
+    /// through this function. `sync::merge::apply_push` picks a winner by
+    /// comparing `updated_at`, so a delete that leaves `updated_at`
+    /// unchanged from creation would silently lose to the server's existing
+    /// live copy on the next push instead of propagating (see doc comment
+    /// on `delete_node`).
+    #[test]
+    fn delete_node_bumps_updated_at_in_lockstep_with_deleted_at() {
+        let (_tmp, conn) = setup();
+        let node = add_node(
+            &conn,
+            NodeType::Decision,
+            "obsolete decision",
+            Some("no longer relevant"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let deleted = delete_node(&conn, node.id).expect("delete node");
+        assert!(deleted);
+
+        // get_node filters `deleted_at IS NULL`, so read the raw row.
+        let (deleted_at, updated_at): (Option<String>, String) = conn
+            .query_row(
+                "SELECT deleted_at, updated_at FROM nodes WHERE id = ?1",
+                params![node.id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row exists");
+
+        assert!(deleted_at.is_some(), "deleted_at must be set");
+        assert_eq!(
+            deleted_at.as_deref(),
+            Some(updated_at.as_str()),
+            "updated_at must be bumped to the same instant as deleted_at, \
+             so a subsequent push is recognized as the newest change"
+        );
+
+        let updated_at: chrono::DateTime<Utc> = updated_at.parse().expect("valid timestamp");
+        assert!(
+            updated_at >= node.updated_at,
+            "updated_at must not move backward from the pre-delete value"
+        );
+    }
 }

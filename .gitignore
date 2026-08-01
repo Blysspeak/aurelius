@@ -12,4 +12,6 @@ CLAUDE.md
 
 # Local tooling
 .playwright-mcp/
+
+# Claude Code local settings (per-machine permissions, not shared)
 .claude/settings.local.json

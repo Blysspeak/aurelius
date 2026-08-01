@@ -5,7 +5,7 @@ use aurelius_core::{
 };
 use serde_json::json;
 
-use super::{node_compact, open_db, resolve_node, truncate};
+use super::{node_compact, open_db, resolve_node, sync_push_if_enabled, truncate};
 
 pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
     let summary = params
@@ -157,6 +157,10 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
                 })
             })
             .collect();
+
+    // US2: push everything new locally for a shared project right after this
+    // session write. Best-effort — never fails memory_session (T022).
+    sync_push_if_enabled(&conn, project);
 
     Ok(json!({
         "id": session.id.to_string(),

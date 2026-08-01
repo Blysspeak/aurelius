@@ -1,13 +1,13 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use aurelius_core::{
-    db, graph, indexer,
+    db, graph, identity, indexer,
     models::{MemoryKind, NodeType, Relation},
     timeforged,
 };
 use serde_json::json;
 use std::path::PathBuf;
 
-use crate::{DbAction, TaskAction};
+use crate::{DbAction, IdentityAction, ShareAction, TaskAction};
 
 use aurelius_core::db::db_path;
 
@@ -98,7 +98,7 @@ pub async fn note(
     Ok(())
 }
 
-pub async fn context(topic: &str, depth: u32) -> Result<()> {
+pub async fn context(topic: &str, depth: u32, verbose: bool) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
     let (nodes, edges) = graph::context(&conn, topic, depth)?;
     if nodes.is_empty() {
@@ -118,8 +118,36 @@ pub async fn context(topic: &str, depth: u32) -> Result<()> {
         if let Some(note) = &node.note {
             println!("    → {note}");
         }
+        if verbose {
+            print_sync_conflict(node);
+        }
     }
     Ok(())
+}
+
+/// T027: surfaces `data._sync_conflict` (see data-model.md's conflict
+/// bookkeeping) — the losing edit a sync conflict retained on this node —
+/// when `au context -v/--verbose` is passed.
+fn print_sync_conflict(node: &aurelius_core::models::Node) {
+    let Some(conflict) = node.data.get("_sync_conflict") else {
+        return;
+    };
+    println!("    ⚠ sync conflict — a losing edit was retained:");
+    if let Some(updated_by) = conflict.get("updated_by").and_then(|v| v.as_str()) {
+        println!("      from: {updated_by}");
+    }
+    if let Some(updated_at) = conflict.get("updated_at").and_then(|v| v.as_str()) {
+        println!("      at:   {updated_at}");
+    }
+    if let Some(note) = conflict.get("note").and_then(|v| v.as_str()) {
+        println!("      note: {note}");
+    }
+    match conflict.get("data") {
+        Some(data) if !data.is_null() && *data != json!({}) => {
+            println!("      data: {data}");
+        }
+        _ => {}
+    }
 }
 
 pub async fn search(query: &str) -> Result<()> {
@@ -332,6 +360,15 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 };
                 println!("  {icon} [{pri}] {} — {st}", t.label);
                 println!("    id: {}", t.id);
+                if let Some(created_by) = &t.created_by {
+                    print!("    by: {created_by}");
+                    match &t.updated_by {
+                        Some(updated_by) if updated_by != created_by => {
+                            println!(" (last: {updated_by})")
+                        }
+                        _ => println!(),
+                    }
+                }
             }
         }
 
@@ -352,6 +389,12 @@ pub async fn task(action: TaskAction) -> Result<()> {
             println!("  ID:       {}", task.id);
             println!("  Status:   {st}");
             println!("  Priority: {pri}");
+            if let Some(created_by) = &task.created_by {
+                println!("  Created by: {created_by}");
+            }
+            if let Some(updated_by) = &task.updated_by {
+                println!("  Last actor: {updated_by}");
+            }
             if let Some(note) = &task.note {
                 println!("  Note:     {note}");
             }
@@ -812,4 +855,342 @@ fn resolve_node_any(conn: &rusqlite::Connection, id: &str) -> Result<aurelius_co
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("node not found: {id}"))
+}
+
+// ---------------------------------------------------------------------------
+// au identity
+// ---------------------------------------------------------------------------
+
+pub async fn identity(action: IdentityAction) -> Result<()> {
+    match action {
+        IdentityAction::Set { name, email } => {
+            let id = identity::Identity { name, email };
+            id.save()?;
+            println!("✓ Identity set: {}", id.as_author());
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// au share
+// ---------------------------------------------------------------------------
+
+// Push/pull, `sync_config` table access, and node/edge selection live in
+// `aurelius_core::sync::client`, shared with `aurelius`'s MCP handlers
+// (memory_status/memory_session automatic sync) — not duplicated here.
+use aurelius_core::sync::client as sync_client;
+use aurelius_core::sync::SyncPullResponse;
+
+pub async fn share(action: ShareAction) -> Result<()> {
+    match action {
+        ShareAction::Issue {
+            project,
+            for_,
+            server,
+        } => share_issue(&project, &for_, &server).await,
+        ShareAction::Revoke {
+            project,
+            for_,
+            server,
+        } => share_revoke(&project, &for_, &server).await,
+        ShareAction::Push { project } => share_push(project).await,
+        ShareAction::Pull { project } => share_pull(project).await,
+        ShareAction::List => share_list().await,
+        ShareAction::Disable { project } => share_disable(&project).await,
+        ShareAction::Connect(args) => {
+            let args: Vec<String> = args
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            if args.len() != 2 {
+                anyhow::bail!("usage: au share <server> <token>");
+            }
+            share_connect(&args[0], &args[1]).await
+        }
+    }
+}
+
+/// Normalizes a `--server`/positional server argument: a bare host becomes
+/// `https://{host}/sync`; anything that already looks like a URL (including
+/// plain `http://` for local testing) is used as-is.
+fn normalize_server(server: &str) -> String {
+    let server = server.trim_end_matches('/');
+    if server.starts_with("http://") || server.starts_with("https://") {
+        server.to_string()
+    } else {
+        format!("https://{server}/sync")
+    }
+}
+
+/// Parses `"Name <email>"` into `(name, email)`.
+fn parse_person(input: &str) -> Result<(String, String)> {
+    let trimmed = input.trim();
+    let (start, end) = match (trimmed.find('<'), trimmed.rfind('>')) {
+        (Some(s), Some(e)) if e > s => (s, e),
+        _ => anyhow::bail!("expected \"Name <email>\" format, got: {trimmed}"),
+    };
+    let name = trimmed[..start].trim().to_string();
+    let email = trimmed[start + 1..end].trim().to_string();
+    if name.is_empty() || email.is_empty() {
+        anyhow::bail!("expected \"Name <email>\" format, got: {trimmed}");
+    }
+    Ok((name, email))
+}
+
+fn admin_token() -> Result<String> {
+    std::env::var("AURELIUS_SYNC_ADMIN_TOKEN").map_err(|_| {
+        anyhow::anyhow!(
+            "AURELIUS_SYNC_ADMIN_TOKEN must be set in the environment for admin commands (au share issue/revoke)"
+        )
+    })
+}
+
+/// [ADMIN] Issues a collaborator token for an EXISTING local project — never
+/// find-or-create, so a typo can't mint access to the wrong/a new project.
+async fn share_issue(project: &str, for_: &str, server: &str) -> Result<()> {
+    let admin_token = admin_token()?;
+    let (person_name, person_email) = parse_person(for_)?;
+
+    let conn = db::open(&db_path())?;
+    let project_node = match graph::find_project_by_label(&conn, project)? {
+        Some(n) => n,
+        None => {
+            let existing = graph::get_nodes_by_type(&conn, &NodeType::Project)?;
+            let labels: Vec<String> = existing.into_iter().map(|n| n.label).collect();
+            if labels.is_empty() {
+                anyhow::bail!("no project named \"{project}\" — no local projects exist yet");
+            }
+            anyhow::bail!(
+                "no project named \"{project}\" — did you mean one of: {}?",
+                labels.join(", ")
+            );
+        }
+    };
+
+    let base_url = normalize_server(server);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base_url}/grants"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "project": project_node.label,
+            "person_name": person_name,
+            "person_email": person_email,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("failed to reach sync server at {base_url}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let token = body
+        .get("token")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("server response missing 'token' field"))?;
+
+    println!(
+        "✓ Issued token for {person_name} <{person_email}> on project '{}'",
+        project_node.label
+    );
+    println!();
+    println!("  {token}");
+    println!();
+    println!("Hand this off to the collaborator out of band. They connect with:");
+    println!("  au share {server} {token}");
+    Ok(())
+}
+
+/// [ADMIN] Revokes a collaborator's access; does not retract data already delivered.
+async fn share_revoke(project: &str, email: &str, server: &str) -> Result<()> {
+    let admin_token = admin_token()?;
+    let base_url = normalize_server(server);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base_url}/grants/revoke"))
+        .bearer_auth(&admin_token)
+        .json(&json!({ "project": project, "person_email": email }))
+        .send()
+        .await
+        .with_context(|| format!("failed to reach sync server at {base_url}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let revoked = body.get("revoked").and_then(|v| v.as_i64()).unwrap_or(0);
+    println!("✓ Revoked {revoked} grant(s) for {email} on project '{project}'");
+    Ok(())
+}
+
+/// `au share <server> <token>` — the only participant-side bootstrap command.
+/// Learns the project's name from the pull response itself (never typed).
+async fn share_connect(server: &str, token: &str) -> Result<()> {
+    if identity::current().is_none() {
+        anyhow::bail!(
+            "no identity configured — run `au identity set --name <name> --email <email>` first"
+        );
+    }
+
+    let base_url = normalize_server(server);
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base_url}/pull?since=0"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach sync server at {base_url}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("server returned {status}: {body}");
+    }
+
+    let pull: SyncPullResponse = resp.json().await?;
+    let conn = db::open(&db_path())?;
+
+    let already_this_config = sync_client::get_sync_config(&conn, &pull.project)?
+        .map(|c| c.server_url == base_url && c.token == token)
+        .unwrap_or(false);
+    let existed_before = graph::find_project_by_label(&conn, &pull.project)?.is_some();
+
+    if existed_before && !already_this_config {
+        println!(
+            "note: local project '{}' already exists — attaching sync to it rather than merging silently",
+            pull.project
+        );
+    }
+
+    // Apply the bootstrapped nodes/edges first — if the server already has
+    // this project (the common case), its own Project node arrives here and
+    // becomes the local anchor. Only fall back to minting a local stub below
+    // if the project still doesn't exist afterward (e.g. connecting before
+    // anyone has pushed yet), so we never create a redundant duplicate
+    // alongside the one the pull just brought down.
+    sync_client::apply_pull(&conn, &pull)?;
+
+    if graph::find_project_by_label(&conn, &pull.project)?.is_none() {
+        graph::add_node(
+            &conn,
+            NodeType::Project,
+            &pull.project,
+            None,
+            "sync",
+            json!({}),
+        )?;
+    }
+    sync_client::upsert_sync_config(
+        &conn,
+        &pull.project,
+        &base_url,
+        token,
+        true,
+        pull.server_seq,
+    )?;
+
+    println!(
+        "✓ Connected '{}' to {base_url} — {} nodes, {} edges bootstrapped",
+        pull.project,
+        pull.nodes.len(),
+        pull.edges.len()
+    );
+    Ok(())
+}
+
+async fn share_push(project: Option<String>) -> Result<()> {
+    let conn = db::open(&db_path())?;
+    let targets = sync_client::resolve_sync_targets(&conn, project.as_deref())?;
+    if targets.is_empty() {
+        println!("No sync-enabled projects.");
+        return Ok(());
+    }
+    let client = reqwest::Client::new();
+    for cfg in &targets {
+        if let Err(e) = push_one(&client, &conn, cfg).await {
+            eprintln!("⚠ push to '{}' failed: {e}", cfg.project_label);
+        }
+    }
+    Ok(())
+}
+
+async fn push_one(
+    client: &reqwest::Client,
+    conn: &rusqlite::Connection,
+    cfg: &sync_client::SyncConfig,
+) -> Result<()> {
+    let push = sync_client::push_project(client, conn, cfg).await?;
+    println!(
+        "✓ Pushed '{}': {} accepted, {} conflicts, server_seq={}",
+        cfg.project_label, push.accepted, push.conflicts, push.server_seq
+    );
+    Ok(())
+}
+
+async fn share_pull(project: Option<String>) -> Result<()> {
+    let conn = db::open(&db_path())?;
+    let targets = sync_client::resolve_sync_targets(&conn, project.as_deref())?;
+    if targets.is_empty() {
+        println!("No sync-enabled projects.");
+        return Ok(());
+    }
+    let client = reqwest::Client::new();
+    for cfg in &targets {
+        if let Err(e) = pull_one(&client, &conn, cfg).await {
+            eprintln!("⚠ pull for '{}' failed: {e}", cfg.project_label);
+        }
+    }
+    Ok(())
+}
+
+async fn pull_one(
+    client: &reqwest::Client,
+    conn: &rusqlite::Connection,
+    cfg: &sync_client::SyncConfig,
+) -> Result<()> {
+    let pull = sync_client::pull_project(client, conn, cfg).await?;
+    println!(
+        "✓ Pulled '{}': {} nodes, {} edges, last_seq={}",
+        cfg.project_label,
+        pull.nodes.len(),
+        pull.edges.len(),
+        pull.server_seq
+    );
+    Ok(())
+}
+
+async fn share_list() -> Result<()> {
+    let conn = db::open(&db_path())?;
+    let configs = sync_client::list_sync_configs(&conn)?;
+    if configs.is_empty() {
+        println!("No projects connected to sync.");
+        return Ok(());
+    }
+    for c in &configs {
+        println!(
+            "{:<20} {:<45} enabled={:<5} last_seq={:<6} updated_at={}",
+            c.project_label, c.server_url, c.enabled, c.last_seq, c.updated_at
+        );
+    }
+    Ok(())
+}
+
+async fn share_disable(project: &str) -> Result<()> {
+    let conn = db::open(&db_path())?;
+    let updated = sync_client::set_sync_enabled(&conn, project, false)?;
+    if !updated {
+        anyhow::bail!(
+            "project '{project}' has no sync_config row — nothing to disable (run `au share <server> <token>` first)"
+        );
+    }
+    println!("✓ Sync disabled for '{project}' (local data untouched)");
+    Ok(())
 }
