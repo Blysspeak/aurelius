@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -39,6 +39,14 @@ type Result<T> = std::result::Result<T, DbError>;
 /// the database through this function — divergent copies would let the CLI and
 /// the MCP server operate on different files while appearing to share one.
 pub fn db_path() -> PathBuf {
+    // AURELIUS_HOME override (test/dev use — see quickstart.md): when set, the
+    // DB lives directly under it instead of the real OS data dir. Unset means
+    // 100% unchanged default behavior.
+    if let Ok(home) = std::env::var("AURELIUS_HOME") {
+        let base = PathBuf::from(home);
+        std::fs::create_dir_all(&base).ok();
+        return base.join("aurelius.db");
+    }
     let base = dirs_next::data_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("aurelius");
@@ -470,6 +478,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 5)?;
     }
 
+    if current < 6 {
+        migrate_v6(&tx)?;
+        set_schema_version(&tx, 6)?;
+    }
+
     tx.commit()?;
     Ok(())
 }
@@ -646,6 +659,72 @@ fn migrate_v5(conn: &Connection) -> Result<()> {
             VALUES (new.rowid, new.query, new.results);
         END;
     ",
+    )?;
+    Ok(())
+}
+
+fn migrate_v6(conn: &Connection) -> Result<()> {
+    // Sync attribution/tombstone/cursor columns on nodes and edges.
+    let node_columns = [
+        "ALTER TABLE nodes ADD COLUMN created_by TEXT",
+        "ALTER TABLE nodes ADD COLUMN updated_by TEXT",
+        "ALTER TABLE nodes ADD COLUMN deleted_at TEXT",
+        "ALTER TABLE nodes ADD COLUMN sync_seq INTEGER",
+    ];
+    for sql in &node_columns {
+        // ALTER TABLE ADD COLUMN IF NOT EXISTS not supported in SQLite,
+        // so we silently ignore "duplicate column" errors
+        match conn.execute(sql, []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    let edge_columns = [
+        "ALTER TABLE edges ADD COLUMN created_by TEXT",
+        "ALTER TABLE edges ADD COLUMN deleted_at TEXT",
+        "ALTER TABLE edges ADD COLUMN sync_seq INTEGER",
+    ];
+    for sql in &edge_columns {
+        match conn.execute(sql, []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column") => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    conn.execute_batch(
+        "
+        -- Client-side, one row per project: sync opt-in and cursor bookkeeping.
+        CREATE TABLE IF NOT EXISTS sync_config (
+            project_label   TEXT PRIMARY KEY,
+            server_url      TEXT NOT NULL,
+            token           TEXT NOT NULL,
+            enabled         BOOLEAN NOT NULL DEFAULT 0,
+            last_seq        INTEGER NOT NULL DEFAULT 0,
+            updated_at      TEXT NOT NULL
+        );
+
+        -- Server-side, one row per issued collaborator token. Looked up by
+        -- token_hash (sha256 of the plaintext token) -- the plaintext itself
+        -- is never stored server-side, only shown once at issuance.
+        CREATE TABLE IF NOT EXISTS collaborator_grants (
+            token_hash      TEXT PRIMARY KEY,
+            person_name     TEXT NOT NULL,
+            person_email    TEXT NOT NULL,
+            project_label   TEXT NOT NULL,
+            granted_at      TEXT NOT NULL,
+            revoked_at      TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_collaborator_grants_project
+            ON collaborator_grants(project_label);
+
+        CREATE INDEX IF NOT EXISTS idx_nodes_sync_seq ON nodes(sync_seq);
+        CREATE INDEX IF NOT EXISTS idx_edges_sync_seq ON edges(sync_seq);
+        CREATE INDEX IF NOT EXISTS idx_nodes_deleted_at ON nodes(deleted_at);
+        ",
     )?;
     Ok(())
 }

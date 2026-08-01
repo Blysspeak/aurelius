@@ -1,6 +1,6 @@
 [package]
-name = "au"
-description = "Aurelius CLI"
+name = "aurelius-sync-server"
+description = "Self-hosted HTTP sync server for Aurelius project sharing"
 
 [package.version]
 workspace = true
@@ -13,25 +13,28 @@ workspace = true
 [package.repository]
 workspace = true
 
+[lib]
+name = "aurelius_sync_server"
+path = "src/lib.rs"
+
 [[bin]]
-name = "au"
+name = "aurelius-sync-server"
 path = "src/main.rs"
 
 [dependencies]
 aurelius-core = { path = "../aurelius-core" }
-aurelius = { path = "../aurelius" }
-anyhow = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
-clap = { workspace = true }
+anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-dirs-next = { workspace = true }
-chrono = { workspace = true }
-uuid = { workspace = true }
+clap = { workspace = true }
 rusqlite = { workspace = true }
-axum = { workspace = true }
-open = { workspace = true }
-rust-embed = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
 reqwest = { workspace = true }

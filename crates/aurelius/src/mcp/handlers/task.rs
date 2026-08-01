@@ -89,6 +89,7 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
         "priority": priority,
         "project": project,
         "created": true,
+        "created_by": task.created_by,
     }))
 }
 
@@ -140,6 +141,7 @@ pub fn task_update(params: &serde_json::Value) -> Result<serde_json::Value> {
         "status": data["status"],
         "priority": data["priority"],
         "updated": true,
+        "updated_by": aurelius_core::identity::current().map(|i| i.as_author()),
     }))
 }
 
@@ -175,6 +177,8 @@ pub fn task_list(params: &serde_json::Value) -> Result<serde_json::Value> {
                 "work_logs": log_count,
                 "created_at": t.created_at.to_rfc3339(),
                 "note": t.note,
+                "created_by": t.created_by,
+                "updated_by": t.updated_by,
             })
         })
         .collect();
