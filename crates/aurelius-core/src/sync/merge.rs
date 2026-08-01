@@ -204,6 +204,13 @@ fn upsert_node(conn: &Connection, node: &Node, seq: &mut i64) -> Result<PushOutc
             replace_node_row(conn, node, &data, *seq)?;
             Ok(PushOutcome::Accepted)
         }
+        // Equal `updated_at` means the client is re-sending a version it
+        // already has in sync (e.g. re-pushing its full project membership
+        // set, which includes nodes it only ever pulled and never edited) —
+        // not a genuine race. Treat as a true no-op: no data mutation, no
+        // conflict recorded. A real conflict requires a strictly older,
+        // divergent edit (handled below).
+        Some(existing) if node.updated_at == existing.updated_at => Ok(PushOutcome::NoOp),
         Some(existing) => {
             stash_conflict_onto_existing(conn, &id_str, &existing, node)?;
             Ok(PushOutcome::Conflict)
@@ -493,6 +500,33 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("from the losing side")
         );
+    }
+
+    /// A client re-pushing its full project membership set (unconditionally,
+    /// not just deltas) will resend nodes it only ever pulled and never
+    /// edited — same `updated_at` it already has in sync. That must be a
+    /// true no-op, not a spurious conflict: no `_sync_conflict` stashed, no
+    /// data mutation, `conflicts` stays 0.
+    #[test]
+    fn identical_repush_with_equal_updated_at_is_a_true_noop() {
+        let conn = setup();
+        let node = make_node("decision-1", "unchanged", Utc::now());
+        apply_push(&conn, "proj", std::slice::from_ref(&node), &[]).expect("initial push ok");
+
+        // Same node, same updated_at, as if it were pulled and pushed back
+        // unmodified.
+        let resp = apply_push(&conn, "proj", std::slice::from_ref(&node), &[]).expect("repush ok");
+
+        assert_eq!(resp.accepted, 0);
+        assert_eq!(resp.conflicts, 0);
+
+        let stored = fetch_node(&conn, &node.id.to_string()).unwrap().unwrap();
+        assert_eq!(stored.note.as_deref(), Some("unchanged"));
+        assert!(
+            stored.data.get("_sync_conflict").is_none(),
+            "an identical re-push must not stash a bogus conflict"
+        );
+        assert_eq!(stored.sync_seq, Some(1), "no new seq assigned for a no-op");
     }
 
     #[test]
