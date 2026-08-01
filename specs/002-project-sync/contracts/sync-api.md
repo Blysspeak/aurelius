@@ -10,7 +10,7 @@ is a single opaque credential (see data-model.md's `CollaboratorGrant`) that
 unambiguously resolves to exactly one `(project_label, person)` — **the
 project is never a separate client-supplied parameter**; it's always
 resolved server-side from the token. This is what lets the client-side flow
-be a single `au sync {server} {token}` command with no project name to type.
+be a single `au share {server} {token}` command with no project name to type.
 The server never stores the plaintext token, only `sha256(token)`; an
 incoming request is authenticated by hashing the supplied token and matching
 it against `collaborator_grants.token_hash`.
@@ -84,7 +84,7 @@ Client sends everything new/changed locally since its last successful push.
 
 ## `POST /sync/grants` (admin-only, token issuance)
 
-Used by `au sync issue <project> --for "Name <email>"` (owner-side) to mint a
+Used by `au share issue <project> --for "Name <email>"` (owner-side) to mint a
 new collaborator token. Protected by a separate admin credential (the
 `AURELIUS_SYNC_ADMIN_TOKEN` the server was started with), not a
 `CollaboratorGrant` — issuing access to a project is an administrative act,

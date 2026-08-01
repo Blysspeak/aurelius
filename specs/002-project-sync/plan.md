@@ -96,7 +96,7 @@ crates/
 │       └── mcp/handlers/status.rs, session.rs   # memory_status triggers pull; memory_session triggers push, for shared projects only
 └── au/
     └── src/
-        └── commands.rs          # + `au identity set`, `au sync issue|<server> <token>|disable|push|pull` subcommands
+        └── commands.rs          # + `au identity set`, `au share issue|<server> <token>|disable|push|pull` subcommands
 contrib/
 └── claude-code/
     └── aurelius-reindex.sh      # extended: push after reindex, for projects with sync enabled
