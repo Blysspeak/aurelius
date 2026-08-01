@@ -15,19 +15,12 @@ pub use task::*;
 use aurelius_core::{db, graph, models::NodeType, models::Relation};
 use rusqlite::Connection;
 use serde_json::json;
-use std::path::PathBuf;
 use uuid::Uuid;
 
-pub(crate) fn db_path() -> PathBuf {
-    let base = dirs_next::data_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("aurelius");
-    std::fs::create_dir_all(&base).ok();
-    base.join("aurelius.db")
-}
+pub(crate) use aurelius_core::db::db_path;
 
 pub(crate) fn open_db() -> anyhow::Result<Connection> {
-    db::open(&db_path())
+    Ok(db::open(&db_path())?)
 }
 
 // ---------------------------------------------------------------------------

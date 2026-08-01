@@ -1,9 +1,10 @@
 {
   "ai": "claude",
   "ai_skills": true,
-  "feature_numbering": "sequential",
+  "branch_numbering": "sequential",
+  "context_file": "CLAUDE.md",
   "here": true,
   "integration": "claude",
   "script": "sh",
-  "speckit_version": "0.15.2.dev0"
+  "speckit_version": "0.8.2"
 }
