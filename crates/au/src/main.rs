@@ -115,10 +115,19 @@ pub enum DbAction {
 }
 
 #[derive(Subcommand)]
-#[command(after_help = "The most common command has no subcommand name — it's just:\n\n    au share <SERVER> <TOKEN>\n\nRun that once per project to connect it (using a token from `au share issue`,\nor one someone else gave you). This attaches the project sync learns the\nname from the server, so there's nothing else to type.")]
+#[command(
+    after_help = "The most common command has no subcommand name — it's just:\n\n    au share <SERVER> <TOKEN>\n\nRun that once per project to connect it (using a token from `au share issue`,\nor one someone else gave you). This attaches the project; sync learns the\nname from the server, so there's nothing else to type.\n\nRunning your own server? `au share admin-set <SERVER> <TOKEN>` once, using\nthe AURELIUS_SYNC_ADMIN_TOKEN you gave the server — after that, `issue` and\n`revoke` pick it up automatically, no per-session env var needed."
+)]
 pub enum ShareAction {
+    /// [ADMIN] Store this machine's admin token for a server, so `issue`/
+    /// `revoke` don't need AURELIUS_SYNC_ADMIN_TOKEN set every session
+    AdminSet {
+        /// Sync server host or URL
+        server: String,
+        /// The admin token the server was started with (AURELIUS_SYNC_ADMIN_TOKEN)
+        token: String,
+    },
     /// [ADMIN] Issue a collaborator a token for an existing local project
-    /// (requires AURELIUS_SYNC_ADMIN_TOKEN in the environment)
     Issue {
         /// Project label — must already exist locally
         project: String,
@@ -132,7 +141,6 @@ pub enum ShareAction {
         server: String,
     },
     /// [ADMIN] Revoke a collaborator's access to a project
-    /// (requires AURELIUS_SYNC_ADMIN_TOKEN in the environment)
     Revoke {
         /// Project label
         project: String,
