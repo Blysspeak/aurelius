@@ -82,8 +82,9 @@ referenced by FR-007.
   soft-deleted row is never revived by sync; a client that still has an old
   live copy will receive the tombstone on next pull and soft-delete its own
   copy to match.
-- **SyncConfig.enabled**: `off` → `on` (via `au share <server> <uuid> <secret>`)
+- **SyncConfig.enabled**: `off` → `on` (via `au share <server> <token>`)
   triggers a full bootstrap pull (FR-004); `on` → `off` (`au share disable
   <project>`) stops future sync but does not delete already-synced local data.
-- **CollaboratorGrant**: `active` (`revoked_at IS NULL`) → `revoked`. Checked
+- **CollaboratorGrant**: `active` (`revoked_at IS NULL`) → `revoked`, via
+  `au share revoke <project> --for <email>` (owner-side). Checked
   on every push/pull request; a revoked credential is rejected.

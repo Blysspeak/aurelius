@@ -107,6 +107,31 @@ ever stores its hash):
 
 **Errors**: `401` (bad/missing admin token), `422` (malformed payload).
 
+## `POST /sync/grants/revoke` (admin-only, token revocation)
+
+Used by `au share revoke <project> --for <email>` (owner-side). Same admin
+auth as `/sync/grants`.
+
+**Request headers**: `Authorization: Bearer {admin_token}`
+
+**Request body**:
+
+```json
+{ "project": "aurelius", "person_email": "tester@example.com" }
+```
+
+Sets `revoked_at` on every matching, not-yet-revoked `collaborator_grants`
+row for that `(project, person_email)` (normally one, but revokes all if a
+person was issued more than one token for the same project). Revocation
+stops future push/pull with that token (checked on every request); it does
+not retract data already delivered to that collaborator's instance (matches
+spec.md's Edge Cases section).
+
+**Response** `200`: `{ "revoked": 1 }`
+
+**Errors**: `401`, `422` (malformed payload). Revoking a project/email with
+no matching active grant is NOT an error — responds `{ "revoked": 0 }`.
+
 ## Failure semantics (push/pull)
 
 - Network failure, timeout, or `5xx`: caller (client) logs a warning and
