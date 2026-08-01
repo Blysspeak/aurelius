@@ -16,7 +16,13 @@ services:
     image: aurelius-sync-server:latest
     restart: unless-stopped
     ports:
-      - "${AURELIUS_SYNC_PORT:-8181}:8181"
+      # Loopback-only by default: this is meant to sit behind a reverse
+      # proxy (nginx/caddy/traefik) that terminates TLS, not be reachable
+      # directly. Docker's own iptables rules for a published port can
+      # bypass host firewalls like ufw entirely, so binding 0.0.0.0 here
+      # would silently expose the admin token-issuance endpoint to the
+      # public internet regardless of any firewall configured on the host.
+      - "127.0.0.1:${AURELIUS_SYNC_PORT:-8181}:8181"
     environment:
       # Required — protects POST /sync/grants and /sync/grants/revoke.
       # Generate your own, e.g.: openssl rand -hex 32
