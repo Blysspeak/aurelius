@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -483,6 +483,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 6)?;
     }
 
+    if current < 7 {
+        migrate_v7(&tx)?;
+        set_schema_version(&tx, 7)?;
+    }
+
     tx.commit()?;
     Ok(())
 }
@@ -724,6 +729,23 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_nodes_sync_seq ON nodes(sync_seq);
         CREATE INDEX IF NOT EXISTS idx_edges_sync_seq ON edges(sync_seq);
         CREATE INDEX IF NOT EXISTS idx_nodes_deleted_at ON nodes(deleted_at);
+        ",
+    )?;
+    Ok(())
+}
+
+/// Client-side, one row per sync server this machine administers. Lets
+/// `au share issue`/`au share revoke` resolve the admin token from a prior
+/// `au share admin-set <server> <token>` instead of requiring
+/// AURELIUS_SYNC_ADMIN_TOKEN to be re-exported every session.
+fn migrate_v7(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS admin_tokens (
+            server_url  TEXT PRIMARY KEY,
+            token       TEXT NOT NULL,
+            saved_at    TEXT NOT NULL
+        );
         ",
     )?;
     Ok(())
