@@ -122,9 +122,11 @@ pub enum ShareAction {
     Issue {
         /// Project label — must already exist locally
         project: String,
-        /// Collaborator identity, e.g. "Tester <tester@example.com>"
+        /// Who the token is for, e.g. "Tester <tester@example.com>". Defaults
+        /// to your own `au identity set` when issuing a token for yourself
+        /// (e.g. to connect this same project from another machine).
         #[arg(long = "for")]
-        for_: String,
+        for_: Option<String>,
         /// Sync server host or URL, e.g. aurelius.boostix.space or http://localhost:8181/sync
         #[arg(long)]
         server: String,
