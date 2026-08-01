@@ -397,7 +397,7 @@ pub fn task_stats(params: &serde_json::Value) -> Result<serde_json::Value> {
         None
     } else {
         let mid = completion_hours.len() / 2;
-        Some(if completion_hours.len() % 2 == 0 {
+        Some(if completion_hours.len().is_multiple_of(2) {
             (completion_hours[mid - 1] + completion_hours[mid]) / 2.0
         } else {
             completion_hours[mid]

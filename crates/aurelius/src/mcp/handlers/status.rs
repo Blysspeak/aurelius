@@ -21,7 +21,7 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
     let projects = graph::search_typed(&conn, "*", &NodeType::Project, 10)?;
     let crates = graph::search_typed(&conn, "*", &NodeType::Crate, 20)?;
     let mut skills = graph::get_nodes_by_type(&conn, &NodeType::Skill)?;
-    skills.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+    skills.sort_by_key(|n| std::cmp::Reverse(n.access_count));
     let total_nodes = graph::count_nodes(&conn)?;
     let total_edges = graph::count_edges(&conn)?;
 

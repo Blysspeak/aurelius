@@ -3,7 +3,9 @@ use aurelius_core::{graph, indexer, models::MemoryKind};
 use serde_json::json;
 use uuid::Uuid;
 
-use super::{edge_brief, node_detail, open_db, parse_node_type, parse_relation, parse_since, resolve_node};
+use super::{
+    edge_brief, node_detail, open_db, parse_node_type, parse_relation, parse_since, resolve_node,
+};
 
 pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     let query = params
@@ -73,10 +75,9 @@ pub fn memory_context(params: &serde_json::Value) -> Result<serde_json::Value> {
     let relevant_edges: Vec<serde_json::Value> = edges
         .iter()
         .filter(|e| {
-            node_ids.contains(&e.from_id.to_string())
-                && node_ids.contains(&e.to_id.to_string())
+            node_ids.contains(&e.from_id.to_string()) && node_ids.contains(&e.to_id.to_string())
         })
-        .map(|e| edge_brief(e))
+        .map(edge_brief)
         .collect();
 
     Ok(json!({
@@ -94,9 +95,15 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         .get("label")
         .and_then(|l| l.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'label' parameter"))?;
-    let type_str = params.get("type").and_then(|t| t.as_str()).unwrap_or("concept");
+    let type_str = params
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("concept");
     let note = params.get("note").and_then(|n| n.as_str());
-    let source = params.get("source").and_then(|s| s.as_str()).unwrap_or("mcp");
+    let source = params
+        .get("source")
+        .and_then(|s| s.as_str())
+        .unwrap_or("mcp");
     let data = params.get("data").cloned().unwrap_or(json!({}));
     let memory_kind = match params.get("memory_kind").and_then(|m| m.as_str()) {
         Some("episodic") => MemoryKind::Episodic,
@@ -105,7 +112,16 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     let node_type = parse_node_type(type_str);
     let conn = open_db()?;
-    let node = graph::add_node_full(&conn, node_type, label, note, source, data, memory_kind, None)?;
+    let node = graph::add_node_full(
+        &conn,
+        node_type,
+        label,
+        note,
+        source,
+        data,
+        memory_kind,
+        None,
+    )?;
 
     Ok(json!({
         "id": node.id.to_string(),
@@ -117,11 +133,17 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
 }
 
 pub fn memory_relate(params: &serde_json::Value) -> Result<serde_json::Value> {
-    let from_str = params.get("from").and_then(|f| f.as_str())
+    let from_str = params
+        .get("from")
+        .and_then(|f| f.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'from' parameter"))?;
-    let to_str = params.get("to").and_then(|t| t.as_str())
+    let to_str = params
+        .get("to")
+        .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'to' parameter"))?;
-    let relation_str = params.get("relation").and_then(|r| r.as_str())
+    let relation_str = params
+        .get("relation")
+        .and_then(|r| r.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'relation' parameter"))?;
     let weight = params.get("weight").and_then(|w| w.as_f64()).unwrap_or(1.0) as f32;
 
@@ -141,7 +163,9 @@ pub fn memory_relate(params: &serde_json::Value) -> Result<serde_json::Value> {
 }
 
 pub fn memory_update(params: &serde_json::Value) -> Result<serde_json::Value> {
-    let identifier = params.get("id").and_then(|i| i.as_str())
+    let identifier = params
+        .get("id")
+        .and_then(|i| i.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'id' parameter (UUID or label)"))?;
     let note = params.get("note").and_then(|n| n.as_str());
     let data = params.get("data").cloned();
@@ -162,7 +186,9 @@ pub fn memory_update(params: &serde_json::Value) -> Result<serde_json::Value> {
 }
 
 pub fn memory_index(params: &serde_json::Value) -> Result<serde_json::Value> {
-    let path = params.get("path").and_then(|p| p.as_str())
+    let path = params
+        .get("path")
+        .and_then(|p| p.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'path' parameter"))?;
 
     let conn = open_db()?;
@@ -180,9 +206,12 @@ pub fn memory_index(params: &serde_json::Value) -> Result<serde_json::Value> {
 }
 
 pub fn memory_forget(params: &serde_json::Value) -> Result<serde_json::Value> {
-    let id_str = params.get("id").and_then(|i| i.as_str())
+    let id_str = params
+        .get("id")
+        .and_then(|i| i.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'id' parameter"))?;
-    let id: Uuid = id_str.parse()
+    let id: Uuid = id_str
+        .parse()
         .map_err(|_| anyhow::anyhow!("invalid UUID: {id_str}"))?;
 
     let conn = open_db()?;
@@ -212,9 +241,13 @@ pub fn memory_dump(params: &serde_json::Value) -> Result<serde_json::Value> {
 }
 
 pub fn memory_merge(params: &serde_json::Value) -> Result<serde_json::Value> {
-    let source = params.get("source").and_then(|s| s.as_str())
+    let source = params
+        .get("source")
+        .and_then(|s| s.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'source' parameter"))?;
-    let target = params.get("target").and_then(|t| t.as_str())
+    let target = params
+        .get("target")
+        .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'target' parameter"))?;
 
     let conn = open_db()?;
@@ -238,19 +271,22 @@ pub fn memory_gc() -> Result<serde_json::Value> {
     let dup_edges = conn.execute(
         "DELETE FROM edges WHERE id NOT IN (
             SELECT MIN(id) FROM edges GROUP BY from_id, to_id, relation
-        )", [],
+        )",
+        [],
     )?;
 
     let orphan_edges = conn.execute(
         "DELETE FROM edges WHERE
             from_id NOT IN (SELECT id FROM nodes) OR
-            to_id NOT IN (SELECT id FROM nodes)", [],
+            to_id NOT IN (SELECT id FROM nodes)",
+        [],
     )?;
 
     let dup_nodes = conn.execute(
         "DELETE FROM nodes WHERE content_hash IS NOT NULL AND id NOT IN (
             SELECT MIN(id) FROM nodes WHERE content_hash IS NOT NULL GROUP BY content_hash
-        )", [],
+        )",
+        [],
     )?;
 
     Ok(json!({

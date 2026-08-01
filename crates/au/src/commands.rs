@@ -10,6 +10,14 @@ use std::path::PathBuf;
 use crate::{IdentityAction, ShareAction, TaskAction};
 
 fn db_path() -> PathBuf {
+    // AURELIUS_HOME override (test/dev use — see quickstart.md): when set, the
+    // DB lives directly under it instead of the real OS data dir. Unset means
+    // 100% unchanged default behavior.
+    if let Ok(home) = std::env::var("AURELIUS_HOME") {
+        let base = PathBuf::from(home);
+        std::fs::create_dir_all(&base).ok();
+        return base.join("aurelius.db");
+    }
     let base = dirs_next::data_dir()
         .unwrap_or_else(|| PathBuf::from("~/.local/share"))
         .join("aurelius");
@@ -624,7 +632,7 @@ fn task_stats_cli(
         None
     } else {
         let mid = completion_hours.len() / 2;
-        Some(if completion_hours.len() % 2 == 0 {
+        Some(if completion_hours.len().is_multiple_of(2) {
             (completion_hours[mid - 1] + completion_hours[mid]) / 2.0
         } else {
             completion_hours[mid]
@@ -695,7 +703,7 @@ pub async fn skills(hook: bool) -> Result<()> {
     let conn = db::open(&db_path())?;
     let mut skills = graph::get_nodes_by_type(&conn, &NodeType::Skill)?;
     // Most-used first — the index leads with battle-tested skills.
-    skills.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+    skills.sort_by_key(|n| std::cmp::Reverse(n.access_count));
 
     if skills.is_empty() {
         if !hook {
@@ -990,28 +998,33 @@ async fn share_connect(server: &str, token: &str) -> Result<()> {
     let already_this_config = sync_client::get_sync_config(&conn, &pull.project)?
         .map(|c| c.server_url == base_url && c.token == token)
         .unwrap_or(false);
+    let existed_before = graph::find_project_by_label(&conn, &pull.project)?.is_some();
 
-    match graph::find_project_by_label(&conn, &pull.project)? {
-        Some(_) if !already_this_config => {
-            println!(
-                "note: local project '{}' already exists — attaching sync to it rather than merging silently",
-                pull.project
-            );
-        }
-        Some(_) => {}
-        None => {
-            graph::add_node(
-                &conn,
-                NodeType::Project,
-                &pull.project,
-                None,
-                "sync",
-                json!({}),
-            )?;
-        }
+    if existed_before && !already_this_config {
+        println!(
+            "note: local project '{}' already exists — attaching sync to it rather than merging silently",
+            pull.project
+        );
     }
 
+    // Apply the bootstrapped nodes/edges first — if the server already has
+    // this project (the common case), its own Project node arrives here and
+    // becomes the local anchor. Only fall back to minting a local stub below
+    // if the project still doesn't exist afterward (e.g. connecting before
+    // anyone has pushed yet), so we never create a redundant duplicate
+    // alongside the one the pull just brought down.
     sync_client::apply_pull(&conn, &pull)?;
+
+    if graph::find_project_by_label(&conn, &pull.project)?.is_none() {
+        graph::add_node(
+            &conn,
+            NodeType::Project,
+            &pull.project,
+            None,
+            "sync",
+            json!({}),
+        )?;
+    }
     sync_client::upsert_sync_config(
         &conn,
         &pull.project,

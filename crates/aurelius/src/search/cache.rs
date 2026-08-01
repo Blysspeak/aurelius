@@ -101,7 +101,10 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Cached
 /// Remove expired cache entries.
 pub fn cleanup(conn: &Connection) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
-    let deleted = conn.execute("DELETE FROM search_cache WHERE expires_at <= ?1", params![now])?;
+    let deleted = conn.execute(
+        "DELETE FROM search_cache WHERE expires_at <= ?1",
+        params![now],
+    )?;
     Ok(deleted)
 }
 

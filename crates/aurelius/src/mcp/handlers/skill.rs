@@ -1,5 +1,8 @@
 use anyhow::Result;
-use aurelius_core::{graph, models::{MemoryKind, Node, NodeType}};
+use aurelius_core::{
+    graph,
+    models::{MemoryKind, Node, NodeType},
+};
 use serde_json::json;
 
 use super::open_db;
@@ -9,7 +12,11 @@ fn tags_of(node: &Node) -> Vec<String> {
     node.data
         .get("tags")
         .and_then(|t| t.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -43,7 +50,11 @@ pub fn skill_save(params: &serde_json::Value) -> Result<serde_json::Value> {
     let tags: Vec<String> = params
         .get("tags")
         .and_then(|t| t.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
         .unwrap_or_default();
 
     let data = json!({ "body": body, "tags": tags });
@@ -85,7 +96,10 @@ pub fn skill_save(params: &serde_json::Value) -> Result<serde_json::Value> {
 /// Ranked by usage (access_count) so the most battle-tested skills surface first.
 /// Optional `query` filters via FTS over name/trigger; optional `tag` filters by tag.
 pub fn skill_list(params: &serde_json::Value) -> Result<serde_json::Value> {
-    let query = params.get("query").and_then(|q| q.as_str()).filter(|s| !s.trim().is_empty());
+    let query = params
+        .get("query")
+        .and_then(|q| q.as_str())
+        .filter(|s| !s.trim().is_empty());
     let tag = params.get("tag").and_then(|t| t.as_str());
     let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(200) as usize;
 
@@ -95,7 +109,7 @@ pub fn skill_list(params: &serde_json::Value) -> Result<serde_json::Value> {
         Some(q) => graph::search_typed(&conn, q, &NodeType::Skill, limit)?,
         None => {
             let mut all = graph::get_nodes_by_type(&conn, &NodeType::Skill)?;
-            all.sort_by(|a, b| b.access_count.cmp(&a.access_count));
+            all.sort_by_key(|n| std::cmp::Reverse(n.access_count));
             all
         }
     };
@@ -125,8 +139,8 @@ pub fn skill_get(params: &serde_json::Value) -> Result<serde_json::Value> {
     let conn = open_db()?;
 
     // 1. Exact label match.
-    let exact = graph::find_node_by_label(&conn, name)?
-        .filter(|n| matches!(n.node_type, NodeType::Skill));
+    let exact =
+        graph::find_node_by_label(&conn, name)?.filter(|n| matches!(n.node_type, NodeType::Skill));
 
     let (node, matched_by) = match exact {
         Some(n) => (n, "exact"),
@@ -135,10 +149,17 @@ pub fn skill_get(params: &serde_json::Value) -> Result<serde_json::Value> {
             let mut hits = graph::search_typed(&conn, name, &NodeType::Skill, 5)?;
             if hits.is_empty() {
                 let available: Vec<String> = graph::get_nodes_by_type(&conn, &NodeType::Skill)?
-                    .into_iter().take(15).map(|n| n.label).collect();
+                    .into_iter()
+                    .take(15)
+                    .map(|n| n.label)
+                    .collect();
                 anyhow::bail!(
                     "skill not found: '{name}'. Available skills: {}",
-                    if available.is_empty() { "(none yet)".to_string() } else { available.join(", ") }
+                    if available.is_empty() {
+                        "(none yet)".to_string()
+                    } else {
+                        available.join(", ")
+                    }
                 );
             }
             let best = hits.remove(0);
