@@ -47,6 +47,14 @@ pub(crate) fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         last_accessed_at,
         access_count: row.get(10).unwrap_or(0),
         content_hash: row.get(11).ok().and_then(|v: Option<String>| v),
+        created_by: row.get(12).ok().and_then(|v: Option<String>| v),
+        updated_by: row.get(13).ok().and_then(|v: Option<String>| v),
+        deleted_at: row
+            .get::<_, Option<String>>(14)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok()),
+        sync_seq: row.get(15).ok().and_then(|v: Option<i64>| v),
     })
 }
 
@@ -71,5 +79,12 @@ pub(crate) fn row_to_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<Edge> {
             .get::<_, String>(5)?
             .parse()
             .map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?,
+        created_by: row.get(6).ok().and_then(|v: Option<String>| v),
+        deleted_at: row
+            .get::<_, Option<String>>(7)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok()),
+        sync_seq: row.get(8).ok().and_then(|v: Option<i64>| v),
     })
 }
