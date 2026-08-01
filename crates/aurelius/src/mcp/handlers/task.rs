@@ -61,12 +61,12 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
             json!({"auto_created": true}),
         )?,
     };
-    graph::add_edge(&conn, task.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
+    graph::add_edge(&conn, task.id, proj_node.id, Relation::BelongsTo, 1.0)?;
 
     // Parent task (subtask_of)
     if let Some(parent_id) = params.get("parent").and_then(|p| p.as_str()) {
         if let Ok(parent) = resolve_node(&conn, parent_id) {
-            graph::add_edge(&conn, task.id, parent.id, Relation::SubtaskOf, 1.0).ok();
+            graph::add_edge(&conn, task.id, parent.id, Relation::SubtaskOf, 1.0)?;
         }
     }
 
@@ -75,7 +75,7 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
         for blocked in blocks {
             if let Some(blocked_id) = blocked.as_str() {
                 if let Ok(blocked_node) = resolve_node(&conn, blocked_id) {
-                    graph::add_edge(&conn, task.id, blocked_node.id, Relation::Blocks, 1.0).ok();
+                    graph::add_edge(&conn, task.id, blocked_node.id, Relation::Blocks, 1.0)?;
                 }
             }
         }
@@ -240,11 +240,11 @@ pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
     )?;
 
     // Link: task --contains--> worklog
-    graph::add_edge(&conn, task.id, log_node.id, Relation::Contains, 1.0).ok();
+    graph::add_edge(&conn, task.id, log_node.id, Relation::Contains, 1.0)?;
 
     // Link worklog to project
     if let Ok(Some(proj_node)) = graph::find_project_by_label(&conn, project) {
-        graph::add_edge(&conn, log_node.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
+        graph::add_edge(&conn, log_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
     }
 
     let mut created_nodes = vec![node_compact(&log_node)];
@@ -261,11 +261,10 @@ pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
                     "mcp-task",
                     json!({"task_id": task.id.to_string()}),
                 )?;
-                graph::add_edge(&conn, task.id, dec_node.id, Relation::Contains, 1.0).ok();
-                graph::add_edge(&conn, log_node.id, dec_node.id, Relation::Contains, 1.0).ok();
+                graph::add_edge(&conn, task.id, dec_node.id, Relation::Contains, 1.0)?;
+                graph::add_edge(&conn, log_node.id, dec_node.id, Relation::Contains, 1.0)?;
                 if let Ok(Some(proj_node)) = graph::find_project_by_label(&conn, project) {
-                    graph::add_edge(&conn, dec_node.id, proj_node.id, Relation::BelongsTo, 1.0)
-                        .ok();
+                    graph::add_edge(&conn, dec_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
                 }
                 created_nodes.push(node_compact(&dec_node));
             }
@@ -294,15 +293,13 @@ pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
                     "mcp-task",
                     json!({"task_id": task.id.to_string()}),
                 )?;
-                graph::add_edge(&conn, sol_node.id, prob_node.id, Relation::Solves, 1.0).ok();
-                graph::add_edge(&conn, task.id, prob_node.id, Relation::Contains, 1.0).ok();
-                graph::add_edge(&conn, task.id, sol_node.id, Relation::Contains, 1.0).ok();
-                graph::add_edge(&conn, log_node.id, prob_node.id, Relation::Contains, 1.0).ok();
+                graph::add_edge(&conn, sol_node.id, prob_node.id, Relation::Solves, 1.0)?;
+                graph::add_edge(&conn, task.id, prob_node.id, Relation::Contains, 1.0)?;
+                graph::add_edge(&conn, task.id, sol_node.id, Relation::Contains, 1.0)?;
+                graph::add_edge(&conn, log_node.id, prob_node.id, Relation::Contains, 1.0)?;
                 if let Ok(Some(proj_node)) = graph::find_project_by_label(&conn, project) {
-                    graph::add_edge(&conn, prob_node.id, proj_node.id, Relation::BelongsTo, 1.0)
-                        .ok();
-                    graph::add_edge(&conn, sol_node.id, proj_node.id, Relation::BelongsTo, 1.0)
-                        .ok();
+                    graph::add_edge(&conn, prob_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
+                    graph::add_edge(&conn, sol_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
                 }
                 created_nodes.push(node_compact(&prob_node));
                 created_nodes.push(node_compact(&sol_node));
@@ -440,7 +437,10 @@ pub fn task_view(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     let conn = open_db()?;
     let task = resolve_node(&conn, id)?;
-    graph::touch_node(&conn, task.id).ok();
+    // Best effort by design: an access counter must never fail a read.
+    if let Err(e) = graph::touch_node(&conn, task.id) {
+        tracing::warn!("could not record access for {}: {e}", task.id);
+    }
 
     // BFS from task node, depth 2
     let (nodes, edges) = graph::context_from_id(&conn, &task.id.to_string(), 2)?;

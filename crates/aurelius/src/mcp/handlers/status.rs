@@ -10,7 +10,10 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     // Auto-index current working directory if not yet indexed
     if let Ok(cwd) = std::env::current_dir() {
-        indexer::ensure_indexed(&conn, &cwd).ok();
+        // Opportunistic: a failed auto-index must not fail the status call.
+        if let Err(e) = indexer::ensure_indexed(&conn, &cwd) {
+            tracing::warn!("could not auto-index {}: {e}", cwd.display());
+        }
     }
 
     // US2: pull any pending sync updates for a shared project before reading
@@ -21,7 +24,7 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
     let projects = graph::search_typed(&conn, "*", &NodeType::Project, 10)?;
     let crates = graph::search_typed(&conn, "*", &NodeType::Crate, 20)?;
     let mut skills = graph::get_nodes_by_type(&conn, &NodeType::Skill)?;
-    skills.sort_by_key(|n| std::cmp::Reverse(n.access_count));
+    skills.sort_by_key(|s| std::cmp::Reverse(s.access_count));
     let total_nodes = graph::count_nodes(&conn)?;
     let total_edges = graph::count_edges(&conn)?;
 

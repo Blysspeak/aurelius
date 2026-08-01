@@ -401,8 +401,36 @@ mod tests {
     use super::*;
     use crate::db;
 
-    fn setup() -> Connection {
-        db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    /// A real temp-file database, not `:memory:` — SQLite's in-memory mode
+    /// can never report journal_mode=WAL, and `db::open`'s `ensure_wal` gate
+    /// now hard-rejects anything else. Kept alive for the test's duration so
+    /// the file isn't removed out from under the open `Connection`; cleans
+    /// up its `-wal`/`-shm` siblings on drop.
+    struct TmpDb(std::path::PathBuf);
+
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "aurelius-crud-test-{tag}-{}.db",
+                uuid::Uuid::new_v4()
+            )))
+        }
+    }
+
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+            }
+        }
+    }
+
+    fn setup() -> (TmpDb, Connection) {
+        let tmp = TmpDb::new("setup");
+        let conn = db::open(&tmp.0).expect("open temp db");
+        (tmp, conn)
     }
 
     /// T025: `memory_forget` (MCP) and any future CLI equivalent both go
@@ -413,7 +441,7 @@ mod tests {
     /// on `delete_node`).
     #[test]
     fn delete_node_bumps_updated_at_in_lockstep_with_deleted_at() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let node = add_node(
             &conn,
             NodeType::Decision,

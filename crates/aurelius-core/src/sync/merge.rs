@@ -375,8 +375,36 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    fn setup() -> Connection {
-        db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    /// A real temp-file database, not `:memory:` — SQLite's in-memory mode
+    /// can never report journal_mode=WAL, and `db::open`'s `ensure_wal` gate
+    /// now hard-rejects anything else. Kept alive for the test's duration so
+    /// the file isn't removed out from under the open `Connection`; cleans
+    /// up its `-wal`/`-shm` siblings on drop.
+    struct TmpDb(std::path::PathBuf);
+
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("aurelius-merge-test-{tag}-{}.db", Uuid::new_v4())),
+            )
+        }
+    }
+
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+            }
+        }
+    }
+
+    fn setup() -> (TmpDb, Connection) {
+        let tmp = TmpDb::new("setup");
+        let conn = db::open(&tmp.0).expect("open temp db");
+        (tmp, conn)
     }
 
     fn make_node(label: &str, note: &str, updated_at: DateTime<Utc>) -> Node {
@@ -403,7 +431,7 @@ mod tests {
 
     #[test]
     fn new_id_inserts_and_gets_sync_seq() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let node = make_node("decision-1", "first note", Utc::now());
 
         let resp = apply_push(&conn, "proj", std::slice::from_ref(&node), &[]).expect("push ok");
@@ -419,7 +447,7 @@ mod tests {
 
     #[test]
     fn newer_write_overwrites_older() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let t0 = Utc::now() - chrono::Duration::seconds(10);
         let original = make_node("decision-1", "v1", t0);
         apply_push(&conn, "proj", std::slice::from_ref(&original), &[]).expect("initial push ok");
@@ -445,7 +473,7 @@ mod tests {
 
     #[test]
     fn older_write_is_a_noop() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let t0 = Utc::now() - chrono::Duration::seconds(10);
         let mut current = make_node("decision-1", "current", Utc::now());
         current.updated_at = Utc::now();
@@ -469,7 +497,7 @@ mod tests {
 
     #[test]
     fn conflict_retention_field_populated_on_real_conflict() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let t0 = Utc::now() - chrono::Duration::seconds(10);
         let mut current = make_node("decision-1", "current", Utc::now());
         current.updated_at = Utc::now();
@@ -509,7 +537,7 @@ mod tests {
     /// data mutation, `conflicts` stays 0.
     #[test]
     fn identical_repush_with_equal_updated_at_is_a_true_noop() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let node = make_node("decision-1", "unchanged", Utc::now());
         apply_push(&conn, "proj", std::slice::from_ref(&node), &[]).expect("initial push ok");
 
@@ -531,7 +559,7 @@ mod tests {
 
     #[test]
     fn missing_attribution_is_rejected() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let mut node = make_node("decision-1", "note", Utc::now());
         node.created_by = None;
 
@@ -541,7 +569,7 @@ mod tests {
 
     #[test]
     fn tombstone_is_sticky_against_later_live_push() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let t0 = Utc::now() - chrono::Duration::seconds(10);
         let node = make_node("decision-1", "v1", t0);
         apply_push(&conn, "proj", std::slice::from_ref(&node), &[]).expect("initial push ok");
@@ -577,7 +605,7 @@ mod tests {
     /// retained under `data._sync_conflict` rather than discarded (FR-012).
     #[test]
     fn simultaneous_update_vs_update_retains_losing_edit_regardless_of_push_order() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let t_create = Utc::now() - chrono::Duration::seconds(30);
         let base = make_node("shared-decision", "original", t_create);
         apply_push(&conn, "proj", std::slice::from_ref(&base), &[]).expect("base push ok");
@@ -643,7 +671,7 @@ mod tests {
     /// as a recoverable conflict rather than silently winning or vanishing.
     #[test]
     fn newer_update_beats_older_concurrent_delete() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let t_create = Utc::now() - chrono::Duration::seconds(30);
         let base = make_node("shared-decision", "original", t_create);
         apply_push(&conn, "proj", std::slice::from_ref(&base), &[]).expect("base push ok");
@@ -690,7 +718,7 @@ mod tests {
     /// owner's overwritten edit retained as a recoverable conflict.
     #[test]
     fn newer_concurrent_delete_beats_older_update_and_tombstones_it() {
-        let conn = setup();
+        let (_tmp, conn) = setup();
         let t_create = Utc::now() - chrono::Duration::seconds(30);
         let base = make_node("shared-decision", "original", t_create);
         apply_push(&conn, "proj", std::slice::from_ref(&base), &[]).expect("base push ok");

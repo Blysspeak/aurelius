@@ -54,7 +54,11 @@ pub fn memory_context(params: &serde_json::Value) -> Result<serde_json::Value> {
     let capped_nodes: Vec<_> = nodes.iter().take(limit).collect();
 
     for node in &capped_nodes {
-        graph::touch_node(&conn, node.id).ok();
+        // Best effort by design: an access counter must never fail a read.
+        // Logged rather than discarded so a failing write is still visible.
+        if let Err(e) = graph::touch_node(&conn, node.id) {
+            tracing::warn!("could not record access for {}: {e}", node.id);
+        }
     }
 
     let compact_nodes: Vec<serde_json::Value> = capped_nodes

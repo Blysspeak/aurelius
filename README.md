@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/v1.6.0-stable-a6e3a1?style=flat-square" alt="v1.6.0">
+  <img src="https://img.shields.io/badge/v1.8.0-stable-a6e3a1?style=flat-square" alt="v1.8.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
   <img src="https://img.shields.io/badge/MCP-25_tools-a6e3a1?style=flat-square" alt="MCP">
@@ -46,7 +46,7 @@ This builds binaries, installs to `~/.local/bin`, configures Claude Code MCP ser
 
 ```
 $ au --version
-au 1.4.0
+au 1.8.0
 ```
 
 ---
@@ -192,6 +192,9 @@ au view                            # open web graph UI
 au touch path/to/file              # track file access
 au export                          # export full graph as JSON
 au mcp                             # start MCP server
+au skills                          # print the skill index
+au db check [PATH]                 # verify integrity (read-only); PATH verifies a snapshot
+au db backup                       # safe snapshot via VACUUM INTO
 ```
 
 ### Sync Commands
@@ -220,6 +223,41 @@ au task done <id>                  # mark complete
 au task block <id> "waiting on API keys"
 au task activate <id>              # resume blocked task
 ```
+
+### Backups
+
+```bash
+au db check          # quick integrity report; exits non-zero when damaged
+au db check --full   # exhaustive check, every table
+au db check FILE     # verify a snapshot — a snapshot is an ordinary database
+au db backup         # snapshot → aurelius-<UTC timestamp>.db next to the database
+```
+
+Snapshots are taken automatically: `install.sh` registers a SessionStart hook that keeps
+a rolling set in `<data-dir>/aurelius/backups/`. Cadence follows activity rather than the
+clock — the graph only changes when Claude Code, the CLI or the git hooks touch it, so an
+idle machine does not accumulate identical copies. Several sessions in a day cost one
+snapshot; ~50 ms for an 8 MB graph. Each snapshot is verified with `au db check` right
+after it is written — one that fails is renamed to `.FAILED-CHECK` so it can never be
+mistaken for a good backup, and kept, because a bad snapshot is evidence worth reading.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AURELIUS_BACKUP_KEEP` | `7` | snapshots retained |
+| `AURELIUS_BACKUP_MIN_HOURS` | `24` | minimum age of the newest snapshot before a new one is taken |
+
+> **Never copy, move or restore `aurelius.db` with `cp`/`mv`/`rsync`, a file manager or a
+> backup agent while `au` or an MCP server is running.** In WAL mode, cross-process cache
+> coherency runs through the `-shm` WAL-index rather than the database header, so replacing
+> the file underneath open connections lets a live process keep flushing its cached pages
+> into the new file — producing a database whose header describes 181 pages while its body
+> holds 1781. `au db backup` uses SQLite's own `VACUUM INTO` and is the only safe way to
+> copy a live database.
+
+To restore a snapshot: stop everything that touches the database (every `au mcp`, `au view`,
+any editor with hooks), move the current database and its `-wal`/`-shm` aside, copy the
+snapshot into place, run `au db check`, then restart. The "stop everything" step is why this
+is a documented procedure and not a command — `au` cannot stop processes it did not start.
 
 ---
 
@@ -284,9 +322,9 @@ deploy/
 
 ### Key Design
 
-- **SQLite + WAL** — concurrent reads, single writer, local-first
+- **SQLite + WAL** — concurrent reads, single writer, local-first. Every connection sets a busy timeout, verifies that WAL mode actually took effect, and checks the file header against the file size before use
 - **FTS5** — indexes label + note (not raw JSON), kept in sync via triggers
-- **6 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache, V6 sync attribution/tombstones + `sync_config`/`collaborator_grants`
+- **6 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache, V6 sync attribution/tombstones + `sync_config`/`collaborator_grants`. Applied atomically in a single `BEGIN IMMEDIATE` transaction
 - **Sync attribution** — `created_by`/`updated_by` stamped from the local identity config; deletes are soft (`deleted_at`) so they propagate as tombstones instead of resurrecting on the next sync
 - **Batch BFS** — `WHERE id IN (...)` per level, not N+1 per node
 - **Session dedup** — SHA-256 content hash on (project, summary)
@@ -331,6 +369,10 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 - [x] v1.2 — UI overhaul, project-scoped linking, indexer fix
 - [x] v1.3 — Obsidian-style graph physics, project hub nodes, session auto-linking
 - [x] v1.4 — Task management (5 MCP tools + CLI), work branches, acceptance criteria
+- [x] v1.5 — `memory_merge`, `task_stats`, semantic cluster graph layout
+- [x] v1.6 — Skills subsystem (4 MCP tools + `au skills`), session auto-injection
+- [x] v1.7 — DB hardening: busy timeout, atomic migrations, integrity gate, `au db check` / `au db backup`
+- [x] v1.8 — `au db check [PATH]` — self-verifying rolling backups
 - [ ] Next — npm distribution, `au repair`, context-ranked search, git log connector
 
 ---

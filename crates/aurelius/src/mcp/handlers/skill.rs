@@ -109,7 +109,7 @@ pub fn skill_list(params: &serde_json::Value) -> Result<serde_json::Value> {
         Some(q) => graph::search_typed(&conn, q, &NodeType::Skill, limit)?,
         None => {
             let mut all = graph::get_nodes_by_type(&conn, &NodeType::Skill)?;
-            all.sort_by_key(|n| std::cmp::Reverse(n.access_count));
+            all.sort_by_key(|s| std::cmp::Reverse(s.access_count));
             all
         }
     };

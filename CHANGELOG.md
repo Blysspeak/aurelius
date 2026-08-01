@@ -1,5 +1,45 @@
 # Changelog
 
+## [v1.8.0] — 2026-07-29
+
+### Added
+- `au db check [PATH]` — the check now takes an optional path, so a snapshot can be verified. A snapshot is an ordinary database, so verifying one is the same command pointed at a different file (a22d373)
+- The rolling backup hook verifies every snapshot it writes. An unverified backup is a guess. A snapshot that fails the check is renamed to `.FAILED-CHECK` — out of the `aurelius-*.db` pattern, so it can never be mistaken for a good backup nor counted by retention — and kept rather than deleted, because a bad snapshot is evidence worth reading (a22d373)
+
+### Fixed
+- `au db backup` reports a missing database instead of failing inside the snapshot call (a22d373)
+
+---
+
+## [v1.7.0] — 2026-07-29
+
+### Fixed
+- **A damaged database is refused instead of silently rewritten.** Every `db::open` now checks the file's own 100-byte header against its size and refuses an image whose header describes less than the file holds — the exact fingerprint of a file-level copy over a live WAL database. The error names the file, the finding, the two commands to run, and the rule that caused the damage, instead of the bare `database disk image is malformed` (d781fe2)
+- **A failed read is no longer mistaken for an empty database.** `get_schema_version(...).unwrap_or(0)` turned `SQLITE_BUSY` and `SQLITE_CORRUPT` into "brand-new database" and re-ran the destructive migration chain over live data on every single invocation. Version reads now propagate their errors; zero means only that the `schema_version` table is absent (d781fe2)
+- **Migrations are atomic.** The whole chain runs in one `BEGIN IMMEDIATE` transaction with the version re-read inside it, so a failure mid-`migrate_v4` can no longer leave the FTS index dropped, its triggers gone and the version advanced. Concurrent processes block instead of racing — 8 simultaneous opens of a fresh database used to fail with `UNIQUE constraint failed: schema_version.version` (d781fe2)
+- **Concurrent access waits instead of failing.** Every connection sets `busy_timeout` before anything can take a lock — a hook spawns a writer on every file edit, and several MCP servers run at once, so contention is the norm rather than the exception (d781fe2)
+- **WAL mode is verified, not assumed.** `PRAGMA journal_mode` reports a refused switch as a result row rather than an error, and `execute_batch` discarded that row — a connection could silently run in rollback-journal mode. The mode is now read back and checked, with bounded retries for the brief exclusive lock a fresh database needs (d781fe2)
+- Databases written by a newer binary are refused instead of being written to under an older understanding of the schema (d781fe2)
+- Failed edge writes propagate instead of being discarded at 20 call sites; `touch_node` and `ensure_indexed` stay best-effort — an access counter must never fail a read — but are logged rather than silently dropped (d781fe2)
+- `migrate_v2` detects existing columns structurally via `pragma_table_info` instead of matching the English text of an error message (d781fe2)
+- The database path had three divergent definitions that disagreed on their fallback; on a machine without a data directory the CLI and the MCP server would have used different files. Now resolved in one place (d781fe2)
+
+### Added
+- `au db backup [--out PATH]` — safe snapshot of a live database via SQLite's own `VACUUM INTO`, including data still sitting in an un-checkpointed `-wal`. **Copying `aurelius.db` with `cp`/`mv`/`rsync` while `au` or an MCP server is running is what corrupts it** — use this instead (d781fe2)
+- `au db check [--full]` — read-only integrity report that never migrates and never writes a page. Exits non-zero when damaged, so it can gate a script or a hook (d781fe2)
+- Skills subsystem — 4 MCP tools (`skill_save`, `skill_list`, `skill_get`, `skill_remove`), `au skills`, and session auto-injection via a SessionStart hook. Released as v1.6.0 but never merged to the default branch; folded in here (78dad01)
+- First automated tests in the workspace: concurrent open, migration rollback, corruption refusal, newer-schema refusal, backup round-trip through an un-checkpointed WAL, fresh-open idempotence. Each was observed failing against the previous code (d781fe2)
+
+### Documentation
+- Spec-kit feature `002-db-durability-hardening` — specification, plan, research, data model, CLI contract, quickstart, task list — and the project constitution the plan is gated against (8d799ce)
+- README: backup section with the reason file-level copying destroys a WAL database, and the manual restore procedure (d781fe2)
+
+### Notes
+- **v1.6.0 is contained in this release.** Its tag pointed at a commit that never reached the default branch, so the repository read as 1.5.0 while the installed binary reported 1.6.0. This release supersedes it.
+- Verified against the preserved database from the 2026-07-27 incident: 22 consecutive operations, zero bytes changed, and both the refusal and the report name the file-level-copy signature in plain words.
+
+---
+
 ## [v1.6.0] — 2026-06-21
 
 ### Added
