@@ -38,9 +38,10 @@ Not a graph node — operational config, local to a client instance.
 
 | Field | Type | Notes |
 |---|---|---|
-| `project_label` | `TEXT` (PK) | Matches the existing project label convention. |
-| `server_url` | `TEXT` | e.g. `https://aurelius.boostix.space/sync`. |
-| `token` | `TEXT` | This client's bearer token for that project. |
+| `project_label` | `TEXT` (PK) | Matches the existing project label convention. Learned from the server's response during connect (see below), not typed in advance by a collaborator. |
+| `server_url` | `TEXT` | Normalized to `https://{host}/sync`; e.g. given host `aurelius.boostix.space`, stored as `https://aurelius.boostix.space/sync`. |
+| `grant_uuid` | `TEXT` | This client's credential ID for that project. |
+| `grant_secret` | `TEXT` | This client's credential secret for that project. |
 | `enabled` | `BOOLEAN` | Sync on/off for this project; opt-in, defaults off. |
 | `last_seq` | `INTEGER` | Highest `sync_seq` this client has pulled for this project. Drives incremental `GET /sync/pull`. |
 | `updated_at` | `TEXT` | Bookkeeping. |
@@ -48,16 +49,23 @@ Not a graph node — operational config, local to a client instance.
 A project with no `SyncConfig` row, or `enabled = false`, is never touched by
 sync — satisfies FR-001/FR-002.
 
-## New: `CollaboratorGrant` (server-side only, one row per issued token)
+## New: `CollaboratorGrant` (server-side only, one row per issued credential)
+
+A grant is identified by a public `uuid` and authenticated with a `secret`
+that only ever exists in plaintext at issuance time and on the holder's own
+machine — the server stores a salted hash, never the plaintext (matches the
+`AccessKeyId`/`SecretAccessKey`-style pattern of public-id + private-secret,
+rather than one opaque bearer string).
 
 | Field | Type | Notes |
 |---|---|---|
-| `token` | `TEXT` (PK) | Bearer token handed to a collaborator out of band. |
+| `uuid` | `TEXT` (PK) | Public credential ID, handed to a collaborator out of band along with the secret. Safe to reference/log. |
+| `secret_hash` | `TEXT` | SHA-256 of the secret (workspace already depends on `sha2`, used elsewhere for `content_hash`). The plaintext secret is shown once at issuance and never stored server-side. |
 | `person_name` | `TEXT` | For audit/logging on the server side; the actual attribution on synced data comes from each node/edge's own `created_by`/`updated_by`, not from this table. |
 | `person_email` | `TEXT` | |
-| `project_label` | `TEXT` | Which single shared project this token may push/pull. A collaborator with access to two projects holds two tokens. |
+| `project_label` | `TEXT` | Which single shared project this credential may push/pull. A collaborator with access to two projects holds two credentials. |
 | `granted_at` | `TEXT` | |
-| `revoked_at` | `Option<TEXT>` | Revocation stops future push/pull with this token; does not retract data already delivered (matches the spec's Edge Cases section). |
+| `revoked_at` | `Option<TEXT>` | Revocation stops future push/pull with this credential; does not retract data already delivered (matches the spec's Edge Cases section). |
 
 ## New: local identity config (file, not a DB table)
 
@@ -72,8 +80,9 @@ email = "blysspeak@gmail.com"
 
 Read once per process start; every node/edge a client creates or updates is
 stamped `"{name} <{email}>"` into `created_by`/`updated_by`. Required before
-`sync enable` can be used (fails fast with a clear error if unset), but is
-independent of sync itself — it's the durable identity referenced by FR-007.
+`au sync` can be used to connect a project (fails fast with a clear error if
+unset), but is independent of sync itself — it's the durable identity
+referenced by FR-007.
 
 ## State transitions
 
@@ -81,8 +90,8 @@ independent of sync itself — it's the durable identity referenced by FR-007.
   soft-deleted row is never revived by sync; a client that still has an old
   live copy will receive the tombstone on next pull and soft-delete its own
   copy to match.
-- **SyncConfig.enabled**: `off` → `on` (via `sync enable`) triggers a full
-  bootstrap pull (FR-004); `on` → `off` (`sync disable`) stops future sync but
-  does not delete already-synced local data.
+- **SyncConfig.enabled**: `off` → `on` (via `au sync <server> <uuid> <secret>`)
+  triggers a full bootstrap pull (FR-004); `on` → `off` (`au sync disable
+  <project>`) stops future sync but does not delete already-synced local data.
 - **CollaboratorGrant**: `active` (`revoked_at IS NULL`) → `revoked`. Checked
-  on every push/pull request; a revoked token is rejected.
+  on every push/pull request; a revoked credential is rejected.
