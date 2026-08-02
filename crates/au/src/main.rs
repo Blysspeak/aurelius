@@ -84,6 +84,22 @@ pub enum TaskAction {
 }
 
 #[derive(Subcommand)]
+pub enum HomeAction {
+    /// Switch the active data/config directory — every au/aurelius
+    /// invocation, from any shell, uses it from now on. No AURELIUS_HOME
+    /// to re-export by hand every session; useful for running more than
+    /// one profile on the same machine (e.g. simulating a collaborator).
+    Use {
+        /// Directory to use (created if it doesn't exist)
+        path: String,
+    },
+    /// Show which home is currently active
+    Current,
+    /// Revert to the default OS data/config directories
+    Reset,
+}
+
+#[derive(Subcommand)]
 pub enum IdentityAction {
     /// Set your name and email — stamped as "Name <email>" on every node/edge
     /// you create or update. Required once per machine before `au share
@@ -245,6 +261,11 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
+    /// Switch or inspect which data/config directory au/aurelius use
+    Home {
+        #[command(subcommand)]
+        action: HomeAction,
+    },
     /// Configure your personal identity for sync attribution
     Identity {
         #[command(subcommand)]
@@ -289,6 +310,7 @@ async fn main() -> Result<()> {
         Commands::Task { action } => commands::task(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,
+        Commands::Home { action } => commands::home(action).await,
         Commands::Identity { action } => commands::identity(action).await,
         Commands::Share { action } => commands::share(action).await,
         Commands::Db { action } => commands::db(action).await,
