@@ -4,11 +4,13 @@
 
 use super::{SyncPullResponse, SyncPushResponse};
 use crate::graph::{row_to_edge, row_to_node};
-use crate::models::{Edge, Node};
+use crate::models::{Edge, Node, NodeType, Relation};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde_json::json;
+use std::collections::HashSet;
+use uuid::Uuid;
 
 const NODE_SELECT: &str = "SELECT id, node_type, label, note, source, data, created_at, updated_at,
                 memory_kind, last_accessed_at, access_count, content_hash,
@@ -50,6 +52,8 @@ pub fn apply_push(
         }
     }
 
+    validate_project_membership(conn, project, nodes, edges)?;
+
     let mut seq = current_max_seq(conn)?;
     let mut accepted = 0usize;
     let mut conflicts = 0usize;
@@ -82,6 +86,80 @@ pub fn apply_push(
         conflicts,
         server_seq: seq,
     })
+}
+
+/// Rejects a push that touches anything outside `project` — a collaborator
+/// token is authenticated to exactly one project (see `auth.rs`), and
+/// without this check that scoping would be advisory only: a valid
+/// credential for project A could inject or overwrite nodes/edges tagged as
+/// belonging to a completely different project B hosted on the same server.
+///
+/// A node counts as "in" the project if it already has a `belongs_to` edge
+/// to the project node server-side, or if this exact push batch introduces
+/// that edge (the normal case — a client pushes a new node together with
+/// the edge that links it). The project node's very first push (bootstrap)
+/// is the one case where the project node itself arrives in `nodes`.
+fn validate_project_membership(
+    conn: &Connection,
+    project: &str,
+    nodes: &[Node],
+    edges: &[Edge],
+) -> Result<()> {
+    if nodes.is_empty() && edges.is_empty() {
+        return Ok(());
+    }
+
+    let existing_project_id = crate::graph::find_project_by_label(conn, project)?.map(|n| n.id);
+    let incoming_project_id = nodes
+        .iter()
+        .find(|n| matches!(n.node_type, NodeType::Project) && n.label == project)
+        .map(|n| n.id);
+
+    let project_id = match existing_project_id.or(incoming_project_id) {
+        Some(id) => id,
+        None => anyhow::bail!(
+            "push rejected: project '{project}' does not exist on the server, and this push does not create it"
+        ),
+    };
+
+    let mut allowed: HashSet<Uuid> = HashSet::from([project_id]);
+    {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT from_id FROM edges WHERE to_id = ?1 AND relation = 'belongs_to'",
+        )?;
+        let rows = stmt.query_map(params![project_id.to_string()], |r| r.get::<_, String>(0))?;
+        for id in rows {
+            if let Ok(uuid) = Uuid::parse_str(&id?) {
+                allowed.insert(uuid);
+            }
+        }
+    }
+    for edge in edges {
+        if matches!(edge.relation, Relation::BelongsTo) && edge.to_id == project_id {
+            allowed.insert(edge.from_id);
+        }
+    }
+
+    for node in nodes {
+        if node.id != project_id && !allowed.contains(&node.id) {
+            anyhow::bail!(
+                "push rejected: node {} is not linked to project '{project}' — a token can only push data for the project it was issued for",
+                node.id
+            );
+        }
+    }
+    for edge in edges {
+        let from_ok = edge.from_id == project_id || allowed.contains(&edge.from_id);
+        let to_ok = edge.to_id == project_id || allowed.contains(&edge.to_id);
+        if !from_ok || !to_ok {
+            anyhow::bail!(
+                "push rejected: edge {} references a node outside project '{project}'",
+                edge.id
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Returns every live and tombstoned node/edge belonging to `project` with
@@ -401,10 +479,32 @@ mod tests {
         }
     }
 
-    fn setup() -> (TmpDb, Connection) {
+    /// Seeds a "proj" project node directly (bypassing push, which now
+    /// requires project membership) so tests can push nodes scoped to it.
+    fn setup() -> (TmpDb, Connection, Uuid) {
         let tmp = TmpDb::new("setup");
         let conn = db::open(&tmp.0).expect("open temp db");
-        (tmp, conn)
+        let project =
+            crate::graph::add_node(&conn, NodeType::Project, "proj", None, "test", json!({}))
+                .expect("seed project");
+        (tmp, conn, project.id)
+    }
+
+    /// A `belongs_to` edge, as a real client would push alongside a new
+    /// node's very first push — this is what makes the node "in" the
+    /// project for `validate_project_membership`.
+    fn belongs_to(node_id: Uuid, project_id: Uuid) -> Edge {
+        Edge {
+            id: Uuid::new_v4(),
+            from_id: node_id,
+            to_id: project_id,
+            relation: Relation::BelongsTo,
+            weight: 1.0,
+            created_at: Utc::now(),
+            created_by: Some("Alice <alice@example.com>".to_string()),
+            deleted_at: None,
+            sync_seq: None,
+        }
     }
 
     fn make_node(label: &str, note: &str, updated_at: DateTime<Utc>) -> Node {
@@ -431,14 +531,21 @@ mod tests {
 
     #[test]
     fn new_id_inserts_and_gets_sync_seq() {
-        let (_tmp, conn) = setup();
+        let (_tmp, conn, project_id) = setup();
         let node = make_node("decision-1", "first note", Utc::now());
+        let edge = belongs_to(node.id, project_id);
 
-        let resp = apply_push(&conn, "proj", std::slice::from_ref(&node), &[]).expect("push ok");
+        let resp = apply_push(
+            &conn,
+            "proj",
+            std::slice::from_ref(&node),
+            std::slice::from_ref(&edge),
+        )
+        .expect("push ok");
 
-        assert_eq!(resp.accepted, 1);
+        assert_eq!(resp.accepted, 2);
         assert_eq!(resp.conflicts, 0);
-        assert_eq!(resp.server_seq, 1);
+        assert_eq!(resp.server_seq, 2);
 
         let stored = fetch_node(&conn, &node.id.to_string()).unwrap().unwrap();
         assert_eq!(stored.note.as_deref(), Some("first note"));
@@ -447,10 +554,17 @@ mod tests {
 
     #[test]
     fn newer_write_overwrites_older() {
-        let (_tmp, conn) = setup();
+        let (_tmp, conn, project_id) = setup();
         let t0 = Utc::now() - chrono::Duration::seconds(10);
         let original = make_node("decision-1", "v1", t0);
-        apply_push(&conn, "proj", std::slice::from_ref(&original), &[]).expect("initial push ok");
+        let edge = belongs_to(original.id, project_id);
+        apply_push(
+            &conn,
+            "proj",
+            std::slice::from_ref(&original),
+            std::slice::from_ref(&edge),
+        )
+        .expect("initial push ok");
 
         let mut updated = original.clone();
         updated.note = Some("v2".to_string());
@@ -468,16 +582,23 @@ mod tests {
             .unwrap();
         assert_eq!(stored.note.as_deref(), Some("v2"));
         assert_eq!(stored.updated_by.as_deref(), Some("Bob <bob@example.com>"));
-        assert_eq!(stored.sync_seq, Some(2));
+        assert_eq!(stored.sync_seq, Some(3));
     }
 
     #[test]
     fn older_write_is_a_noop() {
-        let (_tmp, conn) = setup();
+        let (_tmp, conn, project_id) = setup();
         let t0 = Utc::now() - chrono::Duration::seconds(10);
         let mut current = make_node("decision-1", "current", Utc::now());
         current.updated_at = Utc::now();
-        apply_push(&conn, "proj", std::slice::from_ref(&current), &[]).expect("initial push ok");
+        let edge = belongs_to(current.id, project_id);
+        apply_push(
+            &conn,
+            "proj",
+            std::slice::from_ref(&current),
+            std::slice::from_ref(&edge),
+        )
+        .expect("initial push ok");
 
         let mut stale = current.clone();
         stale.note = Some("stale".to_string());
@@ -497,11 +618,18 @@ mod tests {
 
     #[test]
     fn conflict_retention_field_populated_on_real_conflict() {
-        let (_tmp, conn) = setup();
+        let (_tmp, conn, project_id) = setup();
         let t0 = Utc::now() - chrono::Duration::seconds(10);
         let mut current = make_node("decision-1", "current", Utc::now());
         current.updated_at = Utc::now();
-        apply_push(&conn, "proj", std::slice::from_ref(&current), &[]).expect("initial push ok");
+        let edge = belongs_to(current.id, project_id);
+        apply_push(
+            &conn,
+            "proj",
+            std::slice::from_ref(&current),
+            std::slice::from_ref(&edge),
+        )
+        .expect("initial push ok");
 
         let mut stale = current.clone();
         stale.note = Some("lost edit".to_string());
@@ -537,9 +665,16 @@ mod tests {
     /// data mutation, `conflicts` stays 0.
     #[test]
     fn identical_repush_with_equal_updated_at_is_a_true_noop() {
-        let (_tmp, conn) = setup();
+        let (_tmp, conn, project_id) = setup();
         let node = make_node("decision-1", "unchanged", Utc::now());
-        apply_push(&conn, "proj", std::slice::from_ref(&node), &[]).expect("initial push ok");
+        let edge = belongs_to(node.id, project_id);
+        apply_push(
+            &conn,
+            "proj",
+            std::slice::from_ref(&node),
+            std::slice::from_ref(&edge),
+        )
+        .expect("initial push ok");
 
         // Same node, same updated_at, as if it were pulled and pushed back
         // unmodified.
@@ -559,7 +694,7 @@ mod tests {
 
     #[test]
     fn missing_attribution_is_rejected() {
-        let (_tmp, conn) = setup();
+        let (_tmp, conn, _project_id) = setup();
         let mut node = make_node("decision-1", "note", Utc::now());
         node.created_by = None;
 
@@ -569,10 +704,17 @@ mod tests {
 
     #[test]
     fn tombstone_is_sticky_against_later_live_push() {
-        let (_tmp, conn) = setup();
+        let (_tmp, conn, project_id) = setup();
         let t0 = Utc::now() - chrono::Duration::seconds(10);
         let node = make_node("decision-1", "v1", t0);
-        apply_push(&conn, "proj", std::slice::from_ref(&node), &[]).expect("initial push ok");
+        let edge = belongs_to(node.id, project_id);
+        apply_push(
+            &conn,
+            "proj",
+            std::slice::from_ref(&node),
+            std::slice::from_ref(&edge),
+        )
+        .expect("initial push ok");
 
         let mut tombstone = node.clone();
         tombstone.deleted_at = Some(Utc::now());
@@ -605,10 +747,17 @@ mod tests {
     /// retained under `data._sync_conflict` rather than discarded (FR-012).
     #[test]
     fn simultaneous_update_vs_update_retains_losing_edit_regardless_of_push_order() {
-        let (_tmp, conn) = setup();
+        let (_tmp, conn, project_id) = setup();
         let t_create = Utc::now() - chrono::Duration::seconds(30);
         let base = make_node("shared-decision", "original", t_create);
-        apply_push(&conn, "proj", std::slice::from_ref(&base), &[]).expect("base push ok");
+        let edge = belongs_to(base.id, project_id);
+        apply_push(
+            &conn,
+            "proj",
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&edge),
+        )
+        .expect("base push ok");
 
         // Owner and collaborator both branch off `base` while offline, and
         // owner happens to sync first — but the collaborator's edit is the
@@ -671,10 +820,17 @@ mod tests {
     /// as a recoverable conflict rather than silently winning or vanishing.
     #[test]
     fn newer_update_beats_older_concurrent_delete() {
-        let (_tmp, conn) = setup();
+        let (_tmp, conn, project_id) = setup();
         let t_create = Utc::now() - chrono::Duration::seconds(30);
         let base = make_node("shared-decision", "original", t_create);
-        apply_push(&conn, "proj", std::slice::from_ref(&base), &[]).expect("base push ok");
+        let edge = belongs_to(base.id, project_id);
+        apply_push(
+            &conn,
+            "proj",
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&edge),
+        )
+        .expect("base push ok");
 
         let t_delete = Utc::now() - chrono::Duration::seconds(10);
         let t_update = Utc::now() - chrono::Duration::seconds(5);
@@ -718,10 +874,17 @@ mod tests {
     /// owner's overwritten edit retained as a recoverable conflict.
     #[test]
     fn newer_concurrent_delete_beats_older_update_and_tombstones_it() {
-        let (_tmp, conn) = setup();
+        let (_tmp, conn, project_id) = setup();
         let t_create = Utc::now() - chrono::Duration::seconds(30);
         let base = make_node("shared-decision", "original", t_create);
-        apply_push(&conn, "proj", std::slice::from_ref(&base), &[]).expect("base push ok");
+        let edge = belongs_to(base.id, project_id);
+        apply_push(
+            &conn,
+            "proj",
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&edge),
+        )
+        .expect("base push ok");
 
         let t_update = Utc::now() - chrono::Duration::seconds(10);
         let t_delete = Utc::now() - chrono::Duration::seconds(5);
@@ -760,5 +923,103 @@ mod tests {
             conflict.get("note").and_then(|v| v.as_str()),
             Some("owner kept working on this")
         );
+    }
+
+    // --- project-scope enforcement: a token authenticated for one project
+    // must never be able to write data into a different project. ---
+
+    #[test]
+    fn push_rejects_node_not_linked_to_authorized_project() {
+        let (_tmp, conn, _project_id) = setup();
+        // No belongs_to edge at all — this node claims no project membership.
+        let orphan = make_node("orphan", "not linked to anything", Utc::now());
+
+        let err = apply_push(&conn, "proj", std::slice::from_ref(&orphan), &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("push rejected"),
+            "expected a project-scope rejection, got: {err}"
+        );
+        assert!(
+            fetch_node(&conn, &orphan.id.to_string()).unwrap().is_none(),
+            "a rejected push must not partially write anything"
+        );
+    }
+
+    #[test]
+    fn push_rejects_node_belonging_to_a_different_project_on_the_same_server() {
+        let (_tmp, conn, _proj_id) = setup();
+        // A second, unrelated project hosted on the same server.
+        let other_project = crate::graph::add_node(
+            &conn,
+            NodeType::Project,
+            "other-proj",
+            None,
+            "test",
+            json!({}),
+        )
+        .expect("seed other project");
+
+        let leaked = make_node("belongs-elsewhere", "not yours", Utc::now());
+        let edge = belongs_to(leaked.id, other_project.id);
+
+        // Authenticated for "proj", but this node/edge only ever link to
+        // "other-proj" — a collaborator token for one project must never be
+        // able to write into a different project hosted on the same server.
+        let err = apply_push(
+            &conn,
+            "proj",
+            std::slice::from_ref(&leaked),
+            std::slice::from_ref(&edge),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("push rejected"), "got: {err}");
+        assert!(
+            fetch_node(&conn, &leaked.id.to_string()).unwrap().is_none(),
+            "a rejected push must not partially write anything"
+        );
+    }
+
+    #[test]
+    fn push_bootstraps_a_brand_new_project_via_its_own_first_push() {
+        let tmp = TmpDb::new("bootstrap");
+        let conn = db::open(&tmp.0).expect("open temp db");
+        // Deliberately no pre-seeded project — the very first push for a
+        // brand-new project includes the project node itself.
+        let project_node = Node {
+            id: Uuid::new_v4(),
+            node_type: NodeType::Project,
+            label: "brand-new".to_string(),
+            note: None,
+            source: "test".to_string(),
+            data: json!({}),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            memory_kind: MemoryKind::Semantic,
+            last_accessed_at: Utc::now(),
+            access_count: 0,
+            content_hash: None,
+            created_by: Some("Alice <alice@example.com>".to_string()),
+            updated_by: Some("Alice <alice@example.com>".to_string()),
+            deleted_at: None,
+            sync_seq: None,
+        };
+        let decision = make_node("first-decision", "kickoff", Utc::now());
+        let edge = belongs_to(decision.id, project_node.id);
+
+        let resp = apply_push(
+            &conn,
+            "brand-new",
+            &[project_node.clone(), decision.clone()],
+            std::slice::from_ref(&edge),
+        )
+        .expect("bootstrap push ok");
+
+        assert_eq!(resp.accepted, 3);
+        assert!(fetch_node(&conn, &project_node.id.to_string())
+            .unwrap()
+            .is_some());
+        assert!(fetch_node(&conn, &decision.id.to_string())
+            .unwrap()
+            .is_some());
     }
 }

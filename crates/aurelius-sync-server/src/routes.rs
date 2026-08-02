@@ -82,7 +82,19 @@ async fn push(
         merge::apply_push(&conn, &project, &body.nodes, &body.edges)
     })
     .await
-    .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))??;
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?
+    // `apply_push` bails with a "push rejected:"-prefixed message when a
+    // node/edge falls outside the authenticated token's project — a client
+    // mistake (or a probing attempt), not a server fault, so it maps to 422
+    // rather than the generic 500 every other error here gets.
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.starts_with("push rejected:") {
+            ApiError::Unprocessable(msg)
+        } else {
+            ApiError::Internal(e)
+        }
+    })?;
 
     Ok(Json(response))
 }
