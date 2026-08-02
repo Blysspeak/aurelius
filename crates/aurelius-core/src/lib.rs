@@ -1,6 +1,7 @@
 pub mod connector;
 pub mod db;
 pub mod graph;
+pub mod home;
 pub mod identity;
 pub mod indexer;
 pub mod models;

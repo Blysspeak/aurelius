@@ -39,11 +39,11 @@ type Result<T> = std::result::Result<T, DbError>;
 /// the database through this function — divergent copies would let the CLI and
 /// the MCP server operate on different files while appearing to share one.
 pub fn db_path() -> PathBuf {
-    // AURELIUS_HOME override (test/dev use — see quickstart.md): when set, the
-    // DB lives directly under it instead of the real OS data dir. Unset means
-    // 100% unchanged default behavior.
-    if let Ok(home) = std::env::var("AURELIUS_HOME") {
-        let base = PathBuf::from(home);
+    // Active home override (AURELIUS_HOME env var, or a persisted `au home
+    // use`; see crate::home) — the DB lives directly under it instead of
+    // the real OS data dir. Neither set means 100% unchanged default
+    // behavior.
+    if let Some(base) = crate::home::resolve() {
         std::fs::create_dir_all(&base).ok();
         return base.join("aurelius.db");
     }

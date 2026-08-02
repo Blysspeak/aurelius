@@ -21,11 +21,12 @@ impl Identity {
     }
 
     fn config_path() -> Result<PathBuf> {
-        // AURELIUS_HOME override (test/dev use — see quickstart.md): when set,
-        // identity.toml lives directly under it instead of the real OS config
-        // dir. Unset means 100% unchanged default behavior.
-        if let Ok(home) = std::env::var("AURELIUS_HOME") {
-            return Ok(PathBuf::from(home).join("identity.toml"));
+        // Active home override (AURELIUS_HOME env var, or a persisted `au
+        // home use`; see crate::home) — identity.toml lives directly under
+        // it instead of the real OS config dir. Neither set means 100%
+        // unchanged default behavior.
+        if let Some(home) = crate::home::resolve() {
+            return Ok(home.join("identity.toml"));
         }
         let dir = dirs_next::config_dir()
             .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?

@@ -7,7 +7,7 @@ use aurelius_core::{
 use serde_json::json;
 use std::path::PathBuf;
 
-use crate::{DbAction, IdentityAction, ShareAction, TaskAction};
+use crate::{DbAction, HomeAction, IdentityAction, ShareAction, TaskAction};
 
 use aurelius_core::db::db_path;
 
@@ -860,6 +860,37 @@ fn resolve_node_any(conn: &rusqlite::Connection, id: &str) -> Result<aurelius_co
 // ---------------------------------------------------------------------------
 // au identity
 // ---------------------------------------------------------------------------
+
+pub async fn home(action: HomeAction) -> Result<()> {
+    match action {
+        HomeAction::Use { path } => {
+            let raw = PathBuf::from(&path);
+            // Create first, then canonicalize — canonicalize requires the
+            // path to already exist, and a relative path stored as-is would
+            // break the next time `au` runs from a different cwd.
+            std::fs::create_dir_all(&raw)
+                .with_context(|| format!("failed to create {}", raw.display()))?;
+            let path = raw.canonicalize().unwrap_or(raw);
+            aurelius_core::home::use_home(&path)?;
+            println!(
+                "✓ Active home set to {} — every au/aurelius command uses it from now on, no AURELIUS_HOME needed",
+                path.display()
+            );
+        }
+        HomeAction::Current => match aurelius_core::home::resolve() {
+            Some(path) => println!("{}", path.display()),
+            None => println!(
+                "(default) {}",
+                db_path().parent().unwrap_or(&db_path()).display()
+            ),
+        },
+        HomeAction::Reset => {
+            aurelius_core::home::reset()?;
+            println!("✓ Reverted to the default data/config directories");
+        }
+    }
+    Ok(())
+}
 
 pub async fn identity(action: IdentityAction) -> Result<()> {
     match action {
