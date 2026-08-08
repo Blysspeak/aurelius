@@ -18,7 +18,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#mcp-tools-25">MCP Tools</a> ·
+  <a href="#mcp-tools-28">MCP Tools</a> ·
   <a href="#task-management">Tasks</a> ·
   <a href="#project-sync">Sync</a> ·
   <a href="#web-ui">Graph UI</a> ·
@@ -51,7 +51,7 @@ au 1.8.0
 
 ---
 
-## MCP Tools (25)
+## MCP Tools (28)
 
 Aurelius runs as an MCP server over stdio. `install.sh` configures it automatically, or add manually via `/mcp` in Claude Code (`command: au`, `args: ["mcp"]`).
 
@@ -101,6 +101,16 @@ Reusable procedural "how-to" cards with progressive disclosure — the trigger i
 |------|-------------|
 | `search_web` | Brave Search API with SQLite cache. Repeat queries served from cache. Optional `save_to_graph`. |
 | `search_recall` | FTS search through cached web search results from past sessions. |
+
+### Documents
+
+Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV, PDF, HTML and plain text into GitHub-Flavored Markdown, converted locally — no network, no API key. Everything converted stays searchable afterwards, even once the original file is gone. Out of scope: audio/video transcription and OCR of scans.
+
+| Tool | Description |
+|------|-------------|
+| `doc_convert` | Convert a file, or every file in a directory, to Markdown. Large output spills to a `.md` file and returns an outline + preview instead of filling the context. Optional `save_to_graph`. |
+| `doc_read` | Paginated read of an already-converted document, by content hash or path. |
+| `doc_recall` | FTS search across every document ever converted. |
 
 ---
 
@@ -195,6 +205,9 @@ au mcp                             # start MCP server
 au skills                          # print the skill index
 au db check [PATH]                 # verify integrity (read-only); PATH verifies a snapshot
 au db backup                       # safe snapshot via VACUUM INTO
+au doc convert report.docx         # document → Markdown on stdout
+au doc convert ./contracts -r      # convert a whole tree, cached by content hash
+au doc recall "termination"        # search everything ever converted
 ```
 
 ### Sync Commands
