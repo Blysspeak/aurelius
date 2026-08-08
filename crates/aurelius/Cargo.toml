@@ -36,3 +36,12 @@ rusqlite = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
 reqwest = { workspace = true }
+anydoc = { workspace = true }
+htmd = { workspace = true }
+thiserror = { workspace = true }
+ignore = { workspace = true }
+
+[dev-dependencies]
+# Already in the tree via anydoc; used here only to assemble a real .docx
+# in-test rather than checking a binary fixture into the repository.
+zip = { version = "8", default-features = false, features = ["deflate"] }
