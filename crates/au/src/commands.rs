@@ -7,7 +7,7 @@ use aurelius_core::{
 use serde_json::json;
 use std::path::PathBuf;
 
-use crate::{DbAction, HomeAction, IdentityAction, ShareAction, TaskAction};
+use crate::{DbAction, DocAction, HomeAction, IdentityAction, ShareAction, TaskAction};
 
 use aurelius_core::db::db_path;
 
@@ -773,6 +773,131 @@ pub async fn db(action: DbAction) -> Result<()> {
         }
         DbAction::Backup { out } => db_backup_cli(&db_path(), out),
     }
+}
+
+pub async fn doc(action: DocAction) -> Result<()> {
+    match action {
+        DocAction::Convert {
+            path,
+            out,
+            recursive,
+            force,
+        } => doc_convert_cli(&PathBuf::from(path), out.as_deref(), recursive, force),
+        DocAction::Recall { query, limit } => doc_recall_cli(&query, limit),
+    }
+}
+
+fn doc_convert_cli(
+    path: &std::path::Path,
+    out: Option<&str>,
+    recursive: bool,
+    force: bool,
+) -> Result<()> {
+    let conn = db::open(&db_path())?;
+
+    let targets = if path.is_dir() {
+        aurelius::doc::collect_files(path, recursive, 200)
+    } else {
+        vec![path.to_path_buf()]
+    };
+
+    // Writing every document of a batch into one `--out` file would silently
+    // concatenate unrelated documents, so that combination is refused rather
+    // than guessed at.
+    if targets.len() > 1 && out.is_some() {
+        anyhow::bail!(
+            "--out takes a single document; converting {} files",
+            targets.len()
+        );
+    }
+
+    let mut failures = 0;
+    for target in &targets {
+        match convert_and_cache(&conn, target, force) {
+            Ok((markdown, cached)) => match out {
+                Some(destination) => {
+                    std::fs::write(destination, &markdown)
+                        .with_context(|| format!("could not write {destination}"))?;
+                    eprintln!(
+                        "✓ {} → {destination} ({} chars{})",
+                        target.display(),
+                        markdown.chars().count(),
+                        if cached { ", from cache" } else { "" }
+                    );
+                }
+                None if targets.len() > 1 => {
+                    eprintln!(
+                        "✓ {} ({} chars{})",
+                        target.display(),
+                        markdown.chars().count(),
+                        if cached { ", from cache" } else { "" }
+                    );
+                }
+                None => print!("{markdown}"),
+            },
+            Err(e) => {
+                failures += 1;
+                eprintln!("✗ {}: {e}", target.display());
+            }
+        }
+    }
+
+    if failures > 0 && failures == targets.len() {
+        anyhow::bail!("nothing converted");
+    }
+    Ok(())
+}
+
+/// Returns the Markdown and whether it came back from the cache.
+fn convert_and_cache(
+    conn: &rusqlite::Connection,
+    path: &std::path::Path,
+    force: bool,
+) -> Result<(String, bool)> {
+    use aurelius::doc::{cache, convert};
+
+    let source = convert::read_source(path)?;
+    if !force {
+        if let Some(hit) = cache::get_by_sha(conn, &source.sha256)? {
+            return Ok((hit.markdown, true));
+        }
+    }
+
+    let converted = convert::convert_source(source)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document");
+    cache::put(
+        conn,
+        &converted,
+        &path.display().to_string(),
+        file_name,
+        None,
+    )?;
+    Ok((converted.markdown, false))
+}
+
+fn doc_recall_cli(query: &str, limit: usize) -> Result<()> {
+    let conn = db::open(&db_path())?;
+    let hits = aurelius::doc::cache::recall(&conn, query, limit)?;
+
+    if hits.is_empty() {
+        println!("No converted document matches '{query}'");
+        return Ok(());
+    }
+
+    for hit in &hits {
+        println!(
+            "{} [{}] {} chars",
+            hit.file_name, hit.format, hit.char_count
+        );
+        println!("  {}", hit.source_path);
+        println!("  {}", hit.snippet.replace('\n', " "));
+        println!("  sha256: {}", hit.sha256);
+        println!();
+    }
+    Ok(())
 }
 
 fn db_check_cli(path: &std::path::Path, full: bool) -> Result<()> {

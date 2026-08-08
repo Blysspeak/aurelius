@@ -1,4 +1,5 @@
 mod crud;
+mod doc;
 mod search;
 mod session;
 mod skill;
@@ -6,6 +7,7 @@ mod status;
 mod task;
 
 pub use crud::*;
+pub use doc::*;
 pub use search::*;
 pub use session::*;
 pub use skill::*;

@@ -131,6 +131,32 @@ pub enum DbAction {
 }
 
 #[derive(Subcommand)]
+pub enum DocAction {
+    /// Convert a document (or a directory of them) to Markdown
+    Convert {
+        /// File or directory to convert
+        path: String,
+        /// Write the Markdown here instead of to stdout
+        #[arg(short, long)]
+        out: Option<String>,
+        /// Directory mode: descend into subdirectories
+        #[arg(short, long)]
+        recursive: bool,
+        /// Re-convert even if this content was converted before
+        #[arg(long)]
+        force: bool,
+    },
+    /// Search everything ever converted
+    Recall {
+        /// FTS5 query over document text and file names
+        query: String,
+        /// Max results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
 #[command(
     after_help = "The most common command has no subcommand name — it's just:\n\n    au share <SERVER> <TOKEN>\n\nRun that once per project to connect it (using a token from `au share issue`,\nor one someone else gave you). This attaches the project; sync learns the\nname from the server, so there's nothing else to type.\n\nRunning your own server? `au share admin-set <SERVER> <TOKEN>` once, using\nthe AURELIUS_SYNC_ADMIN_TOKEN you gave the server — after that, `issue` and\n`revoke` pick it up automatically, no per-session env var needed."
 )]
@@ -281,6 +307,11 @@ enum Commands {
         #[command(subcommand)]
         action: DbAction,
     },
+    /// Convert documents to Markdown, and search what was converted
+    Doc {
+        #[command(subcommand)]
+        action: DocAction,
+    },
     /// Start MCP server (used by Claude Code)
     Mcp,
 }
@@ -314,6 +345,7 @@ async fn main() -> Result<()> {
         Commands::Identity { action } => commands::identity(action).await,
         Commands::Share { action } => commands::share(action).await,
         Commands::Db { action } => commands::db(action).await,
+        Commands::Doc { action } => commands::doc(action).await,
         Commands::Mcp => commands::mcp().await,
     }
 }
