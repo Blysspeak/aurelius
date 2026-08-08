@@ -1,5 +1,29 @@
 # Changelog
 
+## [v1.9.0] — 2026-08-08
+
+### Added
+- **Documents into Markdown, converted locally.** Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV, PDF, HTML and plain text, via the `anydoc` and `htmd` crates — in-process, with no network call, no API key and no external binary. Three MCP tools (`doc_convert`, `doc_read`, `doc_recall`) plus `au doc convert` / `au doc recall`. Output over `max_inline_chars` spills to a `.md` file and returns an outline and preview instead, so a 200-page PDF cannot fill an agent's context in one call. Conversions are cached by the SHA-256 of the file contents and full-text indexed, which is the point: a contract read in July stays findable in September after the original file is gone. Audio, video and scanned images are refused by name with the reason — transcription and OCR need external services and are deliberately out of scope (8a022b2)
+- **Sync — one graph across machines and people.** New `aurelius-sync-server` crate, the `au share` command family, and automatic push/pull at session boundaries. Every node and edge carries who created and last updated it; deletions propagate as tombstones rather than reappearing on the next pull; conflicting edits keep the losing version on the node instead of discarding it, surfaced by `au context --verbose`. Collaborator access is granted per project by an issued token and can be revoked (92872ba, f2cc833, 36c5382, d92ff92, d8f7bbc, 2f033b0)
+- `au home use` / `current` / `reset` — a persisted active profile, so a chosen home survives the shell that set it (6e83cd8)
+- `au share admin-set` — stores this machine's admin token per server, so `issue` and `revoke` no longer need `AURELIUS_SYNC_ADMIN_TOKEN` exported every session (3c99ff9)
+- Identity falls back to `git config --global` when unset, so attribution works before anyone configures it (858af64)
+
+### Fixed
+- **A push could write outside its project.** The server now enforces the granted project scope on every pushed node and edge, instead of trusting the client's own labelling (91440a5)
+- `aurelius-sync-server` binds to loopback only by default. Exposing it needs a deliberate choice, not an oversight (6a3f661)
+- `au share issue --for` defaults to the local identity instead of failing when omitted (6ffe192)
+- `au share admin-set` shows its `<server> <token>` usage in `--help` (a80f0d9)
+
+### Documentation
+- Spec-kit features `003-doc-to-markdown` and the project-sync set — specification, plan, research, data model, contracts, quickstart and task list (8a022b2, be9f6f3, 4bdcbd7, a18b124)
+
+### Notes
+- **Sync ships for the first time here.** It landed across PRs #5–#12 after the v1.8.0 tag, so this release is the first one that contains it.
+- Schema V8 adds the document cache and its FTS mirror; V6 and V7, which sync introduced, are also first released here. Migrations run in a single transaction and are applied on first open.
+
+---
+
 ## [v1.8.0] — 2026-07-29
 
 ### Added
