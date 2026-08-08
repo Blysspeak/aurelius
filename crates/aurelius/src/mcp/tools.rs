@@ -519,6 +519,92 @@ pub fn tool_definitions() -> serde_json::Value {
                 }
             },
             {
+                "name": "doc_convert",
+                "description": "Convert a document to GitHub-Flavored Markdown and cache it. Handles Word (doc/docx/docm), PowerPoint (ppt/pptx/pps/pot), Excel (xls/xlsx/xlsm/xlsb), OpenDocument (odt/ods/odp), RTF, EPUB, CSV, PDF, HTML, and plain text or source files. Runs locally — no network, no API key. Point it at a directory to convert everything in it. Not supported: audio/video transcription and OCR of images or scanned pages.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to a file, or to a directory to convert in bulk"
+                        },
+                        "recursive": {
+                            "type": "boolean",
+                            "description": "Directory mode: descend into subdirectories. Respects .gitignore either way.",
+                            "default": false
+                        },
+                        "max_files": {
+                            "type": "integer",
+                            "description": "Directory mode: cap on files converted (default: 200)",
+                            "default": 200
+                        },
+                        "max_inline_chars": {
+                            "type": "integer",
+                            "description": "Markdown at or below this length is returned in full; longer output is written to a .md file and returned as outline + preview + path, readable via doc_read (default: 40000)",
+                            "default": 40000
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Project this document belongs to. Used when save_to_graph is set."
+                        },
+                        "save_to_graph": {
+                            "type": "boolean",
+                            "description": "Also create a 'document' node linked to the project. Metadata and an excerpt only — the full text stays in the cache.",
+                            "default": false
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "description": "Re-convert even if this exact content was converted before",
+                            "default": false
+                        }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "doc_read",
+                "description": "Read a slice of an already-converted document from the cache. Use after doc_convert reports a document too large to inline. Offsets and limits are in characters.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "ref": {
+                            "type": "string",
+                            "description": "The sha256 doc_convert returned, or the source file path"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Character offset to start at (default: 0)",
+                            "default": 0
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Characters to return (default: 40000)",
+                            "default": 40000
+                        }
+                    },
+                    "required": ["ref"]
+                }
+            },
+            {
+                "name": "doc_recall",
+                "description": "Full-text search across every document ever converted, even if the original file is gone. Returns matching snippets with the reference needed to read the full text via doc_read.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "FTS5 query over document text and file names"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max results (default: 10)",
+                            "default": 10
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
                 "name": "skill_list",
                 "description": "Cheap skill index — returns only name + trigger + tags (never the body) for every stored skill card. This is the progressive-disclosure index: scan it to see what reusable how-to knowledge exists, then call skill_get to read the full body. Optional FTS query / tag filter.",
                 "inputSchema": {

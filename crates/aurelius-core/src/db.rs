@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -488,6 +488,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 7)?;
     }
 
+    if current < 8 {
+        migrate_v8(&tx)?;
+        set_schema_version(&tx, 8)?;
+    }
+
     tx.commit()?;
     Ok(())
 }
@@ -747,6 +752,58 @@ fn migrate_v7(conn: &Connection) -> Result<()> {
             saved_at    TEXT NOT NULL
         );
         ",
+    )?;
+    Ok(())
+}
+
+/// Converted-document cache. Keyed by the SHA-256 of the *file contents* rather
+/// than its path, so a copied or renamed document is recognised as the one
+/// already converted. The FTS mirror is what makes a document read months ago
+/// findable without the original file.
+fn migrate_v8(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS doc_cache (
+            sha256      TEXT PRIMARY KEY,
+            source_path TEXT NOT NULL,
+            file_name   TEXT NOT NULL,
+            format      TEXT NOT NULL,
+            markdown    TEXT NOT NULL,
+            char_count  INTEGER NOT NULL,
+            byte_size   INTEGER NOT NULL,
+            spill_path  TEXT,
+            created_at  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_doc_cache_path
+            ON doc_cache(source_path);
+
+        CREATE INDEX IF NOT EXISTS idx_doc_cache_created
+            ON doc_cache(created_at);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS doc_fts USING fts5(
+            file_name, markdown,
+            content='doc_cache',
+            content_rowid='rowid'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS doc_cache_ai AFTER INSERT ON doc_cache BEGIN
+            INSERT INTO doc_fts(rowid, file_name, markdown)
+            VALUES (new.rowid, new.file_name, new.markdown);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS doc_cache_ad AFTER DELETE ON doc_cache BEGIN
+            INSERT INTO doc_fts(doc_fts, rowid, file_name, markdown)
+            VALUES ('delete', old.rowid, old.file_name, old.markdown);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS doc_cache_au AFTER UPDATE ON doc_cache BEGIN
+            INSERT INTO doc_fts(doc_fts, rowid, file_name, markdown)
+            VALUES ('delete', old.rowid, old.file_name, old.markdown);
+            INSERT INTO doc_fts(rowid, file_name, markdown)
+            VALUES (new.rowid, new.file_name, new.markdown);
+        END;
+    ",
     )?;
     Ok(())
 }
