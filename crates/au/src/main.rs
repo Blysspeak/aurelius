@@ -287,6 +287,15 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
+    /// Seven-layer frozen memory snapshot (Markdown, ~1.5K tokens)
+    Snapshot {
+        /// Project scope; with --hook defaults to the current folder name
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Emit Claude Code SessionStart hook JSON (never fails, silent on error)
+        #[arg(long)]
+        hook: bool,
+    },
     /// Switch or inspect which data/config directory au/aurelius use
     Home {
         #[command(subcommand)]
@@ -341,6 +350,7 @@ async fn main() -> Result<()> {
         Commands::Task { action } => commands::task(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,
+        Commands::Snapshot { project, hook } => commands::snapshot(project, hook).await,
         Commands::Home { action } => commands::home(action).await,
         Commands::Identity { action } => commands::identity(action).await,
         Commands::Share { action } => commands::share(action).await,

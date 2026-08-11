@@ -3,6 +3,7 @@ mod doc;
 mod search;
 mod session;
 mod skill;
+mod snapshot;
 mod status;
 mod task;
 
@@ -11,6 +12,7 @@ pub use doc::*;
 pub use search::*;
 pub use session::*;
 pub use skill::*;
+pub use snapshot::*;
 pub use status::*;
 pub use task::*;
 
@@ -170,6 +172,8 @@ pub(crate) fn parse_node_type(s: &str) -> NodeType {
         "file" => NodeType::File,
         "module" => NodeType::Module,
         "crate" => NodeType::Crate,
+        "user_fact" => NodeType::UserFact,
+        "digest" => NodeType::Digest,
         "config" => NodeType::Config,
         "session" => NodeType::Session,
         "language" => NodeType::Language,
