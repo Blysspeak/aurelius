@@ -56,6 +56,7 @@ pub async fn note(
         "concept" => NodeType::Concept,
         "problem" => NodeType::Problem,
         "solution" => NodeType::Solution,
+        "user_fact" => NodeType::UserFact,
         _ => NodeType::Decision,
     };
     let label = label.unwrap_or_else(|| {
@@ -730,6 +731,61 @@ pub async fn skills(hook: bool) -> Result<()> {
         print!("{text}");
     }
     Ok(())
+}
+
+/// Семислойный снапшот памяти. С `--hook` печатает SessionStart-JSON для
+/// прямой инъекции в контекст; проект тогда берётся из имени текущей папки,
+/// а любой сбой глотается (exit 0, пустой вывод) — хук не имеет права
+/// ломать старт сессии.
+pub async fn snapshot(project: Option<String>, hook: bool) -> Result<()> {
+    let run = || -> Result<String> {
+        let conn = db::open(&db_path())?;
+        let derived = project.clone().or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        });
+        // Дистиллят освежаем раз в сутки прямо отсюда: консолидация — чистый
+        // SQL, дешевле одного FTS-запроса, а слой 7 не протухает незаметно.
+        if let Some(p) = derived.as_deref() {
+            let stale = conn
+                .query_row(
+                    "SELECT updated_at < datetime('now', '-1 day') FROM nodes
+                      WHERE node_type = '\"digest\"' AND label = ?1 AND deleted_at IS NULL",
+                    [format!("[{p}] дистиллят")],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(true);
+            if stale {
+                let _ = graph::consolidate(&conn, p); // best-effort: снапшот важнее
+            }
+        }
+        graph::build_snapshot(&conn, derived.as_deref())
+    };
+
+    match run() {
+        Ok(md) => {
+            if hook {
+                let out = json!({
+                    "suppressOutput": true,
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": md,
+                    }
+                });
+                println!("{}", serde_json::to_string(&out)?);
+            } else {
+                println!("{md}");
+            }
+            Ok(())
+        }
+        Err(e) if hook => {
+            // Молча: сломанный хук хуже отсутствующего снапшота.
+            tracing::warn!("snapshot hook failed: {e}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn mcp() -> Result<()> {
