@@ -196,3 +196,59 @@ pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    fn test_conn() -> Connection {
+        let dir = std::env::temp_dir().join(format!("aurelius-snap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        db::open(&dir.join("test.db")).expect("open test db")
+    }
+
+    #[test]
+    fn clip_respects_budget_and_collapses_whitespace() {
+        assert_eq!(clip("a  b\n c", 100), "a b c");
+        let clipped = clip(&"ы".repeat(50), 10);
+        assert!(clipped.chars().count() <= 10);
+        assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn snapshot_has_header_and_fits_total_budget() {
+        let conn = test_conn();
+        super::super::add_node(
+            &conn,
+            NodeType::UserFact,
+            "владелец",
+            Some("факт о владельце"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add user fact");
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+        assert!(md.starts_with("# Память Aurelius · demo"));
+        assert!(md.contains("1 · Владелец"));
+        // Общий потолок: снапшот обязан оставаться маленьким при любом графе.
+        assert!(md.chars().count() < 6_000, "снапшот распух: {}", md.len());
+    }
+
+    #[test]
+    fn consolidate_is_idempotent_one_digest_per_project() {
+        let conn = test_conn();
+        let a = consolidate(&conn, "demo").expect("first");
+        let b = consolidate(&conn, "demo").expect("second");
+        assert_eq!(a.id, b.id, "должен обновляться тот же узел");
+        let type_str = serde_json::to_string(&NodeType::Digest).expect("type");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE node_type = ?1 AND deleted_at IS NULL",
+                [type_str],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(n, 1);
+    }
+}
