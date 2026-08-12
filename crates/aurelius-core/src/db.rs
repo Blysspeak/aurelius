@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -493,7 +493,111 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 8)?;
     }
 
+    if current < 9 {
+        migrate_v9(&tx)?;
+        set_schema_version(&tx, 9)?;
+    }
+
     tx.commit()?;
+    Ok(())
+}
+
+/// V9 — «Бит-и-Дело», волны 1-2 (specs/003-bit-i-delo): журнал следов действий
+/// (append-only WAL с FTS), пробы против ground truth, пути извлечения,
+/// лабильные окна recall-а и коррекции-первыми. Гроссбух битов, обязательства
+/// и словари кодека приедут отдельными миграциями своих волн.
+fn migrate_v9(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        -- Ступень 1. Сырые следы действий агента. Только INSERT: память строится
+        -- из «что сделал и чем кончилось», задним числом факты не редактируются.
+        CREATE TABLE IF NOT EXISTS act_trace (
+            id             INTEGER PRIMARY KEY,
+            ts             INTEGER NOT NULL,
+            session_id     TEXT NOT NULL,
+            kind           TEXT NOT NULL,
+            payload        TEXT NOT NULL,
+            exit_code      INTEGER,
+            state_hash_pre TEXT,
+            state_hash_post TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_act_trace_session ON act_trace(session_id, ts);
+        CREATE TRIGGER IF NOT EXISTS act_trace_ro BEFORE UPDATE ON act_trace BEGIN
+            SELECT RAISE(ABORT, 'act_trace is append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS act_trace_nodel BEFORE DELETE ON act_trace BEGIN
+            SELECT RAISE(ABORT, 'act_trace is append-only');
+        END;
+        CREATE VIRTUAL TABLE IF NOT EXISTS act_trace_fts USING fts5(
+            payload, content='act_trace', content_rowid='id'
+        );
+        CREATE TRIGGER IF NOT EXISTS act_trace_ai AFTER INSERT ON act_trace BEGIN
+            INSERT INTO act_trace_fts(rowid, payload) VALUES (new.id, new.payload);
+        END;
+
+        -- Ступень 2. Машинно-проверяемые пробы: память, чьи утверждения можно
+        -- исполнить против ground truth (файл существует, SHA есть в git).
+        CREATE TABLE IF NOT EXISTS probes (
+            id         INTEGER PRIMARY KEY,
+            node_id    TEXT NOT NULL,
+            kind       TEXT NOT NULL CHECK(kind IN
+                       ('file_exists','git_sha','cmd_in_path','table_in_schema')),
+            expr       TEXT NOT NULL,
+            last_ok    INTEGER,
+            checked_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_probes_node ON probes(node_id);
+
+        -- Ступень 3. Пути извлечения: доверие и забывание живут на паре
+        -- «сигнатура запроса → узел», а не на узле целиком.
+        CREATE TABLE IF NOT EXISTS pathways (
+            query_sig TEXT NOT NULL,
+            node_id   TEXT NOT NULL,
+            confirms  INTEGER NOT NULL DEFAULT 0,
+            misfires  INTEGER NOT NULL DEFAULT 0,
+            blocked   INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (query_sig, node_id)
+        );
+
+        -- Ступень 3. Лабильное окно: recall открывает окно, следы сессии
+        -- атрибутируются к нему, вердикт выносится при закрытии (ступень 4).
+        CREATE TABLE IF NOT EXISTS labile_window (
+            id            INTEGER PRIMARY KEY,
+            node_id       TEXT NOT NULL,
+            session_id    TEXT NOT NULL,
+            snapshot_hash TEXT NOT NULL,
+            opened_at     INTEGER NOT NULL,
+            closed_at     INTEGER,
+            verdict       TEXT CHECK(verdict IN ('reinforce','erode','fork','null'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_lw_one_open
+            ON labile_window(node_id, session_id) WHERE closed_at IS NULL;
+        CREATE TABLE IF NOT EXISTS trace_attribution (
+            window_id     INTEGER NOT NULL,
+            trace_id      INTEGER NOT NULL,
+            overlap_score REAL NOT NULL,
+            PRIMARY KEY (window_id, trace_id)
+        );
+
+        -- Ступень 3. Коррекции: забывание — активная подача поправки ПЕРЕД
+        -- результатами поиска, а не дыра в выдаче.
+        CREATE TABLE IF NOT EXISTS corrections (
+            id             INTEGER PRIMARY KEY,
+            fts_pattern    TEXT NOT NULL,
+            dead_node_id   TEXT NOT NULL,
+            replacement_id TEXT,
+            reason         TEXT NOT NULL,
+            minted_at      INTEGER NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS corrections_fts USING fts5(
+            fts_pattern, reason, content='corrections', content_rowid='id'
+        );
+        CREATE TRIGGER IF NOT EXISTS corrections_ai AFTER INSERT ON corrections BEGIN
+            INSERT INTO corrections_fts(rowid, fts_pattern, reason)
+            VALUES (new.id, new.fts_pattern, new.reason);
+        END;
+    ",
+    )?;
     Ok(())
 }
 
