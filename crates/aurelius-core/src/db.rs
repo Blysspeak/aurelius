@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 10;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -503,7 +503,107 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 10)?;
     }
 
+    if current < 11 {
+        migrate_v11(&tx)?;
+        set_schema_version(&tx, 11)?;
+    }
+
     tx.commit()?;
+    Ok(())
+}
+
+/// V11 — «Бит-и-Дело», волна 4: клиринг гроссбуха (ledger, render_log, calib),
+/// проспективный контур обязательств (obligations, ob_postings,
+/// counterparty_profile) и банкротство-поглощение (receivership,
+/// degrade_stage на узле).
+fn migrate_v11(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        -- Ступень 5. Двойная запись битового гроссбуха: единственная валюта
+        -- ранжирования. Timestamps в ценность не входят — только измерения.
+        CREATE TABLE IF NOT EXISTS ledger (
+            id         INTEGER PRIMARY KEY,
+            node_id    TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            bits_delta INTEGER NOT NULL,
+            kind       TEXT NOT NULL CHECK(kind IN
+                       ('earn','render_miss','discovery','yield_bonus','inversion_debit')),
+            at         INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ledger_node ON ledger(node_id);
+
+        -- Что было показано в снапшоте: с этого момента у показа есть цена.
+        CREATE TABLE IF NOT EXISTS render_log (
+            session_id TEXT NOT NULL,
+            node_id    TEXT NOT NULL,
+            layer      TEXT NOT NULL,
+            bytes      INTEGER NOT NULL,
+            cited      INTEGER NOT NULL DEFAULT 0,
+            at         INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_render_session ON render_log(session_id);
+
+        -- Калибровка оценщика рюкзака: α (биты) и β (исход) правятся по факту.
+        CREATE TABLE IF NOT EXISTS calib (
+            id         INTEGER PRIMARY KEY CHECK(id = 1),
+            alpha      REAL NOT NULL,
+            beta       REAL NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO calib (id, alpha, beta, updated_at) VALUES (1, 1.0, 1.0, 0);
+
+        -- Ступень 6. Обязательства как двойная бухгалтерия: существует ⇔
+        -- проводки не сбалансированы. Не булев флаг, а аудируемый журнал.
+        CREATE TABLE IF NOT EXISTS obligations (
+            id            INTEGER PRIMARY KEY,
+            debtor        TEXT NOT NULL,
+            creditor      TEXT NOT NULL,
+            verb_class    TEXT NOT NULL,
+            object_fp     TEXT NOT NULL,
+            opened_at     INTEGER NOT NULL,
+            deadline      INTEGER,
+            closed_at     INTEGER,
+            src_trace     INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ob_dedup
+            ON obligations(debtor, creditor, object_fp) WHERE closed_at IS NULL;
+        CREATE VIRTUAL TABLE IF NOT EXISTS obligations_fts USING fts5(
+            object_fp, content='obligations', content_rowid='id'
+        );
+        CREATE TRIGGER IF NOT EXISTS obligations_ai AFTER INSERT ON obligations BEGIN
+            INSERT INTO obligations_fts(rowid, object_fp) VALUES (new.id, new.object_fp);
+        END;
+        CREATE TABLE IF NOT EXISTS counterparty_profile (
+            node        TEXT PRIMARY KEY,
+            opened      INTEGER NOT NULL DEFAULT 0,
+            closed      INTEGER NOT NULL DEFAULT 0,
+            breach      INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- Ступень 7. Банкротство-поглощение: кто чьи требования унаследовал.
+        CREATE TABLE IF NOT EXISTS receivership (
+            node_id     TEXT PRIMARY KEY,
+            absorbed_by TEXT NOT NULL,
+            at          INTEGER NOT NULL
+        );
+    ",
+    )?;
+    // degrade_stage: 0 полный текст, 1 выжимка, 2 tombstone. ALTER отдельно —
+    // ADD COLUMN не идемпотентен, а миграция и так под одной версией.
+    let has_stage: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name = 'degrade_stage'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_stage {
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN degrade_stage INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 

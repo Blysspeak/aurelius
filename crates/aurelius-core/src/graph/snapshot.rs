@@ -98,19 +98,36 @@ pub fn build_snapshot(conn: &Connection, project: Option<&str>) -> Result<String
     let mut semantic = layer(&decisions, 150, B_SEMANTIC * 2 / 3);
     semantic.push_str(&layer(&concepts, 150, B_SEMANTIC / 3));
 
-    let sections: [(&str, String); 7] = [
+    // Гроссбух давления (ступень 6): открытые обязательства по напряжению —
+    // недоделанное лезет наверх само. Best-effort: пустой при отсутствии таблиц.
+    let pressure = crate::obligations::top_by_tension(conn, 6)
+        .map(|obs| {
+            obs.iter()
+                .map(|o| {
+                    let obj: String = o.object_fp.chars().take(40).collect();
+                    format!(
+                        "- [{:.1}] {} → {}: {}\n",
+                        o.tension, o.debtor, o.creditor, obj
+                    )
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+
+    let sections: [(&str, String); 8] = [
         ("1 · Владелец", layer(&identity, 120, B_IDENTITY)),
         ("2 · В работе (задачи и открытые проблемы)", working),
-        ("3 · Последние сессии", layer(&sessions, 250, B_EPISODIC)),
-        ("4 · Решения и знания", semantic),
-        ("5 · Приёмы", layer(&skills, 100, B_PROCEDURAL)),
+        ("3 · Давление (незакрытые обязательства)", pressure),
+        ("4 · Последние сессии", layer(&sessions, 250, B_EPISODIC)),
+        ("5 · Решения и знания", semantic),
+        ("6 · Приёмы", layer(&skills, 100, B_PROCEDURAL)),
         (
-            "6 · Архив",
+            "7 · Архив",
             format!(
                 "- {nodes} узлов, {edges} рёбер; глубже — memory_recall(topic) / memory_search(query)\n"
             ),
         ),
-        ("7 · Дистиллят", layer(&digest, B_DIGEST, B_DIGEST)),
+        ("8 · Дистиллят", layer(&digest, B_DIGEST, B_DIGEST)),
     ];
 
     let mut md = format!("# Память Aurelius · {scope} · {ts} UTC\n");
