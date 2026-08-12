@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -498,7 +498,58 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 9)?;
     }
 
+    if current < 10 {
+        migrate_v10(&tx)?;
+        set_schema_version(&tx, 10)?;
+    }
+
     tx.commit()?;
+    Ok(())
+}
+
+/// V10 — «Бит-и-Дело», волны 2-3: словари кодека и дельта-счета (шлюз
+/// сюрприза, NCS), ревизии узлов (единственный писатель контента — судья
+/// исхода, история правок аудируема).
+fn migrate_v10(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        -- Шлюз сюрприза: обученные zstd-словари ожиданий по scope.
+        CREATE TABLE IF NOT EXISTS codec (
+            dict_id INTEGER PRIMARY KEY,
+            scope   TEXT NOT NULL,
+            epoch   INTEGER NOT NULL DEFAULT 1,
+            blob    BLOB NOT NULL,
+            trained_at INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_codec_scope_epoch ON codec(scope, epoch);
+
+        -- Дельта-счёт записи: сколько информации она внесла против ожидания.
+        CREATE TABLE IF NOT EXISTS delta (
+            id             INTEGER PRIMARY KEY,
+            node_id        TEXT NOT NULL,
+            scope          TEXT NOT NULL,
+            raw_len        INTEGER NOT NULL,
+            resid_len      INTEGER NOT NULL,
+            surprisal_bits INTEGER NOT NULL,
+            ncs            REAL NOT NULL,
+            epoch_born     INTEGER NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'active'
+                           CHECK(status IN ('active','assimilating','folded','inverted'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_delta_node ON delta(node_id);
+
+        -- Ревизии контента: правки только append-ом с причиной-окном.
+        CREATE TABLE IF NOT EXISTS node_version (
+            node_id             TEXT NOT NULL,
+            rev                 INTEGER NOT NULL,
+            content             TEXT NOT NULL,
+            consolidation_level INTEGER NOT NULL DEFAULT 0,
+            cause_window_id     INTEGER,
+            created_at          INTEGER NOT NULL,
+            PRIMARY KEY (node_id, rev)
+        );
+    ",
+    )?;
     Ok(())
 }
 

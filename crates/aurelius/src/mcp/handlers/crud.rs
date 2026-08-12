@@ -1,11 +1,37 @@
 use anyhow::Result;
-use aurelius_core::{graph, indexer, models::MemoryKind};
+use aurelius_core::{graph, indexer, models::MemoryKind, window};
 use serde_json::json;
 use uuid::Uuid;
 
 use super::{
     edge_brief, node_detail, open_db, parse_node_type, parse_relation, parse_since, resolve_node,
 };
+
+/// Бит-и-Дело, ступень 3: превратить recall в транзакцию. Отфильтровать
+/// заблокированные пути, открыть лабильные окна и вернуть коррекции-первыми.
+/// session_id берём из параметра тула (Claude Code его прокидывает).
+fn instrument_recall(
+    conn: &rusqlite::Connection,
+    query: &str,
+    session_id: &str,
+    nodes: &[aurelius_core::models::Node],
+) -> Vec<serde_json::Value> {
+    let sig = window::query_sig(query);
+    let corrections: Vec<serde_json::Value> = window::corrections_for(conn, query)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| json!({ "correction": c.reason, "replacement": c.replacement_id }))
+        .collect();
+    for n in nodes {
+        let id = n.id.to_string();
+        if window::pathway_blocked(conn, &sig, &id).unwrap_or(false) {
+            continue;
+        }
+        let content = n.note.as_deref().unwrap_or(&n.label);
+        let _ = window::record_recall(conn, &sig, &id, session_id, content);
+    }
+    corrections
+}
 
 pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     let query = params
@@ -30,10 +56,17 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         }
     }
 
+    let session_id = params
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("mcp");
+    let corrections = instrument_recall(&conn, query, session_id, &nodes);
+
     Ok(json!({
         "query": query,
         "type": type_filter,
         "since": since,
+        "corrections": corrections,
         "count": nodes.len(),
         "results": nodes.iter().map(node_detail).collect::<Vec<_>>(),
     }))
@@ -130,10 +163,11 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
     // Бит-и-Дело, ступень 2 (advisory-режим): проверяемые утверждения памяти
     // исполняются против ground truth прямо при рождении. Провал пока не
     // убивает узел — но виден вызывающему и записан в probes для судьи исхода.
+    let node_id = node.id.to_string();
+    let text = format!("{} {}", label, note.unwrap_or(""));
     let probe_warnings: Vec<String> = {
-        let text = format!("{} {}", label, note.unwrap_or(""));
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        match aurelius_core::probes::check_and_record(&conn, &node.id.to_string(), &text, &cwd) {
+        match aurelius_core::probes::check_and_record(&conn, &node_id, &text, &cwd) {
             Ok(report) => report
                 .failed
                 .iter()
@@ -146,13 +180,24 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         }
     };
 
+    // Ступень 2, шлюз сюрприза (advisory): NCS против словаря scope. Scope —
+    // префикс проекта из label ([proj] ...) либо global. Запись только меряет.
+    let scope = label
+        .strip_prefix('[')
+        .and_then(|s| s.split_once(']'))
+        .map_or_else(|| "global".to_owned(), |(p, _)| p.to_owned());
+    let surprise = aurelius_core::codec::record(&conn, &node_id, &scope, &text)
+        .map(|s| json!({ "ncs": s.ncs, "surprisal_bits": s.surprisal_bits, "epoch": s.epoch }))
+        .unwrap_or(serde_json::Value::Null);
+
     Ok(json!({
-        "id": node.id.to_string(),
+        "id": node_id,
         "label": node.label,
         "type": type_str,
         "memory_kind": node.memory_kind,
         "created": true,
         "probe_warnings": probe_warnings,
+        "surprise": surprise,
     }))
 }
 
