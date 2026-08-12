@@ -358,9 +358,20 @@ pub fn memory_gc() -> Result<serde_json::Value> {
         [],
     )?;
 
+    // Бит-и-Дело, ступень 7: банкротство-поглощение бесполезных узлов
+    // (ниже порога ценности и без подтверждённых путей) в сильнейшего соседа.
+    let gc = aurelius_core::ledger::bankrupt_and_absorb(&conn, 1).unwrap_or(
+        aurelius_core::ledger::GcStats {
+            scanned: 0,
+            absorbed: 0,
+        },
+    );
+
     Ok(json!({
         "duplicate_edges_removed": dup_edges,
         "orphan_edges_removed": orphan_edges,
         "duplicate_nodes_removed": dup_nodes,
+        "bankrupt_scanned": gc.scanned,
+        "bankrupt_absorbed": gc.absorbed,
     }))
 }
