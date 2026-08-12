@@ -56,6 +56,7 @@ pub async fn note(
         "concept" => NodeType::Concept,
         "problem" => NodeType::Problem,
         "solution" => NodeType::Solution,
+        "user_fact" => NodeType::UserFact,
         _ => NodeType::Decision,
     };
     let label = label.unwrap_or_else(|| {
@@ -730,6 +731,227 @@ pub async fn skills(hook: bool) -> Result<()> {
         print!("{text}");
     }
     Ok(())
+}
+
+/// Семислойный снапшот памяти. С `--hook` печатает SessionStart-JSON для
+/// прямой инъекции в контекст; проект тогда берётся из имени текущей папки,
+/// а любой сбой глотается (exit 0, пустой вывод) — хук не имеет права
+/// ломать старт сессии.
+pub async fn snapshot(project: Option<String>, hook: bool) -> Result<()> {
+    let run = || -> Result<String> {
+        let conn = db::open(&db_path())?;
+        let derived = project.clone().or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        });
+        // Дистиллят освежаем раз в сутки прямо отсюда: консолидация — чистый
+        // SQL, дешевле одного FTS-запроса, а слой 7 не протухает незаметно.
+        if let Some(p) = derived.as_deref() {
+            let stale = conn
+                .query_row(
+                    "SELECT updated_at < datetime('now', '-1 day') FROM nodes
+                      WHERE node_type = '\"digest\"' AND label = ?1 AND deleted_at IS NULL",
+                    [format!("[{p}] дистиллят")],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(true);
+            if stale {
+                let _ = graph::consolidate(&conn, p); // best-effort: снапшот важнее
+            }
+        }
+        graph::build_snapshot(&conn, derived.as_deref())
+    };
+
+    match run() {
+        Ok(md) => {
+            if hook {
+                let out = json!({
+                    "suppressOutput": true,
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": md,
+                    }
+                });
+                println!("{}", serde_json::to_string(&out)?);
+            } else {
+                println!("{md}");
+            }
+            Ok(())
+        }
+        Err(e) if hook => {
+            // Молча: сломанный хук хуже отсутствующего снапшота.
+            tracing::warn!("snapshot hook failed: {e}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Записать след действия (ступень 1 «Бит-и-Дело»). `--hook` — режим
+/// PostToolUse-хука Claude Code: JSON со stdin, маппинг по имени тула,
+/// любой сбой глотается (exit 0) — хук не имеет права мешать работе.
+pub async fn trace_cmd(
+    kind: Option<String>,
+    payload: Option<String>,
+    session: Option<String>,
+    exit_code: Option<i64>,
+    hook: bool,
+) -> Result<()> {
+    use aurelius_core::trace::{self, TraceInput, TraceKind};
+
+    let run = || -> Result<()> {
+        let conn = db::open(&db_path())?;
+        if hook {
+            let mut raw = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw)?;
+            let v: serde_json::Value = serde_json::from_str(&raw)?;
+            let session_id = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown")
+                .to_owned();
+            let tool = v.get("tool_name").and_then(|s| s.as_str()).unwrap_or("");
+            let input = v.get("tool_input").cloned().unwrap_or_default();
+            let (kind, payload, hash_post) = match tool {
+                "Edit" | "Write" | "NotebookEdit" => {
+                    let path = input
+                        .get("file_path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let hash = trace::file_state_hash(std::path::Path::new(&path));
+                    (TraceKind::FileEdit, path, Some(hash))
+                }
+                "Bash" | "PowerShell" => (
+                    TraceKind::ToolCall,
+                    input
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    None,
+                ),
+                _ => (TraceKind::ToolCall, tool.to_owned(), None),
+            };
+            if payload.is_empty() {
+                return Ok(()); // нечего журналировать — не шумим
+            }
+            trace::ingest(
+                &conn,
+                &TraceInput {
+                    session_id: &session_id,
+                    kind,
+                    payload: &payload,
+                    exit_code: None,
+                    state_hash_pre: None,
+                    state_hash_post: hash_post,
+                },
+            )?;
+            return Ok(());
+        }
+
+        let kind = kind.as_deref().and_then(TraceKind::parse).ok_or_else(|| {
+            anyhow::anyhow!(
+                "kind обязателен: tool_call|file_edit|error|commit|msg_sent|user_correction"
+            )
+        })?;
+        let payload = payload.ok_or_else(|| anyhow::anyhow!("payload обязателен"))?;
+        let id = trace::ingest(
+            &conn,
+            &TraceInput {
+                session_id: session.as_deref().unwrap_or("cli"),
+                kind,
+                payload: &payload,
+                exit_code,
+                state_hash_pre: None,
+                state_hash_post: None,
+            },
+        )?;
+        println!("✓ след #{id}");
+        Ok(())
+    };
+
+    match run() {
+        Err(e) if hook => {
+            tracing::warn!("trace hook failed: {e}");
+            Ok(()) // молча: журнал не важнее работы
+        }
+        other => other,
+    }
+}
+
+/// Полная Stop-цепочка «Бит-и-Дело»: судья исхода (ступень 4) → обязательства
+/// из следов сессии: гашение погашающими событиями и intake комиссивов
+/// (ступень 6) → клиринг гроссбуха (ступень 5). `--hook` — режим Stop-хука:
+/// min-age 0 (сессия кончилась), любой сбой глотается.
+pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
+    use aurelius_core::{differ, ledger, obligations};
+
+    let run = || -> Result<differ::JudgeStats> {
+        let conn = db::open(&db_path())?;
+        // 4. Судья закрывает созревшие окна и реконсолидирует узлы.
+        let stats = differ::close_ripe_windows(&conn, min_age_secs)?;
+
+        // 6. Обязательства: пройтись по свежим следам всех сессий за последний
+        // час. commit/msg_sent гасят долги; текст с комиссивом заводит новые.
+        // src_trace = id следа: одно обязательство на след, повтор — no-op.
+        let recent: Vec<(i64, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, payload FROM act_trace
+                  WHERE ts >= ?1 ORDER BY id DESC LIMIT 200",
+            )?;
+            let since = chrono::Utc::now().timestamp() - 3_600;
+            let rows = stmt.query_map([since], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.filter_map(std::result::Result::ok).collect()
+        };
+        for (id, kind, payload) in &recent {
+            match kind.as_str() {
+                "commit" | "msg_sent" => {
+                    let _ = obligations::settle(&conn, payload, "я");
+                }
+                _ => {
+                    let _ = obligations::intake(&conn, payload, "я", "влад", Some(*id));
+                }
+            }
+        }
+
+        // 5. Клиринг: yield-бонусы reinforce-окон + штраф render_miss.
+        let sessions: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT session_id FROM labile_window WHERE closed_at IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(std::result::Result::ok).collect()
+        };
+        for s in &sessions {
+            let _ = ledger::clear_session(&conn, s);
+        }
+        Ok(stats)
+    };
+
+    match run() {
+        Ok(s) => {
+            if !hook {
+                println!(
+                    "закрыто окон: {} (reinforce {}, erode {}, fork {})",
+                    s.closed, s.reinforced, s.eroded, s.forked
+                );
+            }
+            Ok(())
+        }
+        Err(e) if hook => {
+            tracing::warn!("judge hook failed: {e}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn mcp() -> Result<()> {

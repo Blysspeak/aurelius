@@ -117,6 +117,8 @@ async fn handle_tools_call(
         "memory_dump" => handlers::memory_dump(&arguments),
         "memory_gc" => handlers::memory_gc(),
         "memory_merge" => handlers::memory_merge(&arguments),
+        "memory_snapshot" => handlers::memory_snapshot(&arguments),
+        "memory_consolidate" => handlers::memory_consolidate(&arguments),
         "task_create" => handlers::task_create(&arguments),
         "task_update" => handlers::task_update(&arguments),
         "task_list" => handlers::task_list(&arguments),
