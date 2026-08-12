@@ -903,7 +903,11 @@ pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
             )?;
             let since = chrono::Utc::now().timestamp() - 3_600;
             let rows = stmt.query_map([since], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })?;
             rows.filter_map(std::result::Result::ok).collect()
         };
