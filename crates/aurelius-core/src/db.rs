@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 11;
+pub const SCHEMA_VERSION: i32 = 12;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -508,7 +508,77 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 11)?;
     }
 
+    if current < 12 {
+        migrate_v12(&tx)?;
+        set_schema_version(&tx, 12)?;
+    }
+
     tx.commit()?;
+    Ok(())
+}
+
+/// V12 — у обязательства появляется ЧИТАЕМЫЙ объект рядом с отпечатком, и
+/// разово вычищается то, что успел завести intake без заслонки на речь.
+///
+/// Отпечаток `object_fp` — отсортированный мешок токенов, он для дедупа и FTS.
+/// Показывать его человеку было ошибкой: слой «Давление» выдавал строки вида
+/// «aurelius blyss force foreach item local path remove silentlycontinue».
+/// Хуже того, половина этих строк вообще не должна была родиться — их завели
+/// шелл-команды, лишь УПОМИНАВШИЕ обещание в своих аргументах.
+///
+/// Чистка опирается на `act_trace`: журнал append-only, исходный текст жив, и
+/// его можно перепроверить нынешним детектором речи. Намеренно зовём боевой
+/// `obligations::is_utterance`, а не замороженную копию: смысл шага — «применить
+/// заслонку задним числом», и он выполняется ровно один раз на базу.
+fn migrate_v12(conn: &Connection) -> Result<()> {
+    // ADD COLUMN не идемпотентен — проверяем, как и degrade_stage в V11.
+    let has_text: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('obligations') WHERE name = 'object_text'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_text {
+        conn.execute(
+            "ALTER TABLE obligations ADD COLUMN object_text TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT o.id, t.payload FROM obligations o
+               JOIN act_trace t ON t.id = o.src_trace",
+        )?;
+        let it = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        it.filter_map(std::result::Result::ok).collect()
+    };
+    for (id, payload) in &rows {
+        match crate::obligations::readable_object(payload) {
+            Some(text) => {
+                conn.execute(
+                    "UPDATE obligations SET object_text = ?1 WHERE id = ?2",
+                    rusqlite::params![text, id],
+                )?;
+            }
+            // Источник не был речью — обязательства не существовало.
+            None => {
+                conn.execute("DELETE FROM obligations WHERE id = ?1", [id])?;
+            }
+        }
+    }
+    // Строкам без следа-источника читаемого текста взять неоткуда: оставляем им
+    // отпечаток, чтобы снапшот не показывал пустоту.
+    conn.execute(
+        "UPDATE obligations SET object_text = object_fp
+          WHERE object_text = '' AND src_trace IS NULL",
+        [],
+    )?;
+    // V11 завела только AFTER INSERT-триггер, delete-триггера у FTS нет —
+    // после удаления строк индекс пересобираем целиком.
+    conn.execute_batch("INSERT INTO obligations_fts(obligations_fts) VALUES('rebuild');")?;
     Ok(())
 }
 
