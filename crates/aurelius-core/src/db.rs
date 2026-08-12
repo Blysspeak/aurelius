@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 12;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -493,7 +493,332 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 8)?;
     }
 
+    if current < 9 {
+        migrate_v9(&tx)?;
+        set_schema_version(&tx, 9)?;
+    }
+
+    if current < 10 {
+        migrate_v10(&tx)?;
+        set_schema_version(&tx, 10)?;
+    }
+
+    if current < 11 {
+        migrate_v11(&tx)?;
+        set_schema_version(&tx, 11)?;
+    }
+
+    if current < 12 {
+        migrate_v12(&tx)?;
+        set_schema_version(&tx, 12)?;
+    }
+
     tx.commit()?;
+    Ok(())
+}
+
+/// V12 — у обязательства появляется ЧИТАЕМЫЙ объект рядом с отпечатком, и
+/// разово вычищается то, что успел завести intake без заслонки на речь.
+///
+/// Отпечаток `object_fp` — отсортированный мешок токенов, он для дедупа и FTS.
+/// Показывать его человеку было ошибкой: слой «Давление» выдавал строки вида
+/// «aurelius blyss force foreach item local path remove silentlycontinue».
+/// Хуже того, половина этих строк вообще не должна была родиться — их завели
+/// шелл-команды, лишь УПОМИНАВШИЕ обещание в своих аргументах.
+///
+/// Чистка опирается на `act_trace`: журнал append-only, исходный текст жив, и
+/// его можно перепроверить нынешним детектором речи. Намеренно зовём боевой
+/// `obligations::is_utterance`, а не замороженную копию: смысл шага — «применить
+/// заслонку задним числом», и он выполняется ровно один раз на базу.
+fn migrate_v12(conn: &Connection) -> Result<()> {
+    // ADD COLUMN не идемпотентен — проверяем, как и degrade_stage в V11.
+    let has_text: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('obligations') WHERE name = 'object_text'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_text {
+        conn.execute(
+            "ALTER TABLE obligations ADD COLUMN object_text TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT o.id, t.payload FROM obligations o
+               JOIN act_trace t ON t.id = o.src_trace",
+        )?;
+        let it = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        it.filter_map(std::result::Result::ok).collect()
+    };
+    for (id, payload) in &rows {
+        match crate::obligations::readable_object(payload) {
+            Some(text) => {
+                conn.execute(
+                    "UPDATE obligations SET object_text = ?1 WHERE id = ?2",
+                    rusqlite::params![text, id],
+                )?;
+            }
+            // Источник не был речью — обязательства не существовало.
+            None => {
+                conn.execute("DELETE FROM obligations WHERE id = ?1", [id])?;
+            }
+        }
+    }
+    // Строкам без следа-источника читаемого текста взять неоткуда: оставляем им
+    // отпечаток, чтобы снапшот не показывал пустоту.
+    conn.execute(
+        "UPDATE obligations SET object_text = object_fp
+          WHERE object_text = '' AND src_trace IS NULL",
+        [],
+    )?;
+    // V11 завела только AFTER INSERT-триггер, delete-триггера у FTS нет —
+    // после удаления строк индекс пересобираем целиком.
+    conn.execute_batch("INSERT INTO obligations_fts(obligations_fts) VALUES('rebuild');")?;
+    Ok(())
+}
+
+/// V11 — «Бит-и-Дело», волна 4: клиринг гроссбуха (ledger, render_log, calib),
+/// проспективный контур обязательств (obligations, ob_postings,
+/// counterparty_profile) и банкротство-поглощение (receivership,
+/// degrade_stage на узле).
+fn migrate_v11(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        -- Ступень 5. Двойная запись битового гроссбуха: единственная валюта
+        -- ранжирования. Timestamps в ценность не входят — только измерения.
+        CREATE TABLE IF NOT EXISTS ledger (
+            id         INTEGER PRIMARY KEY,
+            node_id    TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            bits_delta INTEGER NOT NULL,
+            kind       TEXT NOT NULL CHECK(kind IN
+                       ('earn','render_miss','discovery','yield_bonus','inversion_debit')),
+            at         INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ledger_node ON ledger(node_id);
+
+        -- Что было показано в снапшоте: с этого момента у показа есть цена.
+        CREATE TABLE IF NOT EXISTS render_log (
+            session_id TEXT NOT NULL,
+            node_id    TEXT NOT NULL,
+            layer      TEXT NOT NULL,
+            bytes      INTEGER NOT NULL,
+            cited      INTEGER NOT NULL DEFAULT 0,
+            at         INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_render_session ON render_log(session_id);
+
+        -- Калибровка оценщика рюкзака: α (биты) и β (исход) правятся по факту.
+        CREATE TABLE IF NOT EXISTS calib (
+            id         INTEGER PRIMARY KEY CHECK(id = 1),
+            alpha      REAL NOT NULL,
+            beta       REAL NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO calib (id, alpha, beta, updated_at) VALUES (1, 1.0, 1.0, 0);
+
+        -- Ступень 6. Обязательства как двойная бухгалтерия: существует ⇔
+        -- проводки не сбалансированы. Не булев флаг, а аудируемый журнал.
+        CREATE TABLE IF NOT EXISTS obligations (
+            id            INTEGER PRIMARY KEY,
+            debtor        TEXT NOT NULL,
+            creditor      TEXT NOT NULL,
+            verb_class    TEXT NOT NULL,
+            object_fp     TEXT NOT NULL,
+            opened_at     INTEGER NOT NULL,
+            deadline      INTEGER,
+            closed_at     INTEGER,
+            src_trace     INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ob_dedup
+            ON obligations(debtor, creditor, object_fp) WHERE closed_at IS NULL;
+        CREATE VIRTUAL TABLE IF NOT EXISTS obligations_fts USING fts5(
+            object_fp, content='obligations', content_rowid='id'
+        );
+        CREATE TRIGGER IF NOT EXISTS obligations_ai AFTER INSERT ON obligations BEGIN
+            INSERT INTO obligations_fts(rowid, object_fp) VALUES (new.id, new.object_fp);
+        END;
+        CREATE TABLE IF NOT EXISTS counterparty_profile (
+            node        TEXT PRIMARY KEY,
+            opened      INTEGER NOT NULL DEFAULT 0,
+            closed      INTEGER NOT NULL DEFAULT 0,
+            breach      INTEGER NOT NULL DEFAULT 0
+        );
+
+        -- Ступень 7. Банкротство-поглощение: кто чьи требования унаследовал.
+        CREATE TABLE IF NOT EXISTS receivership (
+            node_id     TEXT PRIMARY KEY,
+            absorbed_by TEXT NOT NULL,
+            at          INTEGER NOT NULL
+        );
+    ",
+    )?;
+    // degrade_stage: 0 полный текст, 1 выжимка, 2 tombstone. ALTER отдельно —
+    // ADD COLUMN не идемпотентен, а миграция и так под одной версией.
+    let has_stage: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name = 'degrade_stage'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    if !has_stage {
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN degrade_stage INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// V10 — «Бит-и-Дело», волны 2-3: словари кодека и дельта-счета (шлюз
+/// сюрприза, NCS), ревизии узлов (единственный писатель контента — судья
+/// исхода, история правок аудируема).
+fn migrate_v10(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        -- Шлюз сюрприза: обученные zstd-словари ожиданий по scope.
+        CREATE TABLE IF NOT EXISTS codec (
+            dict_id INTEGER PRIMARY KEY,
+            scope   TEXT NOT NULL,
+            epoch   INTEGER NOT NULL DEFAULT 1,
+            blob    BLOB NOT NULL,
+            trained_at INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_codec_scope_epoch ON codec(scope, epoch);
+
+        -- Дельта-счёт записи: сколько информации она внесла против ожидания.
+        CREATE TABLE IF NOT EXISTS delta (
+            id             INTEGER PRIMARY KEY,
+            node_id        TEXT NOT NULL,
+            scope          TEXT NOT NULL,
+            raw_len        INTEGER NOT NULL,
+            resid_len      INTEGER NOT NULL,
+            surprisal_bits INTEGER NOT NULL,
+            ncs            REAL NOT NULL,
+            epoch_born     INTEGER NOT NULL,
+            status         TEXT NOT NULL DEFAULT 'active'
+                           CHECK(status IN ('active','assimilating','folded','inverted'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_delta_node ON delta(node_id);
+
+        -- Ревизии контента: правки только append-ом с причиной-окном.
+        CREATE TABLE IF NOT EXISTS node_version (
+            node_id             TEXT NOT NULL,
+            rev                 INTEGER NOT NULL,
+            content             TEXT NOT NULL,
+            consolidation_level INTEGER NOT NULL DEFAULT 0,
+            cause_window_id     INTEGER,
+            created_at          INTEGER NOT NULL,
+            PRIMARY KEY (node_id, rev)
+        );
+    ",
+    )?;
+    Ok(())
+}
+
+/// V9 — «Бит-и-Дело», волны 1-2 (specs/003-bit-i-delo): журнал следов действий
+/// (append-only WAL с FTS), пробы против ground truth, пути извлечения,
+/// лабильные окна recall-а и коррекции-первыми. Гроссбух битов, обязательства
+/// и словари кодека приедут отдельными миграциями своих волн.
+fn migrate_v9(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        -- Ступень 1. Сырые следы действий агента. Только INSERT: память строится
+        -- из «что сделал и чем кончилось», задним числом факты не редактируются.
+        CREATE TABLE IF NOT EXISTS act_trace (
+            id             INTEGER PRIMARY KEY,
+            ts             INTEGER NOT NULL,
+            session_id     TEXT NOT NULL,
+            kind           TEXT NOT NULL,
+            payload        TEXT NOT NULL,
+            exit_code      INTEGER,
+            state_hash_pre TEXT,
+            state_hash_post TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_act_trace_session ON act_trace(session_id, ts);
+        CREATE TRIGGER IF NOT EXISTS act_trace_ro BEFORE UPDATE ON act_trace BEGIN
+            SELECT RAISE(ABORT, 'act_trace is append-only');
+        END;
+        CREATE TRIGGER IF NOT EXISTS act_trace_nodel BEFORE DELETE ON act_trace BEGIN
+            SELECT RAISE(ABORT, 'act_trace is append-only');
+        END;
+        CREATE VIRTUAL TABLE IF NOT EXISTS act_trace_fts USING fts5(
+            payload, content='act_trace', content_rowid='id'
+        );
+        CREATE TRIGGER IF NOT EXISTS act_trace_ai AFTER INSERT ON act_trace BEGIN
+            INSERT INTO act_trace_fts(rowid, payload) VALUES (new.id, new.payload);
+        END;
+
+        -- Ступень 2. Машинно-проверяемые пробы: память, чьи утверждения можно
+        -- исполнить против ground truth (файл существует, SHA есть в git).
+        CREATE TABLE IF NOT EXISTS probes (
+            id         INTEGER PRIMARY KEY,
+            node_id    TEXT NOT NULL,
+            kind       TEXT NOT NULL CHECK(kind IN
+                       ('file_exists','git_sha','cmd_in_path','table_in_schema')),
+            expr       TEXT NOT NULL,
+            last_ok    INTEGER,
+            checked_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_probes_node ON probes(node_id);
+
+        -- Ступень 3. Пути извлечения: доверие и забывание живут на паре
+        -- «сигнатура запроса → узел», а не на узле целиком.
+        CREATE TABLE IF NOT EXISTS pathways (
+            query_sig TEXT NOT NULL,
+            node_id   TEXT NOT NULL,
+            confirms  INTEGER NOT NULL DEFAULT 0,
+            misfires  INTEGER NOT NULL DEFAULT 0,
+            blocked   INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (query_sig, node_id)
+        );
+
+        -- Ступень 3. Лабильное окно: recall открывает окно, следы сессии
+        -- атрибутируются к нему, вердикт выносится при закрытии (ступень 4).
+        CREATE TABLE IF NOT EXISTS labile_window (
+            id            INTEGER PRIMARY KEY,
+            node_id       TEXT NOT NULL,
+            session_id    TEXT NOT NULL,
+            snapshot_hash TEXT NOT NULL,
+            opened_at     INTEGER NOT NULL,
+            closed_at     INTEGER,
+            verdict       TEXT CHECK(verdict IN ('reinforce','erode','fork','null'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_lw_one_open
+            ON labile_window(node_id, session_id) WHERE closed_at IS NULL;
+        CREATE TABLE IF NOT EXISTS trace_attribution (
+            window_id     INTEGER NOT NULL,
+            trace_id      INTEGER NOT NULL,
+            overlap_score REAL NOT NULL,
+            PRIMARY KEY (window_id, trace_id)
+        );
+
+        -- Ступень 3. Коррекции: забывание — активная подача поправки ПЕРЕД
+        -- результатами поиска, а не дыра в выдаче.
+        CREATE TABLE IF NOT EXISTS corrections (
+            id             INTEGER PRIMARY KEY,
+            fts_pattern    TEXT NOT NULL,
+            dead_node_id   TEXT NOT NULL,
+            replacement_id TEXT,
+            reason         TEXT NOT NULL,
+            minted_at      INTEGER NOT NULL
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS corrections_fts USING fts5(
+            fts_pattern, reason, content='corrections', content_rowid='id'
+        );
+        CREATE TRIGGER IF NOT EXISTS corrections_ai AFTER INSERT ON corrections BEGIN
+            INSERT INTO corrections_fts(rowid, fts_pattern, reason)
+            VALUES (new.id, new.fts_pattern, new.reason);
+        END;
+    ",
+    )?;
     Ok(())
 }
 

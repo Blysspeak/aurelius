@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.9.0"
+version = "1.10.0"
 edition = "2021"
 license = "MIT"
 authors = ["Vladislav Rahmanov <blysspeak@pm.me>"]
@@ -31,7 +31,9 @@ toml = "0.8"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 async-trait = "0.1"
 ignore = "0.4"
+regex = "1"
 sha2 = "0.10"
+zstd = "0.13"
 axum = "0.8"
 open = "5"
 rust-embed = "8"

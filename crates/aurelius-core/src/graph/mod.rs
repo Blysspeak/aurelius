@@ -1,9 +1,11 @@
 mod crud;
 mod search;
+mod snapshot;
 mod traverse;
 
 pub use crud::*;
 pub use search::*;
+pub use snapshot::*;
 pub use traverse::*;
 
 use crate::models::{Edge, MemoryKind, Node};
