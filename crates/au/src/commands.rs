@@ -881,14 +881,57 @@ pub async fn trace_cmd(
     }
 }
 
-/// Судья исхода (ступень 4 «Бит-и-Дело»): закрыть созревшие лабильные окна и
-/// применить вердикты. `--hook` — режим Stop-хука Claude Code: min-age 0
-/// (сессия кончилась, тянуть нечего), любой сбой глотается.
+/// Полная Stop-цепочка «Бит-и-Дело»: судья исхода (ступень 4) → обязательства
+/// из следов сессии: гашение погашающими событиями и intake комиссивов
+/// (ступень 6) → клиринг гроссбуха (ступень 5). `--hook` — режим Stop-хука:
+/// min-age 0 (сессия кончилась), любой сбой глотается.
 pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
-    let run = || -> Result<aurelius_core::differ::JudgeStats> {
+    use aurelius_core::{differ, ledger, obligations};
+
+    let run = || -> Result<differ::JudgeStats> {
         let conn = db::open(&db_path())?;
-        aurelius_core::differ::close_ripe_windows(&conn, min_age_secs)
+        // 4. Судья закрывает созревшие окна и реконсолидирует узлы.
+        let stats = differ::close_ripe_windows(&conn, min_age_secs)?;
+
+        // 6. Обязательства: пройтись по свежим следам всех сессий за последний
+        // час. commit/msg_sent гасят долги; текст с комиссивом заводит новые.
+        // src_trace = id следа: одно обязательство на след, повтор — no-op.
+        let recent: Vec<(i64, String, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, kind, payload FROM act_trace
+                  WHERE ts >= ?1 ORDER BY id DESC LIMIT 200",
+            )?;
+            let since = chrono::Utc::now().timestamp() - 3_600;
+            let rows = stmt.query_map([since], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })?;
+            rows.filter_map(std::result::Result::ok).collect()
+        };
+        for (id, kind, payload) in &recent {
+            match kind.as_str() {
+                "commit" | "msg_sent" => {
+                    let _ = obligations::settle(&conn, payload, "я");
+                }
+                _ => {
+                    let _ = obligations::intake(&conn, payload, "я", "влад", Some(*id));
+                }
+            }
+        }
+
+        // 5. Клиринг: yield-бонусы reinforce-окон + штраф render_miss.
+        let sessions: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT session_id FROM labile_window WHERE closed_at IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.filter_map(std::result::Result::ok).collect()
+        };
+        for s in &sessions {
+            let _ = ledger::clear_session(&conn, s);
+        }
+        Ok(stats)
     };
+
     match run() {
         Ok(s) => {
             if !hook {
