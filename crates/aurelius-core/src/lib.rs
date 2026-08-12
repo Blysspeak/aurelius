@@ -5,6 +5,7 @@ pub mod home;
 pub mod identity;
 pub mod indexer;
 pub mod models;
+pub mod probes;
 pub mod sync;
 pub mod timeforged;
 pub mod trace;
