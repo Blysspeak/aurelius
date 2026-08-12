@@ -299,6 +299,38 @@ pub fn tool_definitions() -> serde_json::Value {
                 }
             },
             {
+                "name": "memory_snapshot",
+                "description": "Seven-layer frozen memory snapshot as compact Markdown (~1.5K tokens): 1 owner facts (user_fact), 2 active tasks + open problems, 3 recent sessions, 4 decisions/concepts, 5 skills, 6 archive pointers, 7 project digest. Built for direct context injection at session start (the SessionStart hook calls `au snapshot --hook`). Read-only and instant. Prefer this over memory_status when you need orientation, not raw data.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": "Project scope (label prefix). Omit for global snapshot."
+                        },
+                        "consolidate": {
+                            "type": "boolean",
+                            "description": "Rebuild the project digest (layer 7) before building the snapshot"
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "memory_consolidate",
+                "description": "Rebuild the project's Digest node (memory layer 7): distills next_steps from recent sessions plus unsolved problems into one compact note. Idempotent — one digest per project, overwritten in place. Run at session end or when the digest looks stale.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": "Project name"
+                        }
+                    },
+                    "required": ["project"]
+                }
+            },
+            {
                 "name": "task_create",
                 "description": "Create a well-structured task with title, description, acceptance criteria, and priority. Auto-links to project. Supports subtask hierarchy and blocking relations.",
                 "inputSchema": {
