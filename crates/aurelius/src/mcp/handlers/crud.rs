@@ -127,12 +127,32 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         None,
     )?;
 
+    // Бит-и-Дело, ступень 2 (advisory-режим): проверяемые утверждения памяти
+    // исполняются против ground truth прямо при рождении. Провал пока не
+    // убивает узел — но виден вызывающему и записан в probes для судьи исхода.
+    let probe_warnings: Vec<String> = {
+        let text = format!("{} {}", label, note.unwrap_or(""));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match aurelius_core::probes::check_and_record(&conn, &node.id.to_string(), &text, &cwd) {
+            Ok(report) => report
+                .failed
+                .iter()
+                .map(|p| format!("проба не прошла: {}", p.expr))
+                .collect(),
+            Err(e) => {
+                tracing::warn!("probes failed for {}: {e}", node.id);
+                Vec::new()
+            }
+        }
+    };
+
     Ok(json!({
         "id": node.id.to_string(),
         "label": node.label,
         "type": type_str,
         "memory_kind": node.memory_kind,
         "created": true,
+        "probe_warnings": probe_warnings,
     }))
 }
 

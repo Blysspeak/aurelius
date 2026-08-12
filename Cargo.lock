@@ -205,6 +205,7 @@ dependencies = [
  "chrono",
  "dirs-next",
  "ignore",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",
