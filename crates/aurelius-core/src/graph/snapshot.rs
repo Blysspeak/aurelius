@@ -104,7 +104,7 @@ pub fn build_snapshot(conn: &Connection, project: Option<&str>) -> Result<String
         .map(|obs| {
             obs.iter()
                 .map(|o| {
-                    let obj: String = o.object_fp.chars().take(40).collect();
+                    let obj: String = o.object.chars().take(72).collect();
                     format!(
                         "- [{:.1}] {} → {}: {}\n",
                         o.tension, o.debtor, o.creditor, obj
