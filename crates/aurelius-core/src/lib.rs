@@ -7,5 +7,6 @@ pub mod indexer;
 pub mod models;
 pub mod sync;
 pub mod timeforged;
+pub mod trace;
 
 pub use db::{db_path, CheckReport, DbError};
