@@ -881,6 +881,32 @@ pub async fn trace_cmd(
     }
 }
 
+/// Судья исхода (ступень 4 «Бит-и-Дело»): закрыть созревшие лабильные окна и
+/// применить вердикты. `--hook` — режим Stop-хука Claude Code: min-age 0
+/// (сессия кончилась, тянуть нечего), любой сбой глотается.
+pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
+    let run = || -> Result<aurelius_core::differ::JudgeStats> {
+        let conn = db::open(&db_path())?;
+        aurelius_core::differ::close_ripe_windows(&conn, min_age_secs)
+    };
+    match run() {
+        Ok(s) => {
+            if !hook {
+                println!(
+                    "закрыто окон: {} (reinforce {}, erode {}, fork {})",
+                    s.closed, s.reinforced, s.eroded, s.forked
+                );
+            }
+            Ok(())
+        }
+        Err(e) if hook => {
+            tracing::warn!("judge hook failed: {e}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub async fn mcp() -> Result<()> {
     aurelius::mcp::serve().await
 }

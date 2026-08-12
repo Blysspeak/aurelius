@@ -305,6 +305,15 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
+    /// Close ripe labile windows and apply outcome verdicts (Bit-i-Delo stage 4)
+    Judge {
+        /// Only close windows at least this many seconds old (default 0)
+        #[arg(short, long, default_value = "0")]
+        min_age: i64,
+        /// Stop-hook mode: never fail
+        #[arg(long)]
+        hook: bool,
+    },
     /// Seven-layer frozen memory snapshot (Markdown, ~1.5K tokens)
     Snapshot {
         /// Project scope; with --hook defaults to the current folder name
@@ -375,6 +384,7 @@ async fn main() -> Result<()> {
             exit_code,
             hook,
         } => commands::trace_cmd(kind, payload, session, exit_code, hook).await,
+        Commands::Judge { min_age, hook } => commands::judge_cmd(min_age, hook).await,
         Commands::Snapshot { project, hook } => commands::snapshot(project, hook).await,
         Commands::Home { action } => commands::home(action).await,
         Commands::Identity { action } => commands::identity(action).await,
