@@ -788,6 +788,99 @@ pub async fn snapshot(project: Option<String>, hook: bool) -> Result<()> {
     }
 }
 
+/// Записать след действия (ступень 1 «Бит-и-Дело»). `--hook` — режим
+/// PostToolUse-хука Claude Code: JSON со stdin, маппинг по имени тула,
+/// любой сбой глотается (exit 0) — хук не имеет права мешать работе.
+pub async fn trace_cmd(
+    kind: Option<String>,
+    payload: Option<String>,
+    session: Option<String>,
+    exit_code: Option<i64>,
+    hook: bool,
+) -> Result<()> {
+    use aurelius_core::trace::{self, TraceInput, TraceKind};
+
+    let run = || -> Result<()> {
+        let conn = db::open(&db_path())?;
+        if hook {
+            let mut raw = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw)?;
+            let v: serde_json::Value = serde_json::from_str(&raw)?;
+            let session_id = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown")
+                .to_owned();
+            let tool = v.get("tool_name").and_then(|s| s.as_str()).unwrap_or("");
+            let input = v.get("tool_input").cloned().unwrap_or_default();
+            let (kind, payload, hash_post) = match tool {
+                "Edit" | "Write" | "NotebookEdit" => {
+                    let path = input
+                        .get("file_path")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    let hash = trace::file_state_hash(std::path::Path::new(&path));
+                    (TraceKind::FileEdit, path, Some(hash))
+                }
+                "Bash" | "PowerShell" => (
+                    TraceKind::ToolCall,
+                    input
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    None,
+                ),
+                _ => (TraceKind::ToolCall, tool.to_owned(), None),
+            };
+            if payload.is_empty() {
+                return Ok(()); // нечего журналировать — не шумим
+            }
+            trace::ingest(
+                &conn,
+                &TraceInput {
+                    session_id: &session_id,
+                    kind,
+                    payload: &payload,
+                    exit_code: None,
+                    state_hash_pre: None,
+                    state_hash_post: hash_post,
+                },
+            )?;
+            return Ok(());
+        }
+
+        let kind = kind.as_deref().and_then(TraceKind::parse).ok_or_else(|| {
+            anyhow::anyhow!(
+                "kind обязателен: tool_call|file_edit|error|commit|msg_sent|user_correction"
+            )
+        })?;
+        let payload = payload.ok_or_else(|| anyhow::anyhow!("payload обязателен"))?;
+        let id = trace::ingest(
+            &conn,
+            &TraceInput {
+                session_id: session.as_deref().unwrap_or("cli"),
+                kind,
+                payload: &payload,
+                exit_code,
+                state_hash_pre: None,
+                state_hash_post: None,
+            },
+        )?;
+        println!("✓ след #{id}");
+        Ok(())
+    };
+
+    match run() {
+        Err(e) if hook => {
+            tracing::warn!("trace hook failed: {e}");
+            Ok(()) // молча: журнал не важнее работы
+        }
+        other => other,
+    }
+}
+
 pub async fn mcp() -> Result<()> {
     aurelius::mcp::serve().await
 }

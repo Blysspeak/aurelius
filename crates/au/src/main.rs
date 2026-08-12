@@ -287,6 +287,24 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
+    /// Append an action trace (Bit-i-Delo stage 1); --hook reads Claude hook JSON from stdin
+    Trace {
+        /// tool_call|file_edit|error|commit|msg_sent|user_correction
+        #[arg(short, long)]
+        kind: Option<String>,
+        /// Trace payload text
+        #[arg(short = 'm', long)]
+        payload: Option<String>,
+        /// Session id (defaults to "cli")
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Exit code of the traced action
+        #[arg(short, long)]
+        exit_code: Option<i64>,
+        /// PostToolUse hook mode: parse hook JSON from stdin, never fail
+        #[arg(long)]
+        hook: bool,
+    },
     /// Seven-layer frozen memory snapshot (Markdown, ~1.5K tokens)
     Snapshot {
         /// Project scope; with --hook defaults to the current folder name
@@ -350,6 +368,13 @@ async fn main() -> Result<()> {
         Commands::Task { action } => commands::task(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,
+        Commands::Trace {
+            kind,
+            payload,
+            session,
+            exit_code,
+            hook,
+        } => commands::trace_cmd(kind, payload, session, exit_code, hook).await,
         Commands::Snapshot { project, hook } => commands::snapshot(project, hook).await,
         Commands::Home { action } => commands::home(action).await,
         Commands::Identity { action } => commands::identity(action).await,
