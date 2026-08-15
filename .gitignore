@@ -13,5 +13,9 @@ CLAUDE.md
 # Local tooling
 .playwright-mcp/
 
+# A literal "~" directory: tools that pass an unexpanded ~ to a Windows shell
+# create one here instead of writing to the home directory.
+/~/
+
 # Claude Code local settings (per-machine permissions, not shared)
 .claude/settings.local.json
