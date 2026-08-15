@@ -145,18 +145,23 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
     }
 
     // Always show active tasks for this project as a hint
-    let active_tasks: Vec<serde_json::Value> =
-        graph::get_tasks_filtered(&conn, Some(project), Some("active,blocked"), None, 5)?
-            .iter()
-            .map(|t| {
-                json!({
-                    "id": t.id.to_string(),
-                    "label": t.label,
-                    "status": t.data.get("status"),
-                    "priority": t.data.get("priority"),
-                })
-            })
-            .collect();
+    let active_tasks: Vec<serde_json::Value> = graph::get_tasks_filtered(
+        &conn,
+        Some(project),
+        Some(graph::OPEN_TASK_STATUSES),
+        None,
+        5,
+    )?
+    .iter()
+    .map(|t| {
+        json!({
+            "id": t.id.to_string(),
+            "label": t.label,
+            "status": t.data.get("status"),
+            "priority": t.data.get("priority"),
+        })
+    })
+    .collect();
 
     // US2: push everything new locally for a shared project right after this
     // session write. Best-effort — never fails memory_session (T022).
