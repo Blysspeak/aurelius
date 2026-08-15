@@ -12,7 +12,6 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::Connection;
 
-use super::row_to_node;
 use crate::models::{MemoryKind, Node, NodeType};
 
 /// Бюджеты слоёв в символах. Сумма ~4500 — порядка 1.5К токенов.
@@ -46,28 +45,126 @@ fn layer(nodes: &[Node], per_line: usize, budget: usize) -> String {
     out
 }
 
+/// Свежие узлы типа в области проекта. Тонкая обёртка над общим предикатом
+/// принадлежности: раньше здесь жил свой запрос по префиксу метки, который не
+/// видел узлы, связанные с проектом ребром.
 fn typed_recent(
     conn: &Connection,
     t: &NodeType,
     project: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Node>> {
-    let type_str = serde_json::to_string(t)?;
-    let like = project.map(|p| format!("[{p}]%"));
-    let mut stmt = conn.prepare(
-        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
-                memory_kind, last_accessed_at, access_count, content_hash,
-                created_by, updated_by, deleted_at, sync_seq
-           FROM nodes
-          WHERE node_type = ?1 AND deleted_at IS NULL
-            AND (?2 IS NULL OR label LIKE ?2 OR label = ?3)
-          ORDER BY updated_at DESC LIMIT ?4",
-    )?;
-    let rows = stmt.query_map(
-        rusqlite::params![type_str, like, project.unwrap_or(""), limit as i64],
-        row_to_node,
-    )?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    super::typed_in_project(conn, t, project, limit)
+}
+
+/// Один факт снапшота в машинной форме.
+///
+/// Существует потому, что потребитель, разбирающий markdown регулярками по
+/// `## N · Заголовок`, читает ОФОРМЛЕНИЕ: следующая смена вёрстки сломает его
+/// так же тихо, как молчал сам канал. Здесь форма зафиксирована.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Fact {
+    /// Слой-источник: `userfact` | `task` | `problem` | `obligation` |
+    /// `session` | `decision` | `concept` | `skill` | `digest`.
+    pub kind: &'static str,
+    /// Полный текст, без бюджетной обрезки: у потребителя свой бюджет, а молча
+    /// укороченный факт неотличим от короткого.
+    pub text: String,
+    /// RFC 3339, время последнего изменения узла. `null` там, где источник
+    /// времени не хранит (обязательства).
+    pub at: Option<String>,
+}
+
+/// Машинная форма снапшота.
+///
+/// Пустой `facts` при коде возврата 0 однозначно значит «нечего сказать»;
+/// отсутствие вывода или ненулевой код — «сломан». Отдельные коды возврата под
+/// каждое состояние не нужны: форма их уже различает.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SnapshotFacts {
+    pub project: Option<String>,
+    pub facts: Vec<Fact>,
+}
+
+/// Дистиллят, в котором нечего сказать.
+///
+/// Это НЕ факт: пустой дистиллят несёт ноль информации, занимает бюджет и в
+/// машинной форме ломает контракт «пустой `facts` = нечего сказать» — новый
+/// проект отдавал бы одну строку-заглушку вместо пустого массива.
+const EMPTY_DIGEST: &str = "Хвостов нет — чисто.";
+
+/// Всё, что снапшот читает из графа. Одно место сбора на обе формы вывода —
+/// иначе markdown и JSON разойдутся, и разойдутся молча.
+struct Gathered {
+    identity: Vec<Node>,
+    tasks: Vec<Node>,
+    problems: Vec<Node>,
+    pressure: Vec<String>,
+    sessions: Vec<Node>,
+    decisions: Vec<Node>,
+    concepts: Vec<Node>,
+    skills: Vec<Node>,
+    digest: Vec<Node>,
+}
+
+fn gather(conn: &Connection, project: Option<&str>) -> Result<Gathered> {
+    Ok(Gathered {
+        identity: typed_recent(conn, &NodeType::UserFact, None, 12)?,
+        tasks: super::get_tasks_filtered(conn, project, Some(super::OPEN_TASK_STATUSES), None, 8)?,
+        problems: super::get_unsolved_problems(conn, project, 6)?,
+        // Гроссбух давления (ступень 6): открытые обязательства по напряжению —
+        // недоделанное лезет наверх само. Best-effort: пусто при отсутствии таблиц.
+        pressure: crate::obligations::top_by_tension(conn, 6)
+            .map(|obs| {
+                obs.iter()
+                    .map(|o| {
+                        let obj: String = o.object.chars().take(72).collect();
+                        format!("[{:.1}] {} → {}: {}", o.tension, o.debtor, o.creditor, obj)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        sessions: typed_recent(conn, &NodeType::Session, project, 3)?,
+        decisions: typed_recent(conn, &NodeType::Decision, project, 8)?,
+        concepts: typed_recent(conn, &NodeType::Concept, project, 5)?,
+        skills: typed_recent(conn, &NodeType::Skill, None, 8)?,
+        digest: typed_recent(conn, &NodeType::Digest, project, 1)?
+            .into_iter()
+            .filter(|n| n.note.as_deref() != Some(EMPTY_DIGEST))
+            .collect(),
+    })
+}
+
+fn push_facts(facts: &mut Vec<Fact>, kind: &'static str, nodes: &[Node]) {
+    facts.extend(nodes.iter().map(|n| Fact {
+        kind,
+        text: n.note.clone().unwrap_or_else(|| n.label.clone()),
+        at: Some(n.updated_at.to_rfc3339()),
+    }));
+}
+
+/// Тот же снапшот, что и [`build_snapshot`], но машинной формой: без вёрстки,
+/// без бюджетной обрезки и без счётчика узлов (это оформление, а не знание).
+pub fn snapshot_facts(conn: &Connection, project: Option<&str>) -> Result<SnapshotFacts> {
+    let g = gather(conn, project)?;
+    let mut facts = Vec::new();
+    push_facts(&mut facts, "userfact", &g.identity);
+    push_facts(&mut facts, "task", &g.tasks);
+    push_facts(&mut facts, "problem", &g.problems);
+    facts.extend(g.pressure.iter().map(|line| Fact {
+        kind: "obligation",
+        text: line.clone(),
+        at: None,
+    }));
+    push_facts(&mut facts, "session", &g.sessions);
+    push_facts(&mut facts, "decision", &g.decisions);
+    push_facts(&mut facts, "concept", &g.concepts);
+    push_facts(&mut facts, "skill", &g.skills);
+    push_facts(&mut facts, "digest", &g.digest);
+    Ok(SnapshotFacts {
+        project: project.map(str::to_owned),
+        facts,
+    })
 }
 
 /// Собрать семислойный снапшот. Только чтение, без сети и индексации —
@@ -76,58 +173,38 @@ pub fn build_snapshot(conn: &Connection, project: Option<&str>) -> Result<String
     let ts = Utc::now().format("%Y-%m-%d %H:%M");
     let scope = project.unwrap_or("глобально");
 
-    let identity = typed_recent(conn, &NodeType::UserFact, None, 12)?;
-    let tasks = super::get_tasks_filtered(conn, project, Some("active,blocked"), None, 8)?;
-    let problems: Vec<Node> = super::get_unsolved_problems(conn, 30)?
-        .into_iter()
-        .filter(|n| project.is_none_or(|p| n.label.starts_with(&format!("[{p}]"))))
-        .take(6)
-        .collect();
-    let sessions = typed_recent(conn, &NodeType::Session, project, 3)?;
-    let decisions = typed_recent(conn, &NodeType::Decision, project, 8)?;
-    let concepts = typed_recent(conn, &NodeType::Concept, project, 5)?;
-    let skills = typed_recent(conn, &NodeType::Skill, None, 8)?;
-    let digest = typed_recent(conn, &NodeType::Digest, project, 1)?;
-
+    let g = gather(conn, project)?;
     let nodes = super::count_nodes(conn)?;
     let edges = super::count_edges(conn)?;
 
-    let mut working = layer(&tasks, 160, B_WORKING / 2);
-    working.push_str(&layer(&problems, 160, B_WORKING / 2));
+    let mut working = layer(&g.tasks, 160, B_WORKING / 2);
+    working.push_str(&layer(&g.problems, 160, B_WORKING / 2));
 
-    let mut semantic = layer(&decisions, 150, B_SEMANTIC * 2 / 3);
-    semantic.push_str(&layer(&concepts, 150, B_SEMANTIC / 3));
+    let mut semantic = layer(&g.decisions, 150, B_SEMANTIC * 2 / 3);
+    semantic.push_str(&layer(&g.concepts, 150, B_SEMANTIC / 3));
 
-    // Гроссбух давления (ступень 6): открытые обязательства по напряжению —
-    // недоделанное лезет наверх само. Best-effort: пустой при отсутствии таблиц.
-    let pressure = crate::obligations::top_by_tension(conn, 6)
-        .map(|obs| {
-            obs.iter()
-                .map(|o| {
-                    let obj: String = o.object.chars().take(72).collect();
-                    format!(
-                        "- [{:.1}] {} → {}: {}\n",
-                        o.tension, o.debtor, o.creditor, obj
-                    )
-                })
-                .collect::<String>()
-        })
-        .unwrap_or_default();
+    let pressure = g
+        .pressure
+        .iter()
+        .map(|line| format!("- {line}\n"))
+        .collect::<String>();
+
+    let (identity, sessions, skills, digest) = (&g.identity, &g.sessions, &g.skills, &g.digest);
 
     let sections: [(&str, String); 8] = [
-        ("1 · Владелец", layer(&identity, 120, B_IDENTITY)),
+        ("1 · Владелец", layer(identity, 120, B_IDENTITY)),
         ("2 · В работе (задачи и открытые проблемы)", working),
         ("3 · Давление (незакрытые обязательства)", pressure),
-        ("4 · Последние сессии", layer(&sessions, 250, B_EPISODIC)),
+        ("4 · Последние сессии", layer(sessions, 250, B_EPISODIC)),
         ("5 · Решения и знания", semantic),
-        ("6 · Приёмы", layer(&skills, 100, B_PROCEDURAL)),
+        ("6 · Приёмы", layer(skills, 100, B_PROCEDURAL)),
         (
             "7 · Архив",
             format!(
                 "- {nodes} узлов, {edges} рёбер; глубже — memory_recall(topic) / memory_search(query)\n"
             ),
         ),
-        ("8 · Дистиллят", layer(&digest, B_DIGEST, B_DIGEST)),
+        ("8 · Дистиллят", layer(digest, B_DIGEST, B_DIGEST)),
     ];
 
     let mut md = format!("# Память Aurelius · {scope} · {ts} UTC\n");
@@ -157,11 +234,7 @@ pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
             }
         }
     }
-    let problems: Vec<Node> = super::get_unsolved_problems(conn, 30)?
-        .into_iter()
-        .filter(|n| n.label.starts_with(&format!("[{project}]")))
-        .take(5)
-        .collect();
+    let problems = super::get_unsolved_problems(conn, Some(project), 5)?;
 
     let mut note = String::new();
     if !steps.is_empty() {
@@ -178,7 +251,7 @@ pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
         note.push_str(&format!(" Нерешённое: {p}."));
     }
     if note.is_empty() {
-        note = "Хвостов нет — чисто.".to_owned();
+        note = EMPTY_DIGEST.to_owned();
     }
 
     let label = format!("[{project}] дистиллят");
@@ -250,6 +323,159 @@ mod tests {
         assert!(md.contains("1 · Владелец"));
         // Общий потолок: снапшот обязан оставаться маленьким при любом графе.
         assert!(md.chars().count() < 6_000, "снапшот распух: {}", md.len());
+    }
+
+    /// Знание, записанное документированным путём `memory_add` + `memory_relate`:
+    /// метка голая, принадлежность проекту выражена ТОЛЬКО ребром.
+    #[test]
+    fn snapshot_sees_knowledge_linked_by_edge_not_by_label_prefix() {
+        use crate::models::Relation;
+
+        let conn = test_conn();
+        let project = super::super::add_node(
+            &conn,
+            NodeType::Project,
+            "demo",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add project");
+        let decision = super::super::add_node(
+            &conn,
+            NodeType::Decision,
+            "взяли sqlite вместо постгреса",
+            Some("решение: sqlite, потому что память локальная и однопользовательская"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add decision");
+        super::super::add_edge(&conn, decision.id, project.id, Relation::BelongsTo, 1.0)
+            .expect("link decision to project");
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+
+        assert!(
+            md.contains("sqlite"),
+            "узел, связанный с проектом ребром, обязан попадать в снапшот; было:\n{md}"
+        );
+        assert!(
+            md.contains("5 · Решения и знания"),
+            "слой решений пуст:\n{md}"
+        );
+    }
+
+    /// Снапшот другого проекта не имеет права утащить чужое знание.
+    #[test]
+    fn snapshot_does_not_leak_other_projects_knowledge() {
+        use crate::models::Relation;
+
+        let conn = test_conn();
+        let project = super::super::add_node(
+            &conn,
+            NodeType::Project,
+            "demo",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add project");
+        let decision = super::super::add_node(
+            &conn,
+            NodeType::Decision,
+            "взяли sqlite вместо постгреса",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add decision");
+        super::super::add_edge(&conn, decision.id, project.id, Relation::BelongsTo, 1.0)
+            .expect("link");
+
+        let md = build_snapshot(&conn, Some("другой")).expect("snapshot");
+
+        assert!(!md.contains("sqlite"), "чужое знание протекло:\n{md}");
+    }
+
+    /// task_create кладёт задачу в `backlog`. Если слой «В работе» её не видит,
+    /// завести задачу означает потерять её.
+    #[test]
+    fn snapshot_shows_freshly_created_backlog_task() {
+        let conn = test_conn();
+        super::super::add_node(
+            &conn,
+            NodeType::Task,
+            "[demo] починить снапшот",
+            Some("слои 1-6 не доезжают"),
+            "test",
+            serde_json::json!({ "status": "backlog", "priority": "high" }),
+        )
+        .expect("add task");
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+
+        assert!(
+            md.contains("слои 1-6 не доезжают"),
+            "свежая задача в backlog обязана быть видна:\n{md}"
+        );
+    }
+
+    /// Форма машинного вывода зафиксирована: потребитель не должен зависеть от
+    /// вёрстки markdown. Пустой массив при успехе — «нечего сказать».
+    #[test]
+    fn json_facts_shape_is_fixed_and_empty_means_nothing_to_say() {
+        let conn = test_conn();
+        // Дистиллят-заглушка рождается сама при первом обращении к проекту и
+        // однажды уже подменяла «нечего сказать» на строку с нулём информации.
+        consolidate(&conn, "пусто").expect("consolidate");
+        let out = snapshot_facts(&conn, Some("пусто")).expect("facts");
+
+        assert_eq!(out.project.as_deref(), Some("пусто"));
+        assert!(out.facts.is_empty());
+        assert_eq!(
+            serde_json::to_string(&out).expect("serialize"),
+            r#"{"project":"пусто","facts":[]}"#
+        );
+    }
+
+    #[test]
+    fn json_facts_carry_kind_for_edge_linked_knowledge() {
+        use crate::models::Relation;
+
+        let conn = test_conn();
+        let project = super::super::add_node(
+            &conn,
+            NodeType::Project,
+            "demo",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add project");
+        let decision = super::super::add_node(
+            &conn,
+            NodeType::Decision,
+            "метка",
+            Some("взяли sqlite"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add decision");
+        super::super::add_edge(&conn, decision.id, project.id, Relation::BelongsTo, 1.0)
+            .expect("link");
+
+        let out = snapshot_facts(&conn, Some("demo")).expect("facts");
+
+        let fact = out
+            .facts
+            .iter()
+            .find(|f| f.kind == "decision")
+            .expect("решение обязано попасть в машинную форму");
+        assert_eq!(
+            fact.text, "взяли sqlite",
+            "текст отдаётся целиком, без обрезки"
+        );
+        assert!(fact.at.is_some(), "время изменения обязано быть в форме");
     }
 
     #[test]

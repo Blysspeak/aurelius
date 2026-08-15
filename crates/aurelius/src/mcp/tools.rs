@@ -70,13 +70,17 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_add",
-                "description": "Add a new knowledge node to the graph. Supports structured data and memory classification.",
+                "description": "Add a new knowledge node to the graph. Supports structured data and memory classification. Pass 'project' so the node is linked to that project — without a link (or a '[project]' label prefix) the node is invisible to memory_status(project=…) and to the snapshot, and the response carries an 'attachment_warning' saying so.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "label": {
                             "type": "string",
                             "description": "Short label for the node"
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Project this node belongs to. Creates the belongs_to edge for you (and the project node if missing). Omit only for genuinely global knowledge."
                         },
                         "type": {
                             "type": "string",
