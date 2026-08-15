@@ -737,7 +737,12 @@ pub async fn skills(hook: bool) -> Result<()> {
 /// прямой инъекции в контекст; проект тогда берётся из имени текущей папки,
 /// а любой сбой глотается (exit 0, пустой вывод) — хук не имеет права
 /// ломать старт сессии.
-pub async fn snapshot(project: Option<String>, hook: bool) -> Result<()> {
+/// С `--json` вместо markdown печатается машинная форма
+/// `{"project":…,"facts":[…]}`: пустой `facts` при коде 0 — «нечего сказать»,
+/// отсутствие вывода или ненулевой код — «сломан». Разбирать markdown
+/// регулярками значит зависеть от вёрстки, и смена вёрстки ломает потребителя
+/// молча.
+pub async fn snapshot(project: Option<String>, hook: bool, json_out: bool) -> Result<()> {
     let run = || -> Result<String> {
         let conn = db::open(&db_path())?;
         let derived = project.clone().or_else(|| {
@@ -759,6 +764,10 @@ pub async fn snapshot(project: Option<String>, hook: bool) -> Result<()> {
             if stale {
                 let _ = graph::consolidate(&conn, p); // best-effort: снапшот важнее
             }
+        }
+        if json_out {
+            let facts = graph::snapshot_facts(&conn, derived.as_deref())?;
+            return Ok(serde_json::to_string(&facts)?);
         }
         graph::build_snapshot(&conn, derived.as_deref())
     };
