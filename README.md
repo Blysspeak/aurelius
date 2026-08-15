@@ -10,19 +10,20 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/v1.8.0-stable-a6e3a1?style=flat-square" alt="v1.8.0">
+  <img src="https://img.shields.io/badge/v1.11.0-stable-a6e3a1?style=flat-square" alt="v1.11.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
-  <img src="https://img.shields.io/badge/MCP-25_tools-a6e3a1?style=flat-square" alt="MCP">
+  <img src="https://img.shields.io/badge/MCP-30_tools-a6e3a1?style=flat-square" alt="MCP">
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#mcp-tools-28">MCP Tools</a> ·
+  <a href="#mcp-tools-30">MCP Tools</a> ·
+  <a href="#memory-snapshot">Snapshot</a> ·
   <a href="#task-management">Tasks</a> ·
   <a href="#project-sync">Sync</a> ·
   <a href="#web-ui">Graph UI</a> ·
-  <a href="doc/README-ru.md">Русский</a>
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 ---
@@ -46,12 +47,12 @@ This builds binaries, installs to `~/.local/bin`, configures Claude Code MCP ser
 
 ```
 $ au --version
-au 1.8.0
+au 1.11.0
 ```
 
 ---
 
-## MCP Tools (28)
+## MCP Tools (30)
 
 Aurelius runs as an MCP server over stdio. `install.sh` configures it automatically, or add manually via `/mcp` in Claude Code (`command: au`, `args: ["mcp"]`).
 
@@ -64,7 +65,9 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | `memory_recall` | Smart topic recall — FTS + BFS, grouped by type (incl. tasks), skips structural noise. |
 | `memory_search` | Full-text search with `type`, `since`, and `limit` filters. `*` for recent. |
 | `memory_context` | Raw BFS graph traversal from FTS seed nodes. |
-| `memory_add` | Create node with label, type, note, data (JSON), memory_kind. |
+| `memory_snapshot` | The seven-layer frozen slice as Markdown, under a hard budget. |
+| `memory_consolidate` | Rebuild a project's distillate — open next steps plus unsolved problems. Idempotent. |
+| `memory_add` | Create node with label, type, note, data (JSON), memory_kind. Pass `project` to link it; without a link the response says so instead of reporting a silent success. |
 | `memory_update` | Update existing node's note/data by UUID or label. |
 | `memory_relate` | Create typed edge. INSERT OR IGNORE for dedup. |
 | `memory_forget` | Delete node by UUID (cascades to edges). |
@@ -111,6 +114,67 @@ Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV, PDF, HTML and plain text 
 | `doc_convert` | Convert a file, or every file in a directory, to Markdown. Large output spills to a `.md` file and returns an outline + preview instead of filling the context. Optional `save_to_graph`. |
 | `doc_read` | Paginated read of an already-converted document, by content hash or path. |
 | `doc_recall` | FTS search across every document ever converted. |
+
+---
+
+## Memory Snapshot
+
+The snapshot is how the graph reaches a session. It is a small curated slice injected
+**once** at session start — frozen for the session, so it does not break the prefix
+cache — rather than a large JSON blob fetched on demand.
+
+```
+1 · Owner                       what is known about you
+2 · In progress                 open tasks and unsolved problems
+3 · Pressure                    obligations taken on and not yet settled
+4 · Recent sessions             what the last sessions concluded
+5 · Decisions and knowledge     decisions, then concepts
+6 · Practices                   skills
+7 · Archive                     node/edge counts and where to dig deeper
+8 · Distillate                  the structural residue of the layers above
+```
+
+Every layer has a hard character budget (~4.5K in total, on the order of 1.5K tokens),
+and empty layers are omitted entirely.
+
+```bash
+au snapshot --project myapp          # Markdown, for humans and for context
+au snapshot --project myapp --json   # fixed shape, for programs
+au snapshot --hook                   # Claude Code SessionStart envelope
+```
+
+### Machine-readable form
+
+Hooks are ordinary processes — they cannot reach the MCP server, so the CLI is their
+only channel. Parsing the Markdown means depending on its layout, and a layout change
+would break the consumer silently. `--json` fixes the shape instead:
+
+```json
+{"project":"myapp","facts":[{"kind":"decision","text":"chose SQLite over Postgres","at":"2026-08-15T21:30:40Z"}]}
+```
+
+`kind` names the source layer: `userfact`, `task`, `problem`, `obligation`, `session`,
+`decision`, `concept`, `skill`, `digest`. Text is returned whole — the budget belongs to
+the consumer, and a silently shortened fact reads exactly like a short one.
+
+The contract distinguishes the two states that a silent channel confuses:
+
+| Result | Meaning |
+|---|---|
+| `{"project":…,"facts":[]}`, exit 0 | nothing to say |
+| no output, or a non-zero exit | broken |
+
+### What counts as "belonging to a project"
+
+A node belongs to a project if **either** holds:
+
+- its label carries the `[project-name]` prefix, or
+- an edge connects it to that project's node, in either direction and under any relation.
+
+Both are checked by a single predicate. Only the first used to be, which made every node
+written through `memory_add` + `memory_relate` invisible to project-scoped queries —
+including the snapshot itself. If you are upgrading from ≤ 1.10.0, that knowledge becomes
+visible again with no re-import.
 
 ---
 
@@ -203,6 +267,9 @@ au touch path/to/file              # track file access
 au export                          # export full graph as JSON
 au mcp                             # start MCP server
 au skills                          # print the skill index
+au snapshot -p myapp [--json]      # seven-layer slice: Markdown, or a fixed JSON shape
+au trace -m "what just happened"   # append to the action journal (or --hook on PostToolUse)
+au judge                           # settle the session: reinforce, erode, fork or null
 au db check [PATH]                 # verify integrity (read-only); PATH verifies a snapshot
 au db backup                       # safe snapshot via VACUUM INTO
 au doc convert report.docx         # document → Markdown on stdout
@@ -309,12 +376,19 @@ Session end    →  memory_session(summary, decisions, problems_solved, tasks)
 ```
 crates/
   aurelius-core/
-    src/graph/       — crud.rs, search.rs, traverse.rs
-    src/db.rs        — SQLite setup, migrations V1-V6
+    src/graph/       — crud.rs, search.rs, traverse.rs, snapshot.rs (layers + distillate)
+    src/db.rs        — SQLite setup, migrations V1-V12
     src/models.rs    — Node, Edge, NodeType, Relation, MemoryKind
     src/indexer.rs   — Cargo.toml project indexer
     src/identity.rs  — local identity config (~/.config/aurelius/identity.toml)
     src/sync/        — push/pull types, upsert + last-writer-wins merge logic
+    src/trace.rs     — append-only journal of what the agent actually did
+    src/probes.rs    — claims checked against ground truth (paths, git SHAs)
+    src/codec.rs     — surprise gate: normalised compression distance per scope
+    src/window.rs    — recall as a transaction: query signature, labile windows
+    src/differ.rs    — outcome judge: reinforce / erode / fork / null, no model called
+    src/ledger.rs    — clearing, node value in bits, bankruptcy-driven GC
+    src/obligations.rs — promises taken in from speech, settled by later events
   aurelius-sync-server/ — self-hosted sync server (POST/GET /sync/push,pull,grants)
   aurelius/
     src/mcp/
@@ -337,7 +411,7 @@ deploy/
 
 - **SQLite + WAL** — concurrent reads, single writer, local-first. Every connection sets a busy timeout, verifies that WAL mode actually took effect, and checks the file header against the file size before use
 - **FTS5** — indexes label + note (not raw JSON), kept in sync via triggers
-- **6 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache, V6 sync attribution/tombstones + `sync_config`/`collaborator_grants`. Applied atomically in a single `BEGIN IMMEDIATE` transaction
+- **12 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache, V6 sync attribution/tombstones, V7-V8 documents and skills, V9 the action journal (`act_trace`, `probes`, `pathways`, `labile_window`, `corrections`), V10 `codec`/`delta`/`node_version`, V11 obligations, V12 readable obligation objects. Applied atomically in a single `BEGIN IMMEDIATE` transaction
 - **Sync attribution** — `created_by`/`updated_by` stamped from the local identity config; deletes are soft (`deleted_at`) so they propagate as tombstones instead of resurrecting on the next sync
 - **Batch BFS** — `WHERE id IN (...)` per level, not N+1 per node
 - **Session dedup** — SHA-256 content hash on (project, summary)
@@ -345,12 +419,13 @@ deploy/
 - **Task hub nodes** — tasks collect work logs, decisions, problems, solutions via `contains` edges
 - **Problem lifecycle** — unsolved = no Solution node with `solves` edge
 - **Relevance ranking** — FTS results boosted by access_count
-- **Project hub nodes** — auto-created by `memory_session` and `task_create`, all children linked via `belongs_to`
+- **Project hub nodes** — auto-created by `memory_session`, `task_create` and `memory_add(project=…)`, all children linked via `belongs_to`
+- **Project scoping** — membership is the label prefix `[project-name]` **or** an edge to the project node, in either direction and under any relation. Checking only the label made everything written via `memory_add` + `memory_relate` invisible to project queries
 - **Label convention** — child nodes prefixed `[project-name] description`, project nodes use plain names
 
 ### Node Types
 
-`project` · `task` · `work_log` · `decision` · `concept` · `problem` · `solution` · `session` · `crate` · `file` · `dependency` · `module` · `config` · `person` · `server` · `language`
+`project` · `task` · `work_log` · `decision` · `concept` · `problem` · `solution` · `session` · `skill` · `user_fact` · `digest` · `crate` · `file` · `dependency` · `module` · `config` · `person` · `server` · `language`
 
 ### Relations
 
@@ -364,9 +439,17 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 
 | Hook | Event | What it does |
 |------|-------|-------------|
-| `aurelius-reindex.sh` | Stop | Re-indexes project on session end |
+| `au snapshot --hook` | SessionStart | Injects the seven-layer slice straight into the context |
+| `aurelius-skills.sh` | SessionStart | Injects the skill index |
+| `aurelius-backup.sh` | SessionStart | Rolling database snapshot, throttled to one a day |
 | `aurelius-track-edit.sh` | PostToolUse (Edit/Write) | Increments access_count on file nodes |
+| `au trace --hook` | PostToolUse | Appends what happened to the action journal |
+| `au judge --hook` | Stop | Settles the session: reinforce, erode, fork or null |
+| `aurelius-reindex.sh` | Stop | Re-indexes project on session end |
 | `post-commit` | git commit | Captures commit as Decision node, linked to project via `belongs_to` |
+
+A failing hook is always swallowed: memory has no right to break the start — or the end —
+of a session.
 
 ---
 
@@ -386,7 +469,10 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 - [x] v1.6 — Skills subsystem (4 MCP tools + `au skills`), session auto-injection
 - [x] v1.7 — DB hardening: busy timeout, atomic migrations, integrity gate, `au db check` / `au db backup`
 - [x] v1.8 — `au db check [PATH]` — self-verifying rolling backups
-- [ ] Next — npm distribution, `au repair`, context-ranked search, git log connector
+- [x] v1.9 — Documents to Markdown, converted locally (3 MCP tools + `au doc`)
+- [x] v1.10 — Seven-layer snapshot; Bit-i-Delo stages 1-4: action journal, ground-truth probes, surprise gate, outcome judge, clearing and obligations
+- [x] v1.11 — Project scoping by edge, not just by label prefix; `au snapshot --json`; `memory_add` warns on unattached nodes
+- [ ] Next — npm distribution, `au repair`, `au doctor`, context-ranked search, git log connector
 
 ---
 

@@ -28,30 +28,22 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
     let total_nodes = graph::count_nodes(&conn)?;
     let total_edges = graph::count_edges(&conn)?;
 
-    let (recent_decisions, problems, recent_solutions, recent_sessions, active_tasks) =
-        if let Some(proj) = project_filter {
-            let fts_query = format!("\"[{}]\"", proj);
-            let prefix = format!("[{}]", proj);
-            (
-                graph::search_typed(&conn, &fts_query, &NodeType::Decision, 10)?,
-                graph::get_unsolved_problems(&conn, 50)?
-                    .into_iter()
-                    .filter(|n| n.label.starts_with(&prefix))
-                    .take(10)
-                    .collect::<Vec<_>>(),
-                graph::search_typed(&conn, &fts_query, &NodeType::Solution, 10)?,
-                graph::search_typed(&conn, &fts_query, &NodeType::Session, 5)?,
-                graph::get_tasks_filtered(&conn, Some(proj), Some("active,blocked"), None, 10)?,
-            )
-        } else {
-            (
-                graph::search_typed(&conn, "*", &NodeType::Decision, 10)?,
-                graph::get_unsolved_problems(&conn, 10)?,
-                graph::search_typed(&conn, "*", &NodeType::Solution, 10)?,
-                graph::search_typed(&conn, "*", &NodeType::Session, 5)?,
-                graph::get_tasks_filtered(&conn, None, Some("active,blocked"), None, 10)?,
-            )
-        };
+    // Проектная выборка идёт через общий предикат принадлежности, а не через
+    // полнотекстовый поиск по литералу "[проект]": FTS видел только префикс
+    // метки и молчал про узлы, связанные с проектом ребром memory_relate.
+    let (recent_decisions, problems, recent_solutions, recent_sessions, active_tasks) = (
+        graph::typed_in_project(&conn, &NodeType::Decision, project_filter, 10)?,
+        graph::get_unsolved_problems(&conn, project_filter, 10)?,
+        graph::typed_in_project(&conn, &NodeType::Solution, project_filter, 10)?,
+        graph::typed_in_project(&conn, &NodeType::Session, project_filter, 5)?,
+        graph::get_tasks_filtered(
+            &conn,
+            project_filter,
+            Some(graph::OPEN_TASK_STATUSES),
+            None,
+            10,
+        )?,
+    );
 
     let active_tasks_json: Vec<serde_json::Value> = active_tasks
         .iter()
