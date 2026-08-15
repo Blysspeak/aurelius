@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/v1.11.0-stable-a6e3a1?style=flat-square" alt="v1.11.0">
+  <img src="https://img.shields.io/badge/v1.11.1-stable-a6e3a1?style=flat-square" alt="v1.11.1">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
   <img src="https://img.shields.io/badge/MCP-30_tools-a6e3a1?style=flat-square" alt="MCP">
@@ -47,7 +47,7 @@ This builds binaries, installs to `~/.local/bin`, configures Claude Code MCP ser
 
 ```
 $ au --version
-au 1.11.0
+au 1.11.1
 ```
 
 ---
