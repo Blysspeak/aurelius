@@ -1,5 +1,9 @@
 use anyhow::Result;
-use aurelius_core::{graph, indexer, models::MemoryKind, window};
+use aurelius_core::{
+    graph, indexer,
+    models::{MemoryKind, NodeType, Relation},
+    window,
+};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -160,6 +164,45 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         None,
     )?;
 
+    // Принадлежность проекту. Узел, не привязанный ни префиксом метки, ни
+    // ребром, не найдётся НИ ОДНОЙ проектной выборкой — а memory_add при этом
+    // возвращал "created": true. Запись, которую никто не найдёт, не имеет
+    // права выглядеть удачной, поэтому: либо привязываем сами по параметру
+    // project, либо говорим вслух, что узел повис.
+    let project = params.get("project").and_then(|p| p.as_str());
+    let mut attachment: Option<String> = None;
+    if let Some(p) = project {
+        let proj_node = match graph::find_project_by_label(&conn, p) {
+            Ok(Some(n)) => Some(n),
+            _ => graph::add_node(
+                &conn,
+                NodeType::Project,
+                p,
+                None,
+                "mcp",
+                json!({ "auto_created": true }),
+            )
+            .ok(),
+        };
+        match proj_node {
+            Some(pn) => {
+                graph::add_edge(&conn, node.id, pn.id, Relation::BelongsTo, 1.0)?;
+            }
+            None => attachment = Some(format!("не удалось привязать узел к проекту '{p}'")),
+        }
+    } else if !label.starts_with('[')
+        && !matches!(
+            node.node_type,
+            NodeType::Project | NodeType::UserFact | NodeType::Skill
+        )
+    {
+        attachment = Some(
+            "узел не привязан ни к одному проекту: он не попадёт ни в memory_status(project=…), \
+             ни в снапшот. Передай project или свяжи через memory_relate"
+                .to_owned(),
+        );
+    }
+
     // Бит-и-Дело, ступень 2 (advisory-режим): проверяемые утверждения памяти
     // исполняются против ground truth прямо при рождении. Провал пока не
     // убивает узел — но виден вызывающему и записан в probes для судьи исхода.
@@ -197,6 +240,8 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         "memory_kind": node.memory_kind,
         "created": true,
         "probe_warnings": probe_warnings,
+        "project": project,
+        "attachment_warning": attachment,
         "surprise": surprise,
     }))
 }
