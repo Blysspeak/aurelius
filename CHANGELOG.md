@@ -1,5 +1,12 @@
 # Changelog
 
+## [v1.11.1] — 2026-08-15
+
+### Fixed
+- **A URL, a version number and a fragment of a path were all being probed as files.** Stage-2 probes extract verifiable claims from a node's text and run them against the file system, so a claim that fails is reported back in `probe_warnings`. A single release note — one containing a GitHub link and a path to a source file — produced three warnings about paths that were never claimed and never existed. Three separate false positives shared one regex. A URL matched the pattern twice over: inside `https://`, the fragment `s:/` reads as a Windows drive, and everything after the host reads as an absolute path; URLs are now stripped *before* extraction, because once a URL has been cut into pieces its pieces are indistinguishable from paths. `/Blysspeak/aurelius/releases/tag/v1.11` passed as a path whose extension was `.11` — an extension made only of digits is a version number, not a file. And `crates/aurelius-core/src/graph/search.rs` was matched from its interior slash onward, yielding `/aurelius-core/src/graph/search.rs`, an assertion the author never made; Rust's regex engine has no lookbehind and `\b` does not help here, since there *is* a word boundary before a slash, so the character preceding a match is now examined directly. A false probe is worse than a missing one: it fires on every write and trains the caller to stop reading warnings, which is the only thing warnings are for (c7e3f16)
+
+---
+
 ## [v1.11.0] — 2026-08-15
 
 ### Added
