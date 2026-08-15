@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Aurelius v1.2.0 — one-command install
+# Aurelius — one-command install
 # Usage: ./install.sh
 set -euo pipefail
 
@@ -21,7 +21,11 @@ cat << 'BANNER'
   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝ ╚═════╝ ╚══════╝
 BANNER
 echo -e "${RESET}"
-echo -e "  ${BOLD}v1.2.0${RESET} ${DIM}— Knowledge Graph Memory for AI Agents${RESET}"
+# Read from the manifest rather than hardcoding: a version literal in a banner
+# rots silently, and an installer that lies about the version is worse than one
+# that says nothing.
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$(dirname "$0")/Cargo.toml" | head -1)"
+echo -e "  ${BOLD}v${VERSION:-?}${RESET} ${DIM}— Knowledge Graph Memory for AI Agents${RESET}"
 echo ""
 
 # --- 1. Check prerequisites ---
@@ -231,9 +235,9 @@ echo -e "${GREEN}✓${RESET} Project indexed"
 
 # --- Done ---
 echo ""
-echo -e "${GOLD}${BOLD}Aurelius v1.2.0 installed!${RESET}"
+echo -e "${GOLD}${BOLD}Aurelius v${VERSION:-?} installed!${RESET}"
 echo ""
-echo "  14 MCP tools ready for Claude Code."
+echo "  MCP tools ready for Claude Code."
 echo "  Database: ~/.local/share/aurelius/aurelius.db"
 if [ -f "$BRAVE_KEY_FILE" ] && [ -s "$BRAVE_KEY_FILE" ]; then
 echo "  Brave Search: configured (2 search tools active)"
@@ -244,6 +248,7 @@ echo ""
 echo "  Commands:"
 echo "    au view        — open graph visualization"
 echo "    au search      — search the knowledge graph"
+echo "    au snapshot    — seven-layer memory slice (--json for programs)"
 echo "    au mcp         — start MCP server (auto-configured)"
 echo ""
 echo "  To install git hooks in other repos:"
