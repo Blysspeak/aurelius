@@ -322,6 +322,12 @@ enum Commands {
         /// Emit Claude Code SessionStart hook JSON (never fails, silent on error)
         #[arg(long)]
         hook: bool,
+        /// Emit machine-readable facts instead of Markdown:
+        /// {"project":…,"facts":[{"kind","text","at"}]}. An empty `facts` with
+        /// exit 0 means "nothing to say"; no output or a non-zero exit means
+        /// "broken". Parsing the Markdown means parsing the layout.
+        #[arg(long, conflicts_with = "hook")]
+        json: bool,
     },
     /// Switch or inspect which data/config directory au/aurelius use
     Home {
@@ -385,7 +391,11 @@ async fn main() -> Result<()> {
             hook,
         } => commands::trace_cmd(kind, payload, session, exit_code, hook).await,
         Commands::Judge { min_age, hook } => commands::judge_cmd(min_age, hook).await,
-        Commands::Snapshot { project, hook } => commands::snapshot(project, hook).await,
+        Commands::Snapshot {
+            project,
+            hook,
+            json,
+        } => commands::snapshot(project, hook, json).await,
         Commands::Home { action } => commands::home(action).await,
         Commands::Identity { action } => commands::identity(action).await,
         Commands::Share { action } => commands::share(action).await,
