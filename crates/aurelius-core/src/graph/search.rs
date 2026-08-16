@@ -9,6 +9,11 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
     if trimmed.is_empty() || trimmed == "*" {
         return get_recent_nodes(conn, limit);
     }
+    // Строка от человека — текст, а не выражение FTS5 (см. crate::fts).
+    let expr = crate::fts::sanitize(trimmed);
+    if expr.is_empty() {
+        return get_recent_nodes(conn, limit);
+    }
     let mut stmt = conn.prepare(
         "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
                 n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash,
@@ -20,7 +25,7 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
          LIMIT ?2",
     )?;
     let nodes = stmt
-        .query_map(params![trimmed, limit as i64], row_to_node)?
+        .query_map(params![expr, limit as i64], row_to_node)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(nodes)
 }
@@ -33,7 +38,8 @@ pub fn search_typed(
 ) -> Result<Vec<Node>> {
     let type_str = serde_json::to_string(node_type)?;
     let trimmed = query.trim();
-    if trimmed.is_empty() || trimmed == "*" {
+    let expr = crate::fts::sanitize(trimmed);
+    if trimmed.is_empty() || trimmed == "*" || expr.is_empty() {
         let mut stmt = conn.prepare(
             "SELECT id, node_type, label, note, source, data, created_at, updated_at,
                     memory_kind, last_accessed_at, access_count, content_hash,
@@ -55,7 +61,7 @@ pub fn search_typed(
          LIMIT ?3",
     )?;
     let nodes = stmt
-        .query_map(params![trimmed, type_str, limit as i64], row_to_node)?
+        .query_map(params![expr, type_str, limit as i64], row_to_node)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(nodes)
 }
@@ -282,4 +288,72 @@ pub fn get_recent_nodes(conn: &Connection, limit: usize) -> Result<Vec<Node>> {
         .query_map(params![limit as i64], row_to_node)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(nodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> (std::path::PathBuf, Connection) {
+        let path =
+            std::env::temp_dir().join(format!("aurelius-search-{}.db", uuid::Uuid::new_v4()));
+        let conn = crate::db::open(&path).expect("open temp db");
+        (path, conn)
+    }
+
+    fn cleanup(path: &std::path::Path, conn: Connection) {
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        }
+    }
+
+    /// Дефис в FTS5 — оператор `NOT`, и запрос `skills-store` отвечал «no such
+    /// column: store». Так названы почти все скиллы, так что поиск падал на
+    /// самых обычных словах.
+    #[test]
+    fn hyphenated_query_finds_instead_of_failing() {
+        let (path, conn) = temp_db();
+        super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "скилл rust-clean-code",
+            Some("карточка лежит в .claude/skills проекта"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let found = search(&conn, "rust-clean-code", 5).expect("поиск не должен падать");
+        assert_eq!(found.len(), 1, "дефисное имя обязано находиться");
+
+        let typed = search_typed(&conn, "rust-clean-code", &NodeType::Concept, 5)
+            .expect("типизированный поиск не должен падать");
+        assert_eq!(typed.len(), 1);
+
+        cleanup(&path, conn);
+    }
+
+    /// Строка из одних операторов и кавычек не должна ни падать, ни выдумывать
+    /// результат: это «искать нечего», а не «база сломалась».
+    #[test]
+    fn punctuation_only_query_is_harmless() {
+        let (path, conn) = temp_db();
+        super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "любой узел",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        assert!(search(&conn, "\"", 5).is_ok());
+        assert!(search_typed(&conn, "\"", &NodeType::Concept, 5).is_ok());
+
+        cleanup(&path, conn);
+    }
 }

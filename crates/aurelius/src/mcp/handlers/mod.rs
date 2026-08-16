@@ -159,52 +159,21 @@ pub(crate) fn resolve_node(
         .ok_or_else(|| anyhow::anyhow!("node not found: {identifier}"))
 }
 
+/// Разбор живёт в ядре (`NodeType::parse`), чтобы CLI и MCP не расходились в
+/// том, какие типы вообще существуют. Здесь — мягкий вариант: незнакомое имя
+/// становится `Custom`, как и было в контракте инструмента.
 pub(crate) fn parse_node_type(s: &str) -> NodeType {
-    match s {
-        "project" => NodeType::Project,
-        "decision" => NodeType::Decision,
-        "concept" => NodeType::Concept,
-        "problem" => NodeType::Problem,
-        "solution" => NodeType::Solution,
-        "person" => NodeType::Person,
-        "dependency" => NodeType::Dependency,
-        "server" => NodeType::Server,
-        "file" => NodeType::File,
-        "module" => NodeType::Module,
-        "crate" => NodeType::Crate,
-        "user_fact" => NodeType::UserFact,
-        "digest" => NodeType::Digest,
-        "config" => NodeType::Config,
-        "session" => NodeType::Session,
-        "language" => NodeType::Language,
-        "task" => NodeType::Task,
-        "work_log" | "worklog" => NodeType::WorkLog,
-        "skill" => NodeType::Skill,
-        other => NodeType::Custom(other.to_owned()),
-    }
+    NodeType::parse(s)
 }
 
+/// Как и `parse_node_type`, разбор живёт в ядре — иначе `au relate` и
+/// `memory_relate` расходятся в том, какие связи вообще существуют.
 pub(crate) fn parse_relation(s: &str) -> anyhow::Result<Relation> {
-    Ok(match s {
-        "uses" => Relation::Uses,
-        "depends_on" => Relation::DependsOn,
-        "solves" => Relation::Solves,
-        "caused_by" => Relation::CausedBy,
-        "inspired_by" => Relation::InspiredBy,
-        "conflicts_with" => Relation::ConflictsWith,
-        "supersedes" => Relation::Supersedes,
-        "belongs_to" => Relation::BelongsTo,
-        "related_to" => Relation::RelatedTo,
-        "learned_from" => Relation::LearnedFrom,
-        "contains" => Relation::Contains,
-        "imports" => Relation::Imports,
-        "exports" => Relation::Exports,
-        "implements" => Relation::Implements,
-        "configures" => Relation::Configures,
-        "tracked_by" => Relation::TrackedBy,
-        "subtask_of" => Relation::SubtaskOf,
-        "blocks" => Relation::Blocks,
-        _ => anyhow::bail!("unknown relation: {s}"),
+    Relation::parse_known(s).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown relation: {s}. Known: {}",
+            Relation::KNOWN.join(", ")
+        )
     })
 }
 

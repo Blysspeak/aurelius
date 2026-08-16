@@ -259,6 +259,12 @@ to self-host a sync server.
 ```bash
 au init                            # initialize database
 au note "chose X over Y" -p app   # capture a decision → project
+au note --stdin --kind episodic \
+  --key precompact:$SESSION --json  # a moment, not a lasting fact: ages out, upserts, reports its id
+au session "what happened" -p app \
+  -d "decision" -n "next step"     # the layer-4 record: what `memory_session` writes, without MCP
+au session --stdin -p app --json    # same record from a hook: {"summary":…,"decisions":[…],"next_steps":[…]}
+au relate <from> <to> --type solves # edge between two nodes (`part-of`, `refines`, … — hyphens fine)
 au context beacon                  # graph around a topic
 au search "redis"                  # full-text search
 au reindex                         # index current project
@@ -276,6 +282,21 @@ au doc convert report.docx         # document → Markdown on stdout
 au doc convert ./contracts -r      # convert a whole tree, cached by content hash
 au doc recall "termination"        # search everything ever converted
 ```
+
+### Exit codes
+
+A caller has to tell "I called it wrong" from "the store is unreachable": the first is
+fixed by calling differently, the second by hand — retrying it is pointless.
+
+| Code | Meaning |
+|------|---------|
+| `0` | done (`--help` and `--version` included) |
+| `1` | bad call — unknown `--type`, missing argument, node not found, malformed JSON on stdin |
+| `2` | storage unreachable — no database, damaged image, locked SQLite |
+
+The `--hook` variants (`au snapshot --hook`, `au trace --hook`, `au judge --hook`) are the
+deliberate exception: they never fail and stay silent on error. A broken hook is worse than
+a missing snapshot.
 
 ### Sync Commands
 
