@@ -221,6 +221,103 @@ fn session_lands_in_layer_four_and_relate_links_to_it() {
     );
 }
 
+/// Запустить с дополнительными переменными окружения.
+fn run_env(home: &TmpHome, args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
+    let mut cmd = au(home, args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .stdin(Stdio::null())
+        .output()
+        .expect("запустить au с окружением");
+    (
+        out.status.code().expect("процесс завершился сам"),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// Ради чего метка заводилась: хук конца сессии обязан собрать СВОИ записи, а
+/// не все записи проекта. Проверяем, что чужой прогон и непомеченная запись в
+/// выборку не попадают.
+#[test]
+fn journal_returns_only_what_this_run_wrote() {
+    let home = TmpHome::dir("journal");
+    let project = "тестпроект-журнал";
+
+    let (code, out) = run(
+        &home,
+        &[
+            "session",
+            "--project",
+            project,
+            "--session",
+            "run-one",
+            "--json",
+            "итог первого прогона",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "запись сессии: {out}");
+    let session: serde_json::Value = serde_json::from_str(out.trim()).expect("JSON сессии");
+    assert_eq!(
+        session["session"], "run-one",
+        "ответ обязан подтвердить метку, а не молчать о ней"
+    );
+
+    for (text, session_arg) in [
+        ("заметка того же прогона", Some("run-one")),
+        ("заметка чужого прогона", Some("run-two")),
+        ("заметка без метки", None),
+    ] {
+        let mut args = vec!["note", "--project", project, "--json", text];
+        if let Some(id) = session_arg {
+            args.extend_from_slice(&["--session", id]);
+        }
+        let (code, out) = run(&home, &args, None);
+        assert_eq!(code, 0, "запись заметки: {out}");
+    }
+
+    let (code, out) = run(&home, &["journal", "--session", "run-one", "--json"], None);
+    assert_eq!(code, 0, "журнал: {out}");
+    let journal: serde_json::Value = serde_json::from_str(out.trim()).expect("JSON журнала");
+    assert_eq!(
+        journal["count"], 2,
+        "сессия и её заметка — и ничего чужого: {journal}"
+    );
+    let labels = journal["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|e| e["label"].as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        !labels.contains("чужого") && !labels.contains("без метки"),
+        "в журнал прогона попало лишнее: {labels}"
+    );
+
+    // Переменная окружения — второй канал для хука, у которого stdin занят.
+    let (code, from_env) = run_env(
+        &home,
+        &["journal", "--json"],
+        &[("AURELIUS_SESSION_ID", "run-one")],
+    );
+    assert_eq!(code, 0, "журнал через окружение: {from_env}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(from_env.trim()).expect("JSON")["count"],
+        2
+    );
+
+    // Без идентификатора выбирать нечего — это ошибка вызова, а не пустой ответ.
+    let (code, _) = run_env(
+        &home,
+        &["journal", "--json"],
+        &[("AURELIUS_SESSION_ID", "")],
+    );
+    assert_eq!(code, USAGE, "журнал без сессии — ошибка вызова");
+}
+
 /// Тело секции markdown-снапшота по её заголовку.
 fn section<'a>(snapshot: &'a str, title: &str) -> &'a str {
     let Some(start) = snapshot.find(&format!("## {title}")) else {

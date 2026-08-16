@@ -228,6 +228,9 @@ enum Commands {
     /// Link two nodes with a typed edge — what `memory_relate` does over MCP.
     /// Without it everything a hook writes lands in the graph edgeless.
     Relate(commands::RelateArgs),
+    /// List what a given run wrote. A session-end hook needs this to tell its
+    /// own records from yesterday's — until now nothing carried the run.
+    Journal(commands::JournalArgs),
     /// Show knowledge graph context around a topic
     Context {
         topic: String,
@@ -408,6 +411,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Note(args) => commands::note(args).await,
         Commands::Session(args) => commands::session(args).await,
         Commands::Relate(args) => commands::relate(args).await,
+        Commands::Journal(args) => commands::journal(args).await,
         Commands::Context {
             topic,
             depth,
