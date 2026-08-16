@@ -31,6 +31,67 @@ pub enum NodeType {
     Custom(String),
 }
 
+impl NodeType {
+    /// Имена типов, которые понимают все входы разом — и MCP, и CLI. Единый
+    /// список: пока он жил только внутри MCP-хендлера, из хука нельзя было
+    /// написать то, что пишется инструментом.
+    pub const KNOWN: &'static [&'static str] = &[
+        "project",
+        "decision",
+        "concept",
+        "problem",
+        "solution",
+        "person",
+        "dependency",
+        "server",
+        "file",
+        "module",
+        "crate",
+        "config",
+        "session",
+        "language",
+        "task",
+        "work_log",
+        "skill",
+        "user_fact",
+        "digest",
+    ];
+
+    /// Строгий разбор: только известные имена. `None` оставляет решение
+    /// вызывающему — CLI обязан ругнуться на опечатку, MCP заводит `Custom`.
+    #[must_use]
+    pub fn parse_known(s: &str) -> Option<Self> {
+        Some(match s {
+            "project" => Self::Project,
+            "decision" => Self::Decision,
+            "concept" => Self::Concept,
+            "problem" => Self::Problem,
+            "solution" => Self::Solution,
+            "person" => Self::Person,
+            "dependency" => Self::Dependency,
+            "server" => Self::Server,
+            "file" => Self::File,
+            "module" => Self::Module,
+            "crate" => Self::Crate,
+            "config" => Self::Config,
+            "session" => Self::Session,
+            "language" => Self::Language,
+            "task" => Self::Task,
+            "work_log" | "worklog" => Self::WorkLog,
+            "skill" => Self::Skill,
+            "user_fact" => Self::UserFact,
+            "digest" => Self::Digest,
+            _ => return None,
+        })
+    }
+
+    /// Мягкий разбор: незнакомое имя становится `Custom`.
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        Self::parse_known(s).unwrap_or_else(|| Self::Custom(s.to_owned()))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Relation {
@@ -41,6 +102,9 @@ pub enum Relation {
     InspiredBy,
     ConflictsWith,
     Supersedes,
+    /// Уточняет, не заменяя: поздняя запись делает раннюю точнее, а не отменяет
+    /// её. Отдельно от `Supersedes` (замена) и `RelatedTo` (связь без смысла).
+    Refines,
     BelongsTo,
     RelatedTo,
     LearnedFrom,
@@ -52,6 +116,65 @@ pub enum Relation {
     TrackedBy,
     SubtaskOf,
     Blocks,
+}
+
+impl Relation {
+    /// Словарь связей, единый для MCP и CLI — тот же приём, что и
+    /// [`NodeType::KNOWN`]: пока список жил внутри MCP-хендлера, из хука нельзя
+    /// было поставить ребро теми же словами, какими его ставит инструмент.
+    pub const KNOWN: &'static [&'static str] = &[
+        "uses",
+        "depends_on",
+        "solves",
+        "caused_by",
+        "inspired_by",
+        "conflicts_with",
+        "supersedes",
+        "refines",
+        "belongs_to",
+        "related_to",
+        "learned_from",
+        "contains",
+        "imports",
+        "exports",
+        "implements",
+        "configures",
+        "tracked_by",
+        "subtask_of",
+        "blocks",
+    ];
+
+    /// Строгий разбор имени связи. Дефис принимается наравне с подчёркиванием
+    /// (`part-of`, `related-to`): в командной строке дефис — естественная
+    /// форма, и считать её опечаткой значило бы отказывать в записи по
+    /// орфографии. `part_of` — синоним `belongs_to`, а не отдельная связь:
+    /// два имени одного отношения разорвали бы проектные выборки надвое.
+    #[must_use]
+    pub fn parse_known(s: &str) -> Option<Self> {
+        let name = s.trim().to_ascii_lowercase().replace('-', "_");
+        Some(match name.as_str() {
+            "uses" => Self::Uses,
+            "depends_on" => Self::DependsOn,
+            "solves" => Self::Solves,
+            "caused_by" => Self::CausedBy,
+            "inspired_by" => Self::InspiredBy,
+            "conflicts_with" => Self::ConflictsWith,
+            "supersedes" => Self::Supersedes,
+            "refines" => Self::Refines,
+            "belongs_to" | "part_of" => Self::BelongsTo,
+            "related_to" => Self::RelatedTo,
+            "learned_from" => Self::LearnedFrom,
+            "contains" => Self::Contains,
+            "imports" => Self::Imports,
+            "exports" => Self::Exports,
+            "implements" => Self::Implements,
+            "configures" => Self::Configures,
+            "tracked_by" => Self::TrackedBy,
+            "subtask_of" => Self::SubtaskOf,
+            "blocks" => Self::Blocks,
+            _ => return None,
+        })
+    }
 }
 
 impl std::fmt::Display for Relation {
@@ -69,6 +192,21 @@ impl std::fmt::Display for Relation {
 pub enum MemoryKind {
     Semantic,
     Episodic,
+}
+
+impl MemoryKind {
+    pub const KNOWN: &'static [&'static str] = &["semantic", "episodic"];
+
+    /// `None` на незнакомом имени: подставлять `Semantic` молча нельзя —
+    /// именно так эпизод и превращается в вечный факт.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "semantic" => Some(Self::Semantic),
+            "episodic" => Some(Self::Episodic),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for MemoryKind {
@@ -137,4 +275,68 @@ pub struct RawEvent {
     pub kind: String,
     pub payload: serde_json::Value,
     pub timestamp: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MemoryKind, NodeType, Relation};
+
+    /// `KNOWN` — это то, что CLI печатает в подсказке при опечатке. Список,
+    /// разошедшийся с `parse_known`, обещает пользователю тип, который тут же
+    /// будет отвергнут.
+    #[test]
+    fn every_known_node_type_parses_and_round_trips() {
+        for name in NodeType::KNOWN {
+            let parsed = NodeType::parse_known(name)
+                .unwrap_or_else(|| panic!("KNOWN содержит '{name}', но parse_known его не знает"));
+            let serialized = serde_json::to_value(&parsed).expect("тип сериализуется");
+            assert_eq!(
+                serialized.as_str(),
+                Some(*name),
+                "имя в KNOWN должно совпадать с тем, что уходит в базу"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_node_type_is_rejected_strictly_and_kept_loosely() {
+        assert!(NodeType::parse_known("decison").is_none());
+        assert!(matches!(NodeType::parse("decison"), NodeType::Custom(s) if s == "decison"));
+    }
+
+    /// То же требование, что и к типам узлов: имя из `KNOWN` должно и
+    /// разбираться, и ложиться в базу ровно этой строкой — иначе ребро,
+    /// поставленное из CLI, не совпадёт с поставленным из MCP.
+    #[test]
+    fn every_known_relation_parses_and_round_trips() {
+        for name in Relation::KNOWN {
+            let parsed = Relation::parse_known(name)
+                .unwrap_or_else(|| panic!("KNOWN содержит '{name}', но parse_known его не знает"));
+            assert_eq!(parsed.to_string(), *name);
+        }
+    }
+
+    #[test]
+    fn relation_accepts_hyphens_and_part_of_alias() {
+        assert_eq!(
+            Relation::parse_known("part-of").map(|r| r.to_string()),
+            Some("belongs_to".to_owned()),
+            "part-of — это belongs_to, а не новая связь"
+        );
+        assert_eq!(
+            Relation::parse_known("related-to").map(|r| r.to_string()),
+            Some("related_to".to_owned())
+        );
+        assert!(Relation::parse_known("солвес").is_none());
+    }
+
+    #[test]
+    fn every_known_memory_kind_parses_and_round_trips() {
+        for name in MemoryKind::KNOWN {
+            let parsed = MemoryKind::parse(name)
+                .unwrap_or_else(|| panic!("KNOWN содержит '{name}', но parse его не знает"));
+            assert_eq!(parsed.to_string(), *name);
+        }
+        assert!(MemoryKind::parse("epizodic").is_none());
+    }
 }

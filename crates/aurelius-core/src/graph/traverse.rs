@@ -4,12 +4,18 @@ use rusqlite::Connection;
 
 use super::{row_to_edge, row_to_node, search};
 
+/// Одно ребро видно с обоих концов, и на следующем шаге BFS оно приходит
+/// вторично — уже со стороны соседа. Без этой отметки связь A→B попадала в
+/// ответ дважды: счётчик «N edges» врал, а печать связей показывала близнеца.
+type SeenEdges = std::collections::HashSet<uuid::Uuid>;
+
 pub fn context(conn: &Connection, topic: &str, depth: u32) -> Result<(Vec<Node>, Vec<Edge>)> {
     let seeds = search(conn, topic, 5)?;
     if seeds.is_empty() {
         return Ok((vec![], vec![]));
     }
     let mut visited_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_edges = SeenEdges::new();
     let mut all_nodes: Vec<Node> = vec![];
     let mut all_edges: Vec<Edge> = vec![];
     let mut queue: Vec<String> = seeds.iter().map(|n| n.id.to_string()).collect();
@@ -33,7 +39,9 @@ pub fn context(conn: &Connection, topic: &str, depth: u32) -> Result<(Vec<Node>,
                 visited_nodes.insert(neighbor_id.clone());
                 neighbor_ids.push(neighbor_id);
             }
-            all_edges.push(edge);
+            if seen_edges.insert(edge.id) {
+                all_edges.push(edge);
+            }
         }
         let neighbors = get_nodes_batch(conn, &neighbor_ids)?;
         queue = neighbors.iter().map(|n| n.id.to_string()).collect();
@@ -55,6 +63,7 @@ pub fn context_from_id(
     };
 
     let mut visited_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_edges = SeenEdges::new();
     let mut all_nodes: Vec<Node> = vec![];
     let mut all_edges: Vec<Edge> = vec![];
     let mut queue: Vec<String> = vec![seed.id.to_string()];
@@ -78,7 +87,9 @@ pub fn context_from_id(
                 visited_nodes.insert(neighbor_id.clone());
                 neighbor_ids.push(neighbor_id);
             }
-            all_edges.push(edge);
+            if seen_edges.insert(edge.id) {
+                all_edges.push(edge);
+            }
         }
         let neighbors = get_nodes_batch(conn, &neighbor_ids)?;
         queue = neighbors.iter().map(|n| n.id.to_string()).collect();
@@ -141,4 +152,50 @@ fn get_nodes_batch(conn: &Connection, ids: &[String]) -> Result<Vec<Node>> {
         .query_map(params.as_slice(), row_to_node)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(nodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{NodeType, Relation};
+
+    /// Ребро видно с обоих концов: на втором шаге BFS оно приходит со стороны
+    /// соседа. Пока обход не помечал увиденное, `au context` печатал одну связь
+    /// дважды, а MCP отдавал её дважды в JSON.
+    #[test]
+    fn traversal_returns_each_edge_once() {
+        let path =
+            std::env::temp_dir().join(format!("aurelius-traverse-{}.db", uuid::Uuid::new_v4()));
+        let conn = crate::db::open(&path).expect("open temp db");
+
+        let a = super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "узел A",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("node a");
+        let b = super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "узел B",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("node b");
+        super::super::add_edge(&conn, a.id, b.id, Relation::RelatedTo, 1.0).expect("edge");
+
+        let (_, edges) = context_from_id(&conn, &a.id.to_string(), 3).expect("traverse");
+        assert_eq!(edges.len(), 1, "одно ребро — одна запись в ответе");
+
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        }
+    }
 }
