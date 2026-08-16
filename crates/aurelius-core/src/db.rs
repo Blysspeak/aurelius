@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 12;
+pub const SCHEMA_VERSION: i32 = 13;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -513,7 +513,39 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 12)?;
     }
 
+    if current < 13 {
+        migrate_v13(&tx)?;
+        set_schema_version(&tx, 13)?;
+    }
+
     tx.commit()?;
+    Ok(())
+}
+
+/// V13 — запись помечается прогоном, который её сделал.
+///
+/// Журнал не различал сессии вообще: `session_id` жил только в лабильном окне
+/// отзыва, а сами узлы его не несли. Хук конца сессии видел все записи проекта
+/// и не мог отделить свои сегодняшние от вчерашних — «собрать всё, что я
+/// написал за этот прогон» было невозможно механически, только на глаз по
+/// времени.
+///
+/// Метка легла в `data.agent_session`, а не отдельной колонкой: колонка
+/// потребовала бы вручную править десяток рукописных списков `SELECT`, и
+/// пропущенный список упал бы не при компиляции, а в рантайме на `row.get`.
+/// Скорость колонки при этом сохраняется — индекс по выражению даёт ровно тот
+/// же поиск по равенству.
+///
+/// Индекс частичный: непомеченные записи в него не попадают, поэтому он не
+/// растёт на всей истории, накопленной до этой версии.
+fn migrate_v13(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_nodes_agent_session
+            ON nodes(json_extract(data, '$.agent_session'))
+            WHERE json_extract(data, '$.agent_session') IS NOT NULL;
+        ",
+    )?;
     Ok(())
 }
 

@@ -105,6 +105,10 @@ pub fn tool_definitions() -> serde_json::Value {
                             "enum": ["semantic", "episodic"],
                             "description": "Memory classification: semantic (facts, concepts) or episodic (events, sessions). Default: semantic",
                             "default": "semantic"
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "The run that wrote this. Without it nothing distinguishes this record from one written yesterday, and 'everything written in this session' cannot be selected at all. Readable back with `au journal --session <id>`."
                         }
                     },
                     "required": ["label"]
@@ -214,6 +218,10 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Key files that were modified or are relevant"
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "The run that wrote this record. Stamps the session node and everything it spawns, so `au journal --session <id>` can list them back."
                         },
                         "tasks": {
                             "type": "array",

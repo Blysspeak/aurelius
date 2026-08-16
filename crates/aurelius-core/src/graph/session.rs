@@ -16,6 +16,67 @@ use sha2::{Digest, Sha256};
 
 use crate::models::{MemoryKind, Node, NodeType, Relation};
 
+/// Ключ в `data`, под которым лежит идентификатор ПРОГОНА — той сессии агента,
+/// что сделала запись.
+///
+/// Намеренно не `session_id`: под этим именем у решений и проблем уже лежит id
+/// узла `Session`, а это другое. Узел графа против прогона харнесса — совпади
+/// имена, и однажды выборка «что записано в этом прогоне» молча притащила бы
+/// половину чужой сессии.
+pub const AGENT_SESSION_KEY: &str = "agent_session";
+
+/// Проставить метку прогона в `data`.
+///
+/// Без метки объект возвращается как был: «сессия неизвестна» обязана остаться
+/// ОТСУТСТВИЕМ ключа, а не пустой строкой. Иначе выборка по сессии начала бы
+/// совпадать с записями, которых никто не метил, — а это ровно та беда, от
+/// которой метка и заводится.
+#[must_use]
+pub fn with_agent_session(
+    mut data: serde_json::Value,
+    agent_session: Option<&str>,
+) -> serde_json::Value {
+    let Some(id) = agent_session.map(str::trim).filter(|s| !s.is_empty()) else {
+        return data;
+    };
+    if data.is_null() {
+        data = serde_json::json!({});
+    }
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(AGENT_SESSION_KEY.to_owned(), id.into());
+    }
+    data
+}
+
+/// Всё, что записано в прогоне `agent_session`, в порядке появления.
+///
+/// Это вторая половина метки: пометить и не уметь выбрать — то же самое, что не
+/// метить. Порядок по возрастанию `created_at` — журнал читают сверху вниз, как
+/// он писался.
+pub fn nodes_by_agent_session(
+    conn: &Connection,
+    agent_session: &str,
+    limit: usize,
+) -> Result<Vec<Node>> {
+    let id = agent_session.trim();
+    if id.is_empty() {
+        anyhow::bail!("пустой идентификатор сессии — выбирать нечего");
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes
+         WHERE json_extract(data, '$.agent_session') = ?1 AND deleted_at IS NULL
+         ORDER BY created_at ASC
+         LIMIT ?2",
+    )?;
+    let nodes = stmt
+        .query_map(rusqlite::params![id, limit as i64], super::row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nodes)
+}
+
 /// Пара «что сломалось — как починили». В графе это два узла и ребро `solves`
 /// между ними: половина пары бессмысленна, поэтому и в типе они неразделимы.
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +100,10 @@ pub struct SessionInput<'a> {
     pub key_files: &'a [String],
     /// Чем записано — `mcp` или `cli`; видно в `source` узла.
     pub source: &'a str,
+    /// Идентификатор прогона агента. Им метится и сам узел сессии, и всё, что
+    /// она породила: без метки хук конца сессии не отличит свои записи от
+    /// вчерашних. См. [`AGENT_SESSION_KEY`].
+    pub agent_session: Option<&'a str>,
 }
 
 impl<'a> SessionInput<'a> {
@@ -53,6 +118,7 @@ impl<'a> SessionInput<'a> {
             next_steps: &[],
             key_files: &[],
             source,
+            agent_session: None,
         }
     }
 }
@@ -127,7 +193,7 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
         &label,
         Some(summary),
         input.source,
-        serde_json::Value::Object(data),
+        with_agent_session(serde_json::Value::Object(data), input.agent_session),
         MemoryKind::Episodic,
         Some(&hash),
     )?;
@@ -157,7 +223,10 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
             &format!("[{project}] {}", truncate(text, 60)),
             Some(text),
             input.source,
-            serde_json::json!({ "session_id": session.id.to_string() }),
+            with_agent_session(
+                serde_json::json!({ "session_id": session.id.to_string() }),
+                input.agent_session,
+            ),
         )?;
         super::add_edge(conn, session.id, node.id, Relation::Contains, 1.0)?;
         super::add_edge(conn, node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
@@ -176,7 +245,10 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
             &format!("[{project}] {}", truncate(problem, 60)),
             Some(problem),
             input.source,
-            serde_json::json!({ "session_id": session.id.to_string() }),
+            with_agent_session(
+                serde_json::json!({ "session_id": session.id.to_string() }),
+                input.agent_session,
+            ),
         )?;
         let sol = super::add_node(
             conn,
@@ -184,7 +256,10 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
             &format!("[{project}] {}", truncate(solution, 60)),
             Some(solution),
             input.source,
-            serde_json::json!({ "session_id": session.id.to_string() }),
+            with_agent_session(
+                serde_json::json!({ "session_id": session.id.to_string() }),
+                input.agent_session,
+            ),
         )?;
         super::add_edge(conn, sol.id, prob.id, Relation::Solves, 1.0)?;
         super::add_edge(conn, session.id, prob.id, Relation::Contains, 1.0)?;
@@ -327,5 +402,96 @@ mod tests {
         let (_tmp, conn) = setup();
         let input = SessionInput::new("тестпроект", "   ", "cli");
         assert!(record_session(&conn, &input).is_err());
+    }
+
+    /// Метка обязана лечь не только на саму сессию, но и на всё, что она
+    /// породила: хук конца сессии собирает свои записи, а не одну заглавную.
+    #[test]
+    fn the_run_stamps_the_session_and_everything_it_spawned() {
+        let (_tmp, conn) = setup();
+        let decisions = ["метка прогона легла в data".to_owned()];
+        let pairs = [ProblemSolved {
+            problem: "журнал не различал сессии".to_owned(),
+            solution: "запись метится прогоном".to_owned(),
+        }];
+        let input = SessionInput {
+            decisions: &decisions,
+            problems_solved: &pairs,
+            agent_session: Some("run-alpha"),
+            ..SessionInput::new("тестпроект", "итог прогона alpha", "cli")
+        };
+        record_session(&conn, &input).expect("record");
+
+        let written = nodes_by_agent_session(&conn, "run-alpha", 50).expect("journal");
+        assert_eq!(
+            written.len(),
+            4,
+            "сессия, решение, проблема и решение проблемы — все четыре записи прогона: {:?}",
+            written.iter().map(|n| &n.label).collect::<Vec<_>>()
+        );
+        assert!(written
+            .iter()
+            .any(|n| matches!(n.node_type, NodeType::Session)));
+    }
+
+    /// Главное свойство: чужой прогон и непомеченная запись в выборку не лезут.
+    /// Ради этого метка и заводилась.
+    #[test]
+    fn another_run_and_unstamped_records_stay_out() {
+        let (_tmp, conn) = setup();
+        record_session(
+            &conn,
+            &SessionInput {
+                agent_session: Some("run-alpha"),
+                ..SessionInput::new("тестпроект", "вчерашний итог", "cli")
+            },
+        )
+        .expect("alpha");
+        record_session(
+            &conn,
+            &SessionInput {
+                agent_session: Some("run-beta"),
+                ..SessionInput::new("тестпроект", "сегодняшний итог", "cli")
+            },
+        )
+        .expect("beta");
+        record_session(
+            &conn,
+            &SessionInput::new("тестпроект", "итог без метки", "cli"),
+        )
+        .expect("unstamped");
+
+        let beta = nodes_by_agent_session(&conn, "run-beta", 50).expect("journal");
+        assert_eq!(beta.len(), 1);
+        assert_eq!(beta[0].note.as_deref(), Some("сегодняшний итог"));
+
+        assert!(
+            nodes_by_agent_session(&conn, "run-gamma", 50)
+                .expect("journal")
+                .is_empty(),
+            "прогон, которого не было, не должен ничего находить"
+        );
+        assert!(
+            nodes_by_agent_session(&conn, "  ", 50).is_err(),
+            "пустой идентификатор — ошибка вызова, а не выборка всего подряд"
+        );
+    }
+
+    /// «Сессия неизвестна» обязана остаться отсутствием ключа. Пустая строка в
+    /// `data` однажды совпала бы с выборкой и притащила чужое.
+    #[test]
+    fn an_unknown_run_leaves_no_key_behind() {
+        assert_eq!(
+            with_agent_session(serde_json::json!({"a": 1}), None),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            with_agent_session(serde_json::json!({"a": 1}), Some("   ")),
+            serde_json::json!({"a": 1})
+        );
+        assert_eq!(
+            with_agent_session(serde_json::json!({}), Some(" run-alpha ")),
+            serde_json::json!({ AGENT_SESSION_KEY: "run-alpha" })
+        );
     }
 }
