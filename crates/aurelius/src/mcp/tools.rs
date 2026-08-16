@@ -126,7 +126,9 @@ pub fn tool_definitions() -> serde_json::Value {
                         },
                         "relation": {
                             "type": "string",
-                            "description": "Relation type: uses, depends_on, solves, caused_by, inspired_by, conflicts_with, supersedes, belongs_to, related_to, learned_from, contains, imports, exports, implements, configures, tracked_by"
+                            // Список берётся из словаря ядра, а не переписан
+                            // руками: копия уже успела отстать на две связи.
+                            "description": format!("Relation type: {}", aurelius_core::models::Relation::KNOWN.join(", ")),
                         },
                         "weight": {
                             "type": "number",

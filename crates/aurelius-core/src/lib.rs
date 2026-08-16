@@ -2,6 +2,7 @@ pub mod codec;
 pub mod connector;
 pub mod db;
 pub mod differ;
+pub mod fts;
 pub mod graph;
 pub mod home;
 pub mod identity;

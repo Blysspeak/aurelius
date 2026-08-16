@@ -1,11 +1,24 @@
 use anyhow::Result;
 use aurelius_core::{
-    graph,
-    models::{MemoryKind, NodeType, Relation},
+    graph::{self, ProblemSolved, SessionInput},
+    models::{NodeType, Relation},
 };
 use serde_json::json;
 
-use super::{node_compact, open_db, resolve_node, sync_push_if_enabled, truncate};
+use super::{node_compact, open_db, resolve_node, sync_push_if_enabled};
+
+/// Строки массива параметра, пустой вектор при отсутствии или чужом типе.
+fn string_list(params: &serde_json::Value, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
     let summary = params
@@ -17,114 +30,44 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         .and_then(|p| p.as_str())
         .unwrap_or("unknown");
 
-    // Dedup: hash summary+project to prevent duplicate sessions
-    let content_hash = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(project.as_bytes());
-        hasher.update(b"|");
-        hasher.update(summary.as_bytes());
-        format!("{:x}", hasher.finalize())
-    };
+    let decisions = string_list(params, "decisions");
+    let next_steps = string_list(params, "next_steps");
+    let key_files = string_list(params, "key_files");
+    let problems_solved: Vec<ProblemSolved> = params
+        .get("problems_solved")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let conn = open_db()?;
 
-    if let Some(existing) = graph::find_node_by_content_hash(&conn, &content_hash)? {
+    // Сама запись — общий код с `au session` (graph::record_session). Здесь
+    // остаётся только то, что есть у инструмента и нет у CLI: привязка к
+    // задачам, подсказка об активных и авто-push синка.
+    let written = graph::record_session(
+        &conn,
+        &SessionInput {
+            decisions: &decisions,
+            problems_solved: &problems_solved,
+            next_steps: &next_steps,
+            key_files: &key_files,
+            ..SessionInput::new(project, summary, "mcp")
+        },
+    )?;
+    let session = written.session;
+
+    if written.duplicate {
         return Ok(json!({
-            "id": existing.id.to_string(),
-            "label": existing.label,
+            "id": session.id.to_string(),
+            "label": session.label,
             "type": "session",
             "memory_kind": "episodic",
             "duplicate": true,
         }));
-    }
-
-    // Session data: only metadata not stored in child nodes
-    let mut session_data = json!({ "project": project });
-    if let Some(next) = params.get("next_steps") {
-        session_data["next_steps"] = next.clone();
-    }
-    if let Some(files) = params.get("key_files") {
-        session_data["key_files"] = files.clone();
-    }
-
-    let session_label = format!(
-        "[{}] {}",
-        project,
-        chrono::Utc::now().format("%Y-%m-%d %H:%M")
-    );
-    let session = graph::add_node_full(
-        &conn,
-        NodeType::Session,
-        &session_label,
-        Some(summary),
-        "mcp",
-        session_data,
-        MemoryKind::Episodic,
-        Some(&content_hash),
-    )?;
-
-    // Link session to project node — create if it doesn't exist
-    let proj_node = match graph::find_project_by_label(&conn, project) {
-        Ok(Some(n)) => n,
-        _ => graph::add_node(
-            &conn,
-            NodeType::Project,
-            project,
-            None,
-            "mcp-session",
-            json!({"auto_created": true}),
-        )?,
-    };
-    graph::add_edge(&conn, session.id, proj_node.id, Relation::BelongsTo, 1.0)?;
-
-    // Create decision nodes
-    if let Some(decisions) = params.get("decisions").and_then(|d| d.as_array()) {
-        for decision in decisions {
-            if let Some(text) = decision.as_str() {
-                let dec_node = graph::add_node(
-                    &conn,
-                    NodeType::Decision,
-                    &format!("[{}] {}", project, truncate(text, 60)),
-                    Some(text),
-                    "mcp-session",
-                    json!({"session_id": session.id.to_string()}),
-                )?;
-                graph::add_edge(&conn, session.id, dec_node.id, Relation::Contains, 1.0)?;
-                graph::add_edge(&conn, dec_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
-            }
-        }
-    }
-
-    // Create problem+solution pairs
-    if let Some(problems) = params.get("problems_solved").and_then(|p| p.as_array()) {
-        for problem in problems {
-            let prob_text = problem.get("problem").and_then(|p| p.as_str());
-            let sol_text = problem.get("solution").and_then(|s| s.as_str());
-            if let (Some(prob), Some(sol)) = (prob_text, sol_text) {
-                let prob_node = graph::add_node(
-                    &conn,
-                    NodeType::Problem,
-                    &format!("[{}] {}", project, truncate(prob, 60)),
-                    Some(prob),
-                    "mcp-session",
-                    json!({"session_id": session.id.to_string()}),
-                )?;
-                let sol_node = graph::add_node(
-                    &conn,
-                    NodeType::Solution,
-                    &format!("[{}] {}", project, truncate(sol, 60)),
-                    Some(sol),
-                    "mcp-session",
-                    json!({"session_id": session.id.to_string()}),
-                )?;
-                graph::add_edge(&conn, sol_node.id, prob_node.id, Relation::Solves, 1.0)?;
-                graph::add_edge(&conn, session.id, prob_node.id, Relation::Contains, 1.0)?;
-                graph::add_edge(&conn, session.id, sol_node.id, Relation::Contains, 1.0)?;
-                graph::add_edge(&conn, prob_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
-                graph::add_edge(&conn, sol_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
-            }
-        }
     }
 
     // Link session to tasks if specified
