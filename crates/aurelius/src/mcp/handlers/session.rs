@@ -43,6 +43,15 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         })
         .unwrap_or_default();
 
+    // Метка прогона. Не обязательна, но без неё запись невозможно отличить от
+    // вчерашней: id прогона знает только вызывающий, граф его ниоткуда не
+    // выведет.
+    let agent_session = params
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     let conn = open_db()?;
 
     // Сама запись — общий код с `au session` (graph::record_session). Здесь
@@ -55,6 +64,7 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
             problems_solved: &problems_solved,
             next_steps: &next_steps,
             key_files: &key_files,
+            agent_session,
             ..SessionInput::new(project, summary, "mcp")
         },
     )?;

@@ -265,6 +265,8 @@ au session "what happened" -p app \
   -d "decision" -n "next step"     # the layer-4 record: what `memory_session` writes, without MCP
 au session --stdin -p app --json    # same record from a hook: {"summary":…,"decisions":[…],"next_steps":[…]}
 au relate <from> <to> --type solves # edge between two nodes (`part-of`, `refines`, … — hyphens fine)
+au note "…" --session $SESSION_ID   # stamp the run that wrote it (or export AURELIUS_SESSION_ID)
+au journal --session $SESSION_ID    # everything that run wrote — the selection a session-end hook needs
 au context beacon                  # graph around a topic
 au search "redis"                  # full-text search
 au reindex                         # index current project

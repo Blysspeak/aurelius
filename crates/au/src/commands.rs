@@ -99,6 +99,31 @@ pub struct NoteArgs {
     /// so a caller can record which node it wrote, not merely that it wrote
     #[arg(long)]
     pub json: bool,
+    /// Stamp the run that wrote this. Without it a session-end hook sees every
+    /// note of the project and cannot tell its own from yesterday's.
+    /// Falls back to `AURELIUS_SESSION_ID`.
+    #[arg(long)]
+    pub session: Option<String>,
+}
+
+/// Идентификатор прогона: флаг главнее переменной окружения.
+///
+/// Переменная нужна потому, что хук Claude Code получает `session_id` в JSON на
+/// stdin, а у `au note --stdin` stdin уже занят текстом заметки — второго
+/// канала там нет. Пустая строка приравнена к отсутствию: «сессия неизвестна»
+/// должна остаться отсутствием метки, иначе выборка по сессии начнёт совпадать
+/// с непомеченными записями.
+fn resolve_agent_session(flag: Option<&str>) -> Option<String> {
+    let cleaned = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_owned())
+    };
+    flag.and_then(cleaned).or_else(|| {
+        std::env::var("AURELIUS_SESSION_ID")
+            .ok()
+            .as_deref()
+            .and_then(cleaned)
+    })
 }
 
 fn read_note_text(text: Option<String>, from_stdin: bool) -> Result<String> {
@@ -125,6 +150,12 @@ pub async fn note(args: NoteArgs) -> Result<()> {
         t.trim_end().to_owned()
     });
 
+    let agent_session = resolve_agent_session(args.session.as_deref());
+    let mut data = serde_json::Map::new();
+    if let Some(id) = agent_session.as_deref() {
+        data.insert(graph::AGENT_SESSION_KEY.to_owned(), id.into());
+    }
+
     let (node, created) = match args.key.as_deref() {
         Some(key) => graph::upsert_node_by_key(
             &conn,
@@ -133,7 +164,7 @@ pub async fn note(args: NoteArgs) -> Result<()> {
             &label,
             Some(&text),
             "manual",
-            serde_json::Map::new(),
+            data,
             args.kind,
         )?,
         None => (
@@ -143,7 +174,7 @@ pub async fn note(args: NoteArgs) -> Result<()> {
                 &label,
                 Some(&text),
                 "manual",
-                serde_json::json!({}),
+                serde_json::Value::Object(data),
                 args.kind,
                 None,
             )?,
@@ -176,6 +207,7 @@ pub async fn note(args: NoteArgs) -> Result<()> {
             "memory_kind": node.memory_kind,
             "project": args.project,
             "created": created,
+            "session": agent_session,
         });
         println!("{}", serde_json::to_string(&out)?);
         return Ok(());
@@ -227,6 +259,10 @@ pub struct SessionArgs {
     /// Print one JSON line with the session id instead of a human-readable line
     #[arg(long)]
     pub json: bool,
+    /// Stamp the run that wrote this record — the session node and everything
+    /// it spawns. Falls back to `AURELIUS_SESSION_ID`.
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 /// Тело записи. Форма намеренно совпадает с параметрами `memory_session`:
@@ -247,6 +283,11 @@ struct SessionPayload {
     /// Запасной способ назвать проект — флаг `--project` главнее.
     #[serde(default)]
     project: Option<String>,
+    /// Идентификатор прогона — та же роль, что у флага `--session`, который
+    /// главнее. Хук, отдающий запись одним JSON, кладёт сюда `session_id`,
+    /// который ему и так пришёл от Claude Code.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 fn read_session_payload(args: &SessionArgs) -> Result<SessionPayload> {
@@ -279,6 +320,9 @@ pub async fn session(args: SessionArgs) -> Result<()> {
         .or_else(current_dir_name)
         .ok_or_else(|| anyhow::anyhow!("не удалось определить проект — передай --project"))?;
 
+    let agent_session =
+        resolve_agent_session(args.session.as_deref().or(payload.session.as_deref()));
+
     let conn = open_and_ensure(&db_path())?;
     let written = graph::record_session(
         &conn,
@@ -287,6 +331,7 @@ pub async fn session(args: SessionArgs) -> Result<()> {
             problems_solved: &payload.problems_solved,
             next_steps: &payload.next_steps,
             key_files: &payload.key_files,
+            agent_session: agent_session.as_deref(),
             ..graph::SessionInput::new(&project, &payload.summary, "cli")
         },
     )?;
@@ -304,6 +349,7 @@ pub async fn session(args: SessionArgs) -> Result<()> {
             "duplicate": written.duplicate,
             "decisions": written.decisions,
             "problems": written.problems,
+            "session": agent_session,
         });
         println!("{}", serde_json::to_string(&out)?);
         return Ok(());
@@ -339,6 +385,75 @@ async fn push_after_write(conn: &rusqlite::Connection, project: &str) {
     if let Err(e) = sync_client::push_project(&client, conn, &cfg).await {
         eprintln!("⚠ push '{project}' не удался, локальная запись цела: {e}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// au journal — что записано в этом прогоне
+// ---------------------------------------------------------------------------
+
+#[derive(clap::Args)]
+pub struct JournalArgs {
+    /// The run to list. Falls back to `AURELIUS_SESSION_ID`.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Cap on entries returned
+    #[arg(short, long, default_value = "50")]
+    pub limit: usize,
+    /// One JSON object with the whole list, instead of readable lines
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Показать всё, что записано в прогоне.
+///
+/// Вторая половина метки: пометить и не уметь выбрать — то же самое, что не
+/// метить. Именно этой выборки не хватало хуку конца сессии, чтобы собрать свои
+/// записи, а не все записи проекта подряд.
+pub async fn journal(args: JournalArgs) -> Result<()> {
+    let session = resolve_agent_session(args.session.as_deref()).ok_or_else(|| {
+        anyhow::anyhow!("нужен идентификатор сессии: --session <id> или AURELIUS_SESSION_ID")
+    })?;
+
+    let conn = open_and_ensure(&db_path())?;
+    let nodes = graph::nodes_by_agent_session(&conn, &session, args.limit)?;
+
+    if args.json {
+        let entries = nodes
+            .iter()
+            .map(|n| {
+                json!({
+                    "id": n.id.to_string(),
+                    "type": n.node_type,
+                    "label": n.label,
+                    "created_at": n.created_at.to_rfc3339(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let out = json!({
+            "session": session,
+            "count": entries.len(),
+            "entries": entries,
+        });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    if nodes.is_empty() {
+        println!("В сессии {session} записей нет.");
+        return Ok(());
+    }
+
+    println!("Записано в сессии {session} ({}):", nodes.len());
+    for node in &nodes {
+        println!(
+            "  {} {:<9} {}",
+            node.created_at.format("%H:%M"),
+            format!("{:?}", node.node_type).to_lowercase(),
+            node.label
+        );
+        println!("           {}", node.id);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

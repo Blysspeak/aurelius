@@ -145,7 +145,17 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         .get("source")
         .and_then(|s| s.as_str())
         .unwrap_or("mcp");
-    let data = params.get("data").cloned().unwrap_or(json!({}));
+    // Метка прогона ложится в те же `data`, что и у `au note --session`: одна
+    // запись, две двери — иначе выборка по сессии видела бы только половину
+    // написанного.
+    let data = graph::with_agent_session(
+        params.get("data").cloned().unwrap_or(json!({})),
+        params
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    );
     let memory_kind = match params.get("memory_kind").and_then(|m| m.as_str()) {
         Some("episodic") => MemoryKind::Episodic,
         _ => MemoryKind::Semantic,
