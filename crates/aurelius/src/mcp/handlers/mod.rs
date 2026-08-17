@@ -105,11 +105,28 @@ pub(crate) fn node_brief(node: &aurelius_core::models::Node) -> serde_json::Valu
     })
 }
 
+/// Происхождение факта в форме для выдачи.
+///
+/// Отдаётся ВСЕГДА, а не только когда заполнено: молчание о происхождении и
+/// есть та беда, ради которой поля заводились — ложное «флаги выключены»
+/// выглядело ровно как измеренное. Отсутствие читается как `unverified`.
+fn provenance_brief(node: &aurelius_core::models::Node) -> serde_json::Value {
+    let p = aurelius_core::provenance::Provenance::from_data(&node.data);
+    json!({
+        "confidence": p.confidence_or_default().as_str(),
+        "evidence": p.evidence,
+        "measured_at": p.measured_at.map(|d| d.to_rfc3339()),
+        "subject": p.subject,
+        "stale": p.staleness(node.created_at, chrono::Utc::now()).map(|s| s.note()),
+    })
+}
+
 pub(crate) fn node_detail(node: &aurelius_core::models::Node) -> serde_json::Value {
     json!({
         "id": node.id.to_string(),
         "type": node.node_type,
         "label": node.label,
+        "claim": aurelius_core::provenance::Provenance::from_data(&node.data).claim,
         "note": node.note,
         "source": node.source,
         "data": node.data,
@@ -118,6 +135,7 @@ pub(crate) fn node_detail(node: &aurelius_core::models::Node) -> serde_json::Val
         "access_count": node.access_count,
         "created_by": node.created_by,
         "updated_by": node.updated_by,
+        "provenance": provenance_brief(node),
     })
 }
 
@@ -126,8 +144,10 @@ pub(crate) fn node_compact(node: &aurelius_core::models::Node) -> serde_json::Va
         "id": node.id.to_string(),
         "type": node.node_type,
         "label": node.label,
+        "claim": aurelius_core::provenance::Provenance::from_data(&node.data).claim,
         "note": node.note,
         "created_at": node.created_at.to_rfc3339(),
+        "provenance": provenance_brief(node),
     })
 }
 

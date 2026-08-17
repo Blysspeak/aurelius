@@ -120,12 +120,21 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
     // session write. Best-effort — never fails memory_session (T022).
     sync_push_if_enabled(&conn, project);
 
+    // Ровно та беда, ради которой это писалось: имена параметров теперь
+    // проверены заслонкой, но правильно названный пустой список выглядел
+    // переданным — и решения терялись при ответе "created": true.
+    let (stored_fields, dropped_fields) = super::super::params::field_report(params);
+
     Ok(json!({
         "id": session.id.to_string(),
         "label": session.label,
         "type": "session",
         "memory_kind": "episodic",
         "created": true,
+        "decisions_written": written.decisions,
+        "problems_written": written.problems,
+        "stored_fields": stored_fields,
+        "dropped_fields": dropped_fields,
         "linked_tasks": linked_tasks,
         "active_tasks_hint": active_tasks,
     }))

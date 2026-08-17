@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use aurelius_core::{
     db, graph, identity, indexer,
     models::{MemoryKind, NodeType, Relation},
+    provenance::{self, Provenance, Resolution},
     timeforged,
 };
 use serde_json::json;
@@ -104,6 +105,50 @@ pub struct NoteArgs {
     /// Falls back to `AURELIUS_SESSION_ID`.
     #[arg(long)]
     pub session: Option<String>,
+    /// The assertion in one or two lines — returned whole, never clipped
+    /// mid-word. Max 240 chars; long reasoning stays in the note text.
+    #[arg(long)]
+    pub claim: Option<String>,
+    /// The command or query VERBATIM that produced this
+    #[arg(long)]
+    pub evidence: Option<String>,
+    /// Where this came from: measured | inferred | reported | unverified.
+    /// Absent reads as `unverified` — never as "probably measured".
+    #[arg(long)]
+    pub confidence: Option<String>,
+    /// How fast this stops being true: immutable | slow | volatile
+    #[arg(long)]
+    pub volatility: Option<String>,
+    /// Command that re-checks this claim once it goes stale
+    #[arg(long)]
+    pub verify_with: Option<String>,
+    /// What is being asserted, e.g. `xhub:.env:REFUND_REQUESTS_ENABLED`.
+    /// A second fact about the same subject is refused until resolved.
+    #[arg(long)]
+    pub subject: Option<String>,
+    /// How this relates to an existing fact about the same subject:
+    /// supersede | refine | coexist
+    #[arg(long)]
+    pub resolution: Option<String>,
+}
+
+/// Собрать из флагов тот же JSON, что приходит по MCP, и разобрать его тем же
+/// разбором. Симметрия здесь не украшение: разъехавшись, две двери начали бы
+/// по-разному понимать, что такое измеренный факт.
+fn provenance_from_flags(args: &NoteArgs) -> Result<Provenance> {
+    let mut params = serde_json::Map::new();
+    let mut put = |key: &str, value: Option<&String>| {
+        if let Some(v) = value {
+            params.insert(key.to_owned(), v.clone().into());
+        }
+    };
+    put(provenance::CLAIM_KEY, args.claim.as_ref());
+    put(provenance::EVIDENCE_KEY, args.evidence.as_ref());
+    put(provenance::CONFIDENCE_KEY, args.confidence.as_ref());
+    put(provenance::VOLATILITY_KEY, args.volatility.as_ref());
+    put(provenance::VERIFY_WITH_KEY, args.verify_with.as_ref());
+    put(provenance::SUBJECT_KEY, args.subject.as_ref());
+    Provenance::parse(&serde_json::Value::Object(params))
 }
 
 /// Идентификатор прогона: флаг главнее переменной окружения.
@@ -143,6 +188,11 @@ fn read_note_text(text: Option<String>, from_stdin: bool) -> Result<String> {
 }
 
 pub async fn note(args: NoteArgs) -> Result<()> {
+    // Происхождение и разрешение разбираются ПЕРВЫМИ: ошибка в них не имеет
+    // права оставить за собой ни полузаписанный узел, ни съеденный stdin.
+    let prov = provenance_from_flags(&args)?;
+    let resolution = Resolution::parse_arg(args.resolution.as_deref())?;
+
     let text = read_note_text(args.text, args.stdin)?;
     let conn = open_and_ensure(&db_path())?;
     let label = args.label.unwrap_or_else(|| {
@@ -155,6 +205,16 @@ pub async fn note(args: NoteArgs) -> Result<()> {
     if let Some(id) = agent_session.as_deref() {
         data.insert(graph::AGENT_SESSION_KEY.to_owned(), id.into());
     }
+    let mut prov_data = serde_json::Value::Object(serde_json::Map::new());
+    prov.write_into(&mut prov_data);
+    if let serde_json::Value::Object(fields) = prov_data {
+        data.extend(fields);
+    }
+
+    // Противоречие ловится до записи — как и в memory_add: два утверждения об
+    // одном предмете не могут быть истинны одновременно.
+    let conflicts =
+        provenance::guard_subject(&conn, prov.subject.as_deref(), resolution.is_some())?;
 
     let (node, created) = match args.key.as_deref() {
         Some(key) => graph::upsert_node_by_key(
@@ -182,6 +242,18 @@ pub async fn note(args: NoteArgs) -> Result<()> {
         ),
     };
 
+    // Разрешение противоречия — рёбрами, а не на словах: иначе в графе снова
+    // окажутся два факта без единого следа того, как они соотносятся.
+    let mut resolved = Vec::new();
+    if let Some(kind) = resolution {
+        for old in &conflicts {
+            if let Some(r) = kind.relation() {
+                graph::add_edge(&conn, node.id, old.id, r, 1.0)?;
+            }
+            resolved.push(old.id.to_string());
+        }
+    }
+
     // Link to project if specified. Повтор безвреден: на (from, to, relation)
     // висит уникальный индекс, а add_edge вставляет через OR IGNORE.
     if let Some(proj_name) = args.project.as_deref() {
@@ -208,6 +280,10 @@ pub async fn note(args: NoteArgs) -> Result<()> {
             "project": args.project,
             "created": created,
             "session": agent_session,
+            "confidence": prov.confidence_or_default().as_str(),
+            "subject": prov.subject,
+            "resolution": resolution.map(Resolution::as_str),
+            "resolved_against": resolved,
         });
         println!("{}", serde_json::to_string(&out)?);
         return Ok(());
@@ -217,6 +293,14 @@ pub async fn note(args: NoteArgs) -> Result<()> {
     match args.project.as_deref() {
         Some(proj_name) => println!("✓ {verb}: [{}] {} → {proj_name}", node.id, node.label),
         None => println!("✓ {verb}: [{}] {}", node.id, node.label),
+    }
+    // Уверенность печатается всегда, кроме измеренной: молчание о происхождении
+    // и есть та беда, ради которой поля заводились.
+    if let Some(mark) = prov.confidence_mark() {
+        println!("  {mark}");
+    }
+    if !resolved.is_empty() {
+        println!("  разрешено против {} факт(ов)", resolved.len());
     }
     Ok(())
 }
@@ -1346,6 +1430,51 @@ pub async fn trace_cmd(
         }
         other => other,
     }
+}
+
+/// Поймать момент открытия: команда только что вернула данные о мире — предложить
+/// сохранить это как измеренный факт, положив саму команду в `evidence`.
+///
+/// Ничего не пишет. `--hook` печатает Claude-JSON с `additionalContext` и всегда
+/// выходит с нулём: хук не имеет права мешать работе.
+pub async fn capture_cmd(hook: bool, command: Option<String>) -> Result<()> {
+    use crate::capture;
+
+    if hook {
+        let mut raw = String::new();
+        if std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw).is_err() {
+            return Ok(());
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Ok(());
+        };
+        if let Some(catch) = capture::from_hook_event(&event) {
+            println!(
+                "{}",
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": capture::suggestion(&catch),
+                    }
+                })
+            );
+        }
+        return Ok(());
+    }
+
+    let command = command.ok_or_else(|| anyhow::anyhow!("нужен --command или --hook"))?;
+    match capture::classify(&command) {
+        Some(tool) => {
+            let catch = capture::Catch {
+                tool,
+                command,
+                lines: 0,
+            };
+            println!("{}", capture::suggestion(&catch));
+        }
+        None => println!("не добыча данных — предлагать нечего"),
+    }
+    Ok(())
 }
 
 /// Полная Stop-цепочка «Бит-и-Дело»: судья исхода (ступень 4) → обязательства

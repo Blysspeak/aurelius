@@ -2,6 +2,7 @@ use anyhow::Result;
 use aurelius_core::{
     graph, indexer,
     models::{MemoryKind, NodeType, Relation},
+    provenance::{self, Confidence, Provenance, Resolution},
     window,
 };
 use serde_json::json;
@@ -161,18 +162,46 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         _ => MemoryKind::Semantic,
     };
 
+    // Происхождение разбирается ПЕРВЫМ: ошибка в нём не имеет права оставить
+    // за собой полузаписанный узел.
+    let mut prov = Provenance::parse(params)?;
+    let mut data = data;
+    prov.write_into(&mut data);
+
+    // Разбор resolution — тоже до записи, по той же причине.
+    let resolution = Resolution::parse_arg(params.get("resolution").and_then(|r| r.as_str()))?;
+
     let node_type = parse_node_type(type_str);
     let conn = open_db()?;
+
+    // Противоречие ловится ДО записи. Два утверждения об одном предмете не
+    // могут быть истинны одновременно, а граф до сих пор принимал оба молча —
+    // ребро supersedes ставилось руками, то есть по памяти.
+    let conflicts =
+        provenance::guard_subject(&conn, prov.subject.as_deref(), resolution.is_some())?;
+
     let node = graph::add_node_full(
         &conn,
         node_type,
         label,
         note,
         source,
-        data,
+        data.clone(),
         memory_kind,
         None,
     )?;
+
+    // Разрешение противоречия — рёбрами, а не на словах: иначе в графе снова
+    // окажутся два факта без единого следа того, как они соотносятся.
+    let mut resolved = Vec::new();
+    if let Some(kind) = resolution {
+        for old in &conflicts {
+            if let Some(r) = kind.relation() {
+                graph::add_edge(&conn, node.id, old.id, r, 1.0)?;
+            }
+            resolved.push(old.id.to_string());
+        }
+    }
 
     // Принадлежность проекту. Узел, не привязанный ни префиксом метки, ни
     // ребром, не найдётся НИ ОДНОЙ проектной выборкой — а memory_add при этом
@@ -233,6 +262,17 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         }
     };
 
+    // Непрошедшая проба перестала быть просто строкой в ответе. Строку легко
+    // проигнорировать; понижение уверенности работает само — факт, чья проверка
+    // провалилась, больше не выдаёт себя за измеренный.
+    let mut confidence_downgraded = false;
+    if !probe_warnings.is_empty() && prov.confidence_or_default() != Confidence::Unverified {
+        prov.confidence = Some(Confidence::Unverified);
+        prov.write_into(&mut data);
+        graph::update_node(&conn, node.id, None, Some(data.clone()))?;
+        confidence_downgraded = true;
+    }
+
     // Ступень 2, шлюз сюрприза (advisory): NCS против словаря scope. Scope —
     // префикс проекта из label ([proj] ...) либо global. Запись только меряет.
     let scope = label
@@ -243,15 +283,27 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         .map(|s| json!({ "ncs": s.ncs, "surprisal_bits": s.surprisal_bits, "epoch": s.epoch }))
         .unwrap_or(serde_json::Value::Null);
 
+    // Что из переданного действительно легло, а что оказалось пустым. Имена
+    // проверены заслонкой, но параметр с правильным именем и пустым значением
+    // выглядит переданным ровно так же, как настоящий.
+    let (stored_fields, dropped_fields) = super::super::params::field_report(params);
+
     Ok(json!({
         "id": node_id,
         "label": node.label,
         "type": type_str,
         "memory_kind": node.memory_kind,
         "created": true,
+        "confidence": prov.confidence_or_default().as_str(),
+        "confidence_downgraded": confidence_downgraded,
         "probe_warnings": probe_warnings,
         "project": project,
         "attachment_warning": attachment,
+        "subject": prov.subject,
+        "resolution": resolution.map(Resolution::as_str),
+        "resolved_against": resolved,
+        "stored_fields": stored_fields,
+        "dropped_fields": dropped_fields,
         "surprise": surprise,
     }))
 }
