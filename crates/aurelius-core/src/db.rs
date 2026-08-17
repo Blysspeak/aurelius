@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 13;
+pub const SCHEMA_VERSION: i32 = 14;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -518,7 +518,31 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 13)?;
     }
 
+    if current < 14 {
+        migrate_v14(&tx)?;
+        set_schema_version(&tx, 14)?;
+    }
+
     tx.commit()?;
+    Ok(())
+}
+
+/// V14 — у факта появляется предмет, о котором он утверждает.
+///
+/// Противоречие раньше не обнаруживалось никак: «выключено» и «включено» могли
+/// лежать рядом, и граф не возражал. Ребро `supersedes` ставилось руками —
+/// то есть по памяти, а что зависит от памяти, то не происходит.
+///
+/// Индекс частичный и по выражению — той же формы, что `idx_nodes_agent_session`
+/// из V13: поля происхождения живут в `data`, а не колонками.
+fn migrate_v14(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_nodes_subject
+            ON nodes(json_extract(data, '$.subject'))
+            WHERE json_extract(data, '$.subject') IS NOT NULL;
+        ",
+    )?;
     Ok(())
 }
 

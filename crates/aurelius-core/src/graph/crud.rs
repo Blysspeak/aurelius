@@ -399,6 +399,32 @@ pub fn find_node_by_data_field(conn: &Connection, key: &str, value: &str) -> Res
     Ok(rows.next().transpose()?)
 }
 
+/// Все живые узлы с этим значением поля `data`, свежие первыми.
+///
+/// Множественная форма нужна ровно для одного: обнаружения противоречий. Узел с
+/// тем же `subject` — не «дубль, который можно проигнорировать», а второе
+/// утверждение о том же предмете, и вызывающему надо показать их ВСЕ, чтобы он
+/// решил, что с ними делать.
+pub fn find_nodes_by_data_field(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+    limit: usize,
+) -> Result<Vec<Node>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE json_extract(data, ?1) = ?2 AND deleted_at IS NULL
+         ORDER BY created_at DESC LIMIT ?3",
+    )?;
+    let json_path = format!("$.{key}");
+    let nodes = stmt
+        .query_map(params![json_path, value, limit as i64], row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nodes)
+}
+
 pub fn get_all_nodes(conn: &Connection) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
