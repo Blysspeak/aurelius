@@ -4,15 +4,111 @@ use rusqlite::{params, Connection};
 
 use super::row_to_node;
 
+/// Результат поиска вместе с ответом на вопрос «почему не нашлось».
+///
+/// Без `unmatched_terms` инструмент не отличал «знания нет» от «запрос не
+/// сработал»: пустая выдача выглядела одинаково и когда факта в памяти нет, и
+/// когда слово написано в форме, которой нет в индексе («алертов» против
+/// «алерт»). Первое означает «иди и выясняй», второе — «спроси иначе», и цена
+/// ошибки между ними — целая ветка ненужной разведки.
+pub struct SearchOutcome {
+    pub nodes: Vec<Node>,
+    /// Все слова запроса, как их разобрал [`crate::fts::parse`].
+    pub terms: Vec<String>,
+    /// Слова запроса, не встретившиеся в индексе ни разу.
+    pub unmatched_terms: Vec<String>,
+}
+
+impl SearchOutcome {
+    /// Человеческое объяснение пустоты — или `None`, если объяснять нечего.
+    ///
+    /// Диагноз говорит ровно то, что знает: про строку поиска, а не про мир.
+    /// «Знания здесь просто нет» — утверждение о мире, которого у поиска на
+    /// руках нет: «~20 воркеров» лежало в трёх узлах, не совпала одна лишь
+    /// словоформа. Такое ложное успокоение дороже молчания — читатель идёт
+    /// делать заново уже сделанное.
+    #[must_use]
+    pub fn diagnosis(&self) -> Option<String> {
+        if self.unmatched_terms.is_empty() {
+            return None;
+        }
+        let words = self
+            .unmatched_terms
+            .iter()
+            .map(|w| format!("«{w}»"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let advice = match self.unmatched_terms.first().and_then(|w| prefix_hint(w)) {
+            Some(stem) => format!("попробуй другую или короче ({stem}*)"),
+            None => "попробуй другую форму".to_string(),
+        };
+        if self.unmatched_terms.len() == self.terms.len() {
+            return Some(format!(
+                "ни одно слово запроса не встречается в памяти в этой форме ({words}) — \
+                 возможно, дело в словоформе: {advice}. \
+                 Поиск не утверждает, что знания нет, — только что совпадений по этой строке нет"
+            ));
+        }
+        Some(format!(
+            "{words} не встречается в памяти в этой форме — возможно, дело в словоформе: {advice}"
+        ))
+    }
+}
+
+/// Короче какого корня префикс перестаёт что-либо сужать.
+const STEM_FLOOR: usize = 4;
+
+/// Префикс, который стоит предложить вместо промахнувшегося слова.
+///
+/// Обрубается по букве, а не по фиксированной длине: `take(5)` на
+/// пятибуквенном «батчи» возвращал то же слово со звёздочкой — совет,
+/// заведомо не работавший ровно там, где нужен больше всего, ведь у коротких
+/// слов окончание и есть вся разница. Снимается одна буква: «батчи» → `батч*`,
+/// «воркеры» → `воркер*`; две сломали бы второе до «ворке».
+///
+/// `None` — когда слово и так не длиннее корня: звёздочка на нём ничего не
+/// расширит, а несбыточный совет хуже его отсутствия.
+fn prefix_hint(word: &str) -> Option<String> {
+    let letters = word.chars().count();
+    if letters <= STEM_FLOOR {
+        return None;
+    }
+    Some(word.chars().take(letters - 1).collect())
+}
+
+/// Во сколько раз брать больше, чем просили, прежде чем ранжировать.
+///
+/// `OR` находит и то, где совпало одно слово из трёх; отсортировать это по
+/// числу совпавших слов можно только имея запас — иначе `LIMIT` отрежет лучшее
+/// ещё до ранжирования.
+const OVERFETCH: usize = 5;
+
 pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>> {
+    Ok(search_ranked(conn, query, limit)?.nodes)
+}
+
+/// Поиск с ранжированием по числу совпавших слов и с диагностикой запроса.
+///
+/// Слова соединены через `OR` (см. [`crate::fts`]), поэтому порядок здесь и
+/// делает выдачу осмысленной: сначала записи, где совпало больше слов, внутри
+/// группы — по релевантности bm25.
+pub fn search_ranked(conn: &Connection, query: &str, limit: usize) -> Result<SearchOutcome> {
     let trimmed = query.trim();
     if trimmed.is_empty() || trimmed == "*" {
-        return get_recent_nodes(conn, limit);
+        return Ok(SearchOutcome {
+            nodes: get_recent_nodes(conn, limit)?,
+            terms: Vec::new(),
+            unmatched_terms: Vec::new(),
+        });
     }
     // Строка от человека — текст, а не выражение FTS5 (см. crate::fts).
-    let expr = crate::fts::sanitize(trimmed);
-    if expr.is_empty() {
-        return get_recent_nodes(conn, limit);
+    let parsed = crate::fts::parse(trimmed);
+    if parsed.expr.is_empty() {
+        return Ok(SearchOutcome {
+            nodes: get_recent_nodes(conn, limit)?,
+            terms: Vec::new(),
+            unmatched_terms: Vec::new(),
+        });
     }
     let mut stmt = conn.prepare(
         "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
@@ -21,13 +117,104 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
          FROM nodes_fts
          JOIN nodes n ON nodes_fts.rowid = n.rowid
          WHERE nodes_fts MATCH ?1 AND n.deleted_at IS NULL
-         ORDER BY rank + (n.access_count * 0.1) DESC
+         ORDER BY rank - (n.access_count * 0.1)
          LIMIT ?2",
     )?;
-    let nodes = stmt
-        .query_map(params![expr, limit as i64], row_to_node)?
+    let mut nodes = stmt
+        .query_map(
+            params![parsed.expr, (limit * OVERFETCH) as i64],
+            row_to_node,
+        )?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(nodes)
+
+    rank_by_matched_terms(&mut nodes, &parsed.terms);
+    nodes.truncate(limit);
+
+    Ok(SearchOutcome {
+        nodes,
+        unmatched_terms: unmatched_terms(conn, &parsed.terms)?,
+        terms: parsed.terms,
+    })
+}
+
+/// Вес совпадения по полям. Заголовок — то, что автор счёл сутью записи;
+/// `claim` — утверждение в одну строку; `note` — всё остальное, включая
+/// простыни сессионных итогов.
+///
+/// Без этих весов bm25 считает по всему документу, и длинный `note`, где нужные
+/// слова рассыпаны по тексту, перевешивал заголовок, состоящий из них почти
+/// целиком: запись «Горячая перезагрузка флагов доведена до алертов и разбита
+/// на модули» не попадала в топ-3 по запросу из тех же слов.
+const W_LABEL: usize = 3;
+const W_CLAIM: usize = 2;
+const W_NOTE: usize = 1;
+
+/// Взвешенное совпадение: за каждое слово берётся вес самого «сильного» поля,
+/// в котором оно нашлось.
+fn matched_score(node: &Node, terms: &[String]) -> usize {
+    let label = node.label.to_lowercase();
+    let claim = crate::provenance::Provenance::from_data(&node.data)
+        .claim
+        .map(|c| c.to_lowercase());
+    let note = node.note.as_ref().map(|n| n.to_lowercase());
+
+    terms
+        .iter()
+        .map(|t| {
+            let t = t.to_lowercase();
+            if label.contains(&t) {
+                W_LABEL
+            } else if claim.as_ref().is_some_and(|c| c.contains(&t)) {
+                W_CLAIM
+            } else if note.as_ref().is_some_and(|n| n.contains(&t)) {
+                W_NOTE
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
+/// Выше тот, у кого совпало больше и в более значимом поле. Сортировка
+/// устойчивая, поэтому внутри одной группы сохраняется порядок bm25 из SQL.
+fn rank_by_matched_terms(nodes: &mut [Node], terms: &[String]) {
+    if terms.is_empty() {
+        return;
+    }
+    nodes.sort_by_key(|n| std::cmp::Reverse(matched_score(n, terms)));
+}
+
+/// Слова запроса и те из них, что не встретились в индексе ни разу.
+///
+/// Отдельная функция, потому что диагностика нужна и там, где выдача собрана
+/// не `search_ranked`: у поиска с фильтром по типу вопрос «почему пусто» тот же.
+///
+/// # Errors
+/// Ошибка подготовки или исполнения запроса к FTS-таблице.
+pub fn query_terms(conn: &Connection, query: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let terms = crate::fts::parse(query).terms;
+    let unmatched = unmatched_terms(conn, &terms)?;
+    Ok((terms, unmatched))
+}
+
+/// Спрашивается по одному слову: только так видно, какое именно слово увело
+/// запрос в пустоту.
+fn unmatched_terms(conn: &Connection, terms: &[String]) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT 1 FROM nodes_fts JOIN nodes n ON nodes_fts.rowid = n.rowid
+          WHERE nodes_fts MATCH ?1 AND n.deleted_at IS NULL LIMIT 1",
+    )?;
+    let mut out = Vec::new();
+    for term in terms {
+        let found = stmt
+            .query_map(params![crate::fts::term_expr(term)], |_| Ok(()))?
+            .next()
+            .is_some();
+        if !found {
+            out.push(term.clone());
+        }
+    }
+    Ok(out)
 }
 
 pub fn search_typed(
@@ -38,7 +225,8 @@ pub fn search_typed(
 ) -> Result<Vec<Node>> {
     let type_str = serde_json::to_string(node_type)?;
     let trimmed = query.trim();
-    let expr = crate::fts::sanitize(trimmed);
+    let parsed = crate::fts::parse(trimmed);
+    let expr = parsed.expr;
     if trimmed.is_empty() || trimmed == "*" || expr.is_empty() {
         let mut stmt = conn.prepare(
             "SELECT id, node_type, label, note, source, data, created_at, updated_at,
@@ -58,11 +246,17 @@ pub fn search_typed(
          FROM nodes_fts
          JOIN nodes n ON nodes_fts.rowid = n.rowid
          WHERE nodes_fts MATCH ?1 AND n.node_type = ?2 AND n.deleted_at IS NULL
+         ORDER BY rank
          LIMIT ?3",
     )?;
-    let nodes = stmt
-        .query_map(params![expr, type_str, limit as i64], row_to_node)?
+    let mut nodes = stmt
+        .query_map(
+            params![expr, type_str, (limit * OVERFETCH) as i64],
+            row_to_node,
+        )?
         .collect::<Result<Vec<_>, _>>()?;
+    rank_by_matched_terms(&mut nodes, &parsed.terms);
+    nodes.truncate(limit);
     Ok(nodes)
 }
 
@@ -332,6 +526,167 @@ mod tests {
         let typed = search_typed(&conn, "rust-clean-code", &NodeType::Concept, 5)
             .expect("типизированный поиск не должен падать");
         assert_eq!(typed.len(), 1);
+
+        cleanup(&path, conn);
+    }
+
+    /// Ради чего менялся разбор: одно слово в неудачной форме обнуляло выдачу
+    /// целиком, потому что пробел в FTS5 — это AND. Теперь оно портит порядок,
+    /// а не результат, и лучшее совпадение стоит первым.
+    #[test]
+    fn one_bad_word_no_longer_empties_the_result() {
+        let (path, conn) = temp_db();
+        for (label, note) in [
+            ("отправка алерта в телеграм", "и то и другое слово тут есть"),
+            ("телеграм-бот", "только одно слово из запроса"),
+            ("совсем про другое", "ни одного слова запроса"),
+        ] {
+            super::super::add_node(
+                &conn,
+                NodeType::Concept,
+                label,
+                Some(note),
+                "test",
+                serde_json::json!({}),
+            )
+            .expect("add node");
+        }
+
+        // «алертов» нет в индексе ни в какой форме — раньше это давало ноль.
+        let found = search(&conn, "телеграм алертов", 5).expect("поиск");
+        assert!(
+            !found.is_empty(),
+            "неудачная форма одного слова не должна обнулять выдачу"
+        );
+
+        let ranked = search_ranked(&conn, "телеграм алерта", 5).expect("поиск");
+        assert_eq!(
+            ranked.nodes.first().map(|n| n.label.as_str()),
+            Some("отправка алерта в телеграм"),
+            "первым обязано идти совпадение по двум словам, а не по одному: {:?}",
+            ranked.nodes.iter().map(|n| &n.label).collect::<Vec<_>>()
+        );
+
+        cleanup(&path, conn);
+    }
+
+    /// Инструмент обязан отличать «знания нет» от «запрос не сработал».
+    #[test]
+    fn a_word_that_matched_nothing_is_named() {
+        let (path, conn) = temp_db();
+        super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "отправка алерта в телеграм",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let outcome = search_ranked(&conn, "телеграм алертов", 5).expect("поиск");
+        assert_eq!(
+            outcome.unmatched_terms,
+            vec!["алертов".to_owned()],
+            "слово, не давшее ни одного попадания, обязано быть названо"
+        );
+
+        assert!(
+            outcome
+                .diagnosis()
+                .is_some_and(|d| d.contains("словоформе")),
+            "не нашлось слово — назвать причиной форму, а не отсутствие знания"
+        );
+
+        let clean = search_ranked(&conn, "телеграм", 5).expect("поиск");
+        assert!(
+            clean.unmatched_terms.is_empty(),
+            "у сработавшего запроса жаловаться не на что"
+        );
+        assert!(clean.diagnosis().is_none());
+
+        cleanup(&path, conn);
+    }
+
+    /// Поиск знает про свою строку, а не про мир. «Знания здесь просто нет» —
+    /// утверждение, которого у него на руках нет: по «воркеры» выдача была
+    /// пустой, а «~20 воркеров» лежало в трёх узлах. Ложное успокоение дороже
+    /// молчания: читатель идёт делать заново уже сделанное.
+    #[test]
+    fn a_miss_never_claims_the_knowledge_is_absent() {
+        let (path, conn) = temp_db();
+        super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "воркеров примерно двадцать",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let outcome = search_ranked(&conn, "воркеры", 5).expect("поиск");
+        let d = outcome
+            .diagnosis()
+            .expect("пустая выдача обязана объясниться");
+        assert!(
+            !d.contains("знания здесь просто нет") && !d.contains("знания нет —"),
+            "поиск не имеет права утверждать про мир: {d}"
+        );
+        assert!(d.contains("словоформе"), "{d}");
+        assert!(d.contains("(воркер*)"), "совет обязан снять окончание: {d}");
+
+        cleanup(&path, conn);
+    }
+
+    /// Совет должен работать в первую очередь на коротких словах: у них
+    /// окончание и есть вся разница. Фиксированные пять символов возвращали
+    /// «батчи» → «батчи*» — то же слово со звёздочкой и те же ноль попаданий.
+    #[test]
+    fn the_suggested_prefix_is_shorter_than_the_word_it_replaces() {
+        assert_eq!(prefix_hint("батчи").as_deref(), Some("батч"));
+        assert_eq!(prefix_hint("воркеры").as_deref(), Some("воркер"));
+        // Короче корня префикс ничего не расширяет — советовать нечего.
+        assert_eq!(prefix_hint("код"), None);
+        assert_eq!(prefix_hint("тест"), None);
+    }
+
+    /// Заголовок — то, что автор счёл сутью записи, и весит больше простыни.
+    /// Раньше bm25 считал по всему документу, и длинная сессионная запись, где
+    /// те же слова рассыпаны по тексту, обходила точный заголовок.
+    #[test]
+    fn a_precise_label_outranks_a_long_note() {
+        let (path, conn) = temp_db();
+        super::super::add_node(
+            &conn,
+            NodeType::Session,
+            "итог сессии 2026-08-17",
+            Some(
+                "за день сделано много: горячая перезагрузка кое-где упоминалась, \
+                 флаги трогали, алерты обсуждали, модули двигали, а ещё чинили поиск, \
+                 правили пробы, выпускали релиз, обновляли документацию и бинарники",
+            ),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+        super::super::add_node(
+            &conn,
+            NodeType::Decision,
+            "Горячая перезагрузка флагов доведена до алертов и разбита на модули",
+            Some("короткая записка"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let found = search(&conn, "горячая перезагрузка флагов алерты модули", 5).expect("поиск");
+        assert_eq!(
+            found.first().map(|n| n.label.as_str()),
+            Some("Горячая перезагрузка флагов доведена до алертов и разбита на модули"),
+            "запись, у которой запрос почти целиком в заголовке, обязана быть первой: {:?}",
+            found.iter().map(|n| &n.label).collect::<Vec<_>>()
+        );
 
         cleanup(&path, conn);
     }
