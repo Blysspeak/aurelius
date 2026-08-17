@@ -71,11 +71,17 @@ fn url_re() -> &'static Regex {
 /// Regex в Rust не умеет lookbehind, а `\b` здесь не годится: перед `/` в
 /// `crates/aurelius-core/src/graph/search.rs` граница есть, и путь резался с
 /// середины в обрывок `/aurelius-core/...`, которого никто не утверждал.
+///
+/// `@` и `~` в этом списке — про импорт по алиасу. `@/config/env.js` — не
+/// утверждение о файле `/config/env.js`: алиас разворачивается сборщиком по
+/// своим правилам (`@/*` → `src/*`), а расширение в импорте вообще может не
+/// совпадать с расширением на диске (`.js` в ESM-импорте против `.ts` в
+/// файле). Проверять такой токен на диске значит гарантированно проваливать
+/// пробу на любой записи, цитирующей импорт.
 fn starts_at_boundary(hay: &str, start: usize) -> bool {
-    hay[..start]
-        .chars()
-        .next_back()
-        .is_none_or(|c| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '\\')))
+    hay[..start].chars().next_back().is_none_or(|c| {
+        !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '\\' | '@' | '~'))
+    })
 }
 
 /// Расширение из одних цифр — это номер версии, а не файл: `v1.11`, `0.3.2`.
@@ -197,6 +203,21 @@ mod tests {
             "ни адрес, ни номер версии, ни обрывок относительного пути пробами не являются: {:?}",
             probes.iter().map(|p| &p.expr).collect::<Vec<_>>()
         );
+    }
+
+    /// Импорт по алиасу — не утверждение о файле. `@/config/env.js`
+    /// разворачивается сборщиком в `src/config/env.ts`, поэтому проверка
+    /// «/config/env.js» на диске проваливалась всегда, на каждой записи,
+    /// цитирующей импорт.
+    #[test]
+    fn an_aliased_import_is_not_a_claim_about_a_file() {
+        let probes = extract("конфиг читается из @/config/env.js, а не из process.env напрямую");
+        assert!(
+            probes.is_empty(),
+            "алиас-импорт пробой не является: {:?}",
+            probes.iter().map(|p| &p.expr).collect::<Vec<_>>()
+        );
+        assert!(extract("см. ~/config/env.js").is_empty());
     }
 
     #[test]
