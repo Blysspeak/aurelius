@@ -22,27 +22,36 @@ pub struct SearchOutcome {
 impl SearchOutcome {
     /// Человеческое объяснение пустоты — или `None`, если объяснять нечего.
     ///
-    /// Состояний три, а не два, и путать их дорого: «часть слов не нашлась» —
-    /// это про форму слова и означает «спроси иначе»; «не нашлось ни одного
-    /// слова» — это про отсутствие знания и означает «иди и выясняй».
+    /// Диагноз говорит ровно то, что знает: про строку поиска, а не про мир.
+    /// «Знания здесь просто нет» — утверждение о мире, которого у поиска на
+    /// руках нет: «~20 воркеров» лежало в трёх узлах, не совпала одна лишь
+    /// словоформа. Такое ложное успокоение дороже молчания — читатель идёт
+    /// делать заново уже сделанное.
     #[must_use]
     pub fn diagnosis(&self) -> Option<String> {
         if self.unmatched_terms.is_empty() {
             return None;
         }
-        if self.unmatched_terms.len() == self.terms.len() {
-            return Some(format!(
-                "ни одно слово запроса не встречается в памяти ({}) — похоже, этого знания здесь просто нет",
-                self.terms.join(", ")
-            ));
-        }
+        let words = self
+            .unmatched_terms
+            .iter()
+            .map(|w| format!("«{w}»"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let stem: String = self
             .unmatched_terms
             .first()
             .map_or_else(String::new, |w| w.chars().take(5).collect());
+        if self.unmatched_terms.len() == self.terms.len() {
+            return Some(format!(
+                "ни одно слово запроса не встречается в памяти в этой форме ({words}) — \
+                 возможно, дело в словоформе: попробуй другую или короче ({stem}*). \
+                 Поиск не утверждает, что знания нет, — только что совпадений по этой строке нет"
+            ));
+        }
         Some(format!(
-            "ни одного попадания у слов: {} — дело может быть в форме слова, а не в отсутствии знания (попробуй {stem}*)",
-            self.unmatched_terms.join(", ")
+            "{words} не встречается в памяти в этой форме — возможно, дело в словоформе: \
+             попробуй другую или короче ({stem}*)"
         ))
     }
 }
@@ -108,26 +117,51 @@ pub fn search_ranked(conn: &Connection, query: &str, limit: usize) -> Result<Sea
     })
 }
 
-/// Сколько слов запроса встретилось в тексте узла.
-fn matched_count(node: &Node, terms: &[String]) -> usize {
-    let mut hay = node.label.to_lowercase();
-    if let Some(note) = &node.note {
-        hay.push(' ');
-        hay.push_str(&note.to_lowercase());
-    }
+/// Вес совпадения по полям. Заголовок — то, что автор счёл сутью записи;
+/// `claim` — утверждение в одну строку; `note` — всё остальное, включая
+/// простыни сессионных итогов.
+///
+/// Без этих весов bm25 считает по всему документу, и длинный `note`, где нужные
+/// слова рассыпаны по тексту, перевешивал заголовок, состоящий из них почти
+/// целиком: запись «Горячая перезагрузка флагов доведена до алертов и разбита
+/// на модули» не попадала в топ-3 по запросу из тех же слов.
+const W_LABEL: usize = 3;
+const W_CLAIM: usize = 2;
+const W_NOTE: usize = 1;
+
+/// Взвешенное совпадение: за каждое слово берётся вес самого «сильного» поля,
+/// в котором оно нашлось.
+fn matched_score(node: &Node, terms: &[String]) -> usize {
+    let label = node.label.to_lowercase();
+    let claim = crate::provenance::Provenance::from_data(&node.data)
+        .claim
+        .map(|c| c.to_lowercase());
+    let note = node.note.as_ref().map(|n| n.to_lowercase());
+
     terms
         .iter()
-        .filter(|t| hay.contains(&t.to_lowercase()))
-        .count()
+        .map(|t| {
+            let t = t.to_lowercase();
+            if label.contains(&t) {
+                W_LABEL
+            } else if claim.as_ref().is_some_and(|c| c.contains(&t)) {
+                W_CLAIM
+            } else if note.as_ref().is_some_and(|n| n.contains(&t)) {
+                W_NOTE
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
-/// Больше совпавших слов — выше. Сортировка устойчивая, поэтому внутри одной
-/// группы сохраняется порядок bm25, пришедший из SQL.
+/// Выше тот, у кого совпало больше и в более значимом поле. Сортировка
+/// устойчивая, поэтому внутри одной группы сохраняется порядок bm25 из SQL.
 fn rank_by_matched_terms(nodes: &mut [Node], terms: &[String]) {
-    if terms.len() < 2 {
+    if terms.is_empty() {
         return;
     }
-    nodes.sort_by_key(|n| std::cmp::Reverse(matched_count(n, terms)));
+    nodes.sort_by_key(|n| std::cmp::Reverse(matched_score(n, terms)));
 }
 
 /// Слова запроса и те из них, что не встретились в индексе ни разу.
@@ -540,8 +574,8 @@ mod tests {
         assert!(
             outcome
                 .diagnosis()
-                .is_some_and(|d| d.contains("форме слова")),
-            "часть слов не нашлась — это про форму, а не про отсутствие знания"
+                .is_some_and(|d| d.contains("словоформе")),
+            "не нашлось слово — назвать причиной форму, а не отсутствие знания"
         );
 
         let clean = search_ranked(&conn, "телеграм", 5).expect("поиск");
@@ -551,15 +585,74 @@ mod tests {
         );
         assert!(clean.diagnosis().is_none());
 
-        // Третье состояние: не нашлось НИ ОДНОГО слова. Это уже не форма
-        // запроса, а отсутствие знания, и путать их дорого — первое означает
-        // «спроси иначе», второе «иди и выясняй».
-        let nothing = search_ranked(&conn, "зурбаган лисс", 5).expect("поиск");
+        cleanup(&path, conn);
+    }
+
+    /// Поиск знает про свою строку, а не про мир. «Знания здесь просто нет» —
+    /// утверждение, которого у него на руках нет: по «воркеры» выдача была
+    /// пустой, а «~20 воркеров» лежало в трёх узлах. Ложное успокоение дороже
+    /// молчания: читатель идёт делать заново уже сделанное.
+    #[test]
+    fn a_miss_never_claims_the_knowledge_is_absent() {
+        let (path, conn) = temp_db();
+        super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "воркеров примерно двадцать",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let outcome = search_ranked(&conn, "воркеры", 5).expect("поиск");
+        let d = outcome
+            .diagnosis()
+            .expect("пустая выдача обязана объясниться");
         assert!(
-            nothing
-                .diagnosis()
-                .is_some_and(|d| d.contains("просто нет")),
-            "ни одного знакомого слова — знания нет, а не форма подвела"
+            !d.contains("знания здесь просто нет") && !d.contains("знания нет —"),
+            "поиск не имеет права утверждать про мир: {d}"
+        );
+        assert!(d.contains("словоформе"), "{d}");
+
+        cleanup(&path, conn);
+    }
+
+    /// Заголовок — то, что автор счёл сутью записи, и весит больше простыни.
+    /// Раньше bm25 считал по всему документу, и длинная сессионная запись, где
+    /// те же слова рассыпаны по тексту, обходила точный заголовок.
+    #[test]
+    fn a_precise_label_outranks_a_long_note() {
+        let (path, conn) = temp_db();
+        super::super::add_node(
+            &conn,
+            NodeType::Session,
+            "итог сессии 2026-08-17",
+            Some(
+                "за день сделано много: горячая перезагрузка кое-где упоминалась, \
+                 флаги трогали, алерты обсуждали, модули двигали, а ещё чинили поиск, \
+                 правили пробы, выпускали релиз, обновляли документацию и бинарники",
+            ),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+        super::super::add_node(
+            &conn,
+            NodeType::Decision,
+            "Горячая перезагрузка флагов доведена до алертов и разбита на модули",
+            Some("короткая записка"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let found = search(&conn, "горячая перезагрузка флагов алерты модули", 5).expect("поиск");
+        assert_eq!(
+            found.first().map(|n| n.label.as_str()),
+            Some("Горячая перезагрузка флагов доведена до алертов и разбита на модули"),
+            "запись, у которой запрос почти целиком в заголовке, обязана быть первой: {:?}",
+            found.iter().map(|n| &n.label).collect::<Vec<_>>()
         );
 
         cleanup(&path, conn);
