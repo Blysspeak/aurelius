@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v2.0.0] — 2026-08-17
 
 Seven fixes on one root: memory accepted a claim about the world without asking where
 it came from, and stayed silent when it accepted only half of what it was handed.
@@ -25,7 +25,10 @@ it came from, and stayed silent when it accepted only half of what it was handed
 
 ---
 
-## [v1.12.0] — 2026-08-16
+## [v1.12.0] — 2026-08-16 · вышло в составе v2.0.0
+
+Собственного тега у 1.12.0 нет: релиз-PR провисел неслитым до следующей работы, и
+обе вошли одним выпуском. Секция оставлена отдельной — это две разные работы, а не одна.
 
 ### Added
 - **`au session` — the record layer 4 of the snapshot reads, written without a model in the loop.** «Последние сессии» is assembled exclusively from `Session` nodes, and the only thing able to write one was `memory_session` over MCP. A mechanical hook could reach for `au note`, but a note is not a session: it landed in layer 5, among lasting facts, next to decisions that are meant to outlive the day. So the most important record of a session depended on whether the model remembered to call a tool — and what does not happen mechanically does not happen. The writing itself moved into the core (`graph::record_session`): the MCP handler and the CLI now call one function, and what is left in the handler is only what belongs to the transport — task linking, the active-tasks hint, the sync push. Accepts the same shape the tool takes (`summary`, `decisions`, `problems_solved`, `next_steps`, `key_files`), from arguments or from a single JSON on stdin, deduplicated by `sha256(project|summary)` so a hook that fires twice for one occasion leaves one record. An unknown key in that JSON is an error, not a shrug (117e6b9)
