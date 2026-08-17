@@ -11,6 +11,7 @@ pub mod ledger;
 pub mod models;
 pub mod obligations;
 pub mod probes;
+pub mod provenance;
 pub mod sync;
 pub mod timeforged;
 pub mod trace;

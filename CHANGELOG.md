@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+Seven fixes on one root: memory accepted a claim about the world without asking where
+it came from, and stayed silent when it accepted only half of what it was handed.
+
+### Added
+- **A fact now carries its provenance, and `confidence` is required.** A guess landed in the graph looking exactly like a measurement, and six weeks later read back as truth — the project already pays for this rule in money, where a number is never spoken without the query that produced it and the time it was measured. `memory_add` and `au note` take `confidence` (`measured` | `inferred` | `reported` | `unverified`), `evidence` — the command or query verbatim — and `measured_at`. `measured` without `evidence` is refused rather than accepted: a measurement nobody can repeat is an inference. An absent `confidence` reads as `unverified`, never as "probably measured", and anything below `measured` is marked on the way out, so the reader sees the doubt without having to look for it
+- **Volatility, because `semantic` / `episodic` never caught it.** "The .env says true" is neither an event nor an eternal truth: it holds until the first edit of that file, and leaves no trace in git. `volatility` (`immutable` | `slow`, 30 d | `volatile`, 1 d) plus `verify_with` mean that past its age the fact comes back with "старше N дн — перепроверь вот этим" attached, instead of presenting itself as current
+- **Contradictions are refused at the door.** "Disabled" and "enabled" could sit in the graph side by side without a word of objection, and the `supersedes` edge between them got placed by hand — that is, from memory, when someone happened to remember. An optional `subject` (`xhub:.env:REFUND_REQUESTS_ENABLED`) names what is being asserted; a second fact about the same subject is refused, listing what is already on record, until `resolution` says `supersede`, `refine` or `coexist`. The resolution then becomes an edge, so the next reader sees how the two relate instead of guessing
+- **`claim` — the assertion in one or two lines, returned whole.** Recall clipped by character count, so the startup snapshot cut every fact mid-word: the substance sat at the end of a long note and never survived the ellipsis. A `claim` (≤240 chars) is never clipped; the long reasoning stays in the note and comes out on demand
+- **`au capture --hook` — catching a fact at the moment of discovery.** The session-end hook shouts "save, compaction is near", which means memory gets written from an already degraded context, from a recollection of what happened. This one fires the other way round: `psql`/`ssh`/`kubectl`/`curl` just returned data, the output is still on screen, and the hook offers to save it as a measured fact with that exact command already in `evidence`. It writes nothing itself — a command with output is not yet a fact worth keeping, and auto-saving every successful query would turn the graph into a dump. The recogniser is deliberately narrow: a hook that fires on everything is read for a day and ignored thereafter
+- **The seven provenance fields exist on both doors and share one parser.** `au note --confidence …` and `memory_add(confidence=…)` cannot drift apart on what a measured fact is
+
+### Fixed
+- **An unknown parameter name is now an error instead of a silent skip — this is the expensive one.** `memory_session` was called twice with wrong parameter names; both times the answer was `created: true`, and the only sign of trouble was the string `[unknown]` inside a label. The decisions and the next steps were gone, and two orphan nodes were left hanging outside the project. Every MCP call is now checked against the same `inputSchema` served in `tools/list` — one source of truth, so the check cannot drift from the contract — and an unknown name is refused with a "did you mean" suggestion and the words "ничего не записано". All wrong names are listed at once: fixing a call one name per attempt is the same waste the silent skip was. Enum values are checked too, which closes a matching hole — `NodeType::parse` used to turn a typo into `Custom(…)`, giving a node a type no query looks for, while the CLI rejected the same string
+- **The response now says what was stored and what was dropped.** A parameter with a correct name and an empty value looked delivered: `decisions: []` silently records nothing, and the caller found out only by opening the graph. `memory_add` and `memory_session` return `stored_fields` and `dropped_fields`, and the session response additionally counts `decisions_written` and `problems_written`
+- **A failed probe now downgrades `confidence` to `unverified` by itself.** `probe_warnings` worked and reported honestly, but it was a string in a response, and a string is easy to ignore. A fact whose verification failed no longer presents itself as measured — the field does the work without being read
+
+### Notes
+- BREAKING for callers of `memory_add`: `confidence` is now required. The intent is exactly that — a fact whose origin nobody stated is a fact nobody can trust.
+- Schema V14 adds one partial expression index for `subject`. Records written before this release simply carry no provenance: they read as `unverified`, which is what they always were.
+- The MCP server is a long-lived process: restart the client before expecting the new parameters to be accepted.
+
+---
+
 ## [v1.12.0] — 2026-08-16
 
 ### Added

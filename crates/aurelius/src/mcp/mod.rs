@@ -1,4 +1,5 @@
 mod handlers;
+mod params;
 mod protocol;
 mod tools;
 
@@ -100,6 +101,21 @@ async fn handle_tools_call(
         .unwrap_or(serde_json::json!({}));
 
     debug!("tool call: {tool_name}");
+
+    // Заслонка ДО обработчика: перевранное имя параметра обязано остановить
+    // вызов целиком, а не потерять половину записи молча. Отвечаем как об
+    // ошибке ИНСТРУМЕНТА (isError), а не протокола: клиент показывает такую
+    // модели, и она может перезвать правильно — протокольная до неё не дойдёт.
+    if let Err(e) = params::validate(tool_name, &arguments) {
+        error!("rejected call: {e}");
+        return JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "content": [{ "type": "text", "text": format!("Error: {e:#}") }],
+                "isError": true
+            }),
+        );
+    }
 
     // Run handler in spawn_blocking since rusqlite isn't Send
     let tool_name = tool_name.to_owned();

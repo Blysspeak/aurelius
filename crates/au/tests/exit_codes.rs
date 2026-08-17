@@ -318,6 +318,123 @@ fn journal_returns_only_what_this_run_wrote() {
     assert_eq!(code, USAGE, "журнал без сессии — ошибка вызова");
 }
 
+/// Происхождение: заявленное «измерено» обязано предъявить, чем измерено, а
+/// незнакомое слово в `--confidence` — остановить запись, а не лечь молча.
+#[test]
+fn a_measured_claim_must_show_what_measured_it() {
+    let home = TmpHome::dir("provenance");
+
+    let (code, out) = run(
+        &home,
+        &[
+            "note",
+            "--json",
+            "--confidence",
+            "measured",
+            "флаги выключены",
+        ],
+        None,
+    );
+    assert_eq!(code, USAGE, "measured без evidence обязан отказать: {out}");
+
+    let (code, out) = run(
+        &home,
+        &["note", "--json", "--confidence", "измерено", "что-то"],
+        None,
+    );
+    assert_eq!(code, USAGE, "неизвестная уверенность — ошибка: {out}");
+
+    let (code, out) = run(
+        &home,
+        &[
+            "note",
+            "--json",
+            "--confidence",
+            "measured",
+            "--evidence",
+            "cat /home/xhub/app/.env",
+            "--claim",
+            "REFUND_REQUESTS_ENABLED=true",
+            "--volatility",
+            "volatile",
+            "флаг возвратов включён",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "измеренный факт с уликой обязан лечь: {out}");
+    let saved: serde_json::Value = serde_json::from_str(out.trim()).expect("JSON заметки");
+    assert_eq!(saved["confidence"], "measured");
+
+    // Умолчание — не «наверное измерено», а «не проверено».
+    let (code, out) = run(&home, &["note", "--json", "просто заметка"], None);
+    assert_eq!(code, 0, "заметка без происхождения: {out}");
+    let plain: serde_json::Value = serde_json::from_str(out.trim()).expect("JSON заметки");
+    assert_eq!(plain["confidence"], "unverified");
+}
+
+/// Противоречие: второе утверждение о том же предмете не ложится рядом молча.
+#[test]
+fn a_second_claim_about_the_same_subject_needs_resolving() {
+    let home = TmpHome::dir("subject");
+    let subject = "xhub:.env:REFUND_REQUESTS_ENABLED";
+
+    let (code, out) = run(
+        &home,
+        &["note", "--json", "--subject", subject, "выключено"],
+        None,
+    );
+    assert_eq!(code, 0, "первый факт о предмете: {out}");
+
+    let (code, out) = run(
+        &home,
+        &["note", "--json", "--subject", subject, "включено"],
+        None,
+    );
+    assert_eq!(
+        code, USAGE,
+        "второй факт обязан потребовать разрешения: {out}"
+    );
+
+    let (code, out) = run(
+        &home,
+        &[
+            "note",
+            "--json",
+            "--subject",
+            subject,
+            "--resolution",
+            "supersede",
+            "включено",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "с разрешением — ложится: {out}");
+    let saved: serde_json::Value = serde_json::from_str(out.trim()).expect("JSON заметки");
+    assert_eq!(
+        saved["resolved_against"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+        1,
+        "ребро к вытесненному факту обязано быть в ответе: {saved}"
+    );
+
+    let (code, out) = run(
+        &home,
+        &[
+            "note",
+            "--json",
+            "--subject",
+            subject,
+            "--resolution",
+            "заменяет",
+            "ещё раз",
+        ],
+        None,
+    );
+    assert_eq!(code, USAGE, "неизвестное разрешение — ошибка: {out}");
+}
+
 /// Тело секции markdown-снапшота по её заголовку.
 fn section<'a>(snapshot: &'a str, title: &str) -> &'a str {
     let Some(start) = snapshot.find(&format!("## {title}")) else {

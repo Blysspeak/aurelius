@@ -1,3 +1,4 @@
+mod capture;
 mod commands;
 mod view;
 
@@ -303,6 +304,18 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
+    /// Offer to save a measured fact right after a command returned data
+    /// (PostToolUse hook). Never writes anything itself — the command lands in
+    /// `evidence` and the decision stays with the caller.
+    Capture {
+        /// PostToolUse hook mode: read hook JSON from stdin, emit
+        /// additionalContext, never fail
+        #[arg(long)]
+        hook: bool,
+        /// Check one command by hand instead of reading a hook event
+        #[arg(short, long, conflicts_with = "hook")]
+        command: Option<String>,
+    },
     /// Close ripe labile windows and apply outcome verdicts (Bit-i-Delo stage 4)
     Judge {
         /// Only close windows at least this many seconds old (default 0)
@@ -433,6 +446,7 @@ async fn run(cli: Cli) -> Result<()> {
             exit_code,
             hook,
         } => commands::trace_cmd(kind, payload, session, exit_code, hook).await,
+        Commands::Capture { hook, command } => commands::capture_cmd(hook, command).await,
         Commands::Judge { min_age, hook } => commands::judge_cmd(min_age, hook).await,
         Commands::Snapshot {
             project,
