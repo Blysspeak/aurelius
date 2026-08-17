@@ -73,6 +73,10 @@ pub fn put(
 /// FTS search through cached results. Returns matching cached searches.
 pub fn recall(conn: &Connection, query: &str, limit: usize) -> Result<Vec<CachedSearch>> {
     let now = Utc::now().to_rfc3339();
+    let expr = aurelius_core::fts::sanitize(query);
+    if expr.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn.prepare(
         "SELECT sc.id, sc.query, sc.results, sc.source, sc.created_at
          FROM search_fts
@@ -83,7 +87,7 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Cached
     )?;
 
     let rows = stmt
-        .query_map(params![query, now, limit as i64], |row| {
+        .query_map(params![expr, now, limit as i64], |row| {
             let results_json: String = row.get(2)?;
             Ok(CachedSearch {
                 id: row.get(0)?,

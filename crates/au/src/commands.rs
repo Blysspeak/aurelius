@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use aurelius_core::{
     db, graph, identity, indexer,
     models::{MemoryKind, NodeType, Relation},
+    provenance::{self, Provenance, Resolution},
     timeforged,
 };
 use serde_json::json;
@@ -45,57 +46,580 @@ pub async fn init() -> Result<()> {
     Ok(())
 }
 
-pub async fn note(
-    text: &str,
-    type_str: &str,
-    label: Option<String>,
-    project: Option<String>,
-) -> Result<()> {
-    let conn = open_and_ensure(&db_path())?;
-    let node_type = match type_str {
-        "concept" => NodeType::Concept,
-        "problem" => NodeType::Problem,
-        "solution" => NodeType::Solution,
-        "user_fact" => NodeType::UserFact,
-        _ => NodeType::Decision,
+/// Разбор типа узла на границе CLI — строгий, в отличие от MCP. Из хука
+/// опечатка в `--type` иначе прошла бы молча: прежний CLI сводил всё
+/// неизвестное к `decision`, а MCP завёл бы `Custom("decison")`, которого не
+/// увидит ни одна выборка.
+fn parse_node_type_arg(s: &str) -> Result<NodeType, String> {
+    NodeType::parse_known(s).ok_or_else(|| {
+        format!(
+            "неизвестный тип '{s}'. Известные: {}",
+            NodeType::KNOWN.join(", ")
+        )
+    })
+}
+
+fn parse_memory_kind_arg(s: &str) -> Result<MemoryKind, String> {
+    MemoryKind::parse(s).ok_or_else(|| {
+        format!(
+            "неизвестный слой памяти '{s}'. Известные: {}",
+            MemoryKind::KNOWN.join(", ")
+        )
+    })
+}
+
+#[derive(clap::Args)]
+pub struct NoteArgs {
+    /// The note content (decision, observation, etc.). Omit it when using --stdin.
+    #[arg(required_unless_present = "stdin")]
+    pub text: Option<String>,
+    /// Node type — the same set the MCP tools accept
+    #[arg(short, long, default_value = "decision", value_parser = parse_node_type_arg)]
+    pub r#type: NodeType,
+    /// Label (short name). Defaults to first 60 chars of text.
+    #[arg(short, long)]
+    pub label: Option<String>,
+    /// Link to a project node (find or create by name)
+    #[arg(short, long)]
+    pub project: Option<String>,
+    /// Memory layer: `semantic` for a lasting fact, `episodic` for something
+    /// tied to a moment (a pre-compaction snapshot, a session note) that is
+    /// meant to age out instead of settling into the graph forever
+    #[arg(long, default_value = "semantic", value_parser = parse_memory_kind_arg)]
+    pub kind: MemoryKind,
+    /// Idempotency key: repeating the call with the same key rewrites that
+    /// node instead of creating a twin. For hooks that can fire twice for one
+    /// occasion (PreCompact runs on both auto and manual /compact).
+    #[arg(long)]
+    pub key: Option<String>,
+    /// Read the note text from stdin — the way past the ~32K limit a Windows
+    /// command line puts on a single argument
+    #[arg(long, conflicts_with = "text")]
+    pub stdin: bool,
+    /// Print one JSON line with the node id instead of a human-readable line,
+    /// so a caller can record which node it wrote, not merely that it wrote
+    #[arg(long)]
+    pub json: bool,
+    /// Stamp the run that wrote this. Without it a session-end hook sees every
+    /// note of the project and cannot tell its own from yesterday's.
+    /// Falls back to `AURELIUS_SESSION_ID`.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// The assertion in one or two lines — returned whole, never clipped
+    /// mid-word. Max 240 chars; long reasoning stays in the note text.
+    #[arg(long)]
+    pub claim: Option<String>,
+    /// The command or query VERBATIM that produced this
+    #[arg(long)]
+    pub evidence: Option<String>,
+    /// Where this came from: measured | inferred | reported | unverified.
+    /// Absent reads as `unverified` — never as "probably measured".
+    #[arg(long)]
+    pub confidence: Option<String>,
+    /// How fast this stops being true: immutable | slow | volatile
+    #[arg(long)]
+    pub volatility: Option<String>,
+    /// Command that re-checks this claim once it goes stale
+    #[arg(long)]
+    pub verify_with: Option<String>,
+    /// What is being asserted, e.g. `xhub:.env:REFUND_REQUESTS_ENABLED`.
+    /// A second fact about the same subject is refused until resolved.
+    #[arg(long)]
+    pub subject: Option<String>,
+    /// How this relates to an existing fact about the same subject:
+    /// supersede | refine | coexist
+    #[arg(long)]
+    pub resolution: Option<String>,
+}
+
+/// Собрать из флагов тот же JSON, что приходит по MCP, и разобрать его тем же
+/// разбором. Симметрия здесь не украшение: разъехавшись, две двери начали бы
+/// по-разному понимать, что такое измеренный факт.
+fn provenance_from_flags(args: &NoteArgs) -> Result<Provenance> {
+    let mut params = serde_json::Map::new();
+    let mut put = |key: &str, value: Option<&String>| {
+        if let Some(v) = value {
+            params.insert(key.to_owned(), v.clone().into());
+        }
     };
-    let label = label.unwrap_or_else(|| {
+    put(provenance::CLAIM_KEY, args.claim.as_ref());
+    put(provenance::EVIDENCE_KEY, args.evidence.as_ref());
+    put(provenance::CONFIDENCE_KEY, args.confidence.as_ref());
+    put(provenance::VOLATILITY_KEY, args.volatility.as_ref());
+    put(provenance::VERIFY_WITH_KEY, args.verify_with.as_ref());
+    put(provenance::SUBJECT_KEY, args.subject.as_ref());
+    Provenance::parse(&serde_json::Value::Object(params))
+}
+
+/// Идентификатор прогона: флаг главнее переменной окружения.
+///
+/// Переменная нужна потому, что хук Claude Code получает `session_id` в JSON на
+/// stdin, а у `au note --stdin` stdin уже занят текстом заметки — второго
+/// канала там нет. Пустая строка приравнена к отсутствию: «сессия неизвестна»
+/// должна остаться отсутствием метки, иначе выборка по сессии начнёт совпадать
+/// с непомеченными записями.
+fn resolve_agent_session(flag: Option<&str>) -> Option<String> {
+    let cleaned = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_owned())
+    };
+    flag.and_then(cleaned).or_else(|| {
+        std::env::var("AURELIUS_SESSION_ID")
+            .ok()
+            .as_deref()
+            .and_then(cleaned)
+    })
+}
+
+fn read_note_text(text: Option<String>, from_stdin: bool) -> Result<String> {
+    let raw = if from_stdin {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buf)
+            .context("не удалось прочитать текст заметки из stdin")?;
+        buf
+    } else {
+        text.ok_or_else(|| anyhow::anyhow!("нужен текст заметки: аргументом или --stdin"))?
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("пустой текст заметки — записывать нечего");
+    }
+    Ok(trimmed.to_owned())
+}
+
+pub async fn note(args: NoteArgs) -> Result<()> {
+    // Происхождение и разрешение разбираются ПЕРВЫМИ: ошибка в них не имеет
+    // права оставить за собой ни полузаписанный узел, ни съеденный stdin.
+    let prov = provenance_from_flags(&args)?;
+    let resolution = Resolution::parse_arg(args.resolution.as_deref())?;
+
+    let text = read_note_text(args.text, args.stdin)?;
+    let conn = open_and_ensure(&db_path())?;
+    let label = args.label.unwrap_or_else(|| {
         let t = text.chars().take(60).collect::<String>();
         t.trim_end().to_owned()
     });
-    let node = graph::add_node(
-        &conn,
-        node_type,
-        &label,
-        Some(text),
-        "manual",
-        serde_json::json!({}),
-    )?;
 
-    // Link to project if specified
-    if let Some(proj_name) = project {
-        let project_node = match graph::find_project_by_label(&conn, &proj_name)? {
+    let agent_session = resolve_agent_session(args.session.as_deref());
+    let mut data = serde_json::Map::new();
+    if let Some(id) = agent_session.as_deref() {
+        data.insert(graph::AGENT_SESSION_KEY.to_owned(), id.into());
+    }
+    let mut prov_data = serde_json::Value::Object(serde_json::Map::new());
+    prov.write_into(&mut prov_data);
+    if let serde_json::Value::Object(fields) = prov_data {
+        data.extend(fields);
+    }
+
+    // Противоречие ловится до записи — как и в memory_add: два утверждения об
+    // одном предмете не могут быть истинны одновременно.
+    let conflicts =
+        provenance::guard_subject(&conn, prov.subject.as_deref(), resolution.is_some())?;
+
+    let (node, created) = match args.key.as_deref() {
+        Some(key) => graph::upsert_node_by_key(
+            &conn,
+            key,
+            args.r#type,
+            &label,
+            Some(&text),
+            "manual",
+            data,
+            args.kind,
+        )?,
+        None => (
+            graph::add_node_full(
+                &conn,
+                args.r#type,
+                &label,
+                Some(&text),
+                "manual",
+                serde_json::Value::Object(data),
+                args.kind,
+                None,
+            )?,
+            true,
+        ),
+    };
+
+    // Разрешение противоречия — рёбрами, а не на словах: иначе в графе снова
+    // окажутся два факта без единого следа того, как они соотносятся.
+    let mut resolved = Vec::new();
+    if let Some(kind) = resolution {
+        for old in &conflicts {
+            if let Some(r) = kind.relation() {
+                graph::add_edge(&conn, node.id, old.id, r, 1.0)?;
+            }
+            resolved.push(old.id.to_string());
+        }
+    }
+
+    // Link to project if specified. Повтор безвреден: на (from, to, relation)
+    // висит уникальный индекс, а add_edge вставляет через OR IGNORE.
+    if let Some(proj_name) = args.project.as_deref() {
+        let project_node = match graph::find_project_by_label(&conn, proj_name)? {
             Some(n) => n,
             None => graph::add_node(
                 &conn,
                 NodeType::Project,
-                &proj_name,
+                proj_name,
                 None,
                 "auto",
                 serde_json::json!({}),
             )?,
         };
-        graph::add_edge(
-            &conn,
-            node.id,
-            project_node.id,
-            aurelius_core::models::Relation::BelongsTo,
-            1.0,
-        )?;
-        println!("✓ Saved: [{}] {} → {}", node.id, node.label, proj_name);
-    } else {
-        println!("✓ Saved: [{}] {}", node.id, node.label);
+        graph::add_edge(&conn, node.id, project_node.id, Relation::BelongsTo, 1.0)?;
     }
+
+    if args.json {
+        let out = json!({
+            "id": node.id.to_string(),
+            "label": node.label,
+            "type": node.node_type,
+            "memory_kind": node.memory_kind,
+            "project": args.project,
+            "created": created,
+            "session": agent_session,
+            "confidence": prov.confidence_or_default().as_str(),
+            "subject": prov.subject,
+            "resolution": resolution.map(Resolution::as_str),
+            "resolved_against": resolved,
+        });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    let verb = if created { "Saved" } else { "Updated" };
+    match args.project.as_deref() {
+        Some(proj_name) => println!("✓ {verb}: [{}] {} → {proj_name}", node.id, node.label),
+        None => println!("✓ {verb}: [{}] {}", node.id, node.label),
+    }
+    // Уверенность печатается всегда, кроме измеренной: молчание о происхождении
+    // и есть та беда, ради которой поля заводились.
+    if let Some(mark) = prov.confidence_mark() {
+        println!("  {mark}");
+    }
+    if !resolved.is_empty() {
+        println!("  разрешено против {} факт(ов)", resolved.len());
+    }
+    Ok(())
+}
+
+/// Имя текущей папки — им же `au snapshot` определяет проект, когда его не
+/// назвали явно. Хук вызывается из корня проекта и знать имя не обязан.
+fn current_dir_name() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+}
+
+// ---------------------------------------------------------------------------
+// au session — итог сессии, слой 4 снапшота
+// ---------------------------------------------------------------------------
+
+#[derive(clap::Args)]
+pub struct SessionArgs {
+    /// What happened this session. Omit it when using --stdin.
+    #[arg(required_unless_present = "stdin")]
+    pub summary: Option<String>,
+    /// Project the session belongs to. Defaults to the current folder name,
+    /// the same rule `au snapshot` follows.
+    #[arg(short, long)]
+    pub project: Option<String>,
+    /// A decision made this session (repeatable) — becomes its own node,
+    /// linked to the session
+    #[arg(short = 'd', long = "decision")]
+    pub decisions: Vec<String>,
+    /// A tail left for the next session (repeatable) — this is what the
+    /// digest (layer 8) is built from
+    #[arg(short = 'n', long = "next")]
+    pub next_steps: Vec<String>,
+    /// Read the whole record as JSON from stdin — the same shape
+    /// `memory_session` takes: {"summary":…, "decisions":[…],
+    /// "next_steps":[…], "problems_solved":[{"problem":…,"solution":…}],
+    /// "key_files":[…]}. An unknown key is an error, not a shrug.
+    #[arg(long, conflicts_with_all = ["summary", "decisions", "next_steps"])]
+    pub stdin: bool,
+    /// Print one JSON line with the session id instead of a human-readable line
+    #[arg(long)]
+    pub json: bool,
+    /// Stamp the run that wrote this record — the session node and everything
+    /// it spawns. Falls back to `AURELIUS_SESSION_ID`.
+    #[arg(long)]
+    pub session: Option<String>,
+}
+
+/// Тело записи. Форма намеренно совпадает с параметрами `memory_session`:
+/// одна запись, две двери. `deny_unknown_fields` — чтобы вызывающий узнал о
+/// непонятом ключе кодом возврата, а не тишиной.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionPayload {
+    summary: String,
+    #[serde(default)]
+    decisions: Vec<String>,
+    #[serde(default)]
+    next_steps: Vec<String>,
+    #[serde(default)]
+    problems_solved: Vec<graph::ProblemSolved>,
+    #[serde(default)]
+    key_files: Vec<String>,
+    /// Запасной способ назвать проект — флаг `--project` главнее.
+    #[serde(default)]
+    project: Option<String>,
+    /// Идентификатор прогона — та же роль, что у флага `--session`, который
+    /// главнее. Хук, отдающий запись одним JSON, кладёт сюда `session_id`,
+    /// который ему и так пришёл от Claude Code.
+    #[serde(default)]
+    session: Option<String>,
+}
+
+fn read_session_payload(args: &SessionArgs) -> Result<SessionPayload> {
+    if !args.stdin {
+        return Ok(SessionPayload {
+            summary: args.summary.clone().unwrap_or_default(),
+            decisions: args.decisions.clone(),
+            next_steps: args.next_steps.clone(),
+            ..SessionPayload::default()
+        });
+    }
+    let mut raw = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut raw)
+        .context("не удалось прочитать запись сессии из stdin")?;
+    serde_json::from_str(raw.trim()).context(
+        "stdin должен содержать JSON вида \
+         {\"summary\":…,\"decisions\":[…],\"next_steps\":[…]}",
+    )
+}
+
+/// Записать итог сессии. То же, что делает `memory_session` по MCP, но без
+/// участия модели: запись, от которой зависит слой 4 снапшота, не должна
+/// зависеть от того, вспомнит ли кто-то позвать инструмент.
+pub async fn session(args: SessionArgs) -> Result<()> {
+    let payload = read_session_payload(&args)?;
+    let project = args
+        .project
+        .clone()
+        .or_else(|| payload.project.clone())
+        .or_else(current_dir_name)
+        .ok_or_else(|| anyhow::anyhow!("не удалось определить проект — передай --project"))?;
+
+    let agent_session =
+        resolve_agent_session(args.session.as_deref().or(payload.session.as_deref()));
+
+    let conn = open_and_ensure(&db_path())?;
+    let written = graph::record_session(
+        &conn,
+        &graph::SessionInput {
+            decisions: &payload.decisions,
+            problems_solved: &payload.problems_solved,
+            next_steps: &payload.next_steps,
+            key_files: &payload.key_files,
+            agent_session: agent_session.as_deref(),
+            ..graph::SessionInput::new(&project, &payload.summary, "cli")
+        },
+    )?;
+
+    push_after_write(&conn, &project).await;
+
+    if args.json {
+        let out = json!({
+            "id": written.session.id.to_string(),
+            "label": written.session.label,
+            "type": "session",
+            "memory_kind": "episodic",
+            "project": project,
+            "created": !written.duplicate,
+            "duplicate": written.duplicate,
+            "decisions": written.decisions,
+            "problems": written.problems,
+            "session": agent_session,
+        });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    if written.duplicate {
+        println!(
+            "✓ Уже записано: [{}] {}",
+            written.session.id, written.session.label
+        );
+    } else {
+        println!(
+            "✓ Сессия: [{}] {} (решений {}, проблем {})",
+            written.session.id, written.session.label, written.decisions, written.problems
+        );
+    }
+    Ok(())
+}
+
+/// Симметрия с `memory_session`: для общего проекта запись сразу уезжает на
+/// сервер. Best-effort и намеренно без `Result` — сеть не имеет права
+/// провалить то, что уже легло в базу.
+async fn push_after_write(conn: &rusqlite::Connection, project: &str) {
+    let cfg = match sync_client::get_sync_config(conn, project) {
+        Ok(Some(cfg)) if cfg.enabled => cfg,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!("sync: не прочитать sync_config для '{project}': {e}");
+            return;
+        }
+    };
+    let client = reqwest::Client::new();
+    if let Err(e) = sync_client::push_project(&client, conn, &cfg).await {
+        eprintln!("⚠ push '{project}' не удался, локальная запись цела: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// au journal — что записано в этом прогоне
+// ---------------------------------------------------------------------------
+
+#[derive(clap::Args)]
+pub struct JournalArgs {
+    /// The run to list. Falls back to `AURELIUS_SESSION_ID`.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Cap on entries returned
+    #[arg(short, long, default_value = "50")]
+    pub limit: usize,
+    /// One JSON object with the whole list, instead of readable lines
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Показать всё, что записано в прогоне.
+///
+/// Вторая половина метки: пометить и не уметь выбрать — то же самое, что не
+/// метить. Именно этой выборки не хватало хуку конца сессии, чтобы собрать свои
+/// записи, а не все записи проекта подряд.
+pub async fn journal(args: JournalArgs) -> Result<()> {
+    let session = resolve_agent_session(args.session.as_deref()).ok_or_else(|| {
+        anyhow::anyhow!("нужен идентификатор сессии: --session <id> или AURELIUS_SESSION_ID")
+    })?;
+
+    let conn = open_and_ensure(&db_path())?;
+    let nodes = graph::nodes_by_agent_session(&conn, &session, args.limit)?;
+
+    if args.json {
+        let entries = nodes
+            .iter()
+            .map(|n| {
+                json!({
+                    "id": n.id.to_string(),
+                    "type": n.node_type,
+                    "label": n.label,
+                    "created_at": n.created_at.to_rfc3339(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let out = json!({
+            "session": session,
+            "count": entries.len(),
+            "entries": entries,
+        });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    if nodes.is_empty() {
+        println!("В сессии {session} записей нет.");
+        return Ok(());
+    }
+
+    println!("Записано в сессии {session} ({}):", nodes.len());
+    for node in &nodes {
+        println!(
+            "  {} {:<9} {}",
+            node.created_at.format("%H:%M"),
+            format!("{:?}", node.node_type).to_lowercase(),
+            node.label
+        );
+        println!("           {}", node.id);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// au relate — ребро между двумя узлами
+// ---------------------------------------------------------------------------
+
+/// Строгий разбор на границе CLI — как и у типа узла: опечатка в связи из
+/// хука обязана вернуться кодом возврата, а не молчаливым `related_to`.
+fn parse_relation_arg(s: &str) -> Result<Relation, String> {
+    Relation::parse_known(s).ok_or_else(|| {
+        format!(
+            "неизвестная связь '{s}'. Известные: {}",
+            Relation::KNOWN.join(", ")
+        )
+    })
+}
+
+#[derive(clap::Args)]
+pub struct RelateArgs {
+    /// Source node: UUID (what `au note --json` returns), exact label, or a
+    /// search phrase
+    pub from: String,
+    /// Target node — same forms
+    pub to: String,
+    /// Relation: solves, refines, part-of (a spelling of belongs_to),
+    /// depends_on, … — the same vocabulary `memory_relate` accepts, with
+    /// hyphens allowed
+    #[arg(short = 't', long = "type", value_parser = parse_relation_arg)]
+    pub relation: Relation,
+    /// Edge weight
+    #[arg(short, long, default_value = "1.0")]
+    pub weight: f32,
+    /// Print one JSON line instead of a human-readable line
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Связать два узла. Без этого всё, что пишет механика, ложится в граф без
+/// единого ребра — кучей, а не графом.
+pub async fn relate(args: RelateArgs) -> Result<()> {
+    let conn = open_and_ensure(&db_path())?;
+    let from = resolve_node_any(&conn, &args.from)?;
+    let to = resolve_node_any(&conn, &args.to)?;
+    if from.id == to.id {
+        anyhow::bail!(
+            "'{}' и '{}' разрешились в один узел «{}» — связывать нечего",
+            args.from,
+            args.to,
+            from.label
+        );
+    }
+
+    // add_edge вставляет через OR IGNORE и на повторе всё равно возвращает
+    // свежий Edge, которого нет в базе. Спрашиваем заранее, чтобы не сообщать
+    // о созданной связи, когда ничего не создано.
+    let (edge, created) = match graph::find_edge(&conn, from.id, to.id, &args.relation)? {
+        Some(existing) => (existing, false),
+        None => (
+            graph::add_edge(&conn, from.id, to.id, args.relation, args.weight)?,
+            true,
+        ),
+    };
+
+    if args.json {
+        let out = json!({
+            "id": edge.id.to_string(),
+            "from": { "id": from.id.to_string(), "label": from.label },
+            "to": { "id": to.id.to_string(), "label": to.label },
+            "relation": edge.relation.to_string(),
+            "weight": edge.weight,
+            "created": created,
+        });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    let verb = if created {
+        "Связано"
+    } else {
+        "Связь уже была"
+    };
+    println!("✓ {verb}: {} —{}→ {}", from.label, edge.relation, to.label);
     Ok(())
 }
 
@@ -121,6 +645,28 @@ pub async fn context(topic: &str, depth: u32, verbose: bool) -> Result<()> {
         }
         if verbose {
             print_sync_conflict(node);
+        }
+    }
+
+    // Рёбра печатаются, а не только считаются: без этого связь, поставленную
+    // `au relate`, нечем увидеть — счётчик «N edges» меняется одинаково на
+    // правильную связь и на случайную.
+    if !edges.is_empty() {
+        let by_id: std::collections::HashMap<_, _> = nodes.iter().map(|n| (n.id, n)).collect();
+        let name = |id: uuid::Uuid| {
+            by_id
+                .get(&id)
+                .map_or_else(|| id.to_string(), |n| n.label.clone())
+        };
+        println!();
+        println!("Связи:");
+        for edge in &edges {
+            println!(
+                "  {} —{}→ {}",
+                name(edge.from_id),
+                edge.relation,
+                name(edge.to_id)
+            );
         }
     }
     Ok(())
@@ -745,11 +1291,7 @@ pub async fn skills(hook: bool) -> Result<()> {
 pub async fn snapshot(project: Option<String>, hook: bool, json_out: bool) -> Result<()> {
     let run = || -> Result<String> {
         let conn = db::open(&db_path())?;
-        let derived = project.clone().or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
-        });
+        let derived = project.clone().or_else(current_dir_name);
         // Дистиллят освежаем раз в сутки прямо отсюда: консолидация — чистый
         // SQL, дешевле одного FTS-запроса, а слой 7 не протухает незаметно.
         if let Some(p) = derived.as_deref() {
@@ -888,6 +1430,51 @@ pub async fn trace_cmd(
         }
         other => other,
     }
+}
+
+/// Поймать момент открытия: команда только что вернула данные о мире — предложить
+/// сохранить это как измеренный факт, положив саму команду в `evidence`.
+///
+/// Ничего не пишет. `--hook` печатает Claude-JSON с `additionalContext` и всегда
+/// выходит с нулём: хук не имеет права мешать работе.
+pub async fn capture_cmd(hook: bool, command: Option<String>) -> Result<()> {
+    use crate::capture;
+
+    if hook {
+        let mut raw = String::new();
+        if std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw).is_err() {
+            return Ok(());
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Ok(());
+        };
+        if let Some(catch) = capture::from_hook_event(&event) {
+            println!(
+                "{}",
+                json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PostToolUse",
+                        "additionalContext": capture::suggestion(&catch),
+                    }
+                })
+            );
+        }
+        return Ok(());
+    }
+
+    let command = command.ok_or_else(|| anyhow::anyhow!("нужен --command или --hook"))?;
+    match capture::classify(&command) {
+        Some(tool) => {
+            let catch = capture::Catch {
+                tool,
+                command,
+                lines: 0,
+            };
+            println!("{}", capture::suggestion(&catch));
+        }
+        None => println!("не добыча данных — предлагать нечего"),
+    }
+    Ok(())
 }
 
 /// Полная Stop-цепочка «Бит-и-Дело»: судья исхода (ступень 4) → обязательства

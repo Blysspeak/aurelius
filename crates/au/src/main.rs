@@ -1,3 +1,4 @@
+mod capture;
 mod commands;
 mod view;
 
@@ -220,19 +221,17 @@ enum Commands {
     /// Initialize Aurelius in current environment
     Init,
     /// Add a knowledge node manually
-    Note {
-        /// The note content (decision, observation, etc.)
-        text: String,
-        /// Node type: decision, concept, problem, solution
-        #[arg(short, long, default_value = "decision")]
-        r#type: String,
-        /// Label (short name). Defaults to first 50 chars of text.
-        #[arg(short, long)]
-        label: Option<String>,
-        /// Link to a project node (find or create by name)
-        #[arg(short, long)]
-        project: Option<String>,
-    },
+    Note(commands::NoteArgs),
+    /// Record what happened this session — the same record `memory_session`
+    /// writes over MCP, and the only one layer 4 of the snapshot
+    /// ("Последние сессии") reads. A note lands in layer 5, among lasting facts.
+    Session(commands::SessionArgs),
+    /// Link two nodes with a typed edge — what `memory_relate` does over MCP.
+    /// Without it everything a hook writes lands in the graph edgeless.
+    Relate(commands::RelateArgs),
+    /// List what a given run wrote. A session-end hook needs this to tell its
+    /// own records from yesterday's — until now nothing carried the run.
+    Journal(commands::JournalArgs),
     /// Show knowledge graph context around a topic
     Context {
         topic: String,
@@ -305,6 +304,18 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
+    /// Offer to save a measured fact right after a command returned data
+    /// (PostToolUse hook). Never writes anything itself — the command lands in
+    /// `evidence` and the decision stays with the caller.
+    Capture {
+        /// PostToolUse hook mode: read hook JSON from stdin, emit
+        /// additionalContext, never fail
+        #[arg(long)]
+        hook: bool,
+        /// Check one command by hand instead of reading a hook event
+        #[arg(short, long, conflicts_with = "hook")]
+        command: Option<String>,
+    },
     /// Close ripe labile windows and apply outcome verdicts (Bit-i-Delo stage 4)
     Judge {
         /// Only close windows at least this many seconds old (default 0)
@@ -358,17 +369,62 @@ enum Commands {
     Mcp,
 }
 
+/// Договор о кодах возврата. Вызывающий обязан различать «я позвал
+/// неправильно» и «база недоступна»: первое чинится другим вызовом, второе —
+/// руками, и переспрашивать бессмысленно. Раньше оба случая давали единицу, а
+/// clap на опечатку в аргументе отдавал двойку — ровно наоборот.
+mod exit {
+    /// Ошибка вызова: неизвестный тип, кривые аргументы, ненайденный узел.
+    pub const USAGE: u8 = 1;
+    /// Хранилище недоступно: нет базы, битый образ, залоченный SQLite.
+    pub const STORAGE: u8 = 2;
+}
+
+/// Хранилищем считается всё, что пришло из слоя базы: `DbError` (открытие,
+/// миграция, целостность) и голая ошибка `rusqlite` из любого запроса. Всё
+/// остальное — ошибка вызова.
+fn classify(err: &anyhow::Error) -> u8 {
+    let storage = err
+        .chain()
+        .any(|c| c.is::<aurelius_core::db::DbError>() || c.is::<rusqlite::Error>());
+    if storage {
+        exit::STORAGE
+    } else {
+        exit::USAGE
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn main() -> std::process::ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let _ = e.print();
+            // `--help` и `--version` — это не сбой вызова, это запрошенный вывод.
+            return match e.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                    std::process::ExitCode::SUCCESS
+                }
+                _ => std::process::ExitCode::from(exit::USAGE),
+            };
+        }
+    };
+    match run(cli).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Ошибка: {e:#}");
+            std::process::ExitCode::from(classify(&e))
+        }
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Init => commands::init().await,
-        Commands::Note {
-            text,
-            r#type,
-            label,
-            project,
-        } => commands::note(&text, &r#type, label, project).await,
+        Commands::Note(args) => commands::note(args).await,
+        Commands::Session(args) => commands::session(args).await,
+        Commands::Relate(args) => commands::relate(args).await,
+        Commands::Journal(args) => commands::journal(args).await,
         Commands::Context {
             topic,
             depth,
@@ -390,6 +446,7 @@ async fn main() -> Result<()> {
             exit_code,
             hook,
         } => commands::trace_cmd(kind, payload, session, exit_code, hook).await,
+        Commands::Capture { hook, command } => commands::capture_cmd(hook, command).await,
         Commands::Judge { min_age, hook } => commands::judge_cmd(min_age, hook).await,
         Commands::Snapshot {
             project,
