@@ -105,11 +105,28 @@ pub(crate) fn node_brief(node: &aurelius_core::models::Node) -> serde_json::Valu
     })
 }
 
+/// Происхождение факта в форме для выдачи.
+///
+/// Отдаётся ВСЕГДА, а не только когда заполнено: молчание о происхождении и
+/// есть та беда, ради которой поля заводились — ложное «флаги выключены»
+/// выглядело ровно как измеренное. Отсутствие читается как `unverified`.
+fn provenance_brief(node: &aurelius_core::models::Node) -> serde_json::Value {
+    let p = aurelius_core::provenance::Provenance::from_data(&node.data);
+    json!({
+        "confidence": p.confidence_or_default().as_str(),
+        "evidence": p.evidence,
+        "measured_at": p.measured_at.map(|d| d.to_rfc3339()),
+        "subject": p.subject,
+        "stale": p.staleness(node.created_at, chrono::Utc::now()).map(|s| s.note()),
+    })
+}
+
 pub(crate) fn node_detail(node: &aurelius_core::models::Node) -> serde_json::Value {
     json!({
         "id": node.id.to_string(),
         "type": node.node_type,
         "label": node.label,
+        "claim": aurelius_core::provenance::Provenance::from_data(&node.data).claim,
         "note": node.note,
         "source": node.source,
         "data": node.data,
@@ -118,6 +135,7 @@ pub(crate) fn node_detail(node: &aurelius_core::models::Node) -> serde_json::Val
         "access_count": node.access_count,
         "created_by": node.created_by,
         "updated_by": node.updated_by,
+        "provenance": provenance_brief(node),
     })
 }
 
@@ -126,8 +144,10 @@ pub(crate) fn node_compact(node: &aurelius_core::models::Node) -> serde_json::Va
         "id": node.id.to_string(),
         "type": node.node_type,
         "label": node.label,
+        "claim": aurelius_core::provenance::Provenance::from_data(&node.data).claim,
         "note": node.note,
         "created_at": node.created_at.to_rfc3339(),
+        "provenance": provenance_brief(node),
     })
 }
 
@@ -159,52 +179,21 @@ pub(crate) fn resolve_node(
         .ok_or_else(|| anyhow::anyhow!("node not found: {identifier}"))
 }
 
+/// Разбор живёт в ядре (`NodeType::parse`), чтобы CLI и MCP не расходились в
+/// том, какие типы вообще существуют. Здесь — мягкий вариант: незнакомое имя
+/// становится `Custom`, как и было в контракте инструмента.
 pub(crate) fn parse_node_type(s: &str) -> NodeType {
-    match s {
-        "project" => NodeType::Project,
-        "decision" => NodeType::Decision,
-        "concept" => NodeType::Concept,
-        "problem" => NodeType::Problem,
-        "solution" => NodeType::Solution,
-        "person" => NodeType::Person,
-        "dependency" => NodeType::Dependency,
-        "server" => NodeType::Server,
-        "file" => NodeType::File,
-        "module" => NodeType::Module,
-        "crate" => NodeType::Crate,
-        "user_fact" => NodeType::UserFact,
-        "digest" => NodeType::Digest,
-        "config" => NodeType::Config,
-        "session" => NodeType::Session,
-        "language" => NodeType::Language,
-        "task" => NodeType::Task,
-        "work_log" | "worklog" => NodeType::WorkLog,
-        "skill" => NodeType::Skill,
-        other => NodeType::Custom(other.to_owned()),
-    }
+    NodeType::parse(s)
 }
 
+/// Как и `parse_node_type`, разбор живёт в ядре — иначе `au relate` и
+/// `memory_relate` расходятся в том, какие связи вообще существуют.
 pub(crate) fn parse_relation(s: &str) -> anyhow::Result<Relation> {
-    Ok(match s {
-        "uses" => Relation::Uses,
-        "depends_on" => Relation::DependsOn,
-        "solves" => Relation::Solves,
-        "caused_by" => Relation::CausedBy,
-        "inspired_by" => Relation::InspiredBy,
-        "conflicts_with" => Relation::ConflictsWith,
-        "supersedes" => Relation::Supersedes,
-        "belongs_to" => Relation::BelongsTo,
-        "related_to" => Relation::RelatedTo,
-        "learned_from" => Relation::LearnedFrom,
-        "contains" => Relation::Contains,
-        "imports" => Relation::Imports,
-        "exports" => Relation::Exports,
-        "implements" => Relation::Implements,
-        "configures" => Relation::Configures,
-        "tracked_by" => Relation::TrackedBy,
-        "subtask_of" => Relation::SubtaskOf,
-        "blocks" => Relation::Blocks,
-        _ => anyhow::bail!("unknown relation: {s}"),
+    Relation::parse_known(s).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown relation: {s}. Known: {}",
+            Relation::KNOWN.join(", ")
+        )
     })
 }
 
