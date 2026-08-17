@@ -63,7 +63,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | `memory_status` | Session start — full project snapshot with active tasks. Optional `project` filter. |
 | `memory_session` | Session end — save decisions, problems/solutions, next steps. Links to tasks. Returns active tasks hint. SHA-256 dedup. |
 | `memory_recall` | Smart topic recall — FTS + BFS, grouped by type (incl. tasks), skips structural noise. |
-| `memory_search` | Full-text search with `type`, `since`, and `limit` filters. `*` for recent. |
+| `memory_search` | Full-text search with `type`, `since`, and `limit` filters. `*` for recent. Words are OR-ed and ranked by how many of them matched, so one bad word form spoils the order rather than the result; `unmatched_terms` names the words that matched nothing, telling "no such knowledge" apart from "the query didn't work". |
 | `memory_context` | Raw BFS graph traversal from FTS seed nodes. |
 | `memory_snapshot` | The seven-layer frozen slice as Markdown, under a hard budget. |
 | `memory_consolidate` | Rebuild a project's distillate — open next steps plus unsolved problems. Idempotent. |
@@ -322,8 +322,12 @@ back as truth six weeks later.
 | `verify_with` | The command that re-checks it |
 | `subject` | What is being asserted, e.g. `xhub:.env:REFUND_REQUESTS_ENABLED`. A second fact about the same subject is **refused** until `resolution` says `supersede` \| `refine` \| `coexist` — and the resolution becomes an edge, not a memory of one |
 
-A failed probe (`probe_warnings`) downgrades `confidence` to `unverified` on its own.
-A warning string is easy to ignore; a downgraded field keeps working without being read.
+A failed probe (`probe_warnings`) does **not** downgrade `confidence`. Probes extract
+path-like tokens from prose and check them on disk — weak evidence by construction: an
+aliased import, a path on another machine, a file in someone else's repo all fail it
+while saying nothing about the fact. `evidence` with a command and an exit code is
+strong evidence, and the weak one has no business overruling the strong one. A failed
+probe stays a remark, not a verdict.
 
 Both doors take the same fields and share one parser: `au note --confidence …` and
 `memory_add(confidence=…)` cannot drift apart on what a measured fact is.

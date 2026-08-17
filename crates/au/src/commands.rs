@@ -699,13 +699,18 @@ fn print_sync_conflict(node: &aurelius_core::models::Node) {
 
 pub async fn search(query: &str) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
-    let nodes = graph::search(&conn, query, 20)?;
-    if nodes.is_empty() {
-        println!("No results for '{}'", query);
+    let outcome = graph::search_ranked(&conn, query, 20)?;
+    // «Не нашлось» и «запрос не сработал» — разные ответы: первое означает «иди
+    // выясняй», второе — «спроси иначе».
+    let blind = outcome
+        .diagnosis()
+        .map_or_else(String::new, |d| format!("\n  {d}"));
+    if outcome.nodes.is_empty() {
+        println!("No results for '{query}'{blind}");
         return Ok(());
     }
-    println!("{} results:", nodes.len());
-    for node in nodes {
+    println!("{} results:{blind}", outcome.nodes.len());
+    for node in outcome.nodes {
         let type_label = serde_json::to_string(&node.node_type).unwrap_or_default();
         println!(
             "  [{type_label}] {} — {}",

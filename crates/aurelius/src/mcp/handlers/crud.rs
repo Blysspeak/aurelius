@@ -2,7 +2,7 @@ use anyhow::Result;
 use aurelius_core::{
     graph, indexer,
     models::{MemoryKind, NodeType, Relation},
-    provenance::{self, Confidence, Provenance, Resolution},
+    provenance::{self, Provenance, Resolution},
     window,
 };
 use serde_json::json;
@@ -48,12 +48,20 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     let since = params.get("since").and_then(|s| s.as_str());
 
     let conn = open_db()?;
-    let mut nodes = if let Some(type_str) = type_filter {
+    let outcome = if let Some(type_str) = type_filter {
         let node_type = parse_node_type(type_str);
-        graph::search_typed(&conn, query, &node_type, limit)?
+        let (terms, unmatched) = graph::query_terms(&conn, query)?;
+        graph::SearchOutcome {
+            nodes: graph::search_typed(&conn, query, &node_type, limit)?,
+            terms,
+            unmatched_terms: unmatched,
+        }
     } else {
-        graph::search(&conn, query, limit)?
+        graph::search_ranked(&conn, query, limit)?
     };
+    let hint = outcome.diagnosis();
+    let unmatched = outcome.unmatched_terms;
+    let mut nodes = outcome.nodes;
 
     if let Some(since_str) = since {
         if let Some(cutoff_time) = parse_since(since_str) {
@@ -73,6 +81,8 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         "since": since,
         "corrections": corrections,
         "count": nodes.len(),
+        "unmatched_terms": unmatched,
+        "query_hint": hint,
         "results": nodes.iter().map(node_detail).collect::<Vec<_>>(),
     }))
 }
@@ -164,7 +174,7 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     // Происхождение разбирается ПЕРВЫМ: ошибка в нём не имеет права оставить
     // за собой полузаписанный узел.
-    let mut prov = Provenance::parse(params)?;
+    let prov = Provenance::parse(params)?;
     let mut data = data;
     prov.write_into(&mut data);
 
@@ -262,16 +272,17 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         }
     };
 
-    // Непрошедшая проба перестала быть просто строкой в ответе. Строку легко
-    // проигнорировать; понижение уверенности работает само — факт, чья проверка
-    // провалилась, больше не выдаёт себя за измеренный.
-    let mut confidence_downgraded = false;
-    if !probe_warnings.is_empty() && prov.confidence_or_default() != Confidence::Unverified {
-        prov.confidence = Some(Confidence::Unverified);
-        prov.write_into(&mut data);
-        graph::update_node(&conn, node.id, None, Some(data.clone()))?;
-        confidence_downgraded = true;
-    }
+    // Проба НЕ понижает уверенность, хотя один день понижала.
+    //
+    // Она вытаскивает путеподобные токены из прозы и проверяет их на диске —
+    // улика слабая по устройству: импорт по алиасу, путь на другой машине, файл
+    // в чужом репозитории провалят её, ничего не сообщив о самом факте.
+    // `evidence` с командой и кодом возврата — улика сильная. Понижая measured
+    // до unverified по слабой улике, инструмент обесценивал сильную: все записи
+    // одного проекта разом прочитались как непроверенные, и сигнал
+    // происхождения, ради которого поля и заводились, перестал что-либо значить.
+    // Провал остаётся в `probe_warnings` — как замечание, а не как приговор.
+    let confidence_downgraded = false;
 
     // Ступень 2, шлюз сюрприза (advisory): NCS против словаря scope. Scope —
     // префикс проекта из label ([proj] ...) либо global. Запись только меряет.
