@@ -259,6 +259,20 @@ to self-host a sync server.
 ```bash
 au init                            # initialize database
 au note "chose X over Y" -p app   # capture a decision → project
+au note --stdin --kind episodic \
+  --key precompact:$SESSION --json  # a moment, not a lasting fact: ages out, upserts, reports its id
+au session "what happened" -p app \
+  -d "decision" -n "next step"     # the layer-4 record: what `memory_session` writes, without MCP
+au session --stdin -p app --json    # same record from a hook: {"summary":…,"decisions":[…],"next_steps":[…]}
+au relate <from> <to> --type solves # edge between two nodes (`part-of`, `refines`, … — hyphens fine)
+au note "…" --session $SESSION_ID   # stamp the run that wrote it (or export AURELIUS_SESSION_ID)
+au note "flag is on" --confidence measured \
+  --evidence "cat app/.env" \
+  --claim "REFUND_REQUESTS_ENABLED=true" \
+  --volatility volatile --verify-with "cat app/.env" \
+  --subject xhub:.env:REFUND_REQUESTS_ENABLED  # where it came from, how fast it rots, what it is about
+au journal --session $SESSION_ID    # everything that run wrote — the selection a session-end hook needs
+au capture --hook                   # PostToolUse: a command returned data → offer to save it as measured
 au context beacon                  # graph around a topic
 au search "redis"                  # full-text search
 au reindex                         # index current project
@@ -276,6 +290,43 @@ au doc convert report.docx         # document → Markdown on stdout
 au doc convert ./contracts -r      # convert a whole tree, cached by content hash
 au doc recall "termination"        # search everything ever converted
 ```
+
+### Exit codes
+
+A caller has to tell "I called it wrong" from "the store is unreachable": the first is
+fixed by calling differently, the second by hand — retrying it is pointless.
+
+| Code | Meaning |
+|------|---------|
+| `0` | done (`--help` and `--version` included) |
+| `1` | bad call — unknown `--type`, missing argument, node not found, malformed JSON on stdin |
+| `2` | storage unreachable — no database, damaged image, locked SQLite |
+
+The `--hook` variants (`au snapshot --hook`, `au trace --hook`, `au judge --hook`,
+`au capture --hook`) are the deliberate exception: they never fail and stay silent on
+error. A broken hook is worse than a missing snapshot.
+
+### Provenance
+
+A fact about the world is worth exactly as much as the answer to "how do you know?".
+Without that, a guess lands in the graph looking identical to a measurement — and reads
+back as truth six weeks later.
+
+| Field | What it is for |
+|-------|----------------|
+| `confidence` | `measured` \| `inferred` \| `reported` \| `unverified`. **Required** on `memory_add`. Absent reads as `unverified`, never as "probably measured". `measured` without `evidence` is refused — that is `inferred`. |
+| `evidence` | The command or query **verbatim** that produced the fact |
+| `measured_at` | When it was measured; defaults to now for `measured` |
+| `claim` | The assertion in one or two lines (≤240 chars). Returned **whole** — recall clips the long note, never the claim |
+| `volatility` | `immutable` \| `slow` (30 d) \| `volatile` (1 d). Past that age the fact comes back marked "старше N дн — перепроверь" |
+| `verify_with` | The command that re-checks it |
+| `subject` | What is being asserted, e.g. `xhub:.env:REFUND_REQUESTS_ENABLED`. A second fact about the same subject is **refused** until `resolution` says `supersede` \| `refine` \| `coexist` — and the resolution becomes an edge, not a memory of one |
+
+A failed probe (`probe_warnings`) downgrades `confidence` to `unverified` on its own.
+A warning string is easy to ignore; a downgraded field keeps working without being read.
+
+Both doors take the same fields and share one parser: `au note --confidence …` and
+`memory_add(confidence=…)` cannot drift apart on what a measured fact is.
 
 ### Sync Commands
 
@@ -444,6 +495,7 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 | `aurelius-backup.sh` | SessionStart | Rolling database snapshot, throttled to one a day |
 | `aurelius-track-edit.sh` | PostToolUse (Edit/Write) | Increments access_count on file nodes |
 | `au trace --hook` | PostToolUse | Appends what happened to the action journal |
+| `au capture --hook` | PostToolUse (Bash) | A command returned data about the world → offers to save it as a measured fact, with the command already in `evidence`. Writes nothing itself |
 | `au judge --hook` | Stop | Settles the session: reinforce, erode, fork or null |
 | `aurelius-reindex.sh` | Stop | Re-indexes project on session end |
 | `post-commit` | git commit | Captures commit as Decision node, linked to project via `belongs_to` |

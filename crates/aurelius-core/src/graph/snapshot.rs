@@ -31,12 +31,40 @@ fn clip(s: &str, budget: usize) -> String {
     format!("{cut}…")
 }
 
+/// Текст узла для выдачи.
+///
+/// Короткое утверждение (`claim`) отдаётся ЦЕЛИКОМ и не режется никогда: смысл
+/// разделения в том, что суть влезает в бюджет, а длинное обоснование лежит
+/// отдельно и приезжает по запросу. Раньше и то и другое было одним `note`, и
+/// бюджет рубил его вслепую — в стартовом снапшоте всё обрывалось многоточием
+/// на полуслове. Потолок в 240 символов гарантирован при записи.
+fn body(node: &Node, per_line: usize) -> String {
+    match crate::provenance::Provenance::from_data(&node.data).claim {
+        Some(claim) => claim,
+        None => clip(node.note.as_deref().unwrap_or(&node.label), per_line),
+    }
+}
+
+/// Дописать к тексту то, что о нём известно: чем подтверждён и не пора ли
+/// перепроверить. Измеренное и свежее не помечается — пометка на всём подряд
+/// становится фоном и перестаёт читаться.
+fn annotate(node: &Node, text: String) -> String {
+    let p = crate::provenance::Provenance::from_data(&node.data);
+    let mut out = text;
+    if let Some(mark) = p.confidence_mark() {
+        out.push_str(&format!(" [{mark}]"));
+    }
+    if let Some(stale) = p.staleness(node.created_at, Utc::now()) {
+        out.push_str(&format!(" ({})", stale.note()));
+    }
+    out
+}
+
 /// Строки слоя: по одной на узел, суммарно не больше budget.
 fn layer(nodes: &[Node], per_line: usize, budget: usize) -> String {
     let mut out = String::new();
     for n in nodes {
-        let text = n.note.as_deref().unwrap_or(&n.label);
-        let line = format!("- {}\n", clip(text, per_line));
+        let line = format!("- {}\n", annotate(n, body(n, per_line)));
         if out.chars().count() + line.chars().count() > budget {
             break;
         }
@@ -73,6 +101,13 @@ pub struct Fact {
     /// RFC 3339, время последнего изменения узла. `null` там, где источник
     /// времени не хранит (обязательства).
     pub at: Option<String>,
+    /// Чем подтверждён факт: `measured` | `inferred` | `reported` |
+    /// `unverified`. Отсутствие происхождения читается как `unverified`, а не
+    /// как «наверное измерено».
+    pub confidence: &'static str,
+    /// Приписка «старше N дней — перепроверь …», когда факт волатилен и
+    /// просрочен. `null`, пока свежий или пока волатильность не названа.
+    pub stale: Option<String>,
 }
 
 /// Машинная форма снапшота.
@@ -136,10 +171,23 @@ fn gather(conn: &Connection, project: Option<&str>) -> Result<Gathered> {
 }
 
 fn push_facts(facts: &mut Vec<Fact>, kind: &'static str, nodes: &[Node]) {
-    facts.extend(nodes.iter().map(|n| Fact {
-        kind,
-        text: n.note.clone().unwrap_or_else(|| n.label.clone()),
-        at: Some(n.updated_at.to_rfc3339()),
+    let now = Utc::now();
+    facts.extend(nodes.iter().map(|n| {
+        let p = crate::provenance::Provenance::from_data(&n.data);
+        Fact {
+            kind,
+            // Машинной форме пометки в текст не подмешиваются — они отдельными
+            // полями, иначе потребителю пришлось бы выковыривать их регулярками
+            // из той самой строки, которую он читает как факт.
+            text: p
+                .claim
+                .clone()
+                .or_else(|| n.note.clone())
+                .unwrap_or_else(|| n.label.clone()),
+            at: Some(n.updated_at.to_rfc3339()),
+            confidence: p.confidence_or_default().as_str(),
+            stale: p.staleness(n.created_at, now).map(|s| s.note()),
+        }
     }));
 }
 
@@ -155,6 +203,10 @@ pub fn snapshot_facts(conn: &Connection, project: Option<&str>) -> Result<Snapsh
         kind: "obligation",
         text: line.clone(),
         at: None,
+        // Обязательство — не утверждение о мире, а взятое обещание: подтверждать
+        // ему нечего и протухать нечему, у него своя мера в слое «Давление».
+        confidence: crate::provenance::Confidence::Reported.as_str(),
+        stale: None,
     }));
     push_facts(&mut facts, "session", &g.sessions);
     push_facts(&mut facts, "decision", &g.decisions);

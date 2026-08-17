@@ -114,6 +114,12 @@ pub fn put(
 
 /// Full-text search across everything ever converted.
 pub fn recall(conn: &Connection, query: &str, limit: usize) -> Result<Vec<DocHit>> {
+    // Тот же санитайзер, что и у поиска по графу: дефис в запросе — оператор
+    // FTS5, а не буква.
+    let expr = aurelius_core::fts::sanitize(query);
+    if expr.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn.prepare(
         "SELECT d.sha256, d.source_path, d.file_name, d.format, d.char_count, d.created_at,
                 snippet(doc_fts, 1, '**', '**', ' … ', 24)
@@ -125,7 +131,7 @@ pub fn recall(conn: &Connection, query: &str, limit: usize) -> Result<Vec<DocHit
     )?;
 
     let hits = stmt
-        .query_map(params![query, limit as i64], |row| {
+        .query_map(params![expr, limit as i64], |row| {
             Ok(DocHit {
                 sha256: row.get(0)?,
                 source_path: row.get(1)?,

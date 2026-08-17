@@ -1,10 +1,12 @@
 mod crud;
 mod search;
+mod session;
 mod snapshot;
 mod traverse;
 
 pub use crud::*;
 pub use search::*;
+pub use session::*;
 pub use snapshot::*;
 pub use traverse::*;
 

@@ -81,6 +81,65 @@ pub fn add_node_full(
     Ok(node)
 }
 
+/// Идемпотентная запись под пользовательским ключом, который ложится в
+/// `data.key`. Повторный вызов с тем же ключом переписывает узел целиком
+/// вместо того, чтобы завести близнеца — так хук, сработавший дважды за один
+/// повод (авто- и ручная компакция), оставляет одну запись, а не две.
+///
+/// Второй элемент — `true`, если узел создан, `false`, если обновлён.
+/// `data` принимается объектом, а не любым `Value`: ключ должен быть куда
+/// положить, иначе следующий вызов не нашёл бы запись и молча создал вторую.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_node_by_key(
+    conn: &Connection,
+    key: &str,
+    node_type: NodeType,
+    label: &str,
+    note: Option<&str>,
+    source: &str,
+    mut data: serde_json::Map<String, serde_json::Value>,
+    memory_kind: MemoryKind,
+) -> Result<(Node, bool)> {
+    data.insert("key".to_owned(), serde_json::Value::String(key.to_owned()));
+    let data = serde_json::Value::Object(data);
+
+    let Some(existing) = find_node_by_data_field(conn, "key", key)? else {
+        let node = add_node_full(
+            conn,
+            node_type,
+            label,
+            note,
+            source,
+            data,
+            memory_kind,
+            None,
+        )?;
+        return Ok((node, true));
+    };
+
+    let now = Utc::now();
+    let author = identity::current().map(|i| i.as_author());
+    conn.execute(
+        "UPDATE nodes SET node_type = ?1, label = ?2, note = ?3, source = ?4, data = ?5,
+                memory_kind = ?6, updated_at = ?7, updated_by = ?8
+         WHERE id = ?9",
+        params![
+            serde_json::to_string(&node_type)?,
+            label,
+            note,
+            source,
+            serde_json::to_string(&data)?,
+            memory_kind.to_string(),
+            now.to_rfc3339(),
+            author,
+            existing.id.to_string(),
+        ],
+    )?;
+    let updated = get_node(conn, &existing.id.to_string())?
+        .ok_or_else(|| anyhow::anyhow!("узел {} исчез между поиском и обновлением", existing.id))?;
+    Ok((updated, false))
+}
+
 pub fn add_edge(
     conn: &Connection,
     from_id: Uuid,
@@ -113,6 +172,28 @@ pub fn add_edge(
         ],
     )?;
     Ok(edge)
+}
+
+/// Найти уже существующее ребро. `add_edge` вставляет через `OR IGNORE`, то
+/// есть повтор молча ничего не делает и всё равно возвращает свежий `Edge` —
+/// вызывающему, который сообщает пользователю «связь создана», нужен способ
+/// отличить новое ребро от уже бывшего.
+pub fn find_edge(
+    conn: &Connection,
+    from_id: Uuid,
+    to_id: Uuid,
+    relation: &Relation,
+) -> Result<Option<Edge>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, from_id, to_id, relation, weight, created_at, created_by, deleted_at, sync_seq
+         FROM edges
+         WHERE from_id = ?1 AND to_id = ?2 AND relation = ?3 AND deleted_at IS NULL",
+    )?;
+    let mut rows = stmt.query_map(
+        params![from_id.to_string(), to_id.to_string(), relation.to_string()],
+        row_to_edge,
+    )?;
+    Ok(rows.next().transpose()?)
 }
 
 pub fn update_node(
@@ -318,6 +399,32 @@ pub fn find_node_by_data_field(conn: &Connection, key: &str, value: &str) -> Res
     Ok(rows.next().transpose()?)
 }
 
+/// Все живые узлы с этим значением поля `data`, свежие первыми.
+///
+/// Множественная форма нужна ровно для одного: обнаружения противоречий. Узел с
+/// тем же `subject` — не «дубль, который можно проигнорировать», а второе
+/// утверждение о том же предмете, и вызывающему надо показать их ВСЕ, чтобы он
+/// решил, что с ними делать.
+pub fn find_nodes_by_data_field(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+    limit: usize,
+) -> Result<Vec<Node>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE json_extract(data, ?1) = ?2 AND deleted_at IS NULL
+         ORDER BY created_at DESC LIMIT ?3",
+    )?;
+    let json_path = format!("$.{key}");
+    let nodes = stmt
+        .query_map(params![json_path, value, limit as i64], row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nodes)
+}
+
 pub fn get_all_nodes(conn: &Connection) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
@@ -477,5 +584,88 @@ mod tests {
             updated_at >= node.updated_at,
             "updated_at must not move backward from the pre-delete value"
         );
+    }
+
+    /// PreCompact срабатывает и автоматически, и на ручной `/compact`. Без
+    /// ключа это два узла-близнеца; с ключом — один, переписанный.
+    #[test]
+    fn upsert_by_key_updates_instead_of_duplicating() {
+        let (_tmp, conn) = setup();
+        let key = "precompact:session-42";
+
+        let (first, created) = upsert_node_by_key(
+            &conn,
+            key,
+            NodeType::Session,
+            "снимок перед компакцией",
+            Some("первый заход"),
+            "hook",
+            serde_json::Map::new(),
+            MemoryKind::Episodic,
+        )
+        .expect("first upsert");
+        assert!(created, "первый вызов создаёт узел");
+
+        let (second, created) = upsert_node_by_key(
+            &conn,
+            key,
+            NodeType::Session,
+            "снимок перед компакцией",
+            Some("второй заход"),
+            "hook",
+            serde_json::Map::new(),
+            MemoryKind::Episodic,
+        )
+        .expect("second upsert");
+        assert!(!created, "второй вызов обновляет, а не создаёт");
+        assert_eq!(first.id, second.id, "id должен остаться тем же");
+        assert_eq!(second.note.as_deref(), Some("второй заход"));
+        assert_eq!(second.memory_kind, MemoryKind::Episodic);
+        assert_eq!(
+            second.data.get("key").and_then(|v| v.as_str()),
+            Some(key),
+            "ключ должен пережить обновление, иначе следующий вызов не найдёт узел"
+        );
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE json_extract(data, '$.key') = ?1
+                   AND deleted_at IS NULL",
+                params![key],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(total, 1, "близнец не должен появиться");
+    }
+
+    /// Ключ узла — не то же самое, что ключ его соседа: разные ключи должны
+    /// оставаться разными узлами.
+    #[test]
+    fn upsert_by_key_keeps_distinct_keys_apart() {
+        let (_tmp, conn) = setup();
+        let (a, _) = upsert_node_by_key(
+            &conn,
+            "snapshot:a",
+            NodeType::Session,
+            "a",
+            None,
+            "hook",
+            serde_json::Map::new(),
+            MemoryKind::Episodic,
+        )
+        .expect("upsert a");
+        let (b, created) = upsert_node_by_key(
+            &conn,
+            "snapshot:b",
+            NodeType::Session,
+            "b",
+            None,
+            "hook",
+            serde_json::Map::new(),
+            MemoryKind::Episodic,
+        )
+        .expect("upsert b");
+        assert!(created);
+        assert_ne!(a.id, b.id);
     }
 }

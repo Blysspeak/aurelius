@@ -84,7 +84,8 @@ pub fn tool_definitions() -> serde_json::Value {
                         },
                         "type": {
                             "type": "string",
-                            "description": "Node type: project, decision, concept, problem, solution, person, dependency, server, file, module, crate, config, session, language",
+                            "enum": aurelius_core::models::NodeType::KNOWN,
+                            "description": "Node type. A typo used to become a custom type silently — a node no query filters on.",
                             "default": "concept"
                         },
                         "note": {
@@ -105,9 +106,48 @@ pub fn tool_definitions() -> serde_json::Value {
                             "enum": ["semantic", "episodic"],
                             "description": "Memory classification: semantic (facts, concepts) or episodic (events, sessions). Default: semantic",
                             "default": "semantic"
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "The run that wrote this. Without it nothing distinguishes this record from one written yesterday, and 'everything written in this session' cannot be selected at all. Readable back with `au journal --session <id>`."
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["measured", "inferred", "reported", "unverified"],
+                            "description": "Where this came from. REQUIRED — a false claim otherwise lands exactly like a measured one. measured: obtained by a command/query, which must be quoted verbatim in 'evidence'. inferred: derived from something measured, not itself measured. reported: told by a human or docs, unchecked. unverified: origin not named. Anything but 'measured' is marked as such on the way out."
+                        },
+                        "evidence": {
+                            "type": "string",
+                            "description": "The command or query VERBATIM — what produced this. Required when confidence is 'measured': a measurement without the command that made it is an inference."
+                        },
+                        "measured_at": {
+                            "type": "string",
+                            "description": "RFC 3339 timestamp of the measurement. Defaults to now for 'measured'. Pass it explicitly when recording something measured earlier."
+                        },
+                        "claim": {
+                            "type": "string",
+                            "description": "The assertion in one or two lines — returned WHOLE, never clipped mid-word. Max 240 chars; the long reasoning belongs in 'note', which is returned on demand."
+                        },
+                        "volatility": {
+                            "type": "string",
+                            "enum": ["immutable", "slow", "volatile"],
+                            "description": "How fast this stops being true. immutable: never (a function address, a commit sha). slow: rarely and visibly (a DB schema). volatile: quietly and at any moment (a value in .env, a process state). A stale fact is handed back with 'older than N days — re-check with …'. Omit when you do not know; a wrong default would be the same silent lie this field exists to prevent."
+                        },
+                        "verify_with": {
+                            "type": "string",
+                            "description": "Command that re-checks this claim. Without it a staleness note reports trouble without saying how to close it."
+                        },
+                        "subject": {
+                            "type": "string",
+                            "description": "Identity of what is being asserted, e.g. 'xhub:.env:REFUND_REQUESTS_ENABLED'. Two facts sharing a subject cannot both be true, so a second one is refused until you say how to resolve it — see 'resolution'."
+                        },
+                        "resolution": {
+                            "type": "string",
+                            "enum": ["supersede", "refine", "coexist"],
+                            "description": "How this relates to the existing fact about the same 'subject'. supersede: the old one is no longer true (creates a supersedes edge). refine: the old one stays true, this makes it more precise. coexist: both hold — say so deliberately."
                         }
                     },
-                    "required": ["label"]
+                    "required": ["label", "confidence"]
                 }
             },
             {
@@ -126,7 +166,9 @@ pub fn tool_definitions() -> serde_json::Value {
                         },
                         "relation": {
                             "type": "string",
-                            "description": "Relation type: uses, depends_on, solves, caused_by, inspired_by, conflicts_with, supersedes, belongs_to, related_to, learned_from, contains, imports, exports, implements, configures, tracked_by"
+                            // Список берётся из словаря ядра, а не переписан
+                            // руками: копия уже успела отстать на две связи.
+                            "description": format!("Relation type: {}", aurelius_core::models::Relation::KNOWN.join(", ")),
                         },
                         "weight": {
                             "type": "number",
@@ -212,6 +254,10 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Key files that were modified or are relevant"
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "The run that wrote this record. Stamps the session node and everything it spawns, so `au journal --session <id>` can list them back."
                         },
                         "tasks": {
                             "type": "array",
