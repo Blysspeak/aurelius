@@ -13,6 +13,13 @@ use std::process::{Command, Stdio};
 
 const USAGE: i32 = 1;
 const STORAGE: i32 = 2;
+/// Наряд (`au task claim|renew|release|give-up`): пул пуст, либо наряд
+/// больше не принадлежит вызывающему. Контракт `au-task-cli.md` требует этот
+/// код отличным от `LEASE_BUSY` — иначе занятая база выглядит как пустая
+/// очередь.
+const LEASE_EMPTY: i32 = 10;
+/// Наряд: база занята другим писателем. FR-010.
+const LEASE_BUSY: i32 = 11;
 
 /// Временный домен данных: каталог для рабочих тестов, файл — для теста
 /// недоступного хранилища (`<файл>/aurelius.db` открыть нельзя).
@@ -433,6 +440,83 @@ fn a_second_claim_about_the_same_subject_needs_resolving() {
         None,
     );
     assert_eq!(code, USAGE, "неизвестное разрешение — ошибка: {out}");
+}
+
+/// T013: пустой пул даёт `10`, а не молчаливый успех и не сбой вызова —
+/// смена считает подряд идущие ответы `10`, чтобы решить, что очередь
+/// исчерпана (FR-010, FR-017).
+#[test]
+fn claim_on_empty_pool_reports_lease_empty() {
+    let home = TmpHome::dir("lease-empty");
+    let (code, out) = run(
+        &home,
+        &[
+            "task",
+            "claim",
+            "--owner",
+            "smena@test/1",
+            "--run",
+            "run-empty",
+            "--lease-minutes",
+            "60",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(
+        code, LEASE_EMPTY,
+        "пустая очередь обязана давать {LEASE_EMPTY}, а не что-то ещё: {out}"
+    );
+}
+
+/// T013: база под эксклюзивной блокировкой даёт `11`, а не «нарядов нет» —
+/// это тот самый тест, который отличает «очередь пуста» от «не смог
+/// прочитать» (FR-010). Держим монопольную запись одним подключением, пока
+/// `au task claim` пытается взять наряд тем же файлом; `au`'s `busy_timeout`
+/// (10с) исчерпывается, и SQLite возвращает `SQLITE_BUSY`.
+#[test]
+fn claim_on_locked_database_reports_lease_busy() {
+    let home = TmpHome::dir("lease-busy");
+    let db_file = home.0.join("aurelius.db");
+
+    // Тот же путь открытия, что использует `au` — свои прагмы (WAL,
+    // busy_timeout) должны совпасть с тем, что увидит подпроцесс.
+    let locker = aurelius_core::db::open(&db_file).expect("открыть базу для блокировки");
+    locker
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("начать монопольную запись");
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_au"));
+    cmd.env("AURELIUS_HOME", &home.0)
+        // Без Cargo.toml/package.json — авто-индексатор не тронет базу
+        // собственной записью и не встанет между нами и нужной проверкой.
+        .current_dir(&home.0)
+        .args([
+            "task",
+            "claim",
+            "--owner",
+            "smena@test/2",
+            "--run",
+            "run-busy",
+            "--lease-minutes",
+            "60",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().expect("запустить au");
+    let out = child.wait_with_output().expect("дождаться au");
+
+    let _ = locker.execute_batch("ROLLBACK;");
+
+    assert_eq!(
+        out.status.code(),
+        Some(LEASE_BUSY),
+        "занятая база обязана давать {LEASE_BUSY}, не пустую очередь: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Тело секции markdown-снапшота по её заголовку.
