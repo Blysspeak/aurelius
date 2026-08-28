@@ -1085,8 +1085,232 @@ pub async fn task(action: TaskAction) -> Result<()> {
         } => {
             task_stats_cli(&conn, project.as_deref(), since_days)?;
         }
+
+        TaskAction::Claim {
+            owner,
+            run,
+            lease_minutes,
+            project,
+            json,
+        } => {
+            let claimed = graph::claim(&conn, &owner, &run, lease_minutes, project.as_deref())?;
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "claimed": true,
+                        "id": claimed.id.to_string(),
+                        "label": claimed.label,
+                        "note": claimed.note,
+                        "data": claimed.data,
+                    })
+                );
+            } else {
+                println!("✓ Наряд выдан: {}", claimed.label);
+                println!("  id: {}", claimed.id);
+                if let Some(criteria) = claimed
+                    .data
+                    .get("acceptance_criteria")
+                    .and_then(|c| c.as_array())
+                {
+                    if !criteria.is_empty() {
+                        println!("  Критерии приёмки:");
+                        for c in criteria {
+                            if let Some(text) = c.as_str() {
+                                println!("    ☐ {text}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        TaskAction::Renew {
+            id,
+            owner,
+            lease_minutes,
+            json,
+        } => {
+            let task_id = id.parse::<uuid::Uuid>().with_context(|| {
+                format!("--id обязан быть UUID наряда, полученным от claim: {id}")
+            })?;
+            let until = graph::renew(&conn, task_id, &owner, lease_minutes)?;
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "renewed": true,
+                        "id": task_id.to_string(),
+                        "until": until.to_rfc3339(),
+                    })
+                );
+            } else {
+                println!("✓ Аренда продлена до {}", until.to_rfc3339());
+            }
+        }
+
+        TaskAction::Release {
+            id,
+            owner,
+            verdict,
+            evidence,
+            json,
+        } => {
+            let task_id = id.parse::<uuid::Uuid>().with_context(|| {
+                format!("--id обязан быть UUID наряда, полученным от claim: {id}")
+            })?;
+            let verdict_kind = match verdict.as_str() {
+                "done" => graph::Verdict::Done,
+                "failed" => graph::Verdict::Failed,
+                other => anyhow::bail!("неизвестный --verdict '{other}'. Известные: done, failed"),
+            };
+            let outcome = graph::release(&conn, task_id, &owner, verdict_kind, &evidence)?;
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "id": task_id.to_string(),
+                        "verdict": verdict,
+                        "status": outcome.status,
+                        "reason": outcome.reason,
+                    })
+                );
+            } else {
+                match &outcome.reason {
+                    Some(reason) => println!("⛔ Наряд {task_id}: {} — {reason}", outcome.status),
+                    None => println!("✓ Наряд {task_id}: {}", outcome.status),
+                }
+            }
+        }
+
+        TaskAction::GiveUp {
+            id,
+            owner,
+            why,
+            json,
+        } => {
+            let task_id = id.parse::<uuid::Uuid>().with_context(|| {
+                format!("--id обязан быть UUID наряда, полученным от claim: {id}")
+            })?;
+            graph::give_up(&conn, task_id, &owner, &why)?;
+            if json {
+                println!(
+                    "{}",
+                    json!({"id": task_id.to_string(), "status": "blocked", "why": why})
+                );
+            } else {
+                println!("⛔ Наряд сдан: {task_id} — {why}");
+            }
+        }
+
+        TaskAction::Fitness {
+            id,
+            verdict,
+            why,
+            dry_run,
+            project,
+            json,
+        } => {
+            if dry_run {
+                fitness_dry_run(&conn, project.as_deref(), json)?;
+            } else {
+                let id = id.ok_or_else(|| anyhow::anyhow!("--id обязателен без --dry-run"))?;
+                let verdict = verdict.ok_or_else(|| {
+                    anyhow::anyhow!("--verdict обязателен: machine, human, split")
+                })?;
+                let why =
+                    why.ok_or_else(|| anyhow::anyhow!("--why обязателен и не может быть пустым"))?;
+                let task_id = id.parse::<uuid::Uuid>().with_context(|| {
+                    format!("--id обязан быть UUID задачи, полученным от `au task list`: {id}")
+                })?;
+                let fitness_verdict = match verdict.as_str() {
+                    "machine" => graph::FitnessVerdict::Machine,
+                    "human" => graph::FitnessVerdict::Human,
+                    "split" => graph::FitnessVerdict::Split,
+                    other => {
+                        anyhow::bail!(
+                            "неизвестный --verdict '{other}'. Известные: machine, human, split"
+                        )
+                    }
+                };
+                graph::set_fitness(&conn, task_id, fitness_verdict, &why)?;
+                if json {
+                    println!(
+                        "{}",
+                        json!({
+                            "id": task_id.to_string(),
+                            "fitness": {"verdict": fitness_verdict.as_str(), "why": why},
+                        })
+                    );
+                } else {
+                    println!("✓ Вердикт поставлен: {task_id} — {fitness_verdict} ({why})");
+                }
+            }
+        }
     }
 
+    Ok(())
+}
+
+/// `au task fitness --dry-run`: гейты отсева по всем открытым задачам
+/// (`backlog`, `active`), ничего не пишет — контракт `au-task-cli.md`,
+/// режим волны 0 (SC-001).
+fn fitness_dry_run(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+    json_out: bool,
+) -> Result<()> {
+    let tasks = graph::get_tasks_filtered(conn, project, Some("backlog,active"), None, 100_000)?;
+
+    let mut machine = 0usize;
+    let mut split = 0usize;
+    let mut human = 0usize;
+    let mut rows = Vec::with_capacity(tasks.len());
+
+    for t in &tasks {
+        let criteria = graph::task_acceptance_criteria(&t.data);
+        let outcome = graph::evaluate_fitness(&t.label, t.note.as_deref(), &criteria);
+        match outcome.verdict {
+            graph::FitnessVerdict::Machine => machine += 1,
+            graph::FitnessVerdict::Split => split += 1,
+            graph::FitnessVerdict::Human => human += 1,
+        }
+        rows.push((t, outcome));
+    }
+
+    if json_out {
+        let items: Vec<_> = rows
+            .iter()
+            .map(|(t, o)| {
+                json!({
+                    "id": t.id.to_string(),
+                    "label": t.label,
+                    "verdict": o.verdict.as_str(),
+                    "why": o.why,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            json!({
+                "total": tasks.len(),
+                "machine": machine,
+                "split": split,
+                "human": human,
+                "tasks": items,
+            })
+        );
+    } else {
+        for (t, o) in &rows {
+            println!("[{}] {}", o.verdict.as_str().to_uppercase(), t.label);
+            println!("        └ {}", o.why);
+        }
+        println!();
+        println!("открытых задач: {}", tasks.len());
+        println!("  machine — машина закроет сама:      {machine}");
+        println!("  split   — есть машинная часть:      {split}");
+        println!("  human   — нужен человек:            {human}");
+    }
     Ok(())
 }
 

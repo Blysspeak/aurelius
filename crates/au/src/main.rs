@@ -82,6 +82,91 @@ pub enum TaskAction {
         #[arg(long)]
         since_days: Option<u64>,
     },
+    /// Наряд: взять один машинный наряд из пула (спека 006, фаза 2). Только
+    /// смена вызывает это, не исполнитель — контракт contracts/au-task-cli.md
+    Claim {
+        /// Кто берёт: `smena@<host>/<pid>`
+        #[arg(long)]
+        owner: String,
+        /// Номер прогона, выдавшего наряд
+        #[arg(long)]
+        run: String,
+        /// Срок аренды в минутах (вдвое больше стены по времени на наряд)
+        #[arg(long = "lease-minutes")]
+        lease_minutes: i64,
+        /// Фильтр по проекту (не входит в контракт волны 1 — задел на fitness)
+        #[arg(long)]
+        project: Option<String>,
+        /// JSON вместо человекочитаемого текста
+        #[arg(long)]
+        json: bool,
+    },
+    /// Наряд: продлить аренду взятого наряда. Вызывает смена, пока дочерний
+    /// процесс жив, — не исполнитель (FR-009)
+    Renew {
+        /// Идентификатор наряда, выданный `claim`
+        #[arg(long)]
+        id: String,
+        /// Тот же владелец, что взял наряд
+        #[arg(long)]
+        owner: String,
+        #[arg(long = "lease-minutes")]
+        lease_minutes: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Наряд: заявить исход работы. Решение принимает смена — эта команда
+    /// только записывает заявку (FR-012)
+    Release {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        owner: String,
+        /// done | failed
+        #[arg(long)]
+        verdict: String,
+        /// Команда или проверка, которой подтверждён исход
+        #[arg(long)]
+        evidence: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Наряд: сдать наряд — исполнитель распознал упор в человека. Блокирует
+    /// задачу и НЕ возвращает её в очередь (FR-014)
+    GiveUp {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        owner: String,
+        /// Причина, по которой задача не может быть закрыта машиной
+        #[arg(long)]
+        why: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Наряд: поставить вердикт исполнимости, либо сухо прогнать разметку по
+    /// всей очереди. Пишет только `data.fitness` — контракт
+    /// `au-task-cli.md`, раздел `au task fitness` (FR-003, спека 006, фаза 3)
+    Fitness {
+        /// Идентификатор задачи — вместе с --verdict и --why ставит вердикт
+        /// вручную. Обязателен без --dry-run
+        #[arg(long)]
+        id: Option<String>,
+        /// machine | human | split — обязателен вместе с --id
+        #[arg(long)]
+        verdict: Option<String>,
+        /// Обоснование — обязательно и непусто вместе с --id (FR-003a)
+        #[arg(long)]
+        why: Option<String>,
+        /// Сухой прогон по всем открытым задачам — ничего не пишет (SC-001)
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Фильтр по проекту — действует только вместе с --dry-run
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -378,12 +463,35 @@ mod exit {
     pub const USAGE: u8 = 1;
     /// Хранилище недоступно: нет базы, битый образ, залоченный SQLite.
     pub const STORAGE: u8 = 2;
+    /// Наряд (`au task claim|renew|release|give-up`, контракт
+    /// `au-task-cli.md`): пул пуст, либо наряд больше не принадлежит
+    /// вызывающему (аренда истекла и перевыдана). Не ошибка хранилища и не
+    /// ошибка вызова — смена считает подряд идущие ответы с этим кодом,
+    /// чтобы понять, что очередь исчерпана.
+    pub const LEASE_EMPTY: u8 = 10;
+    /// Наряд: база занята другим писателем. FR-010 требует отличать это от
+    /// `LEASE_EMPTY` — иначе ручная сессия владельца выглядит как пустая
+    /// очередь, и смена выходит, отчитавшись об успехе.
+    pub const LEASE_BUSY: u8 = 11;
 }
 
 /// Хранилищем считается всё, что пришло из слоя базы: `DbError` (открытие,
 /// миграция, целостность) и голая ошибка `rusqlite` из любого запроса. Всё
-/// остальное — ошибка вызова.
+/// остальное — ошибка вызова. Наряд проверяется первым: `LeaseError` может
+/// нести `rusqlite::Error` источником (`Busy`), и без этой проверки он
+/// попал бы в `STORAGE`, а контракт `au-task-cli.md` требует для наряда
+/// ровно четыре кода — 0, 10, 11, 1.
 fn classify(err: &anyhow::Error) -> u8 {
+    if let Some(lease_err) = err
+        .chain()
+        .find_map(|c| c.downcast_ref::<aurelius_core::graph::LeaseError>())
+    {
+        return match lease_err {
+            aurelius_core::graph::LeaseError::Busy(_) => exit::LEASE_BUSY,
+            aurelius_core::graph::LeaseError::NoTasksAvailable
+            | aurelius_core::graph::LeaseError::NotOwner => exit::LEASE_EMPTY,
+        };
+    }
     let storage = err
         .chain()
         .any(|c| c.is::<aurelius_core::db::DbError>() || c.is::<rusqlite::Error>());
