@@ -144,6 +144,29 @@ pub enum TaskAction {
         #[arg(long)]
         json: bool,
     },
+    /// Наряд: поставить вердикт исполнимости, либо сухо прогнать разметку по
+    /// всей очереди. Пишет только `data.fitness` — контракт
+    /// `au-task-cli.md`, раздел `au task fitness` (FR-003, спека 006, фаза 3)
+    Fitness {
+        /// Идентификатор задачи — вместе с --verdict и --why ставит вердикт
+        /// вручную. Обязателен без --dry-run
+        #[arg(long)]
+        id: Option<String>,
+        /// machine | human | split — обязателен вместе с --id
+        #[arg(long)]
+        verdict: Option<String>,
+        /// Обоснование — обязательно и непусто вместе с --id (FR-003a)
+        #[arg(long)]
+        why: Option<String>,
+        /// Сухой прогон по всем открытым задачам — ничего не пишет (SC-001)
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Фильтр по проекту — действует только вместе с --dry-run
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
