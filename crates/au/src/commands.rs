@@ -1085,6 +1085,123 @@ pub async fn task(action: TaskAction) -> Result<()> {
         } => {
             task_stats_cli(&conn, project.as_deref(), since_days)?;
         }
+
+        TaskAction::Claim {
+            owner,
+            run,
+            lease_minutes,
+            project,
+            json,
+        } => {
+            let claimed = graph::claim(&conn, &owner, &run, lease_minutes, project.as_deref())?;
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "claimed": true,
+                        "id": claimed.id.to_string(),
+                        "label": claimed.label,
+                        "note": claimed.note,
+                        "data": claimed.data,
+                    })
+                );
+            } else {
+                println!("✓ Наряд выдан: {}", claimed.label);
+                println!("  id: {}", claimed.id);
+                if let Some(criteria) = claimed
+                    .data
+                    .get("acceptance_criteria")
+                    .and_then(|c| c.as_array())
+                {
+                    if !criteria.is_empty() {
+                        println!("  Критерии приёмки:");
+                        for c in criteria {
+                            if let Some(text) = c.as_str() {
+                                println!("    ☐ {text}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        TaskAction::Renew {
+            id,
+            owner,
+            lease_minutes,
+            json,
+        } => {
+            let task_id = id.parse::<uuid::Uuid>().with_context(|| {
+                format!("--id обязан быть UUID наряда, полученным от claim: {id}")
+            })?;
+            let until = graph::renew(&conn, task_id, &owner, lease_minutes)?;
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "renewed": true,
+                        "id": task_id.to_string(),
+                        "until": until.to_rfc3339(),
+                    })
+                );
+            } else {
+                println!("✓ Аренда продлена до {}", until.to_rfc3339());
+            }
+        }
+
+        TaskAction::Release {
+            id,
+            owner,
+            verdict,
+            evidence,
+            json,
+        } => {
+            let task_id = id.parse::<uuid::Uuid>().with_context(|| {
+                format!("--id обязан быть UUID наряда, полученным от claim: {id}")
+            })?;
+            let verdict_kind = match verdict.as_str() {
+                "done" => graph::Verdict::Done,
+                "failed" => graph::Verdict::Failed,
+                other => anyhow::bail!("неизвестный --verdict '{other}'. Известные: done, failed"),
+            };
+            let outcome = graph::release(&conn, task_id, &owner, verdict_kind, &evidence)?;
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "id": task_id.to_string(),
+                        "verdict": verdict,
+                        "status": outcome.status,
+                        "reason": outcome.reason,
+                    })
+                );
+            } else {
+                match &outcome.reason {
+                    Some(reason) => println!("⛔ Наряд {task_id}: {} — {reason}", outcome.status),
+                    None => println!("✓ Наряд {task_id}: {}", outcome.status),
+                }
+            }
+        }
+
+        TaskAction::GiveUp {
+            id,
+            owner,
+            why,
+            json,
+        } => {
+            let task_id = id.parse::<uuid::Uuid>().with_context(|| {
+                format!("--id обязан быть UUID наряда, полученным от claim: {id}")
+            })?;
+            graph::give_up(&conn, task_id, &owner, &why)?;
+            if json {
+                println!(
+                    "{}",
+                    json!({"id": task_id.to_string(), "status": "blocked", "why": why})
+                );
+            } else {
+                println!("⛔ Наряд сдан: {task_id} — {why}");
+            }
+        }
     }
 
     Ok(())
