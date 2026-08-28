@@ -8,10 +8,17 @@
 //! Одна деталь, стоившая бы дня отладки: `node_type` хранится **с кавычками**
 //! (`serde_json::to_string(&NodeType::Task)` даёт `"task"`), поэтому во всех
 //! запросах ниже сравнение идёт с литералом `'"task"'`, а не `'task'`.
+//!
+//! Фаза 3 (спека 006) добавляет сюда же разметку исполнимости: гейты отсева,
+//! перенесённые из одноразового скрипта `fitness-dryrun.mjs` (research.md,
+//! «Волна 0: результат»), и запись вердикта в `data.fitness`.
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use rusqlite::{params, Connection, ErrorCode};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -363,6 +370,489 @@ pub fn give_up(conn: &Connection, id: Uuid, owner: &str, why: &str) -> anyhow::R
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Разметка исполнимости (спека 006, фаза 3, data-model.md «Вердикт
+// исполнимости»). Ступень 1 — детерминированные гейты, без модели: перенос
+// одноразового скрипта `fitness-dryrun.mjs` (research.md, «Волна 0:
+// результат») плюс два гейта, которых скрипт не содержал и которые волна 0
+// вскрыла ручной сверкой уже ПОСЛЕ прогона — эпик (FR-005b) и запрещённое
+// действие (FR-005c).
+// ---------------------------------------------------------------------------
+
+/// Вердикт исполнимости: тот же текст, что хранится в `data.fitness.verdict`
+/// и что принимает `--verdict` у `au task fitness`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FitnessVerdict {
+    /// Машина закроет сама — единственный вердикт, допускающий наряд
+    /// (FR-005).
+    Machine,
+    /// Нужен человек: либо нет проверяемого критерия, либо задача больше
+    /// наряда, либо критерий требует запрещённого действия.
+    Human,
+    /// Часть критериев машинная, часть требует человека — откладывается
+    /// целиком, без автоматического расщепления (FR-005a).
+    Split,
+}
+
+impl FitnessVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FitnessVerdict::Machine => "machine",
+            FitnessVerdict::Human => "human",
+            FitnessVerdict::Split => "split",
+        }
+    }
+}
+
+impl std::fmt::Display for FitnessVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Итог гейтов: вердикт вместе с обязательным обоснованием (FR-003a) — какой
+/// критерий признан проверяемым действием, а при отказе — почему ни один не
+/// признан.
+#[derive(Debug, Clone)]
+pub struct FitnessOutcome {
+    pub verdict: FitnessVerdict,
+    pub why: String,
+}
+
+/// Порог числа критериев приёмки, после которого задача считается эпиком, а
+/// не одним нарядом (FR-005b). Взято по здравому смыслу, как и прочие
+/// потолки прогона в research.md, — не измерено.
+const EPIC_CRITERIA_THRESHOLD: usize = 6;
+
+/// Скомпилированные регэкспы гейтов — строятся один раз на процесс, а не на
+/// каждый вызов `evaluate_fitness` (прогон `--dry-run` вызывает его на всей
+/// открытой очереди).
+struct FitnessGates {
+    /// Критерий-код в обратных кавычках — самый честный признак команды.
+    inline_code: Regex,
+    /// Критерий начинается с команды: «npm test зелёный», «cargo clippy чист».
+    starts_with_cmd: Regex,
+    /// Команда упомянута где-то в строке, с границей слова по обе стороны.
+    cmd_at: Regex,
+    /// Слово, говорящее об исходе запуска, а не о состоянии мира.
+    green_marker: Regex,
+    /// Формулировки проверки с однозначным исходом без имени команды.
+    verifiable_shape: Vec<Regex>,
+    /// Маркеры того, что задача упирается в другого человека.
+    waits_for_human: Vec<Regex>,
+    /// Результат живёт в голове, а не в файловой системе.
+    unverifiable_intent: Vec<Regex>,
+    /// `[project] ` — префикс лейбла, который снимается перед проверкой intent.
+    label_prefix: Regex,
+    /// Маркеры многоэтапности: эпик, фаза/этап/stage N, MVP-N.
+    epic_marker: Vec<Regex>,
+    /// Действия, запрещённые автономной работе (FR-025..FR-027).
+    forbidden_action: Vec<Regex>,
+}
+
+/// Имена, при виде которых строка перестаёт быть намерением и становится
+/// командой. Список — дословный перенос `RUNNABLE` из `fitness-dryrun.mjs`.
+const RUNNABLE_COMMANDS: &[&str] = &[
+    "cargo",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "node",
+    "deno",
+    "bun",
+    "au",
+    "aurelius",
+    "git",
+    "gh",
+    "docker",
+    "make",
+    "bash",
+    "sh",
+    "pwsh",
+    "powershell",
+    "python",
+    "python3",
+    "pip",
+    "pytest",
+    "ruff",
+    "mypy",
+    "curl",
+    "wget",
+    "sqlite3",
+    "psql",
+    "redis-cli",
+    "ssh",
+    "systemctl",
+    "cmake",
+    "clippy",
+    "rustfmt",
+    "eslint",
+    "tsc",
+    "vitest",
+    "jest",
+    "playwright",
+];
+
+/// Компилирует регэксп из литерала, известного правильным на этапе
+/// написания кода, — не из пользовательского ввода. Тот же приём, что в
+/// `probes.rs`: `.expect` здесь не бьёт по принципу III, потому что упасть
+/// он может только на опечатке в исходнике, а не на данных прогона.
+fn re(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("статический регэксп гейтов fitness")
+}
+
+fn build_gates() -> FitnessGates {
+    let mut words: Vec<&str> = RUNNABLE_COMMANDS.to_vec();
+    words.sort_by_key(|w| std::cmp::Reverse(w.len()));
+    let cmd_alt = words
+        .iter()
+        .map(|w| regex::escape(w))
+        .collect::<Vec<_>>()
+        .join("|");
+
+    FitnessGates {
+        inline_code: re(r"`[^`]{2,}`"),
+        starts_with_cmd: re(&format!(r"(?i)^\s*(?:команда\s+)?({cmd_alt})\b")),
+        cmd_at: re(&format!(r#"(?i)(^|[`"'(\s])({cmd_alt})\b[\s:]"#)),
+        green_marker: re(
+            r"(?i)(зелён|зелен|проход(ит|ят)|успешн|без\s+ошибок|green|passes?|ok\b|чист|exit\s*0)",
+        ),
+        verifiable_shape: vec![
+            re(r"(?i)exit\s*code\s*0"),
+            re(r"(?i)код\s+возврата\s+(ноль|0)"),
+            re(r"(?i)завершается\s+успешно"),
+            re(r"(?i)проход(ит|ят)\s+(тест|проверк|сборк)"),
+            re(r"(?i)тест(ы)?\s+(проход|зелён|зелен)"),
+            re(r"(?i)сборка\s+(проход|зелён|зелен|успешн)"),
+            re(r"(?i)собирается\s+без\s+ошибок"),
+            re(r"(?i)без\s+ошибок\s+компил"),
+            re(r"(?i)возвращает\s+(ноль|0|код)"),
+            re(r"(?i)quick_check\s+(зелён|зелен|ok)"),
+            re(r"(?i)integrity\s+ok"),
+        ],
+        waits_for_human: vec![
+            re(r"(?i)дожд(аться|ись|ёмся)"),
+            re(r"(?i)ответ(а|ы)?\s+(мерчант|клиент|партнёр|партнер|провайдер|поддержк)"),
+            re(r"(?i)соглас(ие|ования|овать|уй)"),
+            re(r"(?i)созвон"),
+            re(r"(?i)связаться\s+с"),
+            re(r"(?i)обсудить\s+с"),
+            re(r"(?i)договорит[ьс]"),
+            re(r"решить\s+с\s+\p{Lu}"),
+            re(r"(?i)спросить\s+у"),
+            re(r"(?i)подтвердить\s+у"),
+            re(r"(?i)написать\s+(письмо|мерчант|клиент|провайдер|в\s+поддержк|тео|владельц)"),
+            re(r"(?i)отправить\s+(претензи|письмо|счёт|счет|сообщени)"),
+            re(r"(?i)выставить\s+счёт|выставить\s+счет"),
+            re(r"(?i)оплатить|перевести\s+деньги"),
+        ],
+        unverifiable_intent: vec![
+            re(r"(?i)^изучить"),
+            re(r"(?i)^разобраться"),
+            re(r"(?i)^описать"),
+            re(r"(?i)^продумать"),
+            re(r"(?i)^обдумать"),
+            re(r"(?i)^оценить"),
+            re(r"(?i)^прочитать"),
+            re(r"(?i)^почитать"),
+            re(r"(?i)^посмотреть"),
+            re(r"(?i)^подумать"),
+            re(r"(?i)^исследовать"),
+            re(r"(?i)^понять"),
+            re(r"(?i)^выяснить,?\s+как"),
+            re(r"(?i)^определиться"),
+        ],
+        label_prefix: re(r"^\[[^\]]*\]\s*"),
+        // FR-005b: перечисление фаз пишут и по-русски, и по-английски (спеки
+        // этого репозитория сами используют «Phase N»/«US1») — оба варианта
+        // равно достоверный сигнал многоэтапности, не только русский.
+        epic_marker: vec![
+            re(r"(?i)эпик"),
+            re(r"(?i)фаза\s*\d"),
+            re(r"(?i)phase\s*\d"),
+            re(r"(?i)этап\s*\d"),
+            re(r"(?i)stage\s*\d"),
+            re(r"(?i)mvp[-\s]?\d"),
+        ],
+        // FR-005c: публикация, PR, слияние в основную линию, сообщение
+        // человеку — исполнителю запрещено закрывать такой критерий честно
+        // (FR-025..FR-027), сколько бы попыток он ни истратил.
+        forbidden_action: vec![
+            re(r"(?i)\bpr\b"),
+            re(r"(?i)pull\s*request"),
+            re(r"(?i)(слить|смерж\w*|мерж\w*)\s+(в|to|into)?\s*(main|master|основн\w*)"),
+            re(r"(?i)запушить\s+в\s+(main|master)"),
+            re(r"(?i)опубликова\w*"),
+            re(r"(?i)публикаци\w*"),
+            re(r"(?i)npm\s+publish"),
+            re(r"(?i)cargo\s+publish"),
+            re(r"(?i)отправ(ить|ь)\s+(сообщени|письмо|уведомлени)"),
+        ],
+    }
+}
+
+fn gates() -> &'static FitnessGates {
+    static GATES: OnceLock<FitnessGates> = OnceLock::new();
+    GATES.get_or_init(build_gates)
+}
+
+fn any_match(list: &[Regex], s: &str) -> bool {
+    list.iter().any(|re| re.is_match(s))
+}
+
+/// `true`, если критерий приёмки — проверка с однозначным исходом, а не
+/// намерение (FR-002). Три способа за это сказать, по убыванию честности:
+/// команда в обратных кавычках, критерий начинается с команды, команда
+/// упомянута рядом со словом об исходе; либо форма проверки без имени
+/// команды вовсе («тесты проходят»).
+fn looks_runnable(criterion: &str) -> bool {
+    let g = gates();
+    if g.inline_code.is_match(criterion) {
+        return true;
+    }
+    if g.starts_with_cmd.is_match(criterion) {
+        return true;
+    }
+    if g.cmd_at.is_match(criterion) && g.green_marker.is_match(criterion) {
+        return true;
+    }
+    g.verifiable_shape.iter().any(|re| re.is_match(criterion))
+}
+
+fn truncate_for_why(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
+/// Непустые критерии приёмки из `data.acceptance_criteria` — общая точка,
+/// которой пользуются и гейты, и запись вердикта, и `au task fitness
+/// --dry-run`, чтобы не заводить чтение JSON заново в каждом месте.
+pub fn task_acceptance_criteria(data: &Value) -> Vec<String> {
+    data.get("acceptance_criteria")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Сканирует лейбл и критерии одной строкой — **без** `note`. Эпик и
+/// запрещённое действие ищутся в контракте задачи (заголовок, критерии), а
+/// не в вольном тексте описания: `note` часто пересказывает историю («найдено
+/// при аудите эпика 119», «PR #296 ждёт мержа») и слово «эпик»/«PR» там может
+/// говорить о прошлом или о чужой задаче, а не о размере или закрытии этой.
+/// Все три известных эпика волны 0 и оба известных запрета названы в лейбле
+/// или в самом критерии — сужение до них не теряет ни одного подтверждённого
+/// случая, только убирает ложные срабатывания на пересказе истории.
+fn scoped_text(label: &str, criteria: &[String]) -> String {
+    let mut s = label.to_owned();
+    for c in criteria {
+        s.push('\n');
+        s.push_str(c);
+    }
+    s
+}
+
+/// FR-005b: объём задачи заведомо больше одного наряда. Считается эпиком по
+/// маркеру многоэтапности в тексте, либо по числу критериев приёмки —
+/// настоящий критерий проходит все прочие гейты, но закрыть эпик за один
+/// наряд физически нельзя (research.md, «Волна 0: результат»).
+fn epic_marker_hit(text: &str, criteria_count: usize) -> Option<String> {
+    let g = gates();
+    for re in &g.epic_marker {
+        if let Some(m) = re.find(text) {
+            return Some(format!("маркер многоэтапности «{}»", m.as_str()));
+        }
+    }
+    if criteria_count > EPIC_CRITERIA_THRESHOLD {
+        return Some(format!(
+            "{criteria_count} критериев приёмки — больше одного наряда (порог {EPIC_CRITERIA_THRESHOLD})"
+        ));
+    }
+    None
+}
+
+/// FR-005c: критерий требует действия, запрещённого автономной работе.
+/// Задача машинная по форме, но закрыть её честно нельзя — исполнитель
+/// упрётся в собственный предохранитель и трижды провалится на своём же
+/// запрете (research.md, «Волна 0: результат», задача ledgent).
+fn forbidden_action_hit(text: &str) -> Option<String> {
+    let g = gates();
+    for re in &g.forbidden_action {
+        if let Some(m) = re.find(text) {
+            return Some(format!("запрещённое действие «{}»", m.as_str()));
+        }
+    }
+    None
+}
+
+/// Гейты отсева — ступень 1 разметки исполнимости, без модели (data-model.md,
+/// «Вердикт исполнимости»). Детерминированный порядок проверок:
+///
+/// 1. нет критериев → `human` (FR-002);
+/// 2. ни один критерий не проверяем → `human`, с уточнением «изучить /
+///    описать» для намерений без результата (FR-002a);
+/// 3. есть маркер ожидания человека — в теле или в критерии → `split`,
+///    целиком, без расщепления (FR-005a);
+/// 4. эпик или запрещённое действие → `human` (FR-005b, FR-005c);
+/// 5. иначе → `machine`.
+pub fn evaluate_fitness(label: &str, note: Option<&str>, criteria: &[String]) -> FitnessOutcome {
+    let g = gates();
+
+    if criteria.is_empty() {
+        return FitnessOutcome {
+            verdict: FitnessVerdict::Human,
+            why: "нет ни одного критерия приёмки".to_owned(),
+        };
+    }
+
+    let runnable: Vec<&String> = criteria.iter().filter(|c| looks_runnable(c)).collect();
+
+    if runnable.is_empty() {
+        let bare_label = g.label_prefix.replace(label, "");
+        let intent_only = any_match(&g.unverifiable_intent, &bare_label);
+        let why = if intent_only {
+            "результат не проверяется отдельным действием (изучить / описать / разобраться); \
+             отчёт исполнителя такой проверкой не считается"
+                .to_owned()
+        } else {
+            format!(
+                "ни один критерий не является запускаемой командой: {}",
+                truncate_for_why(&criteria[0], 90)
+            )
+        };
+        return FitnessOutcome {
+            verdict: FitnessVerdict::Human,
+            why,
+        };
+    }
+
+    let body = format!("{label}\n{}", note.unwrap_or(""));
+    let human_in_body = any_match(&g.waits_for_human, &body);
+    let human_in_criteria = criteria.iter().any(|c| any_match(&g.waits_for_human, c));
+
+    if human_in_body || human_in_criteria {
+        return FitnessOutcome {
+            verdict: FitnessVerdict::Split,
+            why: format!(
+                "есть проверяемый критерий ({}), но задача упирается в человека — откладывается целиком",
+                truncate_for_why(runnable[0], 70)
+            ),
+        };
+    }
+
+    let text = scoped_text(label, criteria);
+    if let Some(marker) = epic_marker_hit(&text, criteria.len()) {
+        return FitnessOutcome {
+            verdict: FitnessVerdict::Human,
+            why: format!("объём задачи больше одного наряда: {marker}"),
+        };
+    }
+    if let Some(hit) = forbidden_action_hit(&text) {
+        return FitnessOutcome {
+            verdict: FitnessVerdict::Human,
+            why: format!("критерий запрещён автономной работе: {hit}"),
+        };
+    }
+
+    FitnessOutcome {
+        verdict: FitnessVerdict::Machine,
+        why: format!(
+            "проверяемый критерий: {}",
+            truncate_for_why(runnable[0], 110)
+        ),
+    }
+}
+
+/// Хеш содержания задачи для `fitness.of_hash` (FR-004). Отдельно от
+/// `content_hash` в столбце `nodes` — тот про дедупликацию сессий и у
+/// существующих задач почти всегда `NULL`; этот про то, изменился ли текст,
+/// от которого зависит вердикт.
+fn fitness_content_hash(label: &str, note: Option<&str>, criteria: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(label.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(note.unwrap_or("").as_bytes());
+    for c in criteria {
+        hasher.update(b"\x1e");
+        hasher.update(c.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// `true`, если сохранённый `of_hash` совпадает с хешем текущего содержания
+/// — вердикт ещё не протух. Несовпадение делает его недействительным
+/// независимо от того, что записано в `verdict` (FR-004).
+pub fn fitness_is_current(
+    label: &str,
+    note: Option<&str>,
+    criteria: &[String],
+    of_hash: &str,
+) -> bool {
+    fitness_content_hash(label, note, criteria) == of_hash
+}
+
+const SET_FITNESS_SQL: &str = "
+UPDATE nodes SET
+  data = json_set(data, '$.fitness', json_object('verdict', ?1, 'why', ?2, 'of_hash', ?3)),
+  updated_at = ?4, updated_by = ?5
+WHERE id = ?6 AND deleted_at IS NULL AND node_type = '\"task\"'
+";
+
+/// Ставит вердикт исполнимости (FR-003, FR-003a, FR-004). Пишет ровно один
+/// путь — `data.fitness` через `json_set`, а не общий `update_node`, которому
+/// можно передать любой JSON: на уровне кода разметка физически не может
+/// тронуть ничего другого в задаче (FR-003, T025).
+pub fn set_fitness(
+    conn: &Connection,
+    id: Uuid,
+    verdict: FitnessVerdict,
+    why: &str,
+) -> anyhow::Result<()> {
+    let why = why.trim();
+    if why.is_empty() {
+        anyhow::bail!(
+            "--why не может быть пустым — вердикт без обоснования считается отсутствующим (FR-003a)"
+        );
+    }
+    let id_str = id.to_string();
+    let node = super::get_node(conn, &id_str)?
+        .ok_or_else(|| anyhow::anyhow!("задача не найдена: {id}"))?;
+    let criteria = task_acceptance_criteria(&node.data);
+    let hash = fitness_content_hash(&node.label, node.note.as_deref(), &criteria);
+    let now = Utc::now();
+    let author = crate::identity::current().map(|i| i.as_author());
+
+    let affected = conn
+        .execute(
+            SET_FITNESS_SQL,
+            params![
+                verdict.as_str(),
+                why,
+                hash,
+                now.to_rfc3339(),
+                author,
+                id_str
+            ],
+        )
+        .map_err(map_sqlite_err)?;
+    if affected == 0 {
+        anyhow::bail!("задача не найдена или удалена: {id}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,5 +1126,230 @@ mod tests {
             .expect("node exists");
         assert_eq!(node.data["status"], "done");
         assert_eq!(node.data["done_by"], "smena");
+    }
+
+    // --- T026: разметка исполнимости (фаза 3) ------------------------------
+
+    /// Заводит задачу с произвольными критериями приёмки, без вердикта —
+    /// разметка тестов сама решает, каким его ставить.
+    fn seed_task_with(
+        conn: &Connection,
+        label: &str,
+        note: Option<&str>,
+        criteria: &[&str],
+        extra: serde_json::Value,
+    ) -> Uuid {
+        let mut data = serde_json::json!({
+            "status": "backlog",
+            "priority": "medium",
+            "acceptance_criteria": criteria,
+        });
+        let data_obj = data.as_object_mut().expect("object");
+        if let Some(extra_obj) = extra.as_object() {
+            for (k, v) in extra_obj {
+                data_obj.insert(k.clone(), v.clone());
+            }
+        }
+        crate::graph::add_node_full(
+            conn,
+            NodeType::Task,
+            label,
+            note,
+            "test",
+            data,
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("insert task")
+        .id
+    }
+
+    /// Критерий-команда без маркеров ожидания человека — `machine`.
+    #[test]
+    fn command_criterion_gives_machine() {
+        let outcome = evaluate_fitness(
+            "[boostix] чинит парсер",
+            None,
+            &["cargo test --workspace зелёный".to_owned()],
+        );
+        assert_eq!(outcome.verdict, FitnessVerdict::Machine);
+        assert!(!outcome.why.is_empty(), "обоснование обязано быть непустым");
+        assert!(outcome.why.contains("cargo"));
+    }
+
+    /// Единственный критерий — маркер ожидания человека, команды нет — `human`.
+    #[test]
+    fn human_wait_marker_gives_human() {
+        let outcome = evaluate_fitness(
+            "[boostix] получить креды",
+            None,
+            &["дождаться ответа мерчанта".to_owned()],
+        );
+        assert_eq!(outcome.verdict, FitnessVerdict::Human);
+        assert!(!outcome.why.is_empty());
+    }
+
+    /// Ни одного критерия приёмки — `human`.
+    #[test]
+    fn no_criteria_gives_human() {
+        let outcome = evaluate_fitness("[boostix] сделать что-то", None, &[]);
+        assert_eq!(outcome.verdict, FitnessVerdict::Human);
+        assert_eq!(outcome.why, "нет ни одного критерия приёмки");
+    }
+
+    /// Смешанные критерии — часть машинная, часть про человека — `split`, и
+    /// после записи такая задача не должна попадать в машинный пул (FR-005a).
+    #[test]
+    fn mixed_criteria_give_split_and_stay_out_of_pool() {
+        let criteria = [
+            "cargo test --workspace зелёный",
+            "дождаться ответа провайдера",
+        ];
+        let owned: Vec<String> = criteria.iter().map(|s| (*s).to_owned()).collect();
+        let outcome = evaluate_fitness("[boostix] получить боевые креды", None, &owned);
+        assert_eq!(outcome.verdict, FitnessVerdict::Split);
+
+        let (_tmp, conn) = setup();
+        let id = seed_task_with(
+            &conn,
+            "[boostix] получить боевые креды",
+            None,
+            &criteria,
+            serde_json::json!({}),
+        );
+        set_fitness(&conn, id, FitnessVerdict::Split, &outcome.why).expect("set fitness");
+
+        let err = claim(&conn, "owner-a", "run-1", 60, None).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LeaseError>(),
+                Some(LeaseError::NoTasksAvailable)
+            ),
+            "split-вердикт не должен допускать задачу в пул: {err:#}"
+        );
+    }
+
+    /// Настоящий критерий, но объём — на дни работы (маркер многоэтапности в
+    /// лейбле) — `human`, не `machine` (FR-005b).
+    #[test]
+    fn epic_task_gives_human() {
+        let outcome = evaluate_fitness(
+            "[blyss-core] Реализовать Phase 3 (US1): живой голосовой круг",
+            None,
+            &["cargo test --workspace зелёный".to_owned()],
+        );
+        assert_eq!(outcome.verdict, FitnessVerdict::Human);
+        assert!(
+            outcome.why.contains("наряда"),
+            "обоснование обязано называть причину отказа — объём: {}",
+            outcome.why
+        );
+    }
+
+    /// Настоящий критерий, но его закрытие требует запрещённого действия
+    /// (PR) — `human`, не `machine` (FR-005c).
+    #[test]
+    fn forbidden_pr_criterion_gives_human() {
+        let outcome = evaluate_fitness(
+            "[ledgent] Commit and PR the report feature",
+            None,
+            &["npm run verify зелёный в CI".to_owned()],
+        );
+        assert_eq!(outcome.verdict, FitnessVerdict::Human);
+        assert!(
+            outcome.why.contains("запрещ"),
+            "обоснование обязано называть запрет: {}",
+            outcome.why
+        );
+    }
+
+    /// FR-004: изменение текста задачи делает записанный вердикт
+    /// недействительным — сверяется хеш содержания, а не факт наличия записи.
+    #[test]
+    fn changed_content_invalidates_verdict() {
+        let (_tmp, conn) = setup();
+        let id = seed_task_with(
+            &conn,
+            "[boostix] чинит парсер",
+            None,
+            &["cargo test --workspace зелёный"],
+            serde_json::json!({}),
+        );
+        set_fitness(
+            &conn,
+            id,
+            FitnessVerdict::Machine,
+            "проверяемый критерий: cargo test",
+        )
+        .expect("set fitness");
+
+        let node = crate::graph::get_node(&conn, &id.to_string())
+            .expect("query node")
+            .expect("node exists");
+        let of_hash = node.data["fitness"]["of_hash"]
+            .as_str()
+            .expect("hash written")
+            .to_owned();
+        let criteria = task_acceptance_criteria(&node.data);
+
+        assert!(
+            fitness_is_current(&node.label, node.note.as_deref(), &criteria, &of_hash),
+            "хеш обязан совпасть сразу после записи"
+        );
+        assert!(
+            !fitness_is_current(
+                "[boostix] чинит другой парсер",
+                node.note.as_deref(),
+                &criteria,
+                &of_hash
+            ),
+            "изменённый текст задачи обязан протухнуть вердикт"
+        );
+    }
+
+    /// FR-003, T025: разметка не имеет права трогать ничего, кроме `fitness`
+    /// — на уровне кода, а не соглашения.
+    #[test]
+    fn set_fitness_touches_only_fitness_field() {
+        let (_tmp, conn) = setup();
+        let id = seed_task_with(
+            &conn,
+            "[boostix] чинит парсер",
+            None,
+            &["cargo test --workspace зелёный"],
+            serde_json::json!({"priority": "high", "custom_marker": "не трогать"}),
+        );
+
+        set_fitness(
+            &conn,
+            id,
+            FitnessVerdict::Machine,
+            "проверяемый критерий: cargo test",
+        )
+        .expect("set fitness");
+
+        let node = crate::graph::get_node(&conn, &id.to_string())
+            .expect("query node")
+            .expect("node exists");
+        assert_eq!(node.data["status"], "backlog");
+        assert_eq!(node.data["priority"], "high");
+        assert_eq!(node.data["custom_marker"], "не трогать");
+        assert_eq!(node.data["fitness"]["verdict"], "machine");
+    }
+
+    /// FR-003a: пустое обоснование — вердикт считается отсутствующим, запись
+    /// отклоняется.
+    #[test]
+    fn set_fitness_rejects_empty_why() {
+        let (_tmp, conn) = setup();
+        let id = seed_task_with(
+            &conn,
+            "[boostix] чинит парсер",
+            None,
+            &["cargo test --workspace зелёный"],
+            serde_json::json!({}),
+        );
+        let err = set_fitness(&conn, id, FitnessVerdict::Machine, "   ").unwrap_err();
+        assert!(err.to_string().contains("пустым"));
     }
 }
