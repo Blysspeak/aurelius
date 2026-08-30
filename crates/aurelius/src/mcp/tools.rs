@@ -424,7 +424,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "task_update",
-                "description": "Update task status, priority, or acceptance criteria. Supports status transitions: backlog → active → done/blocked/cancelled. Auto-tracks started_at and completed_at timestamps.",
+                "description": "Update task status, priority, or acceptance criteria. Supports status transitions: backlog → active → done/blocked/cancelled. Transitioning to 'active' stamps activated_at and evicts any other active task in the same project back to backlog (at most one active task per project) — same rule as `au task activate`, not a separate copy of it. Transitioning to 'done' stamps closed_at and builds the resolution (how the task got solved) the same way the CLI does: commit is read from the current git HEAD unless given explicitly, files come from edits traced since activation; optional commit/pull_request/unconfirmed only refine that auto-collected resolution, they don't replace it. Also auto-tracks legacy started_at/completed_at timestamps for older readers.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -454,6 +454,18 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Replace acceptance criteria checklist"
+                        },
+                        "commit": {
+                            "type": "string",
+                            "description": "Only with status='done'. Commit that resolves the task — refines the resolution; if omitted, the commit is read from the repo's current HEAD automatically"
+                        },
+                        "pull_request": {
+                            "type": "string",
+                            "description": "Only with status='done'. Pull request that resolves the task — refines the auto-collected resolution"
+                        },
+                        "unconfirmed": {
+                            "type": "boolean",
+                            "description": "Only with status='done'. Force-mark the resolution as unconfirmed even if a commit/PR/edited files were found (default: unconfirmed only when nothing was found)"
                         }
                     },
                     "required": ["id"]
@@ -461,7 +473,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "task_list",
-                "description": "List tasks with filters by project, status, and priority. Sorted by priority (critical first), then by creation date. Shows work log count per task.",
+                "description": "List tasks with filters by project, status, and priority. Sorted by priority (critical first), then by creation date. Shows work log count per task, plus each task's activated_at/closed_at timestamps, resolution (how it was solved: commit, PR, files, confirmed), evidence (command runs recorded against it), and the derived 'ripe' flag — true when an active task has passing evidence newer than its last edit and is ready to present for closing.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -540,13 +552,21 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "task_view",
-                "description": "Full task overview with its entire knowledge branch: work logs (as timeline), decisions, problems, solutions, and subtasks. Shows acceptance criteria and current status.",
+                "description": "Task overview: the task itself (never truncated — status, priority, acceptance criteria, activated_at/closed_at, resolution, evidence, the derived 'ripe' flag) plus its own knowledge branch (work logs as a timeline, decisions, problems, solutions, direct subtasks). By default the branch is capped at 5 most-recent items per category with notes clipped to 300 chars at a word boundary; a 'truncation' block in the response always reports exactly how many nodes of each type were left out and how to get them. Pass full=true to get the whole branch untruncated, or limit=N to change the per-category cap.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "id": {
                             "type": "string",
                             "description": "UUID or label of the task"
+                        },
+                        "full": {
+                            "type": "boolean",
+                            "description": "Skip truncation entirely: every branch node, notes untrimmed (default: false)"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max nodes shown per category (timeline/decisions/problems/solutions/subtasks) when full is not set (default: 5)"
                         }
                     },
                     "required": ["id"]

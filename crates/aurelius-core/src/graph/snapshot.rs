@@ -30,7 +30,11 @@ const ACTIVE_TASK_CAP: usize = 20;
 
 /// Резать по границе слова, а не посреди него (FR-020). Раньше `chars().take(n)`
 /// рубил вслепую — девять из семнадцати записей дампа обрывались на полуслове.
-fn clip(s: &str, budget: usize) -> String {
+///
+/// `pub`, а не приватная: та же обрезка нужна `mcp::handlers::task::task_view`
+/// для длинных `note` вложенных узлов (decision/problem/solution/work_log) —
+/// заводить вторую копию того же правила ради модульной границы бессмысленно.
+pub fn clip(s: &str, budget: usize) -> String {
     let one = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() <= budget {
         return one;

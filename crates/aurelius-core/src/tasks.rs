@@ -96,6 +96,57 @@ impl TaskFields {
     }
 }
 
+/// Коммит, которым решается задача, если способ решения не назвали явно
+/// (T021a, FR-006): `git rev-parse --short HEAD` в текущем каталоге. `None`,
+/// если это не git-репозиторий или команда недоступна — не повод отказать в
+/// закрытии, только не сможем назвать коммит.
+///
+/// Общая точка для CLI (`au task done`) и MCP (`task_update`, статус `done`)
+/// — то же самое правило, вызванное из обоих мест, а не продублированное.
+pub fn current_commit_sha() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// Собирает способ решения из следов работы (T021a, FR-004…006): коммит — из
+/// состояния репозитория, если не назван явно; файлы — из правок,
+/// привязанных хуком `au trace --hook` с момента взятия задачи в работу.
+/// `commit`/`pull_request` уточняют автоматически собранное, а не заменяют
+/// его (FR-006: не спрашивать у человека то, что система уже знает).
+/// `unconfirmed` форсирует пометку «без подтверждения»; без него она ставится
+/// сама, когда следов не нашлось ни одного (FR-005).
+///
+/// Общая точка для CLI (`au task done`) и MCP (`task_update`, статус `done`).
+pub fn build_resolution(
+    conn: &rusqlite::Connection,
+    since: DateTime<Utc>,
+    commit: Option<String>,
+    pull_request: Option<String>,
+    unconfirmed: bool,
+) -> Resolution {
+    let commit = commit.or_else(current_commit_sha);
+    let files = crate::trace::files_edited_since(conn, since.timestamp()).unwrap_or_default();
+    let confirmed =
+        !unconfirmed && (commit.is_some() || pull_request.is_some() || !files.is_empty());
+    Resolution {
+        commit,
+        pull_request,
+        files,
+        confirmed,
+    }
+}
+
 /// Возвращает улику, дающую созревание, если она есть — основание для
 /// предъявления (какая улика, когда). `None` значит «не созрела».
 ///
