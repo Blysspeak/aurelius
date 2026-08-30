@@ -203,6 +203,56 @@ backlog → active → done
 ```
 
 First `task_log` entry auto-activates a backlog task. `task_update` tracks timestamps automatically.
+A project has at most one active task at a time — activating another demotes the previous
+active task back to `backlog`, keeping its accumulated timestamps and history intact.
+
+### Three Timestamps
+
+Every task carries three moments: when it was **created** (Заведена), when it was **taken
+into work** (Взята — first activation), and when it was **closed** (Закрыта). `au task show`
+and `task_view` print all three, an unfilled one as an explicit dash (`—`), never blank space:
+
+```
+Заведена: 2026-08-30T11:32:11+00:00
+Взята:    —
+Закрыта:  —
+```
+
+Reopening a closed task never erases these, or the resolution recorded at close time; they
+become history the task carries forward.
+
+### Evidence and Ripening
+
+A verify run (`ulika`'s gate, e.g. `node scripts/verify-run.mjs …`) reports its outcome back
+to Aurelius with `au task evidence` — command, exit code, and artifact path, attached to the
+project's active task. **This is not a command you run by hand**: the ulika hook
+(`record-verify.mjs`) calls it after every gate run, because it is the one thing that knows a
+run just happened. You will see it in scripts and hook logs, not type it yourself.
+
+A task **ripens** once it has at least one code edit *and* a green (exit-0) evidence run newer
+than that edit — discussing a task without touching code never ripens it, and a later edit
+un-ripens it again until a fresh green run covers it. `au task ripe` lists what's ripe along
+with why: which evidence, when, what changed. `au judge --hook` (the Stop hook run at the end
+of a turn) surfaces the same list unprompted, so a finished task gets presented for closing
+without anyone having to ask — closing itself still requires a human decision (`au task done`).
+`au task list` marks a ripe task inline too. Declining a proposal (`au task ripe --decline
+<id>`) suppresses it on that task until new work lands.
+
+### Closing with a Resolution
+
+`au task done <id>` records *how* a task was closed, assembled from existing traces of work
+rather than asked of the human:
+
+```bash
+au task done <id>                          # commit auto-detected via `git rev-parse --short HEAD`
+au task done <id> --commit abc1234         # override the detected commit
+au task done <id> --pr https://github.com/…/pull/42
+au task done <id> --unconfirmed            # force "closed without confirmation", even if a commit was detected
+```
+
+If nothing about the resolution can be determined and `--unconfirmed` isn't passed, the task
+still closes — just marked **closed without confirmation**, so the history never silently
+lies about how sure the record is.
 
 ### Acceptance Criteria
 
@@ -221,6 +271,8 @@ au task new "Implement auth" --project myapp --priority high \
 - **`memory_session`** accepts `tasks` parameter to link sessions to tasks, returns active tasks as hints
 - **`memory_recall`** includes tasks in search results
 - **`task_view`** aggregates the full work branch via BFS traversal
+- **`au judge --hook`** surfaces ripe tasks unprompted at the end of a turn — see
+  [Evidence and Ripening](#evidence-and-ripening)
 
 ---
 
@@ -290,6 +342,13 @@ au doc convert ./contracts -r      # convert a whole tree, cached by content has
 au doc recall "termination"        # search everything ever converted
 ```
 
+> **Removed:** `au sync` (the TimeForged connector — spec 007 found zero calls to it across
+> hooks and 19 repositories) and `au capture` (its calling hook was never wired into any
+> project) were pulled after a usage audit found no consumer for either. Both subcommands
+> still parse — calling one prints an explanation and what replaced it, and exits `1`, rather
+> than failing as an unknown-argument error. If a script of yours still calls `au sync` or
+> `au capture`, that script is dead weight: nothing downstream was reading their output either.
+
 ### Exit codes
 
 A caller has to tell "I called it wrong" from "the store is unreachable": the first is
@@ -333,6 +392,9 @@ Both doors take the same fields and share one parser: `au note --confidence …`
 
 ### Sync Commands
 
+Project sync (`identity`/`share`, below) — not the removed `au sync` TimeForged connector
+(see the CLI section's removal note).
+
 ```bash
 au identity set --name "Name" --email you@example.com          # once per machine
 
@@ -351,12 +413,34 @@ au share disable <project>         # stop syncing (local data kept)
 ```bash
 au task new "Title" -p myapp --priority high -c "Tests pass"
 au task list --project myapp --status active,blocked
-au task show <id>                  # full details with work log branch
+au task show <id>                  # full details with work log branch and three timestamps
 au task log <id> "Did X, Y, Z"    # record work (auto-activates)
-au task done <id>                  # mark complete
+au task ripe [--project myapp]     # tasks ripe to close, with evidence + what changed
+au task done <id>                  # mark complete; resolution assembled from traces
+au task done <id> --commit <sha> --pr <url>   # override/add to the detected resolution
+au task done <id> --unconfirmed    # force "closed without confirmation"
 au task block <id> "waiting on API keys"
-au task activate <id>              # resume blocked task
+au task activate <id>              # resume blocked task, demotes any other active task
+
+# called by the ulika verify hook, not by hand:
+au task evidence --project myapp --command "npm test" --exit 0 --artifact run.log
 ```
+
+### Secrets
+
+Aurelius stores where a secret lives, never the value. `--where` is checked for strings that
+look like the value itself (a key, a token, a connection string with credentials embedded) and
+the write is refused, with an explanation, when it matches.
+
+```bash
+au secret add --name STRIPE_SECRET_KEY --where "env:STRIPE_SECRET_KEY" \
+  --purpose "charge webhooks" --project myapp
+au secret list --project myapp     # coordinates only — values were never stored
+au secret rm STRIPE_SECRET_KEY --project myapp
+```
+
+Coordinates are returned on request only; they never appear in the memory snapshot or any
+other automatic dump.
 
 ### Backups
 
