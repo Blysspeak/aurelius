@@ -145,8 +145,7 @@ fn readable_evidence(data: &Value) -> Vec<EvidenceEntry> {
 /// именно эта подмена и была находкой 1 (Aurelius — один процесс на все
 /// проекты, CWD принадлежит тому, где его запустили, а не задаче).
 pub fn project_root(conn: &rusqlite::Connection, project: &str) -> Option<PathBuf> {
-    let node = crate::graph::find_project_by_label(conn, project).ok()??;
-    let path = node.data.get("path")?.as_str()?;
+    let path = crate::graph::find_project_path(conn, project).ok()??;
     Some(PathBuf::from(path))
 }
 
@@ -776,6 +775,30 @@ mod tests {
         let root = project_root(&conn, "proj-with-path");
 
         assert_eq!(root, Some(PathBuf::from("/repos/proj-with-path")));
+    }
+
+    /// В живой базе узлов проекта с одной меткой несколько: свой заводит
+    /// индексатор, свой — автосоздание при заведении задачи, и путь записан
+    /// не у каждого. Каталог надо искать среди тех, где он есть, иначе он
+    /// находится через раз — по порядку строк, — а от него зависит, соберутся
+    /// ли файлы в способ решения.
+    #[test]
+    fn project_root_skips_project_node_without_path() {
+        let (_tmp, conn) = setup();
+        crate::graph::add_node(
+            &conn,
+            crate::models::NodeType::Project,
+            "proj-twice",
+            None,
+            "test",
+            json!({}),
+        )
+        .expect("insert project without path");
+        seed_project_with_path(&conn, "proj-twice", "/repos/proj-twice");
+
+        let root = project_root(&conn, "proj-twice");
+
+        assert_eq!(root, Some(PathBuf::from("/repos/proj-twice")));
     }
 
     #[test]
