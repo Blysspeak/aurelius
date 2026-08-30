@@ -300,6 +300,14 @@ while the runner is still alive; `au task release` records the outcome. The gran
 single `UPDATE … RETURNING`, so two concurrent `claim` calls cannot land on the same
 task — not "unlikely", but structurally impossible.
 
+`claim` also honours the one-active-task-per-project rule the other two entry points
+(`au task activate`, MCP `task_update`) enforce: if the project already has a different
+active task, that one is evicted back to the queue first. The exception is an active task
+still under someone else's live lease — there `claim` declines instead, and the task it
+had just taken is rolled back untouched. Evicting would return that task to the pool
+while its lease still holds, so a third owner could claim it: one double-grant would be
+traded for another.
+
 ```bash
 au task claim --owner smena@host/123 --run 42 --lease-minutes 50   # take one machine-fit task
 au task renew --id <id> --owner smena@host/123 --lease-minutes 50  # keep the lease alive
@@ -309,10 +317,14 @@ au task give-up --id <id> --owner smena@host/123 \
   --why "needs a human decision"                                   # blocks, does not requeue
 ```
 
-`release --verdict done` only sticks when all three hold at once: the run exited zero, a
-green check postdates the moment the lease was taken, and every acceptance criterion has
-a recorded check — short of that, the task goes back to the queue with its attempt
-counter already incremented. `--verdict failed` always requeues and starts a cooldown. A
+`release --verdict done` closes the task through the same rule as `au task done` and the
+MCP `task_update`: it stamps the close time and assembles the resolution from traces of
+the work, and the `--evidence` text is kept as an ordinary run record, visible under
+`au task show`. It does **not** yet judge the verdict it is handed — the runner's word
+that the work is done is taken at face value. Gating the close on the run's exit code, on
+a green check postdating the lease, and on every acceptance criterion having a recorded
+check is designed but not implemented; until it is, that judgement lives in the driver
+that calls these commands. `--verdict failed` always requeues and starts a cooldown. A
 lease that simply expires is picked up again by the next `claim` the same way, attempts
 climbing each time; a task claimed three times without a `done` verdict drops out of
 `claim`'s selection instead of cycling through the queue forever. `give-up` is the one
