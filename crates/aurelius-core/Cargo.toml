@@ -13,6 +13,9 @@ workspace = true
 [package.repository]
 workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }

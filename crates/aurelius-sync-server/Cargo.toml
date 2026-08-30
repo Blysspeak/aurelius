@@ -13,6 +13,9 @@ workspace = true
 [package.repository]
 workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 name = "aurelius_sync_server"
 path = "src/lib.rs"
