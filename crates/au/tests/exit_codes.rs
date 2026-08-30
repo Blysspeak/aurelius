@@ -8,6 +8,10 @@
 //! Каждый тест работает в своём `AURELIUS_HOME`, поэтому настоящая база
 //! владельца не задета.
 
+// Интеграционный тест — весь файл рантайм-путём не является; unwrap/expect
+// здесь и есть сам способ проверки.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::io::Write;
 use std::process::{Command, Stdio};
 

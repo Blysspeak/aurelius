@@ -498,6 +498,7 @@ const RUNNABLE_COMMANDS: &[&str] = &[
 /// написания кода, — не из пользовательского ввода. Тот же приём, что в
 /// `probes.rs`: `.expect` здесь не бьёт по принципу III, потому что упасть
 /// он может только на опечатке в исходнике, а не на данных прогона.
+#[allow(clippy::expect_used)]
 fn re(pattern: &str) -> Regex {
     Regex::new(pattern).expect("статический регэксп гейтов fitness")
 }
