@@ -1,4 +1,3 @@
-mod capture;
 mod commands;
 mod view;
 
@@ -44,7 +43,11 @@ pub enum TaskAction {
         #[arg(long)]
         priority: Option<String>,
     },
-    /// Show full task details with work log branch
+    /// Show full task details with work log branch. Спека 007, FR-002:
+    /// печатает три времени (заведена/взята/закрыта), способ решения и
+    /// улики. Контракт `contracts/cli.md` называет её `au task view` —
+    /// алиас, а не переименование (принцип VI)
+    #[command(alias = "view")]
     Show {
         /// Task UUID or label
         id: String,
@@ -56,10 +59,25 @@ pub enum TaskAction {
         /// Description of work done
         text: String,
     },
-    /// Mark task as done
+    /// Mark task as done. Способ решения (спека 007, FR-004…006) собирается
+    /// из следов работы — коммит из состояния репозитория, файлы из
+    /// привязанных правок; флаги здесь только уточняют. Без сведений и без
+    /// `--unconfirmed` закрытие всё равно проходит, но помечается как
+    /// закрытое без подтверждения (FR-005)
     Done {
         /// Task UUID or label
         id: String,
+        /// Коммит, которым решена задача. При отсутствии система пытается
+        /// определить его сама (`git rev-parse --short HEAD`)
+        #[arg(long)]
+        commit: Option<String>,
+        /// Ссылка на запрос на слияние
+        #[arg(long = "pr")]
+        pull_request: Option<String>,
+        /// Явно пометить «закрыта без подтверждения», даже если что-то из
+        /// способа решения удалось определить самостоятельно
+        #[arg(long)]
+        unconfirmed: bool,
     },
     /// Block a task with a reason
     Block {
@@ -68,10 +86,50 @@ pub enum TaskAction {
         /// Reason for blocking
         reason: String,
     },
-    /// Activate a task (set status to active)
+    /// Activate a task (set status to active). Вытесняет прежнюю активную
+    /// задачу проекта в `backlog` — в проекте не более одной активной
+    /// (спека 007, FR-031)
     Activate {
         /// Task UUID or label
         id: String,
+    },
+    /// Привязать улику прогона к задаче (спека 007, FR-007…010). Зовётся
+    /// хуком ulika (`record-verify.mjs`), не человеком. Хук знает, в каком
+    /// проекте состоялся прогон, но не id активной задачи — поэтому вместо
+    /// `id` можно назвать `--project`: улика уйдёт активной задаче этого
+    /// проекта (FR-008, привязка без отдельного действия человека; FR-009,
+    /// не пересекает границу проекта — resolve строго по `data.project`)
+    Evidence {
+        /// Task UUID or label. Можно опустить, если задан `--project`
+        id: Option<String>,
+        /// Проект, чья активная задача получит улику — альтернатива `id`
+        #[arg(long)]
+        project: Option<String>,
+        /// Прогнанная команда
+        #[arg(long)]
+        command: String,
+        /// Код возврата прогона
+        #[arg(long)]
+        exit: i64,
+        /// Путь к артефакту прогона, если он есть
+        #[arg(long)]
+        artifact: Option<String>,
+        /// Печатать одну строку JSON вместо человекочитаемого текста
+        #[arg(long)]
+        json: bool,
+    },
+    /// Показать созревшие к закрытию задачи с основанием: какая улика, когда,
+    /// что изменено (спека 007, FR-011…013)
+    Ripe {
+        /// Filter by project
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+        /// Отклонить предложение закрыть эту задачу — не предъявлять снова,
+        /// пока по ней не появится новая правка (FR-015)
+        #[arg(long)]
+        decline: Option<String>,
     },
     /// Show task analytics (completion rate, avg duration, blocked, etc.)
     Stats {
@@ -166,6 +224,46 @@ pub enum TaskAction {
         project: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Координаты секретов (спека 007, US4). Хранится место, где лежит секрет —
+/// не сам секрет: FR-025 запрещает хранить значение в любом виде, включая
+/// зашифрованный.
+#[derive(Subcommand)]
+pub enum SecretAction {
+    /// Записать координату секрета. Строка `--where` проверяется на признаки
+    /// «похоже на само значение» (FR-026) — совпадение отклоняет запись с
+    /// кодом 1 и объяснением, какой признак сработал.
+    Add {
+        /// Имя секрета, например STRIPE_SECRET_KEY
+        #[arg(long)]
+        name: String,
+        /// Место хранения: переменная окружения, путь к файлу или запись в
+        /// менеджере паролей — НЕ само значение
+        #[arg(long = "where")]
+        location: String,
+        /// Назначение секрета человеческим языком
+        #[arg(long)]
+        purpose: Option<String>,
+        /// Проект, которому принадлежит секрет
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Показать записанные координаты — без значений, их здесь и не было
+    List {
+        /// Filter by project
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Удалить координату по имени
+    Rm {
+        /// Имя секрета
+        name: String,
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -329,7 +427,11 @@ enum Commands {
     },
     /// Search the knowledge graph
     Search { query: String },
-    /// Sync from all connectors (git, beads, timeforged, beacon)
+    /// Изъята (спека 007, US5, T047, `contracts/cli.md` §«Изымается»):
+    /// TimeForged-коннектор не имел ни одного вызова ни в хуках, ни в
+    /// журналах 19 репозиториев (разведка 30.08.2026). Подкоманда остаётся
+    /// разбираемой — старый вызов получает внятное сообщение и код 1, а не
+    /// ошибку разбора аргументов clap.
     Sync,
     /// Re-index current project (auto-detects project root)
     Reindex {
@@ -357,6 +459,11 @@ enum Commands {
     Task {
         #[command(subcommand)]
         action: TaskAction,
+    },
+    /// Координаты секретов проекта — место хранения, не значение (спека 007, US4)
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
     },
     /// Merge two duplicate nodes — rewires edges from source to target, deletes source
     Merge {
@@ -389,15 +496,14 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
-    /// Offer to save a measured fact right after a command returned data
-    /// (PostToolUse hook). Never writes anything itself — the command lands in
-    /// `evidence` and the decision stays with the caller.
+    /// Изъята (спека 007, US5, T046, `contracts/cli.md` §«Изымается»): хук,
+    /// который её звал, не подключён ни в одном проекте (разведка
+    /// 30.08.2026). Флаги ниже приняты только ради совместимости разбора —
+    /// подкоманда остаётся разбираемой, старый вызов получает внятное
+    /// сообщение об изъятии и код 1, а не ошибку разбора аргументов clap.
     Capture {
-        /// PostToolUse hook mode: read hook JSON from stdin, emit
-        /// additionalContext, never fail
         #[arg(long)]
         hook: bool,
-        /// Check one command by hand instead of reading a hook event
         #[arg(short, long, conflicts_with = "hook")]
         command: Option<String>,
     },
@@ -539,12 +645,19 @@ async fn run(cli: Cli) -> Result<()> {
             verbose,
         } => commands::context(&topic, depth, verbose).await,
         Commands::Search { query } => commands::search(&query).await,
-        Commands::Sync => commands::sync().await,
+        Commands::Sync => {
+            commands::removed(
+                "sync",
+                "TimeForged-коннектор не имел ни одного вызова ни в хуках, ни в журналах 19 репозиториев",
+            )
+            .await
+        }
         Commands::Reindex { path } => commands::reindex(path).await,
         Commands::View { port, no_open } => view::serve(port, no_open).await,
         Commands::Touch { path } => commands::touch(&path).await,
         Commands::Export => commands::export().await,
         Commands::Task { action } => commands::task(action).await,
+        Commands::Secret { action } => commands::secret(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,
         Commands::Trace {
@@ -554,7 +667,15 @@ async fn run(cli: Cli) -> Result<()> {
             exit_code,
             hook,
         } => commands::trace_cmd(kind, payload, session, exit_code, hook).await,
-        Commands::Capture { hook, command } => commands::capture_cmd(hook, command).await,
+        Commands::Capture { hook, command } => {
+            // Флаги старого вызова принимаются разбором (иначе это была бы
+            // ошибка разбора аргументов, которую запрещает T048), но здесь
+            // только называются в сообщении — команда ничего не делает.
+            let reason = format!(
+                "хук, который её звал, не подключён ни в одном проекте (--hook={hook}, --command={command:?})"
+            );
+            commands::removed("capture", &reason).await
+        }
         Commands::Judge { min_age, hook } => commands::judge_cmd(min_age, hook).await,
         Commands::Snapshot {
             project,

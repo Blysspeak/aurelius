@@ -12,8 +12,83 @@ pub use session::*;
 pub use snapshot::*;
 pub use traverse::*;
 
-use crate::models::{Edge, MemoryKind, Node};
+use crate::models::{Edge, MemoryKind, Node, NodeType, Relation};
 use chrono::Utc;
+use uuid::Uuid;
+
+/// Заводит узел прогона и связывает его с задачей ребром `verified_by`
+/// (спека 007, T013/T014, data-model.md «Ребро»). Улика внутри `data.evidence`
+/// задачи — для быстрого чтения без обхода графа; этот узел и ребро — для
+/// обратного пути: от прогона к задаче, которую он подтвердил.
+pub fn link_evidence_run(
+    conn: &rusqlite::Connection,
+    task_id: Uuid,
+    command: &str,
+    exit_code: i64,
+    artifact: Option<&str>,
+) -> anyhow::Result<Uuid> {
+    let label = format!("прогон: {command}");
+    let data = serde_json::json!({
+        "command": command,
+        "exit_code": exit_code,
+        "artifact": artifact,
+    });
+    let run = crud::add_node(
+        conn,
+        NodeType::Custom("run".to_owned()),
+        &label,
+        None,
+        "au-task-evidence",
+        data,
+    )?;
+    crud::add_edge(conn, task_id, run.id, Relation::VerifiedBy, 1.0)?;
+    Ok(run.id)
+}
+
+/// Заводит координату секрета — узел `Config` с признаком `kind: "secret_ref"`
+/// (спека 007, US4, T039, data-model.md). Значения секрета здесь нет ни в
+/// одном поле: вызывающий обязан прогнать `location` через
+/// `secret::detect_lookalike` до вызова — эта функция только пишет.
+///
+/// Метка следует соглашению задач: `[project] name`, если проект назван, иначе
+/// голое имя — так `typed_in_project` находит координату тем же механизмом
+/// области видимости, что и прочие типы узлов.
+pub fn add_secret_ref(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+    name: &str,
+    purpose: Option<&str>,
+    location: &str,
+) -> anyhow::Result<Node> {
+    let location_kind = crate::secret::infer_location_kind(location);
+    let label = match project {
+        Some(p) => format!("[{p}] {name}"),
+        None => name.to_owned(),
+    };
+    let data = serde_json::json!({
+        "kind": "secret_ref",
+        "name": name,
+        "purpose": purpose,
+        "location": location,
+        "location_kind": location_kind.as_str(),
+    });
+    crud::add_node(conn, NodeType::Config, &label, None, "au-secret", data)
+}
+
+/// Живые координаты секретов, свежие первыми. Область видимости — та же, что
+/// у `typed_in_project`: без `project` отдаёт координаты всех проектов.
+///
+/// Тип `Config` уже занят прочими настройками, поэтому фильтр по
+/// `data.kind == "secret_ref"` обязателен — иначе `au secret list` показал бы
+/// чужие конфигурационные узлы.
+pub fn list_secret_refs(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+) -> anyhow::Result<Vec<Node>> {
+    let mut nodes = search::typed_in_project(conn, &NodeType::Config, project, 500)?;
+    nodes.retain(|n| n.data.get("kind").and_then(|v| v.as_str()) == Some("secret_ref"));
+    Ok(nodes)
+}
 
 pub(crate) fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
     let memory_kind_str: String = row

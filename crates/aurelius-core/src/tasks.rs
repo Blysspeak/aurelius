@@ -1,0 +1,304 @@
+//! Типизированные поля задачи (спека 007, фаза 2): времена, способ решения и
+//! улики, которые сегодня лежат вперемешку с прочим в `Node.data` узла типа
+//! `Task` (`status`, `priority`, поля аренды из `graph::lease`).
+//!
+//! Схема БД не меняется (принцип I) — все поля ниже лишь новые ключи в том же
+//! `data`. Узел, заведённый до этой фичи, не содержит ни одного из них:
+//! [`TaskFields::from_data`] обязана прочитать такой узел без ошибки и отдать
+//! пустые поля (T005). Обратная запись — [`TaskFields::merge_into`] — обязана
+//! не терять посторонние ключи чужих модулей (T006): она стартует с исходной
+//! карты `data` и только перезаписывает свои шесть ключей.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Способ решения задачи (`data.resolution`), пишется при закрытии.
+/// `confirmed: false` — «закрыта без подтверждения»: способ решения неизвестен,
+/// и это записано явно, а не подразумевается пустотой (data-model.md).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Resolution {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+/// Одна улика прогона (элемент `data.evidence`).
+///
+/// `artifact_present` — `Option`, а не `bool`: улики, привязанные до проверки
+/// наличия файла (или до этой фичи вовсе), не обязаны иметь мнение на этот
+/// счёт. `None` значит «не проверялось», а не «файл есть».
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvidenceEntry {
+    pub command: String,
+    pub exit_code: i64,
+    pub at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_present: Option<bool>,
+}
+
+/// Все новые поля задачи из `data-model.md`, все опциональны. Задача без них
+/// — обычная задача, заведённая до этой фичи.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TaskFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<Resolution>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<EvidenceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_edit_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declined_ripe_at: Option<DateTime<Utc>>,
+}
+
+impl TaskFields {
+    /// Читает шесть полей из `Node.data`, игнорируя все остальные ключи,
+    /// которые там лежат (`status`, `priority`, `lease`, `attempts`, ...).
+    /// Узел без единого нового ключа даёт `TaskFields::default()` — не
+    /// ошибку (T005).
+    pub fn from_data(data: &Value) -> Self {
+        serde_json::from_value(data.clone()).unwrap_or_default()
+    }
+
+    /// Сливает свои шесть полей обратно в `data`, не трогая ничего постороннее
+    /// (T006). Работает всегда от исходной карты: значение, отсутствующее в
+    /// `self` (сериализация пропускает `None`/пустой `Vec` через
+    /// `skip_serializing_if`), просто не упоминается в патче и остаётся в
+    /// `data` тем, чем было.
+    ///
+    /// `data`, не являющийся объектом (пустой узел, миграция чего-то иного),
+    /// заменяется новым объектом целиком — терять посторонние ключи там
+    /// физически не из чего.
+    pub fn merge_into(&self, data: &Value) -> Value {
+        let mut map = match data {
+            Value::Object(m) => m.clone(),
+            _ => serde_json::Map::new(),
+        };
+        let patch = match serde_json::to_value(self) {
+            Ok(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        for (key, value) in patch {
+            map.insert(key, value);
+        }
+        Value::Object(map)
+    }
+}
+
+/// Возвращает улику, дающую созревание, если она есть — основание для
+/// предъявления (какая улика, когда). `None` значит «не созрела».
+///
+/// Условия созревания (data-model.md, «Производное состояние: созревшая»),
+/// все четыре разом:
+/// 1. `status == "active"`;
+/// 2. есть `last_edit_at`;
+/// 3. в `evidence` есть элемент с `exit_code == 0` и `at` позже `last_edit_at`;
+/// 4. `declined_ripe_at` отсутствует или старше `last_edit_at`.
+///
+/// Состояние не хранится — вычисляется каждый раз из уже прочитанных полей.
+pub fn ripe_evidence<'a>(fields: &'a TaskFields, status: &str) -> Option<&'a EvidenceEntry> {
+    if status != "active" {
+        return None;
+    }
+    let last_edit_at = fields.last_edit_at?;
+    if let Some(declined_at) = fields.declined_ripe_at {
+        if declined_at >= last_edit_at {
+            return None;
+        }
+    }
+    fields
+        .evidence
+        .iter()
+        .filter(|e| e.exit_code == 0 && e.at > last_edit_at)
+        .max_by_key(|e| e.at)
+}
+
+/// `true`, если задача созрела к закрытию — см. [`ripe_evidence`].
+pub fn is_ripe(fields: &TaskFields, status: &str) -> bool {
+    ripe_evidence(fields, status).is_some()
+}
+
+/// Помечает `artifact_present: false` у улик, чей файл артефакта больше не
+/// найден на диске: команда, код возврата и время — не трогаются, честно
+/// сохраняется только утрата ссылки (T021d, FR-010). Улики без пути к
+/// артефакту не трогает — им нечего проверять.
+pub fn refresh_artifact_presence(evidence: &mut [EvidenceEntry]) {
+    for entry in evidence.iter_mut() {
+        if let Some(path) = &entry.artifact {
+            entry.artifact_present = Some(std::path::Path::new(path).exists());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// T005: узел задачи, созданный до фичи (без новых ключей), читается без
+    /// ошибки и даёт пустые поля.
+    #[test]
+    fn from_data_reads_legacy_node_without_error() {
+        let data = json!({
+            "status": "backlog",
+            "priority": "high",
+        });
+
+        let fields = TaskFields::from_data(&data);
+
+        assert_eq!(fields, TaskFields::default());
+    }
+
+    /// T006: запись новых полей не затирает посторонние ключи в `data` —
+    /// ни известный (`priority`), ни произвольный, о котором этот модуль
+    /// ничего не знает.
+    #[test]
+    fn merge_into_preserves_foreign_keys() {
+        let data = json!({
+            "status": "active",
+            "priority": "critical",
+            "custom_key_from_another_module": {"nested": true},
+        });
+
+        let mut fields = TaskFields::from_data(&data);
+        fields.last_edit_at = Some("2026-08-30T09:00:00Z".parse().expect("rfc3339"));
+
+        let merged = fields.merge_into(&data);
+
+        assert_eq!(merged["status"], "active");
+        assert_eq!(merged["priority"], "critical");
+        assert_eq!(merged["custom_key_from_another_module"]["nested"], true);
+        assert_eq!(merged["last_edit_at"], "2026-08-30T09:00:00Z");
+    }
+
+    fn evidence(command: &str, exit_code: i64, at: &str) -> EvidenceEntry {
+        EvidenceEntry {
+            command: command.to_owned(),
+            exit_code,
+            at: at.parse().expect("rfc3339"),
+            artifact: None,
+            artifact_present: None,
+        }
+    }
+
+    /// T022: улика старше последней правки не даёт созревания.
+    #[test]
+    fn evidence_older_than_last_edit_is_not_ripe() {
+        let fields = TaskFields {
+            last_edit_at: Some("2026-08-30T10:00:00Z".parse().expect("rfc3339")),
+            evidence: vec![evidence("cargo test", 0, "2026-08-30T09:00:00Z")],
+            ..Default::default()
+        };
+
+        assert!(!is_ripe(&fields, "active"));
+    }
+
+    /// T023: улика с ненулевым кодом возврата не даёт созревания.
+    #[test]
+    fn evidence_with_nonzero_exit_code_is_not_ripe() {
+        let fields = TaskFields {
+            last_edit_at: Some("2026-08-30T09:00:00Z".parse().expect("rfc3339")),
+            evidence: vec![evidence("cargo test", 1, "2026-08-30T10:00:00Z")],
+            ..Default::default()
+        };
+
+        assert!(!is_ripe(&fields, "active"));
+    }
+
+    /// T024: после отказа задача не предъявляется повторно, пока не появится
+    /// новая правка — но появление новой правки после отказа возвращает
+    /// созревание (условие 4 из data-model.md).
+    #[test]
+    fn declined_ripe_blocks_until_new_edit() {
+        let mut fields = TaskFields {
+            last_edit_at: Some("2026-08-30T09:00:00Z".parse().expect("rfc3339")),
+            evidence: vec![evidence("cargo test", 0, "2026-08-30T10:00:00Z")],
+            declined_ripe_at: Some("2026-08-30T10:05:00Z".parse().expect("rfc3339")),
+            ..Default::default()
+        };
+        assert!(!is_ripe(&fields, "active"));
+
+        // Новая правка после отказа — предложение снова уместно.
+        fields.last_edit_at = Some("2026-08-30T11:00:00Z".parse().expect("rfc3339"));
+        fields.evidence = vec![evidence("cargo test", 0, "2026-08-30T11:30:00Z")];
+        assert!(is_ripe(&fields, "active"));
+    }
+
+    #[test]
+    fn not_ripe_when_status_is_not_active() {
+        let fields = TaskFields {
+            last_edit_at: Some("2026-08-30T09:00:00Z".parse().expect("rfc3339")),
+            evidence: vec![evidence("cargo test", 0, "2026-08-30T10:00:00Z")],
+            ..Default::default()
+        };
+
+        assert!(!is_ripe(&fields, "backlog"));
+    }
+
+    #[test]
+    fn not_ripe_without_last_edit_at() {
+        let fields = TaskFields {
+            evidence: vec![evidence("cargo test", 0, "2026-08-30T10:00:00Z")],
+            ..Default::default()
+        };
+
+        assert!(!is_ripe(&fields, "active"));
+    }
+
+    /// T021d: файл артефакта отсутствует — помечается `artifact_present:
+    /// false`, команда, код возврата и время не трогаются.
+    #[test]
+    fn refresh_artifact_presence_marks_missing_file() {
+        let mut evidence = vec![EvidenceEntry {
+            command: "cargo test --workspace".to_owned(),
+            exit_code: 0,
+            at: "2026-08-30T09:14:22Z".parse().expect("rfc3339"),
+            artifact: Some("does/not/exist-on-disk.log".to_owned()),
+            artifact_present: Some(true),
+        }];
+
+        refresh_artifact_presence(&mut evidence);
+
+        assert_eq!(evidence[0].artifact_present, Some(false));
+        assert_eq!(evidence[0].command, "cargo test --workspace");
+        assert_eq!(evidence[0].exit_code, 0);
+        assert_eq!(
+            evidence[0].at,
+            "2026-08-30T09:14:22Z"
+                .parse::<DateTime<Utc>>()
+                .expect("rfc3339")
+        );
+    }
+
+    #[test]
+    fn refresh_artifact_presence_marks_existing_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("aurelius-tasks-test-{}.log", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"ok").expect("write temp artifact");
+
+        let mut evidence = vec![EvidenceEntry {
+            command: "cargo test".to_owned(),
+            exit_code: 0,
+            at: Utc::now(),
+            artifact: Some(path.to_string_lossy().into_owned()),
+            artifact_present: None,
+        }];
+
+        refresh_artifact_presence(&mut evidence);
+
+        assert_eq!(evidence[0].artifact_present, Some(true));
+
+        std::fs::remove_file(&path).expect("cleanup temp artifact");
+    }
+}

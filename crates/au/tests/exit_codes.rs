@@ -519,6 +519,97 @@ fn claim_on_locked_database_reports_lease_busy() {
     );
 }
 
+/// T016 (спека 007): `au task evidence` с несуществующей задачей — внятный
+/// код возврата, а не паника разбора `Uuid`/поиска по графу.
+#[test]
+fn evidence_on_missing_task_is_a_usage_error() {
+    let home = TmpHome::dir("evidence-missing");
+    let (code, out) = run(
+        &home,
+        &[
+            "task",
+            "evidence",
+            "нет такой задачи",
+            "--command",
+            "cargo test --workspace",
+            "--exit",
+            "0",
+        ],
+        None,
+    );
+    assert_eq!(
+        code, USAGE,
+        "отсутствующая задача — ошибка вызова, не паника: {out}"
+    );
+}
+
+/// T043 (спека 007, US4, FR-026): `--where`, похожий на само значение ключа,
+/// отклоняется с кодом вызова, а не создаёт узел молча.
+#[test]
+fn secret_add_rejects_key_lookalike_and_creates_no_node() {
+    let home = TmpHome::dir("secret-lookalike");
+    let (code, out) = run(
+        &home,
+        &[
+            "secret",
+            "add",
+            "--name",
+            "TEST_KEY",
+            "--where",
+            "sk-proj-abc123def456ghi789jkl012mno345",
+            "--project",
+            "aurelius",
+        ],
+        None,
+    );
+    assert_eq!(
+        code, USAGE,
+        "похожая на ключ координата — ошибка вызова: {out}"
+    );
+
+    let (list_code, list_out) = run(
+        &home,
+        &["secret", "list", "--project", "aurelius", "--json"],
+        None,
+    );
+    assert_eq!(list_code, 0, "список читается даже без единой записи");
+    let refs: serde_json::Value = serde_json::from_str(list_out.trim()).expect("JSON списка");
+    assert_eq!(
+        refs,
+        serde_json::json!([]),
+        "отклонённая запись не должна была создать узел: {list_out}"
+    );
+}
+
+/// T050 (спека 007, US5): изъятые `au sync`/`au capture` остаются
+/// разбираемыми подкомандами clap (старые флаги `capture` тоже проходят
+/// разбор) и отвечают кодом 1 с внятным сообщением об изъятии — а не
+/// generic-ошибкой разбора аргументов и не молчаливым успехом.
+#[test]
+fn removed_commands_report_usage_error_with_a_clear_message() {
+    let home = TmpHome::dir("removed");
+
+    let (code, out) = run(&home, &["sync"], None);
+    assert_eq!(code, USAGE, "au sync изъята — ошибка вызова: {out}");
+
+    let (code, _) = run(&home, &["capture", "--hook"], None);
+    assert_eq!(
+        code, USAGE,
+        "au capture изъята даже со старыми флагами — ошибка вызова, не паника разбора"
+    );
+
+    let mut cmd = au(&home, &["sync"]);
+    let output = cmd
+        .stdin(Stdio::null())
+        .output()
+        .expect("запустить au sync");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("изъята"),
+        "сообщение обязано объяснять изъятие, а не молчать: {stderr}"
+    );
+}
+
 /// Тело секции markdown-снапшота по её заголовку.
 fn section<'a>(snapshot: &'a str, title: &str) -> &'a str {
     let Some(start) = snapshot.find(&format!("## {title}")) else {

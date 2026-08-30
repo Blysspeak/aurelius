@@ -3,12 +3,14 @@ use aurelius_core::{
     db, graph, identity, indexer,
     models::{MemoryKind, NodeType, Relation},
     provenance::{self, Provenance, Resolution},
-    timeforged,
+    tasks as task_fields, trace as task_trace,
 };
 use serde_json::json;
 use std::path::PathBuf;
 
-use crate::{DbAction, DocAction, HomeAction, IdentityAction, ShareAction, TaskAction};
+use crate::{
+    DbAction, DocAction, HomeAction, IdentityAction, SecretAction, ShareAction, TaskAction,
+};
 
 use aurelius_core::db::db_path;
 
@@ -721,41 +723,13 @@ pub async fn search(query: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn sync() -> Result<()> {
-    let conn = db::open(&db_path())?;
-
-    println!("Syncing connectors...");
-
-    // TimeForged connector
-    let since = chrono::Utc::now() - chrono::Duration::days(7);
-    let tf = timeforged::TimeForgedConnector::new(since);
-
-    use aurelius_core::connector::Connector;
-    match tf.pull().await {
-        Ok(events) => {
-            if events.is_empty() {
-                println!("  timeforged — no new events");
-            } else {
-                match timeforged::sync_events(&conn, &events) {
-                    Ok(result) => {
-                        println!(
-                            "  timeforged — {} sessions, {} projects, {} languages",
-                            result.sessions, result.projects, result.languages
-                        );
-                    }
-                    Err(e) => println!("  timeforged — sync error: {e}"),
-                }
-            }
-        }
-        Err(e) => println!("  timeforged — offline ({e})"),
-    }
-
-    // TODO: git, beads, beacon connectors
-    println!("  git        — TODO");
-    println!("  beads      — TODO");
-    println!("  beacon     — TODO");
-
-    Ok(())
+/// Т045-Т048 (US5, спека 007, `contracts/cli.md` §«Изымается»): точка входа
+/// для изъятых команд. `au sync`/`au capture` остаются разбираемыми
+/// подкомандами clap — старый вызов получает это сообщение и код 1
+/// (классифицируется как ошибка вызова, см. `main::classify`), а не
+/// generic-ошибку разбора аргументов, которую дал бы неизвестный сабкоманд.
+pub async fn removed(name: &str, reason: &str) -> Result<()> {
+    anyhow::bail!("`au {name}` изъята: {reason}. См. specs/007-task-evidence-loop/contracts/cli.md")
 }
 
 pub async fn reindex(path: Option<String>) -> Result<()> {
@@ -910,7 +884,16 @@ pub async fn task(action: TaskAction) -> Result<()> {
                     "cancelled" => "✗",
                     _ => "○",
                 };
-                println!("  {icon} [{pri}] {} — {st}", t.label);
+                // T021b: помечаем созревшие — предъявление не ждёт вопроса
+                // человека (FR-012), список задач не должен врать о том, что
+                // уже готово к закрытию.
+                let ripe_mark =
+                    if task_fields::is_ripe(&task_fields::TaskFields::from_data(&t.data), st) {
+                        " 🟢 ready-to-close"
+                    } else {
+                        ""
+                    };
+                println!("  {icon} [{pri}] {} — {st}{ripe_mark}", t.label);
                 println!("    id: {}", t.id);
                 if let Some(created_by) = &t.created_by {
                     print!("    by: {created_by}");
@@ -941,6 +924,20 @@ pub async fn task(action: TaskAction) -> Result<()> {
             println!("  ID:       {}", task.id);
             println!("  Status:   {st}");
             println!("  Priority: {pri}");
+
+            // T021b/FR-001/FR-002: три времени, всегда все три — незаполненное
+            // печатается явным прочерком, а не молчанием.
+            let fields = task_fields::TaskFields::from_data(&task.data);
+            let fmt_time = |t: Option<chrono::DateTime<chrono::Utc>>| {
+                t.map(|t| t.to_rfc3339()).unwrap_or_else(|| "—".to_owned())
+            };
+            println!("  Заведена: {}", task.created_at.to_rfc3339());
+            println!("  Взята:    {}", fmt_time(fields.activated_at));
+            println!("  Закрыта:  {}", fmt_time(fields.closed_at));
+            if task_fields::is_ripe(&fields, st) {
+                println!("  🟢 Созрела к закрытию — есть зелёная улика свежее правки");
+            }
+
             if let Some(created_by) = &task.created_by {
                 println!("  Created by: {created_by}");
             }
@@ -949,6 +946,43 @@ pub async fn task(action: TaskAction) -> Result<()> {
             }
             if let Some(note) = &task.note {
                 println!("  Note:     {note}");
+            }
+
+            if let Some(resolution) = &fields.resolution {
+                println!("\n  Способ решения:");
+                if let Some(commit) = &resolution.commit {
+                    println!("    коммит: {commit}");
+                }
+                if let Some(pr) = &resolution.pull_request {
+                    println!("    PR: {pr}");
+                }
+                if !resolution.files.is_empty() {
+                    println!("    файлы: {}", resolution.files.join(", "));
+                }
+                println!(
+                    "    подтверждено: {}",
+                    if resolution.confirmed {
+                        "да"
+                    } else {
+                        "нет"
+                    }
+                );
+            }
+            if !fields.evidence.is_empty() {
+                println!("\n  Улики ({}):", fields.evidence.len());
+                for e in &fields.evidence {
+                    let artifact = match (&e.artifact, e.artifact_present) {
+                        (Some(path), Some(false)) => format!(" [{path} — утрачен]"),
+                        (Some(path), _) => format!(" [{path}]"),
+                        (None, _) => String::new(),
+                    };
+                    println!(
+                        "    {} → exit {} @ {}{artifact}",
+                        e.command,
+                        e.exit_code,
+                        e.at.to_rfc3339()
+                    );
+                }
             }
 
             // Acceptance criteria
@@ -1049,13 +1083,31 @@ pub async fn task(action: TaskAction) -> Result<()> {
             println!("✓ Logged work on: {}", task.label);
         }
 
-        TaskAction::Done { id } => {
+        TaskAction::Done {
+            id,
+            commit,
+            pull_request,
+            unconfirmed,
+        } => {
             let task = find_task(&conn, &id)?;
             let mut data = task.data.clone();
             data["status"] = json!("done");
+            // Легаси-поле: читатели до этой фичи ждут именно его.
             data["completed_at"] = json!(chrono::Utc::now().to_rfc3339());
+
+            let mut fields = task_fields::TaskFields::from_data(&data);
+            let since = fields.activated_at.unwrap_or(task.created_at);
+            let resolution = build_resolution(&conn, since, commit, pull_request, unconfirmed);
+            let confirmed = resolution.confirmed;
+            fields.closed_at = Some(chrono::Utc::now());
+            fields.resolution = Some(resolution);
+            let data = fields.merge_into(&data);
+
             graph::update_node(&conn, task.id, None, Some(data))?;
             println!("✓ Task done: {}", task.label);
+            if !confirmed {
+                println!("  ⚠ закрыта без подтверждения — способ решения неизвестен (FR-005)");
+            }
         }
 
         TaskAction::Block { id, reason } => {
@@ -1069,14 +1121,134 @@ pub async fn task(action: TaskAction) -> Result<()> {
 
         TaskAction::Activate { id } => {
             let task = find_task(&conn, &id)?;
+            let project = task
+                .data
+                .get("project")
+                .and_then(|p| p.as_str())
+                .unwrap_or("unknown")
+                .to_owned();
+
+            // T008/FR-031: в проекте не более одной активной задачи —
+            // взятие этой снимает прежнюю активную того же проекта.
+            let evicted = graph::evict_active(&conn, &project, task.id)?;
+
             let mut data = task.data.clone();
             data["status"] = json!("active");
             if data.get("started_at").and_then(|s| s.as_str()).is_none() {
                 data["started_at"] = json!(chrono::Utc::now().to_rfc3339());
             }
             data.as_object_mut().map(|o| o.remove("blocked_by"));
+
+            // FR-001/FR-021c: пишем новое время взятия в работу, не трогая
+            // `closed_at`/`resolution` — при переоткрытии они остаются
+            // историей, а не стираются.
+            let mut fields = task_fields::TaskFields::from_data(&data);
+            fields.activated_at = Some(chrono::Utc::now());
+            let data = fields.merge_into(&data);
+
             graph::update_node(&conn, task.id, None, Some(data))?;
             println!("▶ Task activated: {}", task.label);
+            // T009: молчаливое вытеснение выглядит как потеря задачи.
+            if let Some(evicted) = evicted {
+                println!(
+                    "  ↩ вытеснена в backlog: {} [{}]",
+                    evicted.label, evicted.id
+                );
+            }
+        }
+
+        TaskAction::Evidence {
+            id,
+            project,
+            command,
+            exit,
+            artifact,
+            json: as_json,
+        } => {
+            // FR-008/FR-009: без явного id улика уходит активной задаче
+            // НАЗВАННОГО проекта — не угадываем проект по текущему каталогу,
+            // как это делает `trace --hook`, потому что вызывающий (хук
+            // ulika) знает свой проект точно, а закрытие ошибкой при
+            // отсутствии активной задачи здесь уместно: явного вызова
+            // человека тут нет, но и молчать о непривязанной улике нельзя.
+            let task = match (&id, &project) {
+                (Some(id), _) => find_task(&conn, id)?,
+                (None, Some(project)) => {
+                    let mut active =
+                        graph::get_tasks_filtered(&conn, Some(project), Some("active"), None, 1)?;
+                    active.pop().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "в проекте '{project}' нет активной задачи — улику не к чему привязать"
+                        )
+                    })?
+                }
+                (None, None) => {
+                    anyhow::bail!("нужно указать задачу либо --project с активной задачей")
+                }
+            };
+            let at = chrono::Utc::now();
+            let artifact_present = artifact
+                .as_deref()
+                .map(|p| std::path::Path::new(p).exists());
+
+            let mut fields = task_fields::TaskFields::from_data(&task.data);
+            fields.evidence.push(task_fields::EvidenceEntry {
+                command: command.clone(),
+                exit_code: exit,
+                at,
+                artifact: artifact.clone(),
+                artifact_present,
+            });
+            let data = fields.merge_into(&task.data);
+            graph::update_node(&conn, task.id, None, Some(data))?;
+            let run_id =
+                graph::link_evidence_run(&conn, task.id, &command, exit, artifact.as_deref())?;
+
+            if as_json {
+                let out = json!({
+                    "id": task.id.to_string(),
+                    "run_id": run_id.to_string(),
+                    "command": command,
+                    "exit_code": exit,
+                });
+                println!("{}", serde_json::to_string(&out)?);
+            } else {
+                println!(
+                    "✓ Улика привязана: {} → {command} (exit {exit})",
+                    task.label
+                );
+            }
+        }
+
+        TaskAction::Ripe {
+            project,
+            json: as_json,
+            decline,
+        } => {
+            if let Some(id) = decline {
+                let task = find_task(&conn, &id)?;
+                let mut fields = task_fields::TaskFields::from_data(&task.data);
+                fields.declined_ripe_at = Some(chrono::Utc::now());
+                let data = fields.merge_into(&task.data);
+                graph::update_node(&conn, task.id, None, Some(data))?;
+                println!(
+                    "Отказ зафиксирован: {} — не предъявится снова без новой правки (FR-015)",
+                    task.label
+                );
+                return Ok(());
+            }
+
+            let ripe = gather_ripe(&conn, project.as_deref())?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&ripe_to_json(&ripe))?);
+            } else if ripe.is_empty() {
+                println!("Созревших задач нет.");
+            } else {
+                println!("{} задач(и) созрели к закрытию:", ripe.len());
+                for r in &ripe {
+                    print_ripe_entry(r);
+                }
+            }
         }
 
         TaskAction::Stats {
@@ -1244,6 +1416,114 @@ pub async fn task(action: TaskAction) -> Result<()> {
                     );
                 } else {
                     println!("✓ Вердикт поставлен: {task_id} — {fitness_verdict} ({why})");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Координаты секретов (спека 007, US4, T040): `au secret add / list / rm`.
+/// FR-025 запрещает хранить значение — `Add` прогоняет `--where` через
+/// `secret::detect_lookalike` (T041) ДО записи; попадание отклоняет вызов с
+/// объяснением, какой признак сработал (FR-026), обычной ошибкой (код 1),
+/// а не паникой.
+pub async fn secret(action: SecretAction) -> Result<()> {
+    let conn = open_and_ensure(&db_path())?;
+
+    match action {
+        SecretAction::Add {
+            name,
+            location,
+            purpose,
+            project,
+        } => {
+            if let Some(hit) = aurelius_core::secret::detect_lookalike(&location) {
+                anyhow::bail!(
+                    "координата отклонена: {} — исправь --where на место хранения, а не сам секрет",
+                    hit.explain()
+                );
+            }
+            let node = graph::add_secret_ref(
+                &conn,
+                project.as_deref(),
+                &name,
+                purpose.as_deref(),
+                &location,
+            )?;
+            let kind = node
+                .data
+                .get("location_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            println!("✓ Координата записана: {name} ({kind})");
+            if let Some(p) = &purpose {
+                println!("  назначение: {p}");
+            }
+            println!("  место: {location}");
+        }
+
+        SecretAction::List {
+            project,
+            json: as_json,
+        } => {
+            let refs = graph::list_secret_refs(&conn, project.as_deref())?;
+            if as_json {
+                let out: Vec<_> = refs
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "name": n.data.get("name"),
+                            "purpose": n.data.get("purpose"),
+                            "location": n.data.get("location"),
+                            "location_kind": n.data.get("location_kind"),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else if refs.is_empty() {
+                println!("Координат нет.");
+            } else {
+                println!("{} координат(ы):", refs.len());
+                for n in &refs {
+                    let name = n.data.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let kind = n
+                        .data
+                        .get("location_kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let location = n
+                        .data
+                        .get("location")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    println!("  {name} [{kind}]");
+                    if let Some(purpose) = n.data.get("purpose").and_then(|v| v.as_str()) {
+                        println!("    назначение: {purpose}");
+                    }
+                    println!("    место: {location}");
+                }
+            }
+        }
+
+        SecretAction::Rm { name, project } => {
+            let matches: Vec<_> = graph::list_secret_refs(&conn, project.as_deref())?
+                .into_iter()
+                .filter(|n| n.data.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+                .collect();
+            match matches.len() {
+                0 => anyhow::bail!("координата '{name}' не найдена"),
+                1 => {
+                    graph::delete_node(&conn, matches[0].id)?;
+                    println!("✓ Координата удалена: {name}");
+                }
+                _ => {
+                    let labels: Vec<_> = matches.iter().map(|n| n.label.as_str()).collect();
+                    anyhow::bail!(
+                        "имя '{name}' неоднозначно без --project: {}",
+                        labels.join(", ")
+                    );
                 }
             }
         }
@@ -1459,6 +1739,141 @@ fn find_task(conn: &rusqlite::Connection, id: &str) -> Result<aurelius_core::mod
         .ok_or_else(|| anyhow::anyhow!("task not found: {id}"))
 }
 
+/// Коммит, которым решается задача, если способ решения не назвали флагом
+/// (T021a, FR-006): `git rev-parse --short HEAD` в текущем каталоге. `None`,
+/// если это не git-репозиторий или команда недоступна — не повод отказать в
+/// закрытии, только не сможем назвать коммит.
+fn current_commit_sha() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// Собирает способ решения из следов работы (T021a, FR-004…006): коммит — из
+/// состояния репозитория, если не назван флагом; файлы — из правок,
+/// привязанных хуком `au trace --hook` с момента взятия задачи в работу.
+/// Флаги (`--commit`, `--pr`) уточняют, а не единственный источник (FR-006:
+/// не спрашивать у человека то, что система уже знает). `--unconfirmed`
+/// форсирует пометку «без подтверждения»; без него она ставится сама, когда
+/// следов не нашлось ни одного (FR-005).
+fn build_resolution(
+    conn: &rusqlite::Connection,
+    since: chrono::DateTime<chrono::Utc>,
+    commit: Option<String>,
+    pull_request: Option<String>,
+    unconfirmed: bool,
+) -> task_fields::Resolution {
+    let commit = commit.or_else(current_commit_sha);
+    let files = task_trace::files_edited_since(conn, since.timestamp()).unwrap_or_default();
+    let confirmed =
+        !unconfirmed && (commit.is_some() || pull_request.is_some() || !files.is_empty());
+    task_fields::Resolution {
+        commit,
+        pull_request,
+        files,
+        confirmed,
+    }
+}
+
+/// Одна созревшая задача с основанием предъявления (T018, FR-013): какая
+/// улика, когда, что изменено.
+struct RipeReport {
+    id: uuid::Uuid,
+    label: String,
+    evidence: task_fields::EvidenceEntry,
+    files: Vec<String>,
+}
+
+/// Собирает созревшие задачи проекта (`None` — по всем проектам). Общая
+/// точка для `au task ripe` (T018) и блока в `au judge --hook` (T019) — одно
+/// вычисление, разные форматтеры вывода.
+fn gather_ripe(conn: &rusqlite::Connection, project: Option<&str>) -> Result<Vec<RipeReport>> {
+    let active = graph::get_tasks_filtered(conn, project, Some("active"), None, 200)?;
+    let mut out = Vec::new();
+    for t in active {
+        let fields = task_fields::TaskFields::from_data(&t.data);
+        let Some(evidence) = task_fields::ripe_evidence(&fields, "active") else {
+            continue;
+        };
+        let since = fields.activated_at.unwrap_or(t.created_at);
+        let files = task_trace::files_edited_since(conn, since.timestamp()).unwrap_or_default();
+        out.push(RipeReport {
+            id: t.id,
+            label: t.label.clone(),
+            evidence: evidence.clone(),
+            files,
+        });
+    }
+    Ok(out)
+}
+
+fn ripe_to_json(ripe: &[RipeReport]) -> serde_json::Value {
+    json!(ripe
+        .iter()
+        .map(|r| json!({
+            "id": r.id.to_string(),
+            "label": r.label,
+            "evidence": {
+                "command": r.evidence.command,
+                "exit_code": r.evidence.exit_code,
+                "at": r.evidence.at.to_rfc3339(),
+                "artifact": r.evidence.artifact,
+            },
+            "files": r.files,
+        }))
+        .collect::<Vec<_>>())
+}
+
+fn print_ripe_entry(r: &RipeReport) {
+    println!("  🟢 {} [{}]", r.label, r.id);
+    println!(
+        "     улика: {} → exit {} @ {}",
+        r.evidence.command,
+        r.evidence.exit_code,
+        r.evidence.at.to_rfc3339()
+    );
+    if r.files.is_empty() {
+        println!("     изменено: (список правок недоступен)");
+    } else {
+        println!("     изменено: {}", r.files.join(", "));
+    }
+}
+
+/// Блок для `au judge --hook` (T019, FR-012): печатается только когда есть
+/// что предъявить — молчание не хуже шума по пустому месту, а лишний вопрос
+/// без созревших задач был бы именно шумом.
+fn format_ripe_hook_block(ripe: &[RipeReport]) -> Option<String> {
+    if ripe.is_empty() {
+        return None;
+    }
+    let mut out = format!("### Созревшие задачи ({})\n", ripe.len());
+    for r in ripe {
+        out.push_str(&format!(
+            "- {} [{}] — улика: {} → exit {} @ {}",
+            r.label,
+            r.id,
+            r.evidence.command,
+            r.evidence.exit_code,
+            r.evidence.at.to_rfc3339()
+        ));
+        if !r.files.is_empty() {
+            out.push_str(&format!("; изменено: {}", r.files.join(", ")));
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
 /// Print the skill index. Plain text by default; with `hook=true` emits the
 /// Claude Code SessionStart hook JSON that injects the index into context.
 pub async fn skills(hook: bool) -> Result<()> {
@@ -1628,6 +2043,25 @@ pub async fn trace_cmd(
                     state_hash_post: hash_post,
                 },
             )?;
+
+            // T012/FR-032: правка кода привязывается к активной задаче
+            // текущего проекта. Активной нет — ничего не делаем, не
+            // угадываем: хук не имеет права мешать работе, а неверная
+            // привязка хуже отсутствующей.
+            if matches!(kind, TraceKind::FileEdit) {
+                if let Some(project) = current_dir_name() {
+                    if let Ok(mut active) =
+                        graph::get_tasks_filtered(&conn, Some(&project), Some("active"), None, 1)
+                    {
+                        if let Some(task) = active.pop() {
+                            let mut fields = task_fields::TaskFields::from_data(&task.data);
+                            fields.last_edit_at = Some(chrono::Utc::now());
+                            let data = fields.merge_into(&task.data);
+                            let _ = graph::update_node(&conn, task.id, None, Some(data));
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -1661,51 +2095,6 @@ pub async fn trace_cmd(
     }
 }
 
-/// Поймать момент открытия: команда только что вернула данные о мире — предложить
-/// сохранить это как измеренный факт, положив саму команду в `evidence`.
-///
-/// Ничего не пишет. `--hook` печатает Claude-JSON с `additionalContext` и всегда
-/// выходит с нулём: хук не имеет права мешать работе.
-pub async fn capture_cmd(hook: bool, command: Option<String>) -> Result<()> {
-    use crate::capture;
-
-    if hook {
-        let mut raw = String::new();
-        if std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw).is_err() {
-            return Ok(());
-        }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            return Ok(());
-        };
-        if let Some(catch) = capture::from_hook_event(&event) {
-            println!(
-                "{}",
-                json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PostToolUse",
-                        "additionalContext": capture::suggestion(&catch),
-                    }
-                })
-            );
-        }
-        return Ok(());
-    }
-
-    let command = command.ok_or_else(|| anyhow::anyhow!("нужен --command или --hook"))?;
-    match capture::classify(&command) {
-        Some(tool) => {
-            let catch = capture::Catch {
-                tool,
-                command,
-                lines: 0,
-            };
-            println!("{}", capture::suggestion(&catch));
-        }
-        None => println!("не добыча данных — предлагать нечего"),
-    }
-    Ok(())
-}
-
 /// Полная Stop-цепочка «Бит-и-Дело»: судья исхода (ступень 4) → обязательства
 /// из следов сессии: гашение погашающими событиями и intake комиссивов
 /// (ступень 6) → клиринг гроссбуха (ступень 5). `--hook` — режим Stop-хука:
@@ -1713,7 +2102,7 @@ pub async fn capture_cmd(hook: bool, command: Option<String>) -> Result<()> {
 pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
     use aurelius_core::{differ, ledger, obligations};
 
-    let run = || -> Result<differ::JudgeStats> {
+    let run = || -> Result<(differ::JudgeStats, Vec<RipeReport>)> {
         let conn = db::open(&db_path())?;
         // 4. Судья закрывает созревшие окна и реконсолидирует узлы.
         let stats = differ::close_ripe_windows(&conn, min_age_secs)?;
@@ -1758,16 +2147,27 @@ pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
         for s in &sessions {
             let _ = ledger::clear_session(&conn, s);
         }
-        Ok(stats)
+
+        // T019: блок созревших задач — только в режиме хука, где он и
+        // предъявляется без вопроса человека (FR-012); ручной вызов уже
+        // отвечает своим текстом ниже.
+        let ripe = if hook {
+            gather_ripe(&conn, None).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok((stats, ripe))
     };
 
     match run() {
-        Ok(s) => {
+        Ok((s, ripe)) => {
             if !hook {
                 println!(
                     "закрыто окон: {} (reinforce {}, erode {}, fork {})",
                     s.closed, s.reinforced, s.eroded, s.forked
                 );
+            } else if let Some(block) = format_ripe_hook_block(&ripe) {
+                println!("{block}");
             }
             Ok(())
         }

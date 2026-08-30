@@ -272,7 +272,6 @@ au note "flag is on" --confidence measured \
   --volatility volatile --verify-with "cat app/.env" \
   --subject xhub:.env:REFUND_REQUESTS_ENABLED  # where it came from, how fast it rots, what it is about
 au journal --session $SESSION_ID    # everything that run wrote — the selection a session-end hook needs
-au capture --hook                   # PostToolUse: a command returned data → offer to save it as measured
 au context beacon                  # graph around a topic
 au search "redis"                  # full-text search
 au reindex                         # index current project
@@ -302,9 +301,9 @@ fixed by calling differently, the second by hand — retrying it is pointless.
 | `1` | bad call — unknown `--type`, missing argument, node not found, malformed JSON on stdin |
 | `2` | storage unreachable — no database, damaged image, locked SQLite |
 
-The `--hook` variants (`au snapshot --hook`, `au trace --hook`, `au judge --hook`,
-`au capture --hook`) are the deliberate exception: they never fail and stay silent on
-error. A broken hook is worse than a missing snapshot.
+The `--hook` variants (`au snapshot --hook`, `au trace --hook`, `au judge --hook`) are the
+deliberate exception: they never fail and stay silent on error. A broken hook is worse than
+a missing snapshot.
 
 ### Provenance
 
@@ -499,7 +498,6 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 | `aurelius-backup.sh` | SessionStart | Rolling database snapshot, throttled to one a day |
 | `aurelius-track-edit.sh` | PostToolUse (Edit/Write) | Increments access_count on file nodes |
 | `au trace --hook` | PostToolUse | Appends what happened to the action journal |
-| `au capture --hook` | PostToolUse (Bash) | A command returned data about the world → offers to save it as a measured fact, with the command already in `evidence`. Writes nothing itself |
 | `au judge --hook` | Stop | Settles the session: reinforce, erode, fork or null |
 | `aurelius-reindex.sh` | Stop | Re-indexes project on session end |
 | `post-commit` | git commit | Captures commit as Decision node, linked to project via `belongs_to` |

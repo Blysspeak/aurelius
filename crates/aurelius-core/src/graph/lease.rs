@@ -853,6 +853,57 @@ pub fn set_fitness(
     Ok(())
 }
 
+/// Прежняя активная задача проекта, вытесненная взятием новой в работу. Несёт
+/// ровно то, что нужно сказать вслух (T009) — карточку открывают отдельно.
+#[derive(Debug, Clone)]
+pub struct EvictedTask {
+    pub id: Uuid,
+    pub label: String,
+}
+
+/// Вытесняет прежнюю активную задачу того же проекта в `backlog` (T008,
+/// FR-031, спека 007): в проекте не более одной активной задачи, взятие новой
+/// снимает прежнюю. Меняется только `data.status` — времена, `evidence` и
+/// `last_edit_at` вытесненной задачи трогать физически нечем, `json_set` с
+/// одним путём не задевает остальные ключи.
+///
+/// `activating` исключён из отбора: реактивация уже активной задачи не
+/// вытесняет саму себя. Отбор идёт строго по `data.project` — вытеснение не
+/// пересекает границу проекта (T011).
+pub fn evict_active(
+    conn: &Connection,
+    project: &str,
+    activating: Uuid,
+) -> anyhow::Result<Option<EvictedTask>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, label FROM nodes
+          WHERE node_type = '\"task\"' AND deleted_at IS NULL
+            AND id != ?1
+            AND json_extract(data,'$.status') = 'active'
+            AND json_extract(data,'$.project') = ?2",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![activating.to_string(), project], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let now = Utc::now().to_rfc3339();
+    let mut evicted = None;
+    for (id_str, label) in rows {
+        let id: Uuid = id_str.parse().map_err(|e| {
+            anyhow::anyhow!("активная задача вернула нечитаемый id '{id_str}': {e}")
+        })?;
+        conn.execute(
+            "UPDATE nodes SET data = json_set(data, '$.status', 'backlog'), updated_at = ?1
+              WHERE id = ?2",
+            params![now, id.to_string()],
+        )?;
+        evicted = Some(EvictedTask { id, label });
+    }
+    Ok(evicted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1351,5 +1402,101 @@ mod tests {
         );
         let err = set_fitness(&conn, id, FitnessVerdict::Machine, "   ").unwrap_err();
         assert!(err.to_string().contains("пустым"));
+    }
+
+    /// T010: две задачи проекта, взятие второй переводит первую в `backlog`
+    /// и не стирает её `activated_at`.
+    #[test]
+    fn evict_active_moves_previous_task_to_backlog_and_keeps_its_times() {
+        let (_tmp, conn) = setup();
+        let first = seed_task_with(
+            &conn,
+            "[aurelius] первая активная",
+            None,
+            &[],
+            serde_json::json!({
+                "status": "active",
+                "project": "aurelius",
+                "activated_at": "2026-08-30T09:00:00Z",
+            }),
+        );
+        let second = seed_task_with(
+            &conn,
+            "[aurelius] вторая, берётся в работу",
+            None,
+            &[],
+            serde_json::json!({"status": "backlog", "project": "aurelius"}),
+        );
+
+        let evicted = evict_active(&conn, "aurelius", second)
+            .expect("evict_active")
+            .expect("прежняя активная задача обязана быть вытеснена");
+        assert_eq!(evicted.id, first);
+
+        let node = crate::graph::get_node(&conn, &first.to_string())
+            .expect("query node")
+            .expect("node exists");
+        assert_eq!(node.data["status"], "backlog");
+        assert_eq!(
+            node.data["activated_at"], "2026-08-30T09:00:00Z",
+            "вытеснение не имеет права стирать времена вытесненной задачи"
+        );
+    }
+
+    /// T011: вытеснение не пересекает границу проекта — активная задача
+    /// другого проекта остаётся активной.
+    #[test]
+    fn evict_active_does_not_cross_project_boundary() {
+        let (_tmp, conn) = setup();
+        let other_project_active = seed_task_with(
+            &conn,
+            "[boostix] чужая активная",
+            None,
+            &[],
+            serde_json::json!({"status": "active", "project": "boostix"}),
+        );
+        let taking_over = seed_task_with(
+            &conn,
+            "[aurelius] берётся в работу",
+            None,
+            &[],
+            serde_json::json!({"status": "backlog", "project": "aurelius"}),
+        );
+
+        let evicted =
+            evict_active(&conn, "aurelius", taking_over).expect("evict_active по aurelius");
+        assert!(
+            evicted.is_none(),
+            "в aurelius не было активной — вытеснять нечего"
+        );
+
+        let node = crate::graph::get_node(&conn, &other_project_active.to_string())
+            .expect("query node")
+            .expect("node exists");
+        assert_eq!(
+            node.data["status"], "active",
+            "активная задача другого проекта не должна была тронута"
+        );
+    }
+
+    /// Реактивация уже активной задачи не вытесняет саму себя.
+    #[test]
+    fn evict_active_excludes_the_task_being_activated() {
+        let (_tmp, conn) = setup();
+        let id = seed_task_with(
+            &conn,
+            "[aurelius] уже активная",
+            None,
+            &[],
+            serde_json::json!({"status": "active", "project": "aurelius"}),
+        );
+
+        let evicted = evict_active(&conn, "aurelius", id).expect("evict_active");
+        assert!(evicted.is_none(), "задача не вытесняет саму себя");
+
+        let node = crate::graph::get_node(&conn, &id.to_string())
+            .expect("query node")
+            .expect("node exists");
+        assert_eq!(node.data["status"], "active");
     }
 }

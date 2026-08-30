@@ -116,6 +116,10 @@ pub enum Relation {
     TrackedBy,
     SubtaskOf,
     Blocks,
+    /// Задача → узел прогона, подтвердившего её уликой (спека 007,
+    /// data-model.md «Ребро»). Улика лежит и в `data.evidence` задачи —
+    /// это ребро лишь даёт обратный путь, от прогона к задаче.
+    VerifiedBy,
 }
 
 impl Relation {
@@ -142,6 +146,7 @@ impl Relation {
         "tracked_by",
         "subtask_of",
         "blocks",
+        "verified_by",
     ];
 
     /// Строгий разбор имени связи. Дефис принимается наравне с подчёркиванием
@@ -172,6 +177,7 @@ impl Relation {
             "tracked_by" => Self::TrackedBy,
             "subtask_of" => Self::SubtaskOf,
             "blocks" => Self::Blocks,
+            "verified_by" => Self::VerifiedBy,
             _ => return None,
         })
     }
