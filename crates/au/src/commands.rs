@@ -3,7 +3,7 @@ use aurelius_core::{
     db, graph, identity, indexer,
     models::{MemoryKind, NodeType, Relation},
     provenance::{self, Provenance, Resolution},
-    tasks as task_fields, trace as task_trace,
+    tasks as task_fields,
 };
 use serde_json::json;
 use std::path::PathBuf;
@@ -1740,54 +1740,11 @@ fn find_task(conn: &rusqlite::Connection, id: &str) -> Result<aurelius_core::mod
         .ok_or_else(|| anyhow::anyhow!("task not found: {id}"))
 }
 
-/// Одна созревшая задача с основанием предъявления (T018, FR-013): какая
-/// улика, когда, что изменено.
-struct RipeReport {
-    id: uuid::Uuid,
-    label: String,
-    evidence: task_fields::EvidenceEntry,
-    files: Vec<String>,
-}
-
-/// Собирает созревшие задачи проекта (`None` — по всем проектам). Общая
-/// точка для `au task ripe` (T018) и блока в `au judge --hook` (T019) — одно
-/// вычисление, разные форматтеры вывода.
-fn gather_ripe(conn: &rusqlite::Connection, project: Option<&str>) -> Result<Vec<RipeReport>> {
-    let active = graph::get_tasks_filtered(conn, project, Some("active"), None, 200)?;
-    let mut out = Vec::new();
-    for t in active {
-        let fields = task_fields::TaskFields::from_data(&t.data);
-        let Some(evidence) = task_fields::ripe_evidence(&fields, "active") else {
-            continue;
-        };
-        let since = fields.activated_at.unwrap_or(t.created_at);
-        let files = task_trace::files_edited_since(conn, since.timestamp()).unwrap_or_default();
-        out.push(RipeReport {
-            id: t.id,
-            label: t.label.clone(),
-            evidence: evidence.clone(),
-            files,
-        });
-    }
-    Ok(out)
-}
-
-fn ripe_to_json(ripe: &[RipeReport]) -> serde_json::Value {
-    json!(ripe
-        .iter()
-        .map(|r| json!({
-            "id": r.id.to_string(),
-            "label": r.label,
-            "evidence": {
-                "command": r.evidence.command,
-                "exit_code": r.evidence.exit_code,
-                "at": r.evidence.at.to_rfc3339(),
-                "artifact": r.evidence.artifact,
-            },
-            "files": r.files,
-        }))
-        .collect::<Vec<_>>())
-}
+// `RipeReport`/`gather_ripe`/`ripe_to_json` перенесены в
+// `aurelius_core::tasks` — MCP (`task_ripe`) обязана звать то же
+// вычисление, что и `au task ripe`, а не вторую копию правила. Импортированы
+// ниже как `task_fields::{RipeReport, gather_ripe, ripe_to_json}`.
+use task_fields::{gather_ripe, ripe_to_json, RipeReport};
 
 fn print_ripe_entry(r: &RipeReport) {
     println!("  🟢 {} [{}]", r.label, r.id);

@@ -228,14 +228,33 @@ fn task_update_with_conn(
     Ok(result)
 }
 
+/// Бюджет `note` одной задачи в `task_list`, в символах, по границе слова.
+///
+/// Читателю списка (в отличие от `task_view` одной задачи) нужна строка-другая
+/// на ориентировку, а не текст целиком — полный текст всё равно лежит в
+/// узле и достаётся через `task_view`. Обрезка честная: `graph::clip`
+/// помечает урезанное окончанием «…», и ответ отдельно называет бюджет и то,
+/// где смотреть текст без урезания — то же требование, что и у `task_view`
+/// (`TASK_VIEW_NOTE_BUDGET`), тем же способом.
+const TASK_LIST_NOTE_BUDGET: usize = 200;
+
 pub fn task_list(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let conn = open_db()?;
+    task_list_with_conn(&conn, params)
+}
+
+/// Тело `task_list` с явным соединением — тот же приём тестируемости, что и
+/// у `task_update_with_conn`/`task_view_with_conn` выше.
+fn task_list_with_conn(
+    conn: &rusqlite::Connection,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value> {
     let project = params.get("project").and_then(|p| p.as_str());
     let status = params.get("status").and_then(|s| s.as_str());
     let priority = params.get("priority").and_then(|p| p.as_str());
     let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
 
-    let conn = open_db()?;
-    let tasks = graph::get_tasks_filtered(&conn, project, status, priority, limit)?;
+    let tasks = graph::get_tasks_filtered(conn, project, status, priority, limit)?;
 
     let task_type = serde_json::to_string(&NodeType::WorkLog)?;
 
@@ -262,6 +281,12 @@ pub fn task_list(params: &serde_json::Value) -> Result<serde_json::Value> {
             let fields = aurelius_core::tasks::TaskFields::from_data(&t.data);
             let ripe = aurelius_core::tasks::is_ripe(&fields, status);
 
+            let note = t
+                .note
+                .as_deref()
+                .map(|n| graph::clip(n, TASK_LIST_NOTE_BUDGET));
+            let note_truncated = note.as_deref().is_some_and(|n| n.ends_with('…'));
+
             json!({
                 "id": t.id.to_string(),
                 "label": t.label,
@@ -269,7 +294,8 @@ pub fn task_list(params: &serde_json::Value) -> Result<serde_json::Value> {
                 "priority": t.data.get("priority").and_then(|p| p.as_str()).unwrap_or("medium"),
                 "work_logs": log_count,
                 "created_at": t.created_at.to_rfc3339(),
-                "note": t.note,
+                "note": note,
+                "note_truncated": note_truncated,
                 "created_by": t.created_by,
                 "updated_by": t.updated_by,
                 "activated_at": fields.activated_at.map(|d| d.to_rfc3339()),
@@ -288,7 +314,40 @@ pub fn task_list(params: &serde_json::Value) -> Result<serde_json::Value> {
             "project": project,
             "status": status,
             "priority": priority,
-        }
+        },
+        // Честный отчёт об урезании note — тот же принцип, что и в task_view:
+        // молчаливая обрезка неотличима от короткого текста, значит нужно
+        // сказать вслух бюджет и куда идти за полным текстом.
+        "note_char_budget": TASK_LIST_NOTE_BUDGET,
+        "how_to_see_full_note": "task_view с id этой задачи возвращает note целиком, без урезания",
+    }))
+}
+
+/// Созревшие задачи проекта — тот же выбор, что и `au task ripe`, доступный
+/// ассистенту через MCP.
+///
+/// Спека 007 предъявляет созревшие задачи текстом, через `au judge --hook`:
+/// работает, только когда задачу закрывает человек в терминале. Ассистент
+/// закрывает задачи через `task_update` и текстовый хук не видит — до этой
+/// ручки узнать «что созрело» через MCP было нечем, хотя вычисление уже было
+/// (`is_ripe`/`ripe_evidence` в `task_list`/`task_view`). Здесь — та же
+/// функция ядра, что и у CLI (`aurelius_core::tasks::gather_ripe`), не вторая
+/// копия правила.
+pub fn task_ripe(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let conn = open_db()?;
+    task_ripe_with_conn(&conn, params)
+}
+
+fn task_ripe_with_conn(
+    conn: &rusqlite::Connection,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let project = params.get("project").and_then(|p| p.as_str());
+    let ripe = aurelius_core::tasks::gather_ripe(conn, project)?;
+    Ok(json!({
+        "ripe": aurelius_core::tasks::ripe_to_json(&ripe),
+        "total": ripe.len(),
+        "project": project,
     }))
 }
 
@@ -1149,5 +1208,151 @@ mod tests {
 
         assert_eq!(result["timeline"].as_array().expect("timeline").len(), 2);
         assert_eq!(result["truncation"]["hidden"]["timeline"], json!(6));
+    }
+
+    // -- task_list: обрезка note по границе слова, честно отчитанная --------
+
+    fn seed_task_with_note(conn: &rusqlite::Connection, project: &str, note: &str) -> uuid::Uuid {
+        graph::add_node_full(
+            conn,
+            NodeType::Task,
+            &format!("[{project}] задача с note"),
+            Some(note),
+            "test",
+            json!({"status": "backlog", "priority": "medium", "project": project}),
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("insert task")
+        .id
+    }
+
+    /// Длинная note обрезается по границе слова (через `graph::clip`, как и
+    /// в `task_view`) и честно помечена: и по хвосту «…», и отдельным
+    /// булевым флагом, чтобы не гадать по внешнему виду строки.
+    #[test]
+    fn task_list_clips_long_note_at_word_boundary_and_reports_it() {
+        let (_tmp, conn) = setup();
+        let words: Vec<String> = (0..100).map(|i| format!("слово{i}")).collect();
+        let note = words.join(" ");
+        seed_task_with_note(&conn, "proj-list-long", &note);
+
+        let result =
+            task_list_with_conn(&conn, &json!({"project": "proj-list-long"})).expect("task_list");
+
+        let task = &result["tasks"][0];
+        let shown = task["note"].as_str().expect("note");
+        assert!(
+            shown.ends_with('…'),
+            "длинная note обязана быть обрезана: {shown}"
+        );
+        assert_eq!(task["note_truncated"], json!(true));
+        assert!(shown.chars().count() <= TASK_LIST_NOTE_BUDGET);
+
+        let trimmed = shown.trim_end_matches('…').trim_end();
+        let last_token = trimmed
+            .split_whitespace()
+            .last()
+            .expect("хотя бы одно слово");
+        assert!(
+            words.iter().any(|w| w == last_token),
+            "обрезка обязана заканчиваться ЦЕЛЫМ словом, получили хвост '{last_token}' в '{shown}'"
+        );
+
+        assert_eq!(result["note_char_budget"], json!(TASK_LIST_NOTE_BUDGET));
+        assert!(result["how_to_see_full_note"]
+            .as_str()
+            .expect("подсказка")
+            .contains("task_view"));
+    }
+
+    /// Асимметрия предыдущего теста: короткая note НЕ обрезается — ни хвоста
+    /// «…», ни `note_truncated: true` быть не должно.
+    #[test]
+    fn task_list_keeps_short_note_whole_and_unmarked() {
+        let (_tmp, conn) = setup();
+        seed_task_with_note(&conn, "proj-list-short", "короткая note без обрезки");
+
+        let result =
+            task_list_with_conn(&conn, &json!({"project": "proj-list-short"})).expect("task_list");
+
+        let task = &result["tasks"][0];
+        assert_eq!(task["note"], json!("короткая note без обрезки"));
+        assert_eq!(task["note_truncated"], json!(false));
+    }
+
+    // -- task_ripe: та же выборка, что и `au task ripe` ----------------------
+
+    fn seed_active_task(
+        conn: &rusqlite::Connection,
+        project: &str,
+        data: serde_json::Value,
+    ) -> uuid::Uuid {
+        graph::add_node_full(
+            conn,
+            NodeType::Task,
+            &format!("[{project}] активная задача"),
+            None,
+            "test",
+            data,
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("insert task")
+        .id
+    }
+
+    /// Активная задача с зелёной уликой новее последней правки — предъявлена
+    /// с основанием (какая улика, когда), той же функцией ядра, что и CLI.
+    #[test]
+    fn task_ripe_returns_active_task_with_evidence_basis() {
+        let (_tmp, conn) = setup();
+        let task_id = seed_active_task(
+            &conn,
+            "proj-ripe",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "project": "proj-ripe",
+                "last_edit_at": "2026-08-30T09:00:00Z",
+                "evidence": [{
+                    "command": "cargo test",
+                    "exit_code": 0,
+                    "at": "2026-08-30T10:00:00Z",
+                }],
+            }),
+        );
+
+        let result =
+            task_ripe_with_conn(&conn, &json!({"project": "proj-ripe"})).expect("task_ripe");
+
+        assert_eq!(result["total"], json!(1));
+        let entry = &result["ripe"][0];
+        assert_eq!(entry["id"], json!(task_id.to_string()));
+        assert_eq!(entry["evidence"]["command"], "cargo test");
+        assert_eq!(entry["evidence"]["exit_code"], 0);
+    }
+
+    /// Асимметрия: активная задача без свежей улики — не созревшая,
+    /// `task_ripe` обязана вернуть пустой список, а не выдумывать основание.
+    #[test]
+    fn task_ripe_excludes_task_without_fresh_evidence() {
+        let (_tmp, conn) = setup();
+        seed_active_task(
+            &conn,
+            "proj-not-ripe",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "project": "proj-not-ripe",
+                "last_edit_at": "2026-08-30T09:00:00Z",
+            }),
+        );
+
+        let result =
+            task_ripe_with_conn(&conn, &json!({"project": "proj-not-ripe"})).expect("task_ripe");
+
+        assert_eq!(result["total"], json!(0));
+        assert!(result["ripe"].as_array().expect("ripe array").is_empty());
     }
 }

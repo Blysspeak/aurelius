@@ -11,7 +11,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Способ решения задачи (`data.resolution`), пишется при закрытии.
 /// `confirmed: false` — «закрыта без подтверждения»: способ решения неизвестен,
@@ -178,6 +178,68 @@ pub fn ripe_evidence<'a>(fields: &'a TaskFields, status: &str) -> Option<&'a Evi
 /// `true`, если задача созрела к закрытию — см. [`ripe_evidence`].
 pub fn is_ripe(fields: &TaskFields, status: &str) -> bool {
     ripe_evidence(fields, status).is_some()
+}
+
+/// Одна созревшая задача с основанием предъявления (T018, FR-013): какая
+/// улика дала созревание, когда, что изменено с момента взятия в работу.
+///
+/// Общая точка для CLI (`au task ripe`, блок в `au judge --hook`) и MCP
+/// (`task_ripe`) — раньше это вычисление сидело приватной функцией внутри
+/// `au/src/commands.rs`, и MCP-стороне позвать было нечего: у ассистента нет
+/// текстового `--hook`, которым это доходит до человека, а закрывает задачи
+/// через MCP тоже ассистент (`task_update`).
+#[derive(Debug, Clone)]
+pub struct RipeReport {
+    pub id: uuid::Uuid,
+    pub label: String,
+    pub evidence: EvidenceEntry,
+    pub files: Vec<String>,
+}
+
+/// Собирает созревшие задачи проекта (`None` — по всем проектам): активные
+/// задачи, у которых `ripe_evidence` нашла подтверждающую улику, плюс список
+/// файлов, изменённых с момента взятия в работу (тот же источник, что и
+/// `build_resolution`).
+pub fn gather_ripe(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+) -> anyhow::Result<Vec<RipeReport>> {
+    let active = crate::graph::get_tasks_filtered(conn, project, Some("active"), None, 200)?;
+    let mut out = Vec::new();
+    for t in active {
+        let fields = TaskFields::from_data(&t.data);
+        let Some(evidence) = ripe_evidence(&fields, "active") else {
+            continue;
+        };
+        let since = fields.activated_at.unwrap_or(t.created_at);
+        let files = crate::trace::files_edited_since(conn, since.timestamp()).unwrap_or_default();
+        out.push(RipeReport {
+            id: t.id,
+            label: t.label.clone(),
+            evidence: evidence.clone(),
+            files,
+        });
+    }
+    Ok(out)
+}
+
+/// Сериализует созревшие задачи в JSON — общая точка для `au task ripe
+/// --json` и MCP `task_ripe`, чтобы формы ответа не разъезжались.
+pub fn ripe_to_json(ripe: &[RipeReport]) -> Value {
+    json!(ripe
+        .iter()
+        .map(|r| json!({
+            "id": r.id.to_string(),
+            "label": r.label,
+            "evidence": {
+                "command": r.evidence.command,
+                "exit_code": r.evidence.exit_code,
+                "at": r.evidence.at.to_rfc3339(),
+                "artifact": r.evidence.artifact,
+            },
+            "files": r.files,
+        }))
+        .collect::<Vec<_>>())
 }
 
 /// Помечает `artifact_present: false` у улик, чей файл артефакта больше не
@@ -351,5 +413,161 @@ mod tests {
         assert_eq!(evidence[0].artifact_present, Some(true));
 
         std::fs::remove_file(&path).expect("cleanup temp artifact");
+    }
+
+    // -- gather_ripe: перенесено из `au/src/commands.rs`, чтобы CLI (`au task
+    // ripe`) и MCP (`task_ripe`) звали одну функцию, а не две копии правила.
+
+    /// Тот же приём, что в `graph::lease` тестах: настоящий temp-файл, не
+    /// `:memory:` — `db::open` жёстко требует WAL.
+    struct TmpDb(std::path::PathBuf);
+
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "aurelius-tasks-gather-ripe-{tag}-{}.db",
+                uuid::Uuid::new_v4()
+            )))
+        }
+    }
+
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+            }
+        }
+    }
+
+    fn setup() -> (TmpDb, rusqlite::Connection) {
+        let tmp = TmpDb::new("setup");
+        let conn = crate::db::open(&tmp.0).expect("open temp db");
+        (tmp, conn)
+    }
+
+    fn seed_task(conn: &rusqlite::Connection, label: &str, data: Value) -> uuid::Uuid {
+        crate::graph::add_node_full(
+            conn,
+            crate::models::NodeType::Task,
+            label,
+            None,
+            "test",
+            data,
+            crate::models::MemoryKind::Semantic,
+            None,
+        )
+        .expect("insert task")
+        .id
+    }
+
+    /// Активная задача с зелёной уликой новее последней правки — созревшая:
+    /// `gather_ripe` обязана вернуть её вместе с уликой, давшей созревание.
+    #[test]
+    fn gather_ripe_includes_active_task_with_fresh_green_evidence() {
+        let (_tmp, conn) = setup();
+        let task_id = seed_task(
+            &conn,
+            "созревшая задача",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "last_edit_at": "2026-08-30T09:00:00Z",
+                "evidence": [{
+                    "command": "cargo test",
+                    "exit_code": 0,
+                    "at": "2026-08-30T10:00:00Z",
+                }],
+            }),
+        );
+
+        let ripe = gather_ripe(&conn, None).expect("gather_ripe");
+
+        assert_eq!(ripe.len(), 1);
+        assert_eq!(ripe[0].id, task_id);
+        assert_eq!(ripe[0].evidence.command, "cargo test");
+        assert_eq!(ripe[0].evidence.exit_code, 0);
+    }
+
+    /// Асимметрия предыдущего теста: активная задача БЕЗ улики новее правки —
+    /// не созревшая, `gather_ripe` обязана её пропустить, а не вернуть с
+    /// пустым основанием.
+    #[test]
+    fn gather_ripe_excludes_active_task_without_fresh_evidence() {
+        let (_tmp, conn) = setup();
+        seed_task(
+            &conn,
+            "не созревшая задача",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "last_edit_at": "2026-08-30T09:00:00Z",
+            }),
+        );
+
+        let ripe = gather_ripe(&conn, None).expect("gather_ripe");
+
+        assert!(
+            ripe.is_empty(),
+            "задача без свежей улики не обязана предъявляться: {ripe:?}"
+        );
+    }
+
+    /// Асимметрия по статусу: задача из `backlog` с той же уликой — не
+    /// предъявляется, `gather_ripe` фильтрует по `status == "active"` на
+    /// уровне запроса, а не только внутри `ripe_evidence`.
+    #[test]
+    fn gather_ripe_excludes_backlog_task_even_with_evidence() {
+        let (_tmp, conn) = setup();
+        seed_task(
+            &conn,
+            "задача в бэклоге",
+            json!({
+                "status": "backlog",
+                "priority": "medium",
+                "last_edit_at": "2026-08-30T09:00:00Z",
+                "evidence": [{
+                    "command": "cargo test",
+                    "exit_code": 0,
+                    "at": "2026-08-30T10:00:00Z",
+                }],
+            }),
+        );
+
+        let ripe = gather_ripe(&conn, None).expect("gather_ripe");
+
+        assert!(ripe.is_empty());
+    }
+
+    /// `ripe_to_json` — форма ответа, общая для CLI и MCP: id строкой, вложенный
+    /// `evidence` со всеми четырьмя полями, `files` массивом.
+    #[test]
+    fn ripe_to_json_serializes_id_as_string_and_nests_evidence() {
+        let (_tmp, conn) = setup();
+        let task_id = seed_task(
+            &conn,
+            "задача для сериализации",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "last_edit_at": "2026-08-30T09:00:00Z",
+                "evidence": [{
+                    "command": "cargo test",
+                    "exit_code": 0,
+                    "at": "2026-08-30T10:00:00Z",
+                    "artifact": "run.log",
+                }],
+            }),
+        );
+
+        let ripe = gather_ripe(&conn, None).expect("gather_ripe");
+        let out = ripe_to_json(&ripe);
+
+        assert_eq!(out[0]["id"], json!(task_id.to_string()));
+        assert_eq!(out[0]["evidence"]["command"], "cargo test");
+        assert_eq!(out[0]["evidence"]["exit_code"], 0);
+        assert_eq!(out[0]["evidence"]["artifact"], "run.log");
+        assert!(out[0]["files"].is_array());
     }
 }

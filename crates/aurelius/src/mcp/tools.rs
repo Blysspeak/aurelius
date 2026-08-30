@@ -29,12 +29,12 @@ pub fn tool_definitions() -> serde_json::Value {
                         },
                         "depth": {
                             "type": "integer",
-                            "description": "BFS traversal depth (default: 2)",
-                            "default": 2
+                            "description": "BFS traversal depth (default: 1). Depth 2+ walks through project hub nodes and back out onto every unrelated task/decision that shares the project — expect a much larger, noisier result.",
+                            "default": 1
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Max nodes to return (default: 50). Seeds first, then by BFS depth.",
+                            "description": "Max nodes to return (default: 50). Seeds first, then by BFS depth. Response's `truncation` field says how many were hidden.",
                             "default": 50
                         }
                     },
@@ -570,6 +570,34 @@ pub fn tool_definitions() -> serde_json::Value {
                         }
                     },
                     "required": ["id"]
+                }
+            },
+            {
+                "name": "task_ripe",
+                "description": "List tasks ready to close: active tasks with a passing (exit-0) evidence run newer than their last edit, each with the basis for the claim — which evidence run, when, and which files were touched since the task was taken active. This is the same computation `au task ripe` runs on the CLI, exposed here because closing a task via MCP is `task_update`, and nothing else on this surface could tell you what has ripened. Declining a proposal is CLI-only (`au task ripe --decline <id>`) — not exposed here.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": "Filter by project name. Omit to check every project."
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "secret_list",
+                "description": "List where each project's secrets live — name, purpose, and location (env var / file path / password manager reference) — never the value itself. Aurelius refuses to store secret values (`au secret add` rejects anything that looks like one); this only reads coordinates already recorded that way. Coordinates are intentionally excluded from memory_snapshot and every other automatic dump, so this is the only MCP path to them. Adding or removing a coordinate stays CLI-only (`au secret add`/`rm`) — recording one is a deliberate human act, and an MCP write path risks a model writing the actual secret value into 'location' by mistake, caught only heuristically.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": "Filter by project name. Omit to list every project's coordinates."
+                        }
+                    },
+                    "required": []
                 }
             },
             {
