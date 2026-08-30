@@ -141,6 +141,8 @@ async fn handle_tools_call(
         "task_log" => handlers::task_log(&arguments),
         "task_view" => handlers::task_view(&arguments),
         "task_stats" => handlers::task_stats(&arguments),
+        "task_ripe" => handlers::task_ripe(&arguments),
+        "secret_list" => handlers::secret_list(&arguments),
         "search_web" => handlers::search_web(&arguments),
         "search_recall" => handlers::search_recall(&arguments),
         "doc_convert" => handlers::doc_convert(&arguments),
