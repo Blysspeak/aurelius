@@ -1,6 +1,6 @@
 //! Слой 7-уровневой памяти: замороженный снапшот и дистилляция.
 //!
-//! Снапшот — компактный Markdown (жёсткий бюджет символов на слой, ~4.5К всего),
+//! Снапшот — компактный Markdown (жёсткий бюджет символов на слой, ~3.8К всего),
 //! который инжектится в контекст агента ОДИН раз при старте сессии. Урок
 //! hermes-agent: маленький курируемый срез в системном промпте бьёт большой
 //! JSON по запросу — и не ломает prefix-cache, потому что заморожен на сессию.
@@ -14,12 +14,11 @@ use rusqlite::Connection;
 
 use crate::models::{MemoryKind, Node, NodeType};
 
-/// Бюджеты слоёв в символах. Сумма ~4500 — порядка 1.5К токенов.
+/// Бюджеты слоёв в символах. Сумма ~3800 — порядка 1.3К токенов.
 const B_IDENTITY: usize = 600;
 const B_WORKING: usize = 1000;
 const B_EPISODIC: usize = 800;
 const B_SEMANTIC: usize = 900;
-const B_PROCEDURAL: usize = 500;
 const B_DIGEST: usize = 500;
 
 fn clip(s: &str, budget: usize) -> String {
@@ -144,7 +143,7 @@ struct Gathered {
 
 fn gather(conn: &Connection, project: Option<&str>) -> Result<Gathered> {
     Ok(Gathered {
-        identity: typed_recent(conn, &NodeType::UserFact, None, 12)?,
+        identity: typed_recent(conn, &NodeType::UserFact, project, 12)?,
         tasks: super::get_tasks_filtered(conn, project, Some(super::OPEN_TASK_STATUSES), None, 8)?,
         problems: super::get_unsolved_problems(conn, project, 6)?,
         // Гроссбух давления (ступень 6): открытые обязательства по напряжению —
@@ -241,15 +240,18 @@ pub fn build_snapshot(conn: &Connection, project: Option<&str>) -> Result<String
         .map(|line| format!("- {line}\n"))
         .collect::<String>();
 
-    let (identity, sessions, skills, digest) = (&g.identity, &g.sessions, &g.skills, &g.digest);
+    let (identity, sessions, digest) = (&g.identity, &g.sessions, &g.digest);
 
-    let sections: [(&str, String); 8] = [
+    // Слоя «6 · Приёмы» здесь больше нет: те же карточки без обрезки печатает
+    // SessionStart-хук aurelius-skills.sh, дублировать их в снапшоте незачем.
+    // Нумерация остальных секций сохранена как есть — заголовки читают
+    // регулярками потребители markdown, дыра после 5-й секции намеренна.
+    let sections: [(&str, String); 7] = [
         ("1 · Владелец", layer(identity, 120, B_IDENTITY)),
         ("2 · В работе (задачи и открытые проблемы)", working),
         ("3 · Давление (незакрытые обязательства)", pressure),
         ("4 · Последние сессии", layer(sessions, 250, B_EPISODIC)),
         ("5 · Решения и знания", semantic),
-        ("6 · Приёмы", layer(skills, 100, B_PROCEDURAL)),
         (
             "7 · Архив",
             format!(
@@ -364,7 +366,7 @@ mod tests {
         super::super::add_node(
             &conn,
             NodeType::UserFact,
-            "владелец",
+            "[demo] владелец",
             Some("факт о владельце"),
             "test",
             serde_json::json!({}),
@@ -447,6 +449,66 @@ mod tests {
         let md = build_snapshot(&conn, Some("другой")).expect("snapshot");
 
         assert!(!md.contains("sqlite"), "чужое знание протекло:\n{md}");
+    }
+
+    /// Слой «1 · Владелец» раньше собирался глобально (`project: None`) и тащил
+    /// UserFact-узлы всех проектов в любой снапшот. Теперь скоуп такой же, как
+    /// у остальных слоёв.
+    #[test]
+    fn identity_layer_does_not_leak_other_projects_userfacts() {
+        let conn = test_conn();
+        super::super::add_node(
+            &conn,
+            NodeType::UserFact,
+            "[projA] владелец",
+            Some("факт проекта A"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add userfact A");
+        super::super::add_node(
+            &conn,
+            NodeType::UserFact,
+            "[projB] владелец",
+            Some("факт проекта B"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add userfact B");
+
+        let md = build_snapshot(&conn, Some("projA")).expect("snapshot");
+
+        assert!(
+            md.contains("факт проекта A"),
+            "свой факт владельца обязан быть виден:\n{md}"
+        );
+        assert!(
+            !md.contains("факт проекта B"),
+            "чужой факт владельца протёк:\n{md}"
+        );
+    }
+
+    /// Слой «6 · Приёмы» убран из markdown насовсем: те же карточки без
+    /// обрезки печатает SessionStart-хук, дублировать их в снапшоте незачем.
+    #[test]
+    fn skills_section_is_absent_from_markdown_even_when_skills_exist() {
+        let conn = test_conn();
+        super::super::add_node(
+            &conn,
+            NodeType::Skill,
+            "приём",
+            Some("какой-то приём"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add skill");
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+
+        assert!(
+            !md.contains("6 · Приёмы"),
+            "слой «Приёмы» обязан быть убран из markdown:\n{md}"
+        );
     }
 
     /// task_create кладёт задачу в `backlog`. Если слой «В работе» её не видит,
