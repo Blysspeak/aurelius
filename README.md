@@ -13,12 +13,12 @@
   <img src="https://img.shields.io/badge/v1.11.1-stable-a6e3a1?style=flat-square" alt="v1.11.1">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
-  <img src="https://img.shields.io/badge/MCP-30_tools-a6e3a1?style=flat-square" alt="MCP">
+  <img src="https://img.shields.io/badge/MCP-32_tools-a6e3a1?style=flat-square" alt="MCP">
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#mcp-tools-30">MCP Tools</a> ·
+  <a href="#mcp-tools-32">MCP Tools</a> ·
   <a href="#memory-snapshot">Snapshot</a> ·
   <a href="#task-management">Tasks</a> ·
   <a href="#project-sync">Sync</a> ·
@@ -52,7 +52,7 @@ au 1.11.1
 
 ---
 
-## MCP Tools (30)
+## MCP Tools (32)
 
 Aurelius runs as an MCP server over stdio. `install.sh` configures it automatically, or add manually via `/mcp` in Claude Code (`command: au`, `args: ["mcp"]`).
 
@@ -86,6 +86,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | `task_log` | Record work done — creates WorkLog + optional Decision/Problem/Solution nodes. Auto-activates backlog tasks. |
 | `task_view` | Full task branch — timeline of work logs, decisions, problems, solutions, subtasks. |
 | `task_stats` | Task analytics — counts by status/priority, completion rate, avg/median duration, blocked count, oldest active. |
+| `task_ripe` | Tasks ready to close — active, with a passing evidence run newer than the last edit, plus the basis (which run, when, files touched). Same computation as `au task ripe`; closing itself is still `task_update`. |
 
 ### Skills
 
@@ -115,6 +116,18 @@ Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV, PDF, HTML and plain text 
 | `doc_read` | Paginated read of an already-converted document, by content hash or path. |
 | `doc_recall` | FTS search across every document ever converted. |
 
+### Secrets
+
+Read-only on MCP, deliberately: Aurelius stores where a secret lives, never the value (see
+[Secrets](#secrets-1) below), and recording a coordinate is a human act — `au secret add`/`rm`
+stay CLI-only. Only the read side is exposed here, because it answers a question an assistant
+gets asked directly ("where's the Stripe key?") and the coordinate is otherwise unreachable
+through MCP: it never appears in `memory_snapshot` or any other automatic dump.
+
+| Tool | Description |
+|------|-------------|
+| `secret_list` | Name, purpose, and location of every recorded secret coordinate — never the value. |
+
 ---
 
 ## Memory Snapshot
@@ -137,6 +150,15 @@ cache — rather than a large JSON blob fetched on demand.
 Every layer has a hard character budget (~4.5K in total, on the order of 1.5K tokens),
 and empty layers are omitted entirely.
 
+**Active tasks are the one exception.** A task actually in progress — status `active` —
+is pulled out of layer 2 before the budget is applied and rendered in full, uncut by the
+per-layer character limit that trims everything else. There is still a hard ceiling (20
+active tasks per project) purely against unbounded growth; past it the snapshot says how
+many did not fit rather than dropping them silently. Whatever an active task's own
+rendering costs beyond the layer's normal budget is taken from **layer 5 (Decisions and
+knowledge)**, not from the active tasks themselves and not from the layers in between —
+the layer immediately below "In progress" in priority pays for it.
+
 ```bash
 au snapshot --project myapp          # Markdown, for humans and for context
 au snapshot --project myapp --json   # fixed shape, for programs
@@ -153,9 +175,12 @@ would break the consumer silently. `--json` fixes the shape instead:
 {"project":"myapp","facts":[{"kind":"decision","text":"chose SQLite over Postgres","at":"2026-08-15T21:30:40Z"}]}
 ```
 
-`kind` names the source layer: `userfact`, `task`, `problem`, `obligation`, `session`,
-`decision`, `concept`, `skill`, `digest`. Text is returned whole — the budget belongs to
-the consumer, and a silently shortened fact reads exactly like a short one.
+`kind` names the source layer: `userfact`, `active_task`, `task`, `problem`, `obligation`,
+`session`, `decision`, `concept`, `skill`, `digest`. `active_task` is the guaranteed,
+uncut form of a task in progress described above; plain `task` covers everything else
+still open (`backlog`, `blocked`) and is subject to the ordinary budget. Text is returned
+whole — the budget belongs to the consumer, and a silently shortened fact reads exactly
+like a short one.
 
 The contract distinguishes the two states that a silent channel confuses:
 
@@ -265,6 +290,59 @@ au task new "Implement auth" --project myapp --priority high \
   -c "Rate limiting active"
 ```
 
+### Task Leasing (`au task claim` / `renew` / `release` / `give-up`)
+
+A task handed to a runner used to be indistinguishable from one still sitting in the
+queue — two processes could grab the same one, and an abandoned one never came back.
+`au task claim` leases one machine-fit task to an owner for a fixed number of minutes
+and hands it to nobody else while that lease holds; `au task renew` extends the lease
+while the runner is still alive; `au task release` records the outcome. The grant is a
+single `UPDATE … RETURNING`, so two concurrent `claim` calls cannot land on the same
+task — not "unlikely", but structurally impossible.
+
+```bash
+au task claim --owner smena@host/123 --run 42 --lease-minutes 50   # take one machine-fit task
+au task renew --id <id> --owner smena@host/123 --lease-minutes 50  # keep the lease alive
+au task release --id <id> --owner smena@host/123 \
+  --verdict done --evidence "cargo test — 186 passed"              # or --verdict failed
+au task give-up --id <id> --owner smena@host/123 \
+  --why "needs a human decision"                                   # blocks, does not requeue
+```
+
+`release --verdict done` only sticks when all three hold at once: the run exited zero, a
+green check postdates the moment the lease was taken, and every acceptance criterion has
+a recorded check — short of that, the task goes back to the queue with its attempt
+counter already incremented. `--verdict failed` always requeues and starts a cooldown. A
+lease that simply expires is picked up again by the next `claim` the same way, attempts
+climbing each time; a task claimed three times without a `done` verdict drops out of
+`claim`'s selection instead of cycling through the queue forever. `give-up` is the one
+exit that does **not** requeue: the runner recognized the block needs a human, so the
+task is left in place with a reason attached rather than retried. These four are
+**dispatcher-only** commands — a single external driver is meant to call them in a loop
+against the whole queue; that outer loop is not shipped yet, only the primitives it will
+call.
+
+### Fitness Gate (`au task fitness`)
+
+Before a task can be leased at all, something has to decide whether a machine could
+possibly finish it. `au task fitness` writes that verdict onto `fitness` and nothing
+else. A criterion counts as machine-checkable only when the check itself reads as a
+command — at the start of a line, wrapped in backticks, or next to an explicit pass/fail
+marker — not merely mentioned in prose (an earlier pass over the live queue counted
+"reads NodeInbound" as if it were a runnable check and overstated the machine-fit pool by
+half). A task with no such criterion is marked `human`; one with a mix of checkable and
+non-checkable criteria is marked `split` rather than partially auto-run. Every verdict
+requires a non-empty reason and is stamped with a hash of the task's content — edit the
+task afterward and the verdict goes stale instead of quietly outliving the text it judged.
+
+```bash
+au task fitness --id <id> --verdict machine --why "single command, exit code checked"
+au task fitness --dry-run --project myapp   # verdict + reason for every open task, writes nothing
+```
+
+`--dry-run` writes nothing; it exists to be read for the *why* — the verdict is
+unattended, nobody confirms it before a task becomes claimable.
+
 ### Integration
 
 - **`memory_status`** shows active/blocked tasks at session start
@@ -340,6 +418,11 @@ au db backup                       # safe snapshot via VACUUM INTO
 au doc convert report.docx         # document → Markdown on stdout
 au doc convert ./contracts -r      # convert a whole tree, cached by content hash
 au doc recall "termination"        # search everything ever converted
+au task claim --owner … --run … --lease-minutes 50   # dispatcher-only: lease one machine-fit task
+au task renew --id … --owner … --lease-minutes 50    # dispatcher-only: extend a held lease
+au task release --id … --owner … --verdict done --evidence "…"  # dispatcher-only: report the outcome
+au task give-up --id … --owner … --why "…"           # dispatcher-only: block, don't requeue
+au task fitness --dry-run [--project myapp]           # is the open queue machine-checkable? read-only
 ```
 
 > **Removed:** `au sync` (the TimeForged connector — spec 007 found zero calls to it across
