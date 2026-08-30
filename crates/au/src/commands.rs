@@ -1097,7 +1097,8 @@ pub async fn task(action: TaskAction) -> Result<()> {
 
             let mut fields = task_fields::TaskFields::from_data(&data);
             let since = fields.activated_at.unwrap_or(task.created_at);
-            let resolution = build_resolution(&conn, since, commit, pull_request, unconfirmed);
+            let resolution =
+                task_fields::build_resolution(&conn, since, commit, pull_request, unconfirmed);
             let confirmed = resolution.confirmed;
             fields.closed_at = Some(chrono::Utc::now());
             fields.resolution = Some(resolution);
@@ -1737,52 +1738,6 @@ fn find_task(conn: &rusqlite::Connection, id: &str) -> Result<aurelius_core::mod
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("task not found: {id}"))
-}
-
-/// Коммит, которым решается задача, если способ решения не назвали флагом
-/// (T021a, FR-006): `git rev-parse --short HEAD` в текущем каталоге. `None`,
-/// если это не git-репозиторий или команда недоступна — не повод отказать в
-/// закрытии, только не сможем назвать коммит.
-fn current_commit_sha() -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if sha.is_empty() {
-        None
-    } else {
-        Some(sha)
-    }
-}
-
-/// Собирает способ решения из следов работы (T021a, FR-004…006): коммит — из
-/// состояния репозитория, если не назван флагом; файлы — из правок,
-/// привязанных хуком `au trace --hook` с момента взятия задачи в работу.
-/// Флаги (`--commit`, `--pr`) уточняют, а не единственный источник (FR-006:
-/// не спрашивать у человека то, что система уже знает). `--unconfirmed`
-/// форсирует пометку «без подтверждения»; без него она ставится сама, когда
-/// следов не нашлось ни одного (FR-005).
-fn build_resolution(
-    conn: &rusqlite::Connection,
-    since: chrono::DateTime<chrono::Utc>,
-    commit: Option<String>,
-    pull_request: Option<String>,
-    unconfirmed: bool,
-) -> task_fields::Resolution {
-    let commit = commit.or_else(current_commit_sha);
-    let files = task_trace::files_edited_since(conn, since.timestamp()).unwrap_or_default();
-    let confirmed =
-        !unconfirmed && (commit.is_some() || pull_request.is_some() || !files.is_empty());
-    task_fields::Resolution {
-        commit,
-        pull_request,
-        files,
-        confirmed,
-    }
 }
 
 /// Одна созревшая задача с основанием предъявления (T018, FR-013): какая
