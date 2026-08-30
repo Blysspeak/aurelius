@@ -13,6 +13,7 @@ use chrono::Utc;
 use rusqlite::Connection;
 
 use crate::models::{MemoryKind, Node, NodeType};
+use crate::secret::is_secret_ref;
 
 /// Бюджеты слоёв в символах. Сумма ~4500 — порядка 1.5К токенов.
 const B_IDENTITY: usize = 600;
@@ -84,18 +85,16 @@ fn annotate(node: &Node, text: String) -> String {
     out
 }
 
-/// Координата секрета (`Config` с `data.kind == "secret_ref"`) — FR-027:
-/// координаты отдаются по запросу (`au secret list`) и НЕ ДОЛЖНЫ попадать в
-/// подаваемую память автоматически. Ни один из типов, перечисленных в
-/// [`gather`], сегодня не выбирает `Config`, так что фильтр здесь — граница,
-/// а не текущая необходимость: он держит инвариант верным и тогда, когда
-/// слой снапшота однажды расширят.
-fn is_secret_ref(n: &Node) -> bool {
-    matches!(n.node_type, NodeType::Config)
-        && n.data.get("kind").and_then(|v| v.as_str()) == Some("secret_ref")
-}
-
 /// Строки слоя: по одной на узел, суммарно не больше budget.
+///
+/// Координаты секретов ([`is_secret_ref`]) отсеиваются — FR-027: они отдаются
+/// по запросу (`au secret list`) и НЕ ДОЛЖНЫ попадать в подаваемую память
+/// автоматически. Ни один из типов, перечисленных в [`gather`], сегодня не
+/// выбирает `Config`, так что фильтр здесь — граница, а не текущая
+/// необходимость: он держит инвариант верным и тогда, когда слой снапшота
+/// однажды расширят. Правило живёт в `secret`, рядом с остальными правилами о
+/// секретах, и переиспользуется отсюда и из поиска — двух копий у него быть не
+/// должно, иначе они разойдутся молча.
 fn layer(nodes: &[Node], per_line: usize, budget: usize) -> String {
     let mut out = String::new();
     for n in nodes.iter().filter(|n| !is_secret_ref(n)) {
@@ -684,6 +683,105 @@ mod tests {
         assert!(
             md.contains("чиним слой активных задач в снапшоте"),
             "активная задача обязана присутствовать целиком среди 200 открытых:\n{md}"
+        );
+    }
+
+    /// Находка 10 (адверсариальный разбор спеки 007): аварийный предел
+    /// `ACTIVE_TASK_CAP` и текст сообщения о переполнении не были покрыты ни
+    /// одним тестом — единственный существующий тест на активные задачи
+    /// (`active_task_survives_whole_among_two_hundred_open_tasks`) держит
+    /// только ОДНУ активную задачу и до этой ветки арифметики не доходит.
+    /// Здесь — `ACTIVE_TASK_CAP + 3` активных задач: три самые старые по
+    /// `activated_at` обязаны уйти в overflow, а сообщение — назвать точное
+    /// число.
+    #[test]
+    fn active_task_overflow_reports_correct_count_and_keeps_most_recent() {
+        let conn = test_conn();
+        let total = ACTIVE_TASK_CAP + 3;
+        for i in 0..total {
+            super::super::add_node(
+                &conn,
+                NodeType::Task,
+                &format!("[demo] активная задача {i:02}"),
+                Some(&format!("нота активной задачи {i:02}")),
+                "test",
+                serde_json::json!({
+                    "status": "active",
+                    // Чем больше i, тем свежее взятие в работу — самые
+                    // свежие ACTIVE_TASK_CAP обязаны остаться, самые старые
+                    // (i < 3) — уйти в overflow.
+                    "activated_at": format!("2020-01-{:02}T00:00:00Z", i + 1),
+                }),
+            )
+            .expect("add active task");
+        }
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+
+        assert!(
+            md.contains("- …и ещё 3 активных не поместилось"),
+            "сообщение о переполнении обязано назвать точное число:\n{md}"
+        );
+
+        for i in 0..3 {
+            let note = format!("нота активной задачи {i:02}");
+            assert!(
+                !md.contains(&note),
+                "самая старая активная задача {i} обязана уйти в overflow, а не остаться в дампе:\n{md}"
+            );
+        }
+        let newest_note = format!("нота активной задачи {:02}", total - 1);
+        assert!(
+            md.contains(&newest_note),
+            "самая свежая активная задача обязана остаться в дампе:\n{md}"
+        );
+    }
+
+    /// Находка 10: когда активные задачи съедают весь бюджет «В работе» и
+    /// ещё сверху, разница вычитается у бюджета «Решения и знания» (FR-017)
+    /// — ветка `semantic_budget = B_SEMANTIC.saturating_sub(...)` тоже не
+    /// была покрыта ни одним тестом. 15 активных задач с длинными note
+    /// (печатаются без бюджетного среза — FR-017) суммарно намного больше
+    /// `B_WORKING + B_SEMANTIC`, так что семантический бюджет обязан
+    /// обнулиться, а слой решений — исчезнуть целиком, а не просто ужаться.
+    #[test]
+    fn active_tasks_overrunning_working_budget_shrink_semantic_layer() {
+        let conn = test_conn();
+        let long_note = "слово ".repeat(40); // ~240 символов — больше per_line=160
+        for i in 0..15 {
+            super::super::add_node(
+                &conn,
+                NodeType::Task,
+                &format!("[demo] активная {i}"),
+                Some(&format!("{long_note}{i}")),
+                "test",
+                serde_json::json!({
+                    "status": "active",
+                    "activated_at": format!("2021-01-{:02}T00:00:00Z", i + 1),
+                }),
+            )
+            .expect("add active task");
+        }
+        let decision_text = "заметное решение, которое обязано пропасть при нулевом бюджете";
+        super::super::add_node(
+            &conn,
+            NodeType::Decision,
+            "[demo] решение",
+            Some(decision_text),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add decision");
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+
+        assert!(
+            !md.contains(decision_text),
+            "decision обязан пропасть при обнулённом семантическом бюджете:\n{md}"
+        );
+        assert!(
+            !md.contains("5 · Решения и знания"),
+            "пустой слой решений не обязан печатать заголовок:\n{md}"
         );
     }
 

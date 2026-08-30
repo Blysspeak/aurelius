@@ -181,6 +181,36 @@ pub(crate) fn resolve_node(
         .ok_or_else(|| anyhow::anyhow!("node not found: {identifier}"))
 }
 
+/// Тот же резолв, что и `resolve_node`, но для мест, где по контракту ручки
+/// узел ОБЯЗАН быть задачей (`task_update`/`task_view`/`task_log`) — как и в
+/// CLI (`find_task` в `crates/au/src/commands.rs`). Разница только в
+/// последнем фолбэке: полнотекстовый поиск ограничен `NodeType::Task`.
+///
+/// Находка 7 (адверсариальный разбор спеки 007): без этого ограничения
+/// нечёткое совпадение по строке могло указать на узел ЛЮБОГО типа — CLI
+/// в этом случае честно отвечает «задача не найдена», а MCP молча находил и
+/// мутировал первый попавшийся узел другого типа (например, Decision).
+/// `resolve_node` выше не трогаем: там любой тип узла законен (общие ручки
+/// вроде `memory_relate`).
+pub(crate) fn resolve_task_node(
+    conn: &Connection,
+    identifier: &str,
+) -> anyhow::Result<aurelius_core::models::Node> {
+    if let Ok(uuid) = identifier.parse::<Uuid>() {
+        if let Some(node) = graph::get_node(conn, &uuid.to_string())? {
+            return Ok(node);
+        }
+    }
+    if let Some(node) = graph::find_node_by_label(conn, identifier)? {
+        return Ok(node);
+    }
+    let results = graph::search_typed(conn, identifier, &NodeType::Task, 1)?;
+    results
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("task not found: {identifier}"))
+}
+
 /// Разбор живёт в ядре (`NodeType::parse`), чтобы CLI и MCP не расходились в
 /// том, какие типы вообще существуют. Здесь — мягкий вариант: незнакомое имя
 /// становится `Custom`, как и было в контракте инструмента.

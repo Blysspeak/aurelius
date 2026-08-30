@@ -130,12 +130,21 @@ WHERE id = ?4 AND deleted_at IS NULL AND node_type = '\"task\"'
   AND json_extract(data,'$.lease.owner') = ?3
 ";
 
+/// Находка 6 (адверсариальный разбор спеки 007): в отличие от прочих
+/// `RELEASE_*_SQL`/`GIVE_UP_SQL`, здесь `data` пишется целиком, а не через
+/// `json_set` с точечными путями — `release_done` строит способ решения
+/// (`resolution`) через общее правило закрытия, и результат проще собрать в
+/// Rust (тот же JSON, что кладут `au task done` и MCP `task_update`), чем
+/// повторять `json_object(...)` в SQL третий раз. `WHERE ... lease.owner = ?3`
+/// сохранён — гонка та же, что и раньше: если аренда истекла и наряд
+/// перевыдан между чтением узла и этой записью, `affected == 0` и вызывающий
+/// получает `NotOwner`, а не запись поверх нового владельца.
 const RELEASE_DONE_SQL: &str = "
 UPDATE nodes SET
-  data = json_set(json_set(data, '$.status', 'done'), '$.done_by', 'smena'),
-  updated_at = ?1, updated_by = ?2
-WHERE id = ?3 AND deleted_at IS NULL AND node_type = '\"task\"'
-  AND json_extract(data,'$.lease.owner') = ?2
+  data = ?1,
+  updated_at = ?2, updated_by = ?3
+WHERE id = ?4 AND deleted_at IS NULL AND node_type = '\"task\"'
+  AND json_extract(data,'$.lease.owner') = ?3
 ";
 
 const RELEASE_RETRY_SQL: &str = "
@@ -183,9 +192,85 @@ fn map_sqlite_err(err: rusqlite::Error) -> anyhow::Error {
     }
 }
 
+/// `true`, если аренда в `data.lease.until` ещё не истекла к моменту
+/// `now_str`. Обе стороны сравниваются как RFC3339-строки — тот же приём, что
+/// и в [`CLAIM_SQL`] (`COALESCE(json_extract(...),'') < ?4`): формат один и
+/// тот же для всех записей, поэтому лексикографическое сравнение работает как
+/// хронологическое, и заводить парсинг `DateTime` здесь незачем.
+fn lease_is_live(data: &Value, now_str: &str) -> bool {
+    data.get("lease")
+        .and_then(|l| l.get("until"))
+        .and_then(|u| u.as_str())
+        .is_some_and(|until| until > now_str)
+}
+
+/// `data` активных задач того же проекта, кроме только что взятой `claimed`.
+/// Отдельная функция от [`evict_active`]: той для объявления вслух хватает
+/// `id`+`label`, а здесь нужна ещё и аренда (`data.lease`), чтобы решить,
+/// вытеснять конфликт или отказать в `claim` целиком (см. [`claim`]).
+fn other_active_tasks(
+    conn: &Connection,
+    project: &str,
+    claimed: Uuid,
+) -> anyhow::Result<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT data FROM nodes
+          WHERE node_type = '\"task\"' AND deleted_at IS NULL
+            AND id != ?1
+            AND json_extract(data,'$.status') = 'active'
+            AND json_extract(data,'$.project') = ?2",
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map(params![claimed.to_string(), project], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.iter()
+        .map(|d| {
+            serde_json::from_str(d).map_err(|e| {
+                anyhow::anyhow!("активная задача проекта вернула нечитаемый data: {e}")
+            })
+        })
+        .collect()
+}
+
 /// Взять один наряд из машинного пула. `project` сужает отбор до задач с тем
 /// же `data.project`; `None` не сужает ничего. См. [`CLAIM_SQL`].
+///
+/// T029, находка 5 (адверсариальный разбор спеки 007): [`CLAIM_SQL`] отбирает
+/// наряд только по его СОБСТВЕННОМУ статусу и не смотрит, есть ли в том же
+/// проекте уже другая активная задача — `claim` был третьим путём взятия в
+/// работу в обход инварианта «одна активная задача на проект» (FR-031),
+/// который для двух других путей (`au task activate`, MCP `task_update`)
+/// соблюдает [`evict_active`]. Правило то же самое, вызванное отсюда, а не
+/// продублированное.
+///
+/// Обёртка нужна ради явной транзакции: сама проверка и возможное вытеснение
+/// идут ПОСЛЕ атомарного `UPDATE ... RETURNING`, и если конфликт разрешается
+/// отказом (см. `claim_locked`), только что взятый наряд обязан вернуться в
+/// точности в прежнее состояние — `ROLLBACK` делает это без ручного учёта
+/// каждого задетого поля (`status`, `lease`, `attempts`, `updated_at`).
 pub fn claim(
+    conn: &Connection,
+    owner: &str,
+    run: &str,
+    lease_minutes: i64,
+    project: Option<&str>,
+) -> anyhow::Result<ClaimedTask> {
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(map_sqlite_err)?;
+    let result = claim_locked(conn, owner, run, lease_minutes, project);
+    if result.is_ok() {
+        conn.execute_batch("COMMIT").map_err(map_sqlite_err)?;
+    } else {
+        // Ошибка отката не должна затмевать исходную ошибку взятия — если
+        // ROLLBACK тоже упал, возвращаем всё равно причину `claim_locked`.
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
+}
+
+fn claim_locked(
     conn: &Connection,
     owner: &str,
     run: &str,
@@ -219,6 +304,27 @@ pub fn claim(
         .map_err(|e| anyhow::anyhow!("наряд вернул нечитаемый id '{id}': {e}"))?;
     let data: Value = serde_json::from_str(&data)
         .map_err(|e| anyhow::anyhow!("наряд вернул нечитаемый data: {e}"))?;
+
+    if let Some(task_project) = data.get("project").and_then(|p| p.as_str()) {
+        let conflicts = other_active_tasks(conn, task_project, id)?;
+        let live_conflict = conflicts.iter().any(|c| lease_is_live(c, &now_str));
+        if live_conflict {
+            // Чужая живая аренда: вытеснение молча ставит конфликтующую
+            // задачу в `backlog`, НЕ трогая её `lease.until` — а `CLAIM_SQL`
+            // допускает в пул любую задачу со статусом `backlog` независимо
+            // от аренды (ветка "OR status='active' AND lease истёк" нужна
+            // только для активных). Вытесненная так задача немедленно стала
+            // бы claim-абельной третьим владельцем, хотя её аренда ещё не
+            // истекла, — то есть чинили бы двойной `active`, а сломали бы
+            // двойную выдачу аренды. Честнее отказать в этом взятии: наш
+            // `ROLLBACK` в `claim` возвращает только что взятый наряд как
+            // будто claim по нему не выполнялся.
+            return Err(LeaseError::NoTasksAvailable.into());
+        }
+        if !conflicts.is_empty() {
+            evict_active(conn, task_project, id)?;
+        }
+    }
 
     Ok(ClaimedTask {
         id,
@@ -268,17 +374,79 @@ pub fn release(
         anyhow::bail!("--evidence не может быть пустым");
     }
     match verdict {
-        Verdict::Done => release_done(conn, id, owner),
+        Verdict::Done => release_done(conn, id, owner, evidence),
         Verdict::Failed => release_failed(conn, id, owner),
     }
 }
 
-fn release_done(conn: &Connection, id: Uuid, owner: &str) -> anyhow::Result<ReleaseOutcome> {
+/// Находка 6 (адверсариальный разбор спеки 007): `release --verdict done` —
+/// третий путь закрытия задачи (помимо `au task done` и MCP `task_update`
+/// `status=done`), и раньше он не звал общее правило закрытия вовсе: не
+/// строил `resolution`, не ставил `closed_at`, не ставил даже легаси
+/// `completed_at`, а `--evidence` использовался только для проверки на
+/// пустоту и дальше терялся. Починка — не третья копия правила, а вызов той
+/// же `tasks::build_resolution`, что и у `au task done`/`task_update`
+/// (T021a). Читает узел двухшаговым способом, как и `release_failed`, — та же
+/// причина: атомарность одним предложением тут не нужна, гонку решает
+/// `WHERE lease.owner = ?` в самой записи.
+///
+/// `--evidence` кладётся в `data.evidence` как обычная улика прогона
+/// (`exit_code: 0` — раз вердикт `done`, прогон считается успешным), а не в
+/// `resolution`: `resolution` — это КАК задача решена (коммит, файлы,
+/// подтверждённость), а `--evidence` — это ЧТО показал наряд при закрытии,
+/// ровно то же по смыслу by design, что копит `au task evidence`. Так текст
+/// становится виден в `au task show` под «Улики», не изобретая для него
+/// отдельное поле.
+fn release_done(
+    conn: &Connection,
+    id: Uuid,
+    owner: &str,
+    evidence: &str,
+) -> anyhow::Result<ReleaseOutcome> {
+    let id_str = id.to_string();
+    let node = super::get_node(conn, &id_str)?.ok_or(LeaseError::NotOwner)?;
+    let current_owner = node
+        .data
+        .get("lease")
+        .and_then(|l| l.get("owner"))
+        .and_then(|o| o.as_str());
+    if current_owner != Some(owner) {
+        return Err(LeaseError::NotOwner.into());
+    }
+
     let now = Utc::now();
+    let mut fields = crate::tasks::TaskFields::from_data(&node.data);
+    let since = fields.activated_at.unwrap_or(node.created_at);
+    let project = node.data.get("project").and_then(|p| p.as_str());
+    // Наряд не даёт своего commit/pull_request/unconfirmed (у `release` нет
+    // таких аргументов, в отличие от `au task done`) — `build_resolution` сам
+    // соберёт то, что сможет, из состояния репозитория проекта и трейса правок.
+    let resolution = crate::tasks::build_resolution(conn, since, project, None, None, false);
+    fields.closed_at = Some(now);
+    fields.resolution = Some(resolution);
+    fields.evidence.push(crate::tasks::EvidenceEntry {
+        command: evidence.to_owned(),
+        exit_code: 0,
+        at: now,
+        artifact: None,
+        artifact_present: None,
+    });
+
+    let mut data = fields.merge_into(&node.data);
+    data["status"] = Value::String("done".to_owned());
+    // Легаси-поле: `done_by=smena` даёт откатить ложные закрытия ночи одним
+    // запросом (FR-015); `completed_at` — второе легаси-поле, которое до
+    // этой починки не ставилось вовсе, из-за чего `task_stats` (считает
+    // именно по нему) никогда не видел наряды закрытыми через `release`.
+    data["done_by"] = Value::String("smena".to_owned());
+    data["completed_at"] = Value::String(now.to_rfc3339());
+
+    let data_str = serde_json::to_string(&data)
+        .map_err(|e| anyhow::anyhow!("не удалось сериализовать закрытие наряда: {e}"))?;
     let affected = conn
         .execute(
             RELEASE_DONE_SQL,
-            params![now.to_rfc3339(), owner, id.to_string()],
+            params![data_str, now.to_rfc3339(), owner, id_str],
         )
         .map_err(map_sqlite_err)?;
     if affected == 0 {
@@ -1178,6 +1346,143 @@ mod tests {
             .expect("node exists");
         assert_eq!(node.data["status"], "done");
         assert_eq!(node.data["done_by"], "smena");
+    }
+
+    /// Находка 6 (адверсариальный разбор спеки 007): `release --verdict done`
+    /// обязан замыкать круг так же, как `au task done` и MCP `task_update` —
+    /// `closed_at`, легаси `completed_at` и способ решения через
+    /// `build_resolution`, а `--evidence` обязан быть виден в улике, а не
+    /// пропадать. До починки ни одно из этих полей не выставлялось вовсе.
+    #[test]
+    fn release_done_closes_the_loop_like_the_other_two_paths() {
+        let (_tmp, conn) = setup();
+        let id = seed_machine_task(&conn, serde_json::json!({}));
+        claim(&conn, "owner-a", "run-1", 60, None).expect("claim");
+
+        release(
+            &conn,
+            id,
+            "owner-a",
+            Verdict::Done,
+            "cargo test --workspace зелёный",
+        )
+        .expect("release done");
+
+        let node = crate::graph::get_node(&conn, &id.to_string())
+            .expect("query node")
+            .expect("node exists");
+        let fields = crate::tasks::TaskFields::from_data(&node.data);
+
+        assert!(
+            fields.closed_at.is_some(),
+            "closed_at обязан быть выставлен, как и у `au task done`/`task_update`"
+        );
+        assert!(
+            node.data["completed_at"].is_string(),
+            "легаси completed_at обязан быть выставлен, иначе task_stats не увидит закрытие"
+        );
+        assert!(
+            fields.resolution.is_some(),
+            "способ решения обязан строиться через build_resolution, а не отсутствовать"
+        );
+        assert!(
+            fields
+                .evidence
+                .iter()
+                .any(|e| e.command == "cargo test --workspace зелёный"),
+            "текст --evidence обязан быть виден в узле, а не только проверен на пустоту: {:?}",
+            fields.evidence
+        );
+    }
+
+    // --- T029: находка 5 — claim и инвариант «одна активная на проект» -----
+
+    /// T029, находка 5 (адверсариальный разбор спеки 007): `claim` — третий
+    /// путь взятия задачи в работу, и до починки он не звал `evict_active`
+    /// вовсе: живая репродукция была `au task activate` (A становится
+    /// active), затем `au task claim` (B становится active тоже) — `au task
+    /// list --project P` показывал ДВЕ активные задачи одного проекта, ровно
+    /// то, что `evict_active` обязан предотвращать (FR-031). Прежняя
+    /// активная задача БЕЗ живой аренды (обычная активация человеком, не
+    /// наряд) вытесняется в `backlog`, как и в двух других путях.
+    #[test]
+    fn claim_evicts_previous_active_task_without_live_lease() {
+        let (_tmp, conn) = setup();
+        let previous_active = seed_task_with(
+            &conn,
+            "[aurelius] прежняя активная",
+            None,
+            &[],
+            serde_json::json!({"status": "active", "project": "aurelius"}),
+        );
+        let backlog_id = seed_machine_task(&conn, serde_json::json!({"project": "aurelius"}));
+
+        let claimed = claim(&conn, "owner-a", "run-1", 60, None).expect("claim");
+        assert_eq!(claimed.id, backlog_id);
+
+        let prev = crate::graph::get_node(&conn, &previous_active.to_string())
+            .expect("query node")
+            .expect("node exists");
+        assert_eq!(
+            prev.data["status"], "backlog",
+            "claim обязан вытеснить прежнюю активную задачу проекта, как и au task activate"
+        );
+    }
+
+    /// Асимметрия предыдущего теста: прежняя активная задача под ЖИВОЙ чужой
+    /// арендой — `claim` обязан отказать, а не вытеснить. Вытеснение
+    /// поставило бы её в `backlog`, НЕ трогая `lease.until`, а `CLAIM_SQL`
+    /// берёт из пула любую задачу со статусом `backlog` независимо от
+    /// аренды — то есть починка одной двойной выдачи создала бы другую
+    /// (третий владелец забрал бы задачу, чья аренда ещё не истекла). Наряд,
+    /// взятый ЭТИМ вызовом, обязан вернуться в точности в исходное
+    /// состояние — это и проверяет откат `attempts`.
+    #[test]
+    fn claim_refuses_when_conflicting_active_task_holds_a_live_lease() {
+        let (_tmp, conn) = setup();
+        let live_until = (Utc::now() + chrono::Duration::minutes(30)).to_rfc3339();
+        let previous_active = seed_task_with(
+            &conn,
+            "[aurelius] держит живую аренду",
+            None,
+            &[],
+            serde_json::json!({
+                "status": "active",
+                "project": "aurelius",
+                "lease": {"owner": "other-owner", "until": live_until},
+            }),
+        );
+        let backlog_id = seed_machine_task(&conn, serde_json::json!({"project": "aurelius"}));
+
+        let err = claim(&conn, "owner-a", "run-1", 60, None).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<LeaseError>(),
+                Some(LeaseError::NoTasksAvailable)
+            ),
+            "конфликт с живой чужой арендой обязан выглядеть как «нарядов нет», а не вытеснять её: {err:#}"
+        );
+
+        let backlog_node = crate::graph::get_node(&conn, &backlog_id.to_string())
+            .expect("query node")
+            .expect("node exists");
+        assert_eq!(
+            backlog_node.data["status"], "backlog",
+            "отказанный claim обязан откатить наряд назад, а не оставить его active"
+        );
+        assert_eq!(
+            backlog_node.data["attempts"], 0,
+            "откат обязан вернуть attempts, увеличенные CLAIM_SQL, назад"
+        );
+
+        let previous = crate::graph::get_node(&conn, &previous_active.to_string())
+            .expect("query node")
+            .expect("node exists");
+        assert_eq!(
+            previous.data["status"], "active",
+            "живая чужая аренда не должна быть вытеснена"
+        );
+        assert_eq!(previous.data["lease"]["until"], live_until);
     }
 
     // --- T026: разметка исполнимости (фаза 3) ------------------------------

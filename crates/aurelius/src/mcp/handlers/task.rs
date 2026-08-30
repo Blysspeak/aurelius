@@ -5,7 +5,7 @@ use aurelius_core::{
 };
 use serde_json::json;
 
-use super::{node_compact, node_detail, open_db, resolve_node, truncate};
+use super::{node_compact, node_detail, open_db, resolve_task_node, truncate};
 
 pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
     let title = params
@@ -63,9 +63,12 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
     };
     graph::add_edge(&conn, task.id, proj_node.id, Relation::BelongsTo, 1.0)?;
 
-    // Parent task (subtask_of)
+    // Parent task (subtask_of). Резолв ограничен типом Task по той же причине,
+    // что и в `task_update`: обе связи по контракту ручки соединяют задачи, и
+    // нестрогий полнотекстовый фолбэк молча привязал бы задачу к решению или
+    // проблеме с похожей меткой — связь, которую потом никто не заметит.
     if let Some(parent_id) = params.get("parent").and_then(|p| p.as_str()) {
-        if let Ok(parent) = resolve_node(&conn, parent_id) {
+        if let Ok(parent) = resolve_task_node(&conn, parent_id) {
             graph::add_edge(&conn, task.id, parent.id, Relation::SubtaskOf, 1.0)?;
         }
     }
@@ -74,7 +77,7 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
     if let Some(blocks) = params.get("blocks").and_then(|b| b.as_array()) {
         for blocked in blocks {
             if let Some(blocked_id) = blocked.as_str() {
-                if let Ok(blocked_node) = resolve_node(&conn, blocked_id) {
+                if let Ok(blocked_node) = resolve_task_node(&conn, blocked_id) {
                     graph::add_edge(&conn, task.id, blocked_node.id, Relation::Blocks, 1.0)?;
                 }
             }
@@ -111,7 +114,7 @@ fn task_update_with_conn(
         .and_then(|i| i.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'id' parameter"))?;
 
-    let node = resolve_node(conn, id)?;
+    let node = resolve_task_node(conn, id)?;
 
     // Merge data fields
     let mut data = node.data.clone();
@@ -120,6 +123,17 @@ fn task_update_with_conn(
 
     if let Some(status) = params.get("status").and_then(|s| s.as_str()) {
         if status == "active" {
+            // Находка 4 (адверсариальный разбор спеки 007): `activated_at`
+            // обязан ставиться ОДИН РАЗ, на переход в active — читаем прежний
+            // статус ДО того, как он ниже перезапишется на новый (`data` тут
+            // ещё исходная копия узла). Вызов на уже активной задаче (заодно
+            // с обновлением `priority`, например) не имеет права сдвигать
+            // `activated_at`: иначе `since` в `build_resolution` уезжает
+            // вперёд и правки, сделанные до этого вызова, выпадают из
+            // `resolution.files`, а с починкой находки 3 такой сдвиг ещё и
+            // обнулял бы цикл созревания.
+            let was_active = data.get("status").and_then(|s| s.as_str()) == Some("active");
+
             // Легаси-поле: читатели до этой фичи (`task_stats`) ждут именно
             // его, и только на первую активацию — как в CLI (`au task
             // activate`).
@@ -143,10 +157,13 @@ fn task_update_with_conn(
 
             // FR-001/FR-021c, симметрия с CLI: пишем новое время взятия в
             // работу, не трогая `closed_at`/`resolution` — при переоткрытии
-            // они остаются историей, а не стираются.
-            let mut fields = aurelius_core::tasks::TaskFields::from_data(&data);
-            fields.activated_at = Some(now);
-            data = fields.merge_into(&data);
+            // они остаются историей, а не стираются. Только на реальный
+            // переход (см. `was_active` выше) — не на каждый вызов.
+            if !was_active {
+                let mut fields = aurelius_core::tasks::TaskFields::from_data(&data);
+                fields.activated_at = Some(now);
+                data = fields.merge_into(&data);
+            }
         }
         if status == "done" {
             // Легаси-поле: `task_stats` считает по нему длительность.
@@ -157,6 +174,7 @@ fn task_update_with_conn(
             // commit/pull_request/unconfirmed лишь уточняют автособранное.
             let mut fields = aurelius_core::tasks::TaskFields::from_data(&data);
             let since = fields.activated_at.unwrap_or(node.created_at);
+            let project = data.get("project").and_then(|p| p.as_str());
             let commit = params
                 .get("commit")
                 .and_then(|c| c.as_str())
@@ -169,9 +187,13 @@ fn task_update_with_conn(
                 .get("unconfirmed")
                 .and_then(|u| u.as_bool())
                 .unwrap_or(false);
+            // Находка 1, FR-004/FR-006: коммит закрываемой задачи ищется в
+            // каталоге ЕЁ ПРОЕКТА (см. `build_resolution`), не в CWD
+            // процесса — процесс тут один на все проекты сразу.
             let resolution = aurelius_core::tasks::build_resolution(
                 conn,
                 since,
+                project,
                 commit,
                 pull_request,
                 unconfirmed,
@@ -362,7 +384,7 @@ pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
         .ok_or_else(|| anyhow::anyhow!("missing 'text' parameter"))?;
 
     let conn = open_db()?;
-    let task = resolve_node(&conn, task_id)?;
+    let task = resolve_task_node(&conn, task_id)?;
 
     // Extract project from task data
     let project = task
@@ -629,7 +651,7 @@ fn task_view_with_conn(
         .map(|l| l as usize)
         .unwrap_or(TASK_VIEW_DEFAULT_ITEM_CAP);
 
-    let task = resolve_node(conn, id)?;
+    let task = resolve_task_node(conn, id)?;
     // Best effort by design: an access counter must never fail a read.
     if let Err(e) = graph::touch_node(conn, task.id) {
         tracing::warn!("could not record access for {}: {e}", task.id);
@@ -933,6 +955,47 @@ mod tests {
         assert_eq!(result["evicted"]["id"], old_active.to_string());
     }
 
+    /// Находка 4 (адверсариальный разбор спеки 007): повторный вызов со
+    /// `status=="active"` на УЖЕ активной задаче (например, попутно с
+    /// обновлением `priority`) не имеет права сдвигать `activated_at`
+    /// вперёд — иначе `since` в `build_resolution` при закрытии исключит
+    /// правки, сделанные до этого вызова, а с починкой находки 3 такой сдвиг
+    /// ещё и обнулял бы цикл созревания. Тест падал на прежней реализации
+    /// (`activated_at` ставился на `now` при ЛЮБОМ `status=="active"`).
+    #[test]
+    fn task_update_active_on_already_active_task_keeps_original_activated_at() {
+        let (_tmp, conn) = setup();
+        let id = seed_task(&conn, "proj-d", "уже активная задача");
+        let original_activated_at = "2026-08-30T08:00:00Z";
+        {
+            let node = graph::get_node(&conn, &id.to_string())
+                .expect("get_node")
+                .expect("node exists");
+            let mut data = node.data.clone();
+            data["status"] = json!("active");
+            data["activated_at"] = json!(original_activated_at);
+            graph::update_node(&conn, id, None, Some(data)).expect("seed active");
+        }
+
+        let result = task_update_with_conn(
+            &conn,
+            &json!({"id": id.to_string(), "status": "active", "priority": "high"}),
+        )
+        .expect("task_update active again");
+
+        let expected: chrono::DateTime<chrono::Utc> =
+            original_activated_at.parse().expect("rfc3339");
+        let got: chrono::DateTime<chrono::Utc> = result["activated_at"]
+            .as_str()
+            .expect("activated_at строкой")
+            .parse()
+            .expect("rfc3339");
+        assert_eq!(
+            got, expected,
+            "повторный вызов на уже активной задаче не обязан сдвигать activated_at"
+        );
+    }
+
     /// Уточняющий `commit` попадает в resolution, а не заменяется
     /// автособранным (FR-006): CLI ведёт себя так же (`--commit` уточняет,
     /// а не единственный источник).
@@ -949,6 +1012,77 @@ mod tests {
 
         assert_eq!(result["resolution"]["commit"], "deadbeef");
         assert_eq!(result["resolution"]["confirmed"], true);
+    }
+
+    /// Находка 7 (адверсариальный разбор спеки 007): фолбэк полнотекстового
+    /// поиска в резолве задачи обязан быть ограничен типом Task, как в CLI
+    /// (`find_task` в `crates/au/src/commands.rs`) — иначе нечёткое имя без
+    /// единой существующей задачи молча находит и мутирует узел ДРУГОГО
+    /// типа. Воспроизведение — как в разборе: в базе есть только
+    /// Decision-узел "[proj-probe] migrate to postgres entirely" и ни одной
+    /// задачи; `task_update({id: "migrate postgres", status: "done"})` не
+    /// имеет права найти и закрыть этот Decision. Тест падал на прежней
+    /// реализации (`resolve_node` без ограничения по типу находил Decision и
+    /// молча правил его `data.status`).
+    #[test]
+    fn task_update_does_not_match_task_of_wrong_type_via_fuzzy_search() {
+        let (_tmp, conn) = setup();
+        let decision = graph::add_node(
+            &conn,
+            NodeType::Decision,
+            "[proj-probe] migrate to postgres entirely",
+            Some("migrate to postgres entirely"),
+            "test",
+            json!({}),
+        )
+        .expect("insert decision");
+
+        let err =
+            task_update_with_conn(&conn, &json!({"id": "migrate postgres", "status": "done"}))
+                .expect_err("нечёткое имя без задач обязано вернуть ошибку, а не найти Decision");
+        assert!(
+            err.to_string().contains("task not found"),
+            "ожидалось «task not found», получили: {err}"
+        );
+
+        // Decision обязан остаться нетронутым — ничего не мутировано.
+        let node = graph::get_node(&conn, &decision.id.to_string())
+            .expect("get_node")
+            .expect("decision exists");
+        assert!(
+            node.data.get("status").is_none(),
+            "Decision не обязан обзавестись полем status задачи: {:?}",
+            node.data
+        );
+    }
+
+    /// Находка 1, монтаж на стороне MCP (адверсариальный разбор спеки 007):
+    /// `task_update` обязан передавать ПРОЕКТ закрываемой задачи в
+    /// `build_resolution`, а не звать его без проекта вовсе — иначе
+    /// автоподстановка коммита ушла бы в CWD процесса aurelius-сервера, а не
+    /// в каталог проекта задачи. Задача из непроиндексированного проекта —
+    /// каталог неизвестен графу — коммит обязан остаться пустым, а не
+    /// подставленным из CWD процесса теста (гарантированно git-репозиторий
+    /// aurelius: воспроизведение находки — «два настоящих git-репозитория,
+    /// CWD в repo_a, resolution для задачи repo_b»). Тест падал на прежней
+    /// реализации (`build_resolution` звалась без параметра `project`).
+    #[test]
+    fn task_update_done_does_not_guess_commit_from_process_cwd() {
+        let (_tmp, conn) = setup();
+        let id = seed_task(
+            &conn,
+            "proj-без-индексации",
+            "задача из непроиндексированного проекта",
+        );
+
+        let result = task_update_with_conn(&conn, &json!({"id": id.to_string(), "status": "done"}))
+            .expect("task_update done");
+
+        assert!(
+            result["resolution"]["commit"].is_null(),
+            "пустой коммит честнее подставленного из CWD чужого процесса: {:?}",
+            result["resolution"]["commit"]
+        );
     }
 
     // -- task_view: объём ответа и честность урезания ----------------------

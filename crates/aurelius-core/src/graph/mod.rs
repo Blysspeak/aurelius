@@ -86,7 +86,7 @@ pub fn list_secret_refs(
     project: Option<&str>,
 ) -> anyhow::Result<Vec<Node>> {
     let mut nodes = search::typed_in_project(conn, &NodeType::Config, project, 500)?;
-    nodes.retain(|n| n.data.get("kind").and_then(|v| v.as_str()) == Some("secret_ref"));
+    nodes.retain(crate::secret::is_secret_ref);
     Ok(nodes)
 }
 
