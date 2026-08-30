@@ -141,14 +141,24 @@ pub fn files_edited_since(
 }
 
 /// Путь к устойчивому виду для сравнения по префиксу каталога проекта:
-/// разделители приведены к `/`, регистр — к нижнему. `data.path` узла
-/// проекта приходит от `Path::to_string_lossy` после `canonicalize`
-/// (Windows отдаёт `\`), а payload в `act_trace` — от `tool_input.file_path`,
-/// как его прислал Claude Code (может быть смешанного регистра/разделителя);
-/// без нормализации сравнение молча отсекало бы всё до единого файла даже на
-/// том же самом каталоге.
+/// разделители приведены к `/`, регистр — к нижнему, снят расширенный
+/// префикс Windows.
+///
+/// Все три приведения обязательны, и третье выяснилось живым прогоном.
+/// `data.path` узла проекта приходит от `Path::to_string_lossy` после
+/// `canonicalize`, а `canonicalize` на Windows возвращает путь в расширенной
+/// форме — `\\?\A:\workSpace\aurelius`. Payload в `act_trace` приходит от
+/// `tool_input.file_path`, как его прислал Claude Code, то есть обычным
+/// `A:\workSpace\aurelius\...`. Без снятия префикса сравнение отсекало ВСЕ
+/// файлы до единого даже внутри того самого каталога — и молча: пустой
+/// список файлов выглядит как «правок не было», а не как «фильтр сломан».
 fn normalize_for_compare(p: &str) -> String {
-    p.replace('\\', "/").to_lowercase()
+    let s = p.replace('\\', "/").to_lowercase();
+    // `\\?\UNC\server\share` → `//server/share`, `\\?\A:\...` → `a:/...`.
+    if let Some(rest) = s.strip_prefix("//?/unc/") {
+        return format!("//{rest}");
+    }
+    s.strip_prefix("//?/").map_or(s.clone(), str::to_owned)
 }
 
 /// `root`, нормализованный и с гарантированным хвостовым `/` — без хвоста
@@ -308,5 +318,26 @@ mod tests {
         let files = files_edited_since(&conn, 0, Some(Path::new("c:/repo"))).expect("query");
 
         assert_eq!(files, vec![r"C:\Repo\src\Main.rs".to_owned()]);
+    }
+
+    /// Каталог проекта приходит из `data.path`, а тот пишется после
+    /// `canonicalize` — на Windows это расширенная форма `\\?\C:\...`, тогда
+    /// как следы правок хранят обычный путь. Живой прогон показал, что без
+    /// снятия префикса фильтр отсекает все файлы до единого, и происходит это
+    /// молча: пустой список читается как «правок не было».
+    #[test]
+    fn files_edited_since_matches_verbatim_windows_root() {
+        let conn = test_conn();
+        ingest_file_edit(&conn, r"A:\workSpace\aurelius\crates\au\src\commands.rs");
+        ingest_file_edit(&conn, r"A:\workSpace\boostix\src\index.ts");
+
+        let files = files_edited_since(&conn, 0, Some(Path::new(r"\\?\A:\workSpace\aurelius")))
+            .expect("query");
+
+        assert_eq!(
+            files,
+            vec![r"A:\workSpace\aurelius\crates\au\src\commands.rs".to_owned()],
+            "файл своего проекта обязан пройти фильтр, чужого — нет"
+        );
     }
 }

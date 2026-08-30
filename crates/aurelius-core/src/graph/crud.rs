@@ -364,6 +364,26 @@ pub fn find_node_by_label(conn: &Connection, label: &str) -> Result<Option<Node>
     Ok(rows.next().transpose()?)
 }
 
+/// Рабочий каталог проекта — из первого его узла, у которого путь вообще
+/// записан. Отдельный запрос, а не `find_project_by_label(...).data.path`:
+/// узлов проекта с одной меткой в живой базе несколько (индексатор заводит
+/// свой, автосоздание при заведении задачи — свой), и путь есть не у всех.
+/// Взяв первый попавшийся, мы получали бы каталог то есть, то нет — в
+/// зависимости от порядка строк, а от него зависит, соберутся ли файлы в
+/// способ решения.
+pub fn find_project_path(conn: &Connection, label: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(data,'$.path') AS path
+           FROM nodes
+          WHERE label = ?1 AND (node_type = 'project' OR node_type = '\"project\"')
+            AND deleted_at IS NULL AND path IS NOT NULL AND path != ''
+          ORDER BY created_at
+          LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(params![label], |row| row.get::<_, String>(0))?;
+    Ok(rows.next().transpose()?)
+}
+
 pub fn find_project_by_label(conn: &Connection, label: &str) -> Result<Option<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
