@@ -796,6 +796,48 @@ pub async fn export() -> Result<()> {
     Ok(())
 }
 
+/// Тело `au task activate` — вынесена отдельной функцией ради тестируемости
+/// (`task()` целиком завязан на `db_path()`, реальный путь БД пользователя,
+/// не подменяемый в тесте; эта логика — нет, она принимает соединение явно).
+///
+/// T008/FR-031: в проекте не более одной активной задачи — взятие этой
+/// снимает прежнюю активную того же проекта. FR-001/FR-021c: пишем новое
+/// время взятия в работу, не трогая `closed_at`/`resolution` — при
+/// переоткрытии они остаются историей, а не стираются.
+///
+/// Находка 4 (адверсариальный разбор спеки 007): `activated_at` ставится
+/// ОДИН РАЗ, на переход в active — не на каждый вызов `au task activate` на
+/// уже активной задаче. Симметрия с MCP `task_update` (`handlers/task.rs`).
+fn activate_task(
+    conn: &rusqlite::Connection,
+    task: &aurelius_core::models::Node,
+) -> Result<Option<graph::EvictedTask>> {
+    let project = task
+        .data
+        .get("project")
+        .and_then(|p| p.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    let evicted = graph::evict_active(conn, &project, task.id)?;
+
+    let was_active = task.data.get("status").and_then(|s| s.as_str()) == Some("active");
+    let mut data = task.data.clone();
+    data["status"] = json!("active");
+    if data.get("started_at").and_then(|s| s.as_str()).is_none() {
+        data["started_at"] = json!(chrono::Utc::now().to_rfc3339());
+    }
+    data.as_object_mut().map(|o| o.remove("blocked_by"));
+
+    if !was_active {
+        let mut fields = task_fields::TaskFields::from_data(&data);
+        fields.activated_at = Some(chrono::Utc::now());
+        data = fields.merge_into(&data);
+    }
+
+    graph::update_node(conn, task.id, None, Some(data))?;
+    Ok(evicted)
+}
+
 pub async fn task(action: TaskAction) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
 
@@ -1097,8 +1139,18 @@ pub async fn task(action: TaskAction) -> Result<()> {
 
             let mut fields = task_fields::TaskFields::from_data(&data);
             let since = fields.activated_at.unwrap_or(task.created_at);
-            let resolution =
-                task_fields::build_resolution(&conn, since, commit, pull_request, unconfirmed);
+            // Находка 1, FR-004/FR-006: коммит ищется в каталоге ПРОЕКТА
+            // ЗАДАЧИ (см. `build_resolution`), а не в CWD процесса — `au`
+            // тоже может быть запущен не из каталога проекта задачи.
+            let project = task.data.get("project").and_then(|p| p.as_str());
+            let resolution = task_fields::build_resolution(
+                &conn,
+                since,
+                project,
+                commit,
+                pull_request,
+                unconfirmed,
+            );
             let confirmed = resolution.confirmed;
             fields.closed_at = Some(chrono::Utc::now());
             fields.resolution = Some(resolution);
@@ -1122,32 +1174,7 @@ pub async fn task(action: TaskAction) -> Result<()> {
 
         TaskAction::Activate { id } => {
             let task = find_task(&conn, &id)?;
-            let project = task
-                .data
-                .get("project")
-                .and_then(|p| p.as_str())
-                .unwrap_or("unknown")
-                .to_owned();
-
-            // T008/FR-031: в проекте не более одной активной задачи —
-            // взятие этой снимает прежнюю активную того же проекта.
-            let evicted = graph::evict_active(&conn, &project, task.id)?;
-
-            let mut data = task.data.clone();
-            data["status"] = json!("active");
-            if data.get("started_at").and_then(|s| s.as_str()).is_none() {
-                data["started_at"] = json!(chrono::Utc::now().to_rfc3339());
-            }
-            data.as_object_mut().map(|o| o.remove("blocked_by"));
-
-            // FR-001/FR-021c: пишем новое время взятия в работу, не трогая
-            // `closed_at`/`resolution` — при переоткрытии они остаются
-            // историей, а не стираются.
-            let mut fields = task_fields::TaskFields::from_data(&data);
-            fields.activated_at = Some(chrono::Utc::now());
-            let data = fields.merge_into(&data);
-
-            graph::update_node(&conn, task.id, None, Some(data))?;
+            let evicted = activate_task(&conn, &task)?;
             println!("▶ Task activated: {}", task.label);
             // T009: молчаливое вытеснение выглядит как потеря задачи.
             if let Some(evicted) = evicted {
@@ -2739,4 +2766,126 @@ async fn share_disable(project: &str) -> Result<()> {
     }
     println!("✓ Sync disabled for '{project}' (local data untouched)");
     Ok(())
+}
+
+// `au` — бинарная цель без `lib.rs`, поэтому здесь нет общего для крейта
+// `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]`,
+// как в `aurelius-core`/`aurelius` (их `lib.rs` — не в списке файлов этой
+// правки). Разрешение ставится локально на сам тестовый модуль, а не через
+// правку `main.rs`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Тот же приём, что и в тестах ядра (`aurelius-core::tasks`): настоящий
+    /// temp-файл, не `:memory:` — `db::open` жёстко требует WAL.
+    struct TmpDb(PathBuf);
+
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "aurelius-au-commands-test-{tag}-{}.db",
+                uuid::Uuid::new_v4()
+            )))
+        }
+    }
+
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(p));
+            }
+        }
+    }
+
+    fn setup() -> (TmpDb, rusqlite::Connection) {
+        let tmp = TmpDb::new("setup");
+        let conn = db::open(&tmp.0).expect("open temp db");
+        (tmp, conn)
+    }
+
+    fn seed_task(
+        conn: &rusqlite::Connection,
+        project: &str,
+        data: serde_json::Value,
+    ) -> uuid::Uuid {
+        graph::add_node_full(
+            conn,
+            NodeType::Task,
+            &format!("[{project}] задача"),
+            None,
+            "test",
+            data,
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("insert task")
+        .id
+    }
+
+    /// Находка 4 (адверсариальный разбор спеки 007), сторона CLI: повторный
+    /// `au task activate` на УЖЕ активной задаче не имеет права сдвигать
+    /// `activated_at` вперёд — симметрично починке в MCP `task_update`
+    /// (`handlers/task.rs`). Тест падал на прежней реализации, ставившей
+    /// `activated_at` на каждый вызов `TaskAction::Activate`.
+    #[test]
+    fn activate_task_on_already_active_task_keeps_original_activated_at() {
+        let (_tmp, conn) = setup();
+        let original_activated_at = "2026-08-30T08:00:00Z";
+        let id = seed_task(
+            &conn,
+            "proj-cli",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "project": "proj-cli",
+                "activated_at": original_activated_at,
+            }),
+        );
+        let task = graph::get_node(&conn, &id.to_string())
+            .expect("get_node")
+            .expect("node exists");
+
+        activate_task(&conn, &task).expect("activate_task");
+
+        let after = graph::get_node(&conn, &id.to_string())
+            .expect("get_node")
+            .expect("node exists");
+        let fields = task_fields::TaskFields::from_data(&after.data);
+        assert_eq!(
+            fields.activated_at,
+            Some(original_activated_at.parse().expect("rfc3339")),
+            "повторная активация уже активной задачи не обязана сдвигать activated_at"
+        );
+    }
+
+    /// Асимметрия предыдущего теста: НАСТОЯЩИЙ переход backlog → active
+    /// обязан ставить `activated_at` — иначе первая активация вообще
+    /// осталась бы без времени взятия в работу.
+    #[test]
+    fn activate_task_from_backlog_sets_activated_at() {
+        let (_tmp, conn) = setup();
+        let id = seed_task(
+            &conn,
+            "proj-cli-2",
+            json!({"status": "backlog", "priority": "medium", "project": "proj-cli-2"}),
+        );
+        let task = graph::get_node(&conn, &id.to_string())
+            .expect("get_node")
+            .expect("node exists");
+
+        activate_task(&conn, &task).expect("activate_task");
+
+        let after = graph::get_node(&conn, &id.to_string())
+            .expect("get_node")
+            .expect("node exists");
+        let fields = task_fields::TaskFields::from_data(&after.data);
+        assert!(
+            fields.activated_at.is_some(),
+            "первая активация обязана выставить activated_at"
+        );
+    }
 }

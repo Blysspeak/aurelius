@@ -12,6 +12,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 /// Способ решения задачи (`data.resolution`), пишется при закрытии.
 /// `confirmed: false` — «закрыта без подтверждения»: способ решения неизвестен,
@@ -67,8 +68,23 @@ impl TaskFields {
     /// которые там лежат (`status`, `priority`, `lease`, `attempts`, ...).
     /// Узел без единого нового ключа даёт `TaskFields::default()` — не
     /// ошибку (T005).
+    ///
+    /// Каждое поле читается по отдельности, а не структура целиком: разбор
+    /// разом (`from_value::<Self>(data).unwrap_or_default()`) означал, что
+    /// одно испорченное значение где угодно в `data` молча обнуляет ВСЕ
+    /// поля сразу. Задача с настоящими правкой и зелёной уликой переставала
+    /// считаться созревшей из-за, например, числа вместо строки в
+    /// `resolution.files` — без единого сообщения о том, что что-то не так.
+    /// Порча остаётся локальной: теряется только то поле, которое испорчено.
     pub fn from_data(data: &Value) -> Self {
-        serde_json::from_value(data.clone()).unwrap_or_default()
+        Self {
+            activated_at: field(data, "activated_at"),
+            closed_at: field(data, "closed_at"),
+            resolution: field(data, "resolution"),
+            evidence: readable_evidence(data),
+            last_edit_at: field(data, "last_edit_at"),
+            declined_ripe_at: field(data, "declined_ripe_at"),
+        }
     }
 
     /// Сливает свои шесть полей обратно в `data`, не трогая ничего постороннее
@@ -96,18 +112,61 @@ impl TaskFields {
     }
 }
 
+/// Одно поле из `data`, если оно там есть и читается. Нечитаемое поле —
+/// `None`: оно теряется в одиночку, не утаскивая за собой соседей.
+fn field<T: serde::de::DeserializeOwned>(data: &Value, key: &str) -> Option<T> {
+    serde_json::from_value(data.get(key)?.clone()).ok()
+}
+
+/// Улики, которые удалось прочесть. Разбор поэлементный, а не разбор всего
+/// массива разом: одна улика с испорченной датой обнуляла бы весь список,
+/// включая прогоны, записанные правильно.
+fn readable_evidence(data: &Value) -> Vec<EvidenceEntry> {
+    data.get("evidence")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Корневой каталог проекта по его имени (`data.project` задачи).
+///
+/// Узел проекта в графе хранит канонический путь в `data.path` — его пишет
+/// индексатор (`indexer.rs::get_or_create_project`) при первой индексации.
+/// `None` значит «неизвестно», а не «текущий каталог»: проекта с такой
+/// меткой нет, либо узел заведён не индексатором и пути не знает (например,
+/// `task_create` создаёт узел проекта на лету, без `data.path`, если проект
+/// раньше не индексировался). Вызывающий обязан читать `None` как «каталог
+/// этой задачи неизвестен», а не подставлять вместо него CWD процесса —
+/// именно эта подмена и была находкой 1 (Aurelius — один процесс на все
+/// проекты, CWD принадлежит тому, где его запустили, а не задаче).
+pub fn project_root(conn: &rusqlite::Connection, project: &str) -> Option<PathBuf> {
+    let node = crate::graph::find_project_by_label(conn, project).ok()??;
+    let path = node.data.get("path")?.as_str()?;
+    Some(PathBuf::from(path))
+}
+
 /// Коммит, которым решается задача, если способ решения не назвали явно
-/// (T021a, FR-006): `git rev-parse --short HEAD` в текущем каталоге. `None`,
-/// если это не git-репозиторий или команда недоступна — не повод отказать в
-/// закрытии, только не сможем назвать коммит.
+/// (T021a, FR-006): `git rev-parse --short HEAD`. `dir` — каталог, в котором
+/// искать репозиторий (`git -C <dir>`); `None` — команда идёт в текущем
+/// рабочем каталоге процесса, что годится только вызывающему, у которого нет
+/// понятия «каталог задачи» вовсе (см. `build_resolution`). `None` в
+/// результате — не повод отказать в закрытии, только не сможем назвать
+/// коммит: не git-репозиторий, каталог не существует, команда недоступна.
 ///
 /// Общая точка для CLI (`au task done`) и MCP (`task_update`, статус `done`)
 /// — то же самое правило, вызванное из обоих мест, а не продублированное.
-pub fn current_commit_sha() -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
+pub fn current_commit_sha(dir: Option<&Path>) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(dir) = dir {
+        cmd.arg("-C").arg(dir);
+    }
+    cmd.args(["rev-parse", "--short", "HEAD"]);
+    let output = cmd.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -127,16 +186,38 @@ pub fn current_commit_sha() -> Option<String> {
 /// `unconfirmed` форсирует пометку «без подтверждения»; без него она ставится
 /// сама, когда следов не нашлось ни одного (FR-005).
 ///
+/// `project` — проект ЗАКРЫВАЕМОЙ задачи, не каталог процесса (находка 1
+/// адверсариального разбора спеки 007): Aurelius — один процесс и одна БД на
+/// все проекты, поэтому CWD процесса — не то же самое, что каталог проекта
+/// задачи. Автоподстановка коммита смотрит в каталог именно этого проекта
+/// (`project_root`), а не в CWD:
+/// - проект назван и его каталог известен — коммит берётся из НЕГО;
+/// - проект назван, а каталог неизвестен — коммит не подставляется вовсе:
+///   пустой способ решения честнее ложного с `confirmed: true`;
+/// - проект не назван совсем (старый однопроектный вызов) — CWD процесса,
+///   как и раньше: единственный источник, который у такого вызова был.
+///
+/// Список файлов (находка 2) ограничен тем же каталогом — см.
+/// `crate::trace::files_edited_since`.
+///
 /// Общая точка для CLI (`au task done`) и MCP (`task_update`, статус `done`).
 pub fn build_resolution(
     conn: &rusqlite::Connection,
     since: DateTime<Utc>,
+    project: Option<&str>,
     commit: Option<String>,
     pull_request: Option<String>,
     unconfirmed: bool,
 ) -> Resolution {
-    let commit = commit.or_else(current_commit_sha);
-    let files = crate::trace::files_edited_since(conn, since.timestamp()).unwrap_or_default();
+    let root = project.and_then(|p| project_root(conn, p));
+    let commit = commit.or_else(|| match project {
+        Some(_) => root
+            .as_deref()
+            .and_then(|dir| current_commit_sha(Some(dir))),
+        None => current_commit_sha(None),
+    });
+    let files = crate::trace::files_edited_since(conn, since.timestamp(), root.as_deref())
+        .unwrap_or_default();
     let confirmed =
         !unconfirmed && (commit.is_some() || pull_request.is_some() || !files.is_empty());
     Resolution {
@@ -151,11 +232,27 @@ pub fn build_resolution(
 /// предъявления (какая улика, когда). `None` значит «не созрела».
 ///
 /// Условия созревания (data-model.md, «Производное состояние: созревшая»),
-/// все четыре разом:
+/// все разом:
 /// 1. `status == "active"`;
 /// 2. есть `last_edit_at`;
 /// 3. в `evidence` есть элемент с `exit_code == 0` и `at` позже `last_edit_at`;
-/// 4. `declined_ripe_at` отсутствует или старше `last_edit_at`.
+/// 4. `declined_ripe_at` отсутствует или старше `last_edit_at`;
+/// 5. если есть `activated_at` — `last_edit_at` строго позже него (созревание
+///    считается по ТЕКУЩЕМУ циклу работы, не по прошлому).
+///
+/// Условие 5 — починка находки 3 (адверсариальный разбор спеки 007):
+/// переоткрытие (`done` → `active`) обновляет только `activated_at` —
+/// `last_edit_at`, `evidence` и `declined_ripe_at` от прошлого цикла
+/// остаются как есть (FR-003 прямо требует, чтобы переоткрытие их не
+/// стирало, спека 007 §data-model.md). Без условия 5 задача с зелёной уликой
+/// прошлого цикла считалась бы созревшей СРАЗУ после переоткрытия — без
+/// единой новой правки и прогона в новом цикле. Раз `last_edit_at` обязан
+/// быть позже `activated_at`, а подходящая улика (условие 3) обязана быть
+/// позже `last_edit_at` — она тем самым тоже гарантированно позже
+/// `activated_at`, отдельная проверка по улике не нужна.
+/// Задачи без `activated_at` (заведены до этой фичи, миграция назад не
+/// делалась) условие 5 не проверяет вовсе — иначе они разом перестали бы
+/// созревать, хотя раньше созревали.
 ///
 /// Состояние не хранится — вычисляется каждый раз из уже прочитанных полей.
 pub fn ripe_evidence<'a>(fields: &'a TaskFields, status: &str) -> Option<&'a EvidenceEntry> {
@@ -165,6 +262,11 @@ pub fn ripe_evidence<'a>(fields: &'a TaskFields, status: &str) -> Option<&'a Evi
     let last_edit_at = fields.last_edit_at?;
     if let Some(declined_at) = fields.declined_ripe_at {
         if declined_at >= last_edit_at {
+            return None;
+        }
+    }
+    if let Some(activated_at) = fields.activated_at {
+        if last_edit_at <= activated_at {
             return None;
         }
     }
@@ -212,7 +314,13 @@ pub fn gather_ripe(
             continue;
         };
         let since = fields.activated_at.unwrap_or(t.created_at);
-        let files = crate::trace::files_edited_since(conn, since.timestamp()).unwrap_or_default();
+        // Находка 2: границу проекта задаёт проект ЭТОЙ задачи (`t.data`), а
+        // не параметр `project` вызова — тот лишь фильтр выборки и может
+        // быть `None` (все проекты разом).
+        let task_project = t.data.get("project").and_then(|p| p.as_str());
+        let root = task_project.and_then(|p| project_root(conn, p));
+        let files = crate::trace::files_edited_since(conn, since.timestamp(), root.as_deref())
+            .unwrap_or_default();
         out.push(RipeReport {
             id: t.id,
             label: t.label.clone(),
@@ -271,6 +379,53 @@ mod tests {
         let fields = TaskFields::from_data(&data);
 
         assert_eq!(fields, TaskFields::default());
+    }
+
+    /// Одно испорченное значение не должно уносить с собой соседние поля.
+    /// Разбор всей структуры разом делал именно это: число вместо строки в
+    /// `resolution.files` обнуляло и времена, и улики, и задача с настоящей
+    /// правкой и зелёным прогоном молча переставала считаться созревшей.
+    #[test]
+    fn corrupt_field_does_not_wipe_the_readable_ones() {
+        let data = json!({
+            "status": "active",
+            "activated_at": "2026-08-30T08:00:00Z",
+            "last_edit_at": "2026-08-30T09:00:00Z",
+            "evidence": [
+                {"command": "cargo test", "exit_code": 0, "at": "2026-08-30T10:00:00Z"},
+            ],
+            "resolution": {"files": [123]},
+        });
+
+        let fields = TaskFields::from_data(&data);
+
+        assert_eq!(fields.evidence.len(), 1, "улика читается: {fields:?}");
+        assert!(fields.last_edit_at.is_some(), "время правки читается");
+        assert!(
+            fields.resolution.is_none(),
+            "испорченный способ решения теряется — но только он"
+        );
+        assert!(
+            is_ripe(&fields, "active"),
+            "созревание считается по читаемым полям, а не отменяется чужой порчей"
+        );
+    }
+
+    /// Улики разбираются поэлементно: соседство с испорченной записью не
+    /// должно стоить прогону места в списке.
+    #[test]
+    fn corrupt_evidence_entry_does_not_hide_the_others() {
+        let data = json!({
+            "evidence": [
+                {"command": "cargo test", "exit_code": 0, "at": "не дата"},
+                {"command": "cargo clippy", "exit_code": 0, "at": "2026-08-30T10:00:00Z"},
+            ],
+        });
+
+        let fields = TaskFields::from_data(&data);
+
+        assert_eq!(fields.evidence.len(), 1, "читаемая улика остаётся");
+        assert_eq!(fields.evidence[0].command, "cargo clippy");
     }
 
     /// T006: запись новых полей не затирает посторонние ключи в `data` —
@@ -345,6 +500,62 @@ mod tests {
         // Новая правка после отказа — предложение снова уместно.
         fields.last_edit_at = Some("2026-08-30T11:00:00Z".parse().expect("rfc3339"));
         fields.evidence = vec![evidence("cargo test", 0, "2026-08-30T11:30:00Z")];
+        assert!(is_ripe(&fields, "active"));
+    }
+
+    /// Находка 3 (адверсариальный разбор спеки 007): переоткрытие
+    /// (`done` → `active`) обновляет только `activated_at` — `last_edit_at`
+    /// и зелёная улика от ПРОШЛОГО цикла остаются нетронутыми (FR-003
+    /// запрещает их стирать). Без условия 5 в `ripe_evidence` задача была бы
+    /// созревшей сразу после переоткрытия, без единой новой правки. Тест
+    /// падал на прежней реализации `ripe_evidence` (проверявшей только
+    /// `last_edit_at`/`evidence`/`declined_ripe_at`, без сравнения с
+    /// `activated_at`).
+    #[test]
+    fn reopened_task_is_not_immediately_ripe_from_previous_cycle() {
+        let fields = TaskFields {
+            // Прошлый цикл: правка и зелёная улика — обе ДО переоткрытия.
+            last_edit_at: Some("2026-08-30T09:00:00Z".parse().expect("rfc3339")),
+            evidence: vec![evidence("cargo test", 0, "2026-08-30T09:30:00Z")],
+            // Переоткрытие — позже и правки, и улики прошлого цикла.
+            activated_at: Some("2026-08-30T12:00:00Z".parse().expect("rfc3339")),
+            ..Default::default()
+        };
+
+        assert!(
+            !is_ripe(&fields, "active"),
+            "улика прошлого цикла не обязана созревать задачу после переоткрытия"
+        );
+    }
+
+    /// Асимметрия предыдущего теста: НОВАЯ правка и НОВАЯ улика ПОСЛЕ
+    /// переоткрытия — созревание обязано вернуться, условие 5 не должно
+    /// блокировать текущий цикл навечно.
+    #[test]
+    fn reopened_task_becomes_ripe_again_after_new_cycle_evidence() {
+        let fields = TaskFields {
+            last_edit_at: Some("2026-08-30T13:00:00Z".parse().expect("rfc3339")),
+            evidence: vec![evidence("cargo test", 0, "2026-08-30T13:30:00Z")],
+            activated_at: Some("2026-08-30T12:00:00Z".parse().expect("rfc3339")),
+            ..Default::default()
+        };
+
+        assert!(is_ripe(&fields, "active"));
+    }
+
+    /// Задача без `activated_at` вовсе (заведена до этой фичи) не обязана
+    /// проверяться условием 5 — иначе она разом перестала бы созревать,
+    /// хотя раньше созревала. Тот же случай, что и `not_ripe_without_last_edit_at`
+    /// выше, но с непустой уликой — подтверждает, что отсутствие
+    /// `activated_at` не блокирует созревание.
+    #[test]
+    fn ripe_without_activated_at_is_unaffected_by_cycle_check() {
+        let fields = TaskFields {
+            last_edit_at: Some("2026-08-30T09:00:00Z".parse().expect("rfc3339")),
+            evidence: vec![evidence("cargo test", 0, "2026-08-30T10:00:00Z")],
+            ..Default::default()
+        };
+
         assert!(is_ripe(&fields, "active"));
     }
 
@@ -538,6 +749,163 @@ mod tests {
         let ripe = gather_ripe(&conn, None).expect("gather_ripe");
 
         assert!(ripe.is_empty());
+    }
+
+    /// Узел проекта с `data.path` — то, что реально пишет индексатор
+    /// (`indexer.rs::get_or_create_project`). `find_project_by_label` ищет по
+    /// метке И типу узла — `add_node` типа `Project` этого достаточно.
+    fn seed_project_with_path(conn: &rusqlite::Connection, label: &str, path: &str) {
+        crate::graph::add_node(
+            conn,
+            crate::models::NodeType::Project,
+            label,
+            None,
+            "test",
+            json!({"path": path}),
+        )
+        .expect("insert project");
+    }
+
+    // -- project_root / build_resolution: находка 1 -------------------------
+
+    #[test]
+    fn project_root_reads_path_from_project_node() {
+        let (_tmp, conn) = setup();
+        seed_project_with_path(&conn, "proj-with-path", "/repos/proj-with-path");
+
+        let root = project_root(&conn, "proj-with-path");
+
+        assert_eq!(root, Some(PathBuf::from("/repos/proj-with-path")));
+    }
+
+    #[test]
+    fn project_root_is_none_for_unknown_project() {
+        let (_tmp, conn) = setup();
+
+        assert_eq!(project_root(&conn, "нет такого проекта"), None);
+    }
+
+    /// Находка 1 (адверсариальный разбор спеки 007): проект задачи назван, но
+    /// его каталог неизвестен графу (узел проекта не индексирован либо не
+    /// хранит `data.path`) — коммит НЕ подставляется автоматически, даже
+    /// если процесс сам работает внутри какого-то git-репозитория (CWD теста
+    /// — рабочее дерево aurelius, оно ГАРАНТИРОВАННО git-репозиторий). Тест
+    /// падал на прежней реализации (`current_commit_sha()` без аргументов,
+    /// бравшей коммит из CWD процесса вне зависимости от того, чей это
+    /// проект) и проходит на новой.
+    #[test]
+    fn build_resolution_does_not_guess_commit_when_project_root_unknown() {
+        let (_tmp, conn) = setup();
+        let since = "2020-01-01T00:00:00Z".parse().expect("rfc3339");
+
+        let resolution = build_resolution(
+            &conn,
+            since,
+            Some("проект-без-индексации"),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            resolution.commit, None,
+            "пустой коммит честнее подставленного из CWD чужого проекта"
+        );
+    }
+
+    /// Прямая репродукция находки 1: два РЕАЛЬНЫХ git-репозитория. Процесс
+    /// (тест) работает в каталоге A (workspace aurelius), а задача
+    /// принадлежит проекту B — отдельному репозиторию во временном каталоге.
+    /// `build_resolution` обязана вернуть SHA репозитория B, а не текущего
+    /// каталога процесса.
+    #[test]
+    fn build_resolution_uses_task_project_repo_not_process_cwd() {
+        let (_tmp, conn) = setup();
+
+        let repo_b =
+            std::env::temp_dir().join(format!("aurelius-tasks-repo-b-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&repo_b).expect("mkdir repo_b");
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo_b)
+                .args(args)
+                .output()
+                .expect("запустить git")
+        };
+        assert!(run_git(&["init", "-q"]).status.success());
+        assert!(run_git(&["config", "user.email", "test@example.com"])
+            .status
+            .success());
+        assert!(run_git(&["config", "user.name", "test"]).status.success());
+        std::fs::write(repo_b.join("README.md"), "b").expect("write file");
+        assert!(run_git(&["add", "."]).status.success());
+        assert!(run_git(&["commit", "-q", "-m", "init"]).status.success());
+        let expected_sha =
+            String::from_utf8_lossy(&run_git(&["rev-parse", "--short", "HEAD"]).stdout)
+                .trim()
+                .to_owned();
+
+        seed_project_with_path(&conn, "proj-b", &repo_b.to_string_lossy());
+        let since = "2020-01-01T00:00:00Z".parse().expect("rfc3339");
+
+        let resolution = build_resolution(&conn, since, Some("proj-b"), None, None, false);
+
+        assert_eq!(resolution.commit.as_deref(), Some(expected_sha.as_str()));
+        // Не CWD процесса: каталог теста (`aurelius`) — другой репозиторий с
+        // другой историей, совпадение SHA было бы подозрительным само по себе.
+        assert_ne!(resolution.commit, current_commit_sha(None));
+
+        std::fs::remove_dir_all(&repo_b).ok();
+    }
+
+    // -- gather_ripe: находка 2 — файлы ограничены проектом задачи ----------
+
+    /// Находка 2 (адверсариальный разбор спеки 007): без границы проекта
+    /// хук `au trace --hook` пишет правки ЛЮБОГО проекта в общую таблицу
+    /// `act_trace` — список файлов созревшей задачи проекта A не обязан
+    /// содержать правки проекта B. Тест падал на прежней реализации
+    /// (`files_edited_since` без параметра каталога, фильтровавшей только по
+    /// времени) и проходит на новой.
+    #[test]
+    fn gather_ripe_files_are_scoped_to_the_task_own_project() {
+        let (_tmp, conn) = setup();
+        seed_project_with_path(&conn, "proj-a", "/repos/proj-a");
+        let task_id = seed_task(
+            &conn,
+            "[proj-a] созревшая задача",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "project": "proj-a",
+                "last_edit_at": "2026-08-30T09:00:00Z",
+                "evidence": [{
+                    "command": "cargo test",
+                    "exit_code": 0,
+                    "at": "2026-08-30T10:00:00Z",
+                }],
+            }),
+        );
+        for payload in ["/repos/proj-a/src/lib.rs", "/repos/proj-b/src/lib.rs"] {
+            crate::trace::ingest(
+                &conn,
+                &crate::trace::TraceInput {
+                    session_id: "s1",
+                    kind: crate::trace::TraceKind::FileEdit,
+                    payload,
+                    exit_code: None,
+                    state_hash_pre: None,
+                    state_hash_post: None,
+                },
+            )
+            .expect("ingest trace");
+        }
+
+        let ripe = gather_ripe(&conn, None).expect("gather_ripe");
+
+        assert_eq!(ripe.len(), 1);
+        assert_eq!(ripe[0].id, task_id);
+        assert_eq!(ripe[0].files, vec!["/repos/proj-a/src/lib.rs".to_owned()]);
     }
 
     /// `ripe_to_json` — форма ответа, общая для CLI и MCP: id строкой, вложенный
