@@ -169,16 +169,31 @@ pub fn task_list(params: &serde_json::Value) -> Result<serde_json::Value> {
                 )
                 .unwrap_or(0);
 
+            // Спека 007, T026: аддитивные поля, ничего существующего не
+            // переименовано (принцип VI). `ripe` — производное, не хранимое.
+            let status = t
+                .data
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("backlog");
+            let fields = aurelius_core::tasks::TaskFields::from_data(&t.data);
+            let ripe = aurelius_core::tasks::is_ripe(&fields, status);
+
             json!({
                 "id": t.id.to_string(),
                 "label": t.label,
-                "status": t.data.get("status").and_then(|s| s.as_str()).unwrap_or("backlog"),
+                "status": status,
                 "priority": t.data.get("priority").and_then(|p| p.as_str()).unwrap_or("medium"),
                 "work_logs": log_count,
                 "created_at": t.created_at.to_rfc3339(),
                 "note": t.note,
                 "created_by": t.created_by,
                 "updated_by": t.updated_by,
+                "activated_at": fields.activated_at.map(|d| d.to_rfc3339()),
+                "closed_at": fields.closed_at.map(|d| d.to_rfc3339()),
+                "resolution": fields.resolution,
+                "evidence": fields.evidence,
+                "ripe": ripe,
             })
         })
         .collect();
@@ -472,6 +487,17 @@ pub fn task_view(params: &serde_json::Value) -> Result<serde_json::Value> {
         a_date.cmp(b_date)
     });
 
+    // Спека 007, T026: аддитивные поля из типизированных полей задачи
+    // (`crates/aurelius-core/src/tasks.rs`) — ничего существующего не
+    // переименовано, новых обязательных параметров нет (принцип VI).
+    let status_str = task
+        .data
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("backlog");
+    let fields = aurelius_core::tasks::TaskFields::from_data(&task.data);
+    let ripe = aurelius_core::tasks::is_ripe(&fields, status_str);
+
     Ok(json!({
         "task": node_detail(&task),
         "status": task.data.get("status"),
@@ -483,5 +509,10 @@ pub fn task_view(params: &serde_json::Value) -> Result<serde_json::Value> {
         "solutions": solutions,
         "subtasks": subtasks,
         "total_edges": edges.len(),
+        "activated_at": fields.activated_at.map(|d| d.to_rfc3339()),
+        "closed_at": fields.closed_at.map(|d| d.to_rfc3339()),
+        "resolution": fields.resolution,
+        "evidence": fields.evidence,
+        "ripe": ripe,
     }))
 }

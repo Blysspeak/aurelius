@@ -1,5 +1,4 @@
 pub mod codec;
-pub mod connector;
 pub mod db;
 pub mod differ;
 pub mod fts;
@@ -12,8 +11,9 @@ pub mod models;
 pub mod obligations;
 pub mod probes;
 pub mod provenance;
+pub mod secret;
 pub mod sync;
-pub mod timeforged;
+pub mod tasks;
 pub mod trace;
 pub mod window;
 

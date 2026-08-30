@@ -103,6 +103,22 @@ pub fn count_for_session(conn: &Connection, session_id: &str) -> Result<i64> {
     )?)
 }
 
+/// Пути файлов, правки которых зафиксированы (`kind = 'file_edit'`) начиная с
+/// момента `since_ts` (unix-секунды) — спека 007, FR-006: «способ решения
+/// собирается из уже существующих следов работы», а не запрашивается у
+/// человека отдельным вопросом. Используется и при закрытии задачи
+/// (`resolution.files`), и при предъявлении созревшей (`au task ripe`,
+/// `au judge --hook`) как перечень изменённого.
+pub fn files_edited_since(conn: &Connection, since_ts: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT payload FROM act_trace
+          WHERE kind = 'file_edit' AND ts >= ?1 AND payload != ''
+          ORDER BY payload",
+    )?;
+    let rows = stmt.query_map([since_ts], |r| r.get::<_, String>(0))?;
+    Ok(rows.filter_map(std::result::Result::ok).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
