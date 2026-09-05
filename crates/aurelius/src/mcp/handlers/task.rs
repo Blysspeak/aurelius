@@ -2003,4 +2003,46 @@ mod tests {
             "expected a subject-conflict message, got: {err}"
         );
     }
+
+    // -- task 23120a83: resolve_task_node accepts a unique id prefix --
+
+    #[test]
+    fn resolve_task_node_finds_task_by_eight_char_id_prefix() {
+        let (_tmp, conn) = setup();
+        let created = task_create_with_conn(
+            &conn,
+            &json!({"title": "задача по префиксу", "project": "aurelius"}),
+        )
+        .expect("create task");
+        let id = created["id"].as_str().expect("id").to_owned();
+
+        let found = resolve_task_node(&conn, &id[..8]).expect("resolve by prefix");
+        assert_eq!(found.id.to_string(), id);
+    }
+
+    /// A non-task node whose id happens to share its 8-char prefix must be
+    /// rejected the same way a missing task is — the caller's contract
+    /// (`task_view`/`task_update`/`task_log`) is "a task or nothing", not
+    /// "whatever node the id prefix names".
+    #[test]
+    fn resolve_task_node_rejects_id_prefix_of_a_non_task_node() {
+        let (_tmp, conn) = setup();
+        let decision = graph::add_node(
+            &conn,
+            NodeType::Decision,
+            "не задача",
+            None,
+            "test",
+            json!({}),
+        )
+        .expect("add decision node");
+
+        let prefix = &decision.id.to_string()[..8];
+        let err = resolve_task_node(&conn, prefix)
+            .expect_err("a non-task node must not resolve as a task");
+        assert!(
+            err.to_string().contains("task not found"),
+            "expected a 'task not found' message, got: {err}"
+        );
+    }
 }

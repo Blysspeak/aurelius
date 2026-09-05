@@ -2378,6 +2378,15 @@ fn find_task(conn: &rusqlite::Connection, id: &str) -> Result<aurelius_core::mod
             return Ok(node);
         }
     }
+    // Try a unique id prefix (same rule as MCP's `resolve_task_node`, kept in
+    // core via `find_node_by_id_prefix` so CLI and MCP cannot diverge).
+    if let Some(node) = graph::find_node_by_id_prefix(conn, id)? {
+        if matches!(node.node_type, NodeType::Task) {
+            return Ok(node);
+        }
+        let type_label = format!("{:?}", node.node_type).to_lowercase();
+        anyhow::bail!("task not found: {id} (id prefix names a {type_label} node)");
+    }
     // Try label match
     if let Some(node) = graph::find_node_by_label(conn, id)? {
         return Ok(node);

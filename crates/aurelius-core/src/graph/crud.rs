@@ -391,6 +391,44 @@ pub fn find_node_by_label(conn: &Connection, label: &str) -> Result<Option<Node>
     Ok(rows.next().transpose()?)
 }
 
+/// Живой узел по уникальному префиксу его `id` (не короче 8 hex-символов).
+///
+/// Правило живёт здесь, а не в CLI/MCP по отдельности, ровно затем, чтобы
+/// `au task …` и `resolve_task_node` (MCP) не разошлись в том, что считать
+/// однозначным префиксом: два независимых порога "восемь символов" рано или
+/// поздно перестанут совпадать.
+///
+/// Короче 8 символов или с посторонним символом (не hex-цифра, не дефис) —
+/// `Ok(None)` без обращения к базе: это заведомо не полный и не уникальный
+/// префикс id, а не "искали и не нашли". Одно совпадение — `Ok(Some(node))`.
+/// Два и больше — ошибка с обоими id-кандидатами: тихо выбрать первый
+/// попавшийся значило бы иногда молча промахнуться мимо нужного узла.
+pub fn find_node_by_id_prefix(conn: &Connection, prefix: &str) -> Result<Option<Node>> {
+    if prefix.len() < 8 || !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes WHERE id LIKE ?1 || '%' AND deleted_at IS NULL LIMIT 2",
+    )?;
+    let candidates = stmt
+        .query_map(params![prefix], row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.into_iter().next()),
+        _ => {
+            anyhow::bail!(
+                "ambiguous id prefix '{prefix}': matches {} and {} — use more characters",
+                candidates[0].id,
+                candidates[1].id
+            )
+        }
+    }
+}
+
 /// Рабочий каталог проекта — из первого его узла, у которого путь вообще
 /// записан. Отдельный запрос, а не `find_project_by_label(...).data.path`:
 /// узлов проекта с одной меткой в живой базе несколько (индексатор заводит
@@ -714,5 +752,98 @@ mod tests {
         .expect("upsert b");
         assert!(created);
         assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn find_by_id_prefix_finds_the_node_by_first_eight_chars() {
+        let (_tmp, conn) = setup();
+        let node = add_node(
+            &conn,
+            NodeType::Task,
+            "задача с длинным id",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let prefix = &node.id.to_string()[..8];
+        let found = find_node_by_id_prefix(&conn, prefix)
+            .expect("lookup")
+            .expect("must find the node");
+        assert_eq!(found.id, node.id);
+    }
+
+    #[test]
+    fn find_by_id_prefix_rejects_prefix_shorter_than_eight_chars() {
+        let (_tmp, conn) = setup();
+        let node = add_node(
+            &conn,
+            NodeType::Task,
+            "задача покороче",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let short_prefix = &node.id.to_string()[..7];
+        let found = find_node_by_id_prefix(&conn, short_prefix).expect("lookup must not error");
+        assert!(found.is_none(), "7 символов — не префикс, а недоввод");
+    }
+
+    #[test]
+    fn find_by_id_prefix_rejects_non_hex_characters() {
+        let (_tmp, conn) = setup();
+        let found =
+            find_node_by_id_prefix(&conn, "zzzzzzzz").expect("lookup must not touch the db");
+        assert!(found.is_none(), "'z' — не hex-цифра и не дефис");
+    }
+
+    /// Реальные id генерируются случайно и общий префикс сами по себе не
+    /// дадут — здесь он прописан вручную прямым `UPDATE`, чтобы проверить
+    /// именно ветку неоднозначности, а не полагаться на удачу.
+    #[test]
+    fn find_by_id_prefix_errs_with_both_candidates_on_ambiguity() {
+        let (_tmp, conn) = setup();
+        let a = add_node(
+            &conn,
+            NodeType::Task,
+            "первый кандидат",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node a");
+        let b = add_node(
+            &conn,
+            NodeType::Task,
+            "второй кандидат",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node b");
+
+        let shared_id_a = "deadbeef-0000-4000-8000-000000000001";
+        let shared_id_b = "deadbeef-0000-4000-8000-000000000002";
+        conn.execute(
+            "UPDATE nodes SET id = ?1 WHERE id = ?2",
+            params![shared_id_a, a.id.to_string()],
+        )
+        .expect("rewrite id a");
+        conn.execute(
+            "UPDATE nodes SET id = ?1 WHERE id = ?2",
+            params![shared_id_b, b.id.to_string()],
+        )
+        .expect("rewrite id b");
+
+        let err = find_node_by_id_prefix(&conn, "deadbeef")
+            .expect_err("два узла с общим префиксом обязаны дать ошибку");
+        let message = err.to_string();
+        assert!(
+            message.contains(shared_id_a) && message.contains(shared_id_b),
+            "сообщение должно называть оба id-кандидата: {message}"
+        );
     }
 }
