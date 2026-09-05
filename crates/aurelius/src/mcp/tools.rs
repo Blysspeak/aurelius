@@ -5,7 +5,7 @@ pub fn tool_definitions() -> serde_json::Value {
         "tools": [
             {
                 "name": "memory_status",
-                "description": "Full project snapshot for session start. Returns project structure, recent decisions with reasoning, open problems, solved problems, session history with summaries, and graph stats. Call this first in every new session.",
+                "description": "Full project snapshot for session start. Returns project structure, recent decisions with reasoning, open problems, solved problems, session history with summaries, graph stats, and a 'server' block (running MCP server version, started_at, and restart_needed when the binary on disk is newer than this running process). Call this first in every new session.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
