@@ -1435,15 +1435,15 @@ pub async fn task(action: TaskAction) -> Result<()> {
                     "cancelled" => "✗",
                     _ => "○",
                 };
+                let fields = task_fields::TaskFields::from_data(&t.data);
                 // T021b: помечаем созревшие — предъявление не ждёт вопроса
                 // человека (FR-012), список задач не должен врать о том, что
                 // уже готово к закрытию.
-                let ripe_mark =
-                    if task_fields::is_ripe(&task_fields::TaskFields::from_data(&t.data), st) {
-                        " 🟢 ready-to-close"
-                    } else {
-                        ""
-                    };
+                let ripe_mark = if task_fields::is_ripe(&fields, st) {
+                    " 🟢 ready-to-close"
+                } else {
+                    ""
+                };
                 println!("  {icon} [{pri}] {} — {st}{ripe_mark}", t.label);
                 println!("    id: {}", t.id);
                 if let Some(created_by) = &t.created_by {
@@ -1453,6 +1453,26 @@ pub async fn task(action: TaskAction) -> Result<()> {
                             println!(" (last: {updated_by})")
                         }
                         _ => println!(),
+                    }
+                }
+                // Та же сводка, что и в MCP `task_list`, той же функцией
+                // ядра — журнал прогонов целиком (35 записей у одной задачи)
+                // здесь не нужен, только то, сколько улик и какая свежая
+                // зелёная.
+                if !fields.evidence.is_empty() {
+                    let summary = task_fields::evidence_summary(&fields);
+                    match &summary.last_green {
+                        Some(g) => println!(
+                            "    улики: {}, зелёных: {}, последняя зелёная: {} {}",
+                            summary.total,
+                            summary.green,
+                            g.command,
+                            g.at.to_rfc3339()
+                        ),
+                        None => println!(
+                            "    улики: {}, зелёных: {}, последняя зелёная: нет",
+                            summary.total, summary.green
+                        ),
                     }
                 }
             }

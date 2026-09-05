@@ -282,6 +282,44 @@ pub fn is_ripe(fields: &TaskFields, status: &str) -> bool {
     ripe_evidence(fields, status).is_some()
 }
 
+/// Сводка улик задачи для списка (`task_list`/`au task list`): сколько
+/// записей всего, сколько зелёных (`exit_code == 0`) и какая зелёная —
+/// самая свежая. Полный массив с командами, временами и путями к
+/// артефактам — по-прежнему только у `task_view`; сводка не заменяет его, а
+/// экономит место там, где читателю нужно ответить «что есть и что
+/// созрело», а не пересматривать журнал прогонов целиком (35 записей одной
+/// задачи весили большую часть 20-тысячесимвольного `task_list` по 16
+/// задачам, измерено 2026-09-05).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct EvidenceSummary {
+    pub total: usize,
+    pub green: usize,
+    pub last_green: Option<EvidenceEntry>,
+}
+
+/// Считает [`EvidenceSummary`] по уликам задачи — общая точка для CLI
+/// (`au task list`) и MCP (`task_list`), чтобы правило «что зелёное» и «что
+/// самое свежее» не разъезжалось между ними так же, как оно уже не
+/// разъезжается у `ripe_evidence`.
+///
+/// При нескольких зелёных с одинаковым `at` побеждает более поздняя по
+/// положению в массиве — `Iterator::max_by_key` возвращает последний из
+/// равных, ту же гарантию использует `ripe_evidence` выше.
+pub fn evidence_summary(fields: &TaskFields) -> EvidenceSummary {
+    let total = fields.evidence.len();
+    let green: Vec<&EvidenceEntry> = fields
+        .evidence
+        .iter()
+        .filter(|e| e.exit_code == 0)
+        .collect();
+    let last_green = green.iter().max_by_key(|e| e.at).map(|e| (*e).clone());
+    EvidenceSummary {
+        total,
+        green: green.len(),
+        last_green,
+    }
+}
+
 /// Одна созревшая задача с основанием предъявления (T018, FR-013): какая
 /// улика дала созревание, когда, что изменено с момента взятия в работу.
 ///
@@ -787,6 +825,39 @@ mod tests {
             artifact: None,
             artifact_present: None,
         }
+    }
+
+    /// Три улики (красная, зелёная, зелёная позже первой) дают сводку 3/2,
+    /// а `last_green` — САМУЮ СВЕЖУЮ зелёную, а не первую попавшуюся.
+    #[test]
+    fn evidence_summary_counts_green_and_picks_latest() {
+        let fields = TaskFields {
+            evidence: vec![
+                evidence("cargo test", 1, "2026-08-30T09:00:00Z"),
+                evidence("cargo clippy", 0, "2026-08-30T09:30:00Z"),
+                evidence("cargo test", 0, "2026-08-30T10:00:00Z"),
+            ],
+            ..Default::default()
+        };
+
+        let summary = evidence_summary(&fields);
+
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.green, 2);
+        assert_eq!(
+            summary.last_green.expect("зелёная улика есть").command,
+            "cargo test"
+        );
+    }
+
+    /// Пустой список улик — 0/0/None, а не паника на пустом `max_by_key`.
+    #[test]
+    fn evidence_summary_of_empty_list_is_zero_and_none() {
+        let summary = evidence_summary(&TaskFields::default());
+
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.green, 0);
+        assert!(summary.last_green.is_none());
     }
 
     /// T022: улика старше последней правки не даёт созревания.

@@ -318,6 +318,13 @@ fn task_list_with_conn(
     let status = params.get("status").and_then(|s| s.as_str());
     let priority = params.get("priority").and_then(|p| p.as_str());
     let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
+    // Опция для того самого маленького аудитора, которому 17 вызовов
+    // `task_view` подряд не по карману: заметки целиком прямо в списке,
+    // без похода за каждой отдельно. По умолчанию — прежнее поведение.
+    let full_notes = params
+        .get("full_notes")
+        .and_then(|f| f.as_bool())
+        .unwrap_or(false);
 
     let tasks = graph::get_tasks_filtered(conn, project, status, priority, limit)?;
 
@@ -346,11 +353,21 @@ fn task_list_with_conn(
             let fields = aurelius_core::tasks::TaskFields::from_data(&t.data);
             let ripe = aurelius_core::tasks::is_ripe(&fields, status);
 
-            let note = t
-                .note
-                .as_deref()
-                .map(|n| graph::clip(n, TASK_LIST_NOTE_BUDGET));
-            let note_truncated = note.as_deref().is_some_and(|n| n.ends_with('…'));
+            // full_notes=true — note целиком, без урезания и без пометки
+            // усечения; иначе поведение то же, что было всегда.
+            let note = if full_notes {
+                t.note.clone()
+            } else {
+                t.note
+                    .as_deref()
+                    .map(|n| graph::clip(n, TASK_LIST_NOTE_BUDGET))
+            };
+            let note_truncated = !full_notes && note.as_deref().is_some_and(|n| n.ends_with('…'));
+
+            // Сводка, не журнал прогонов целиком: полный массив с командами,
+            // временами и путями к артефактам остаётся только у `task_view`
+            // (см. `evidence_summary` в aurelius-core).
+            let evidence = aurelius_core::tasks::evidence_summary(&fields);
 
             json!({
                 "id": t.id.to_string(),
@@ -366,7 +383,7 @@ fn task_list_with_conn(
                 "activated_at": fields.activated_at.map(|d| d.to_rfc3339()),
                 "closed_at": fields.closed_at.map(|d| d.to_rfc3339()),
                 "resolution": fields.resolution,
-                "evidence": fields.evidence,
+                "evidence": evidence,
                 "ripe": ripe,
             })
         })
@@ -384,7 +401,7 @@ fn task_list_with_conn(
         // молчаливая обрезка неотличима от короткого текста, значит нужно
         // сказать вслух бюджет и куда идти за полным текстом.
         "note_char_budget": TASK_LIST_NOTE_BUDGET,
-        "how_to_see_full_note": "task_view с id этой задачи возвращает note целиком, без урезания",
+        "how_to_see_full_note": "task_view с id этой задачи возвращает note целиком, без урезания; либо этот же вызов с full_notes=true отдаёт note целиком сразу для всех задач списка",
     }))
 }
 
@@ -1614,6 +1631,104 @@ mod tests {
         let task = &result["tasks"][0];
         assert_eq!(task["note"], json!("короткая note без обрезки"));
         assert_eq!(task["note_truncated"], json!(false));
+    }
+
+    // -- task_list: сводка улик вместо журнала прогонов ----------------------
+
+    /// Три улики (красная, зелёная, зелёная позже первой) дают в списке
+    /// сводку 3/2 с самой свежей зелёной, а не полный массив — то, ради чего
+    /// затевалась вся правка (35 записей одной задачи весили большую часть
+    /// 20-тысячесимвольного `task_list` по 16 задачам, измерено 2026-09-05).
+    #[test]
+    fn task_list_reports_evidence_summary_not_full_array() {
+        let (_tmp, conn) = setup();
+        seed_active_task(
+            &conn,
+            "proj-evidence-summary",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "project": "proj-evidence-summary",
+                "evidence": [
+                    {"command": "cargo test", "exit_code": 1, "at": "2026-08-30T09:00:00Z"},
+                    {"command": "cargo clippy", "exit_code": 0, "at": "2026-08-30T09:30:00Z"},
+                    {"command": "cargo test", "exit_code": 0, "at": "2026-08-30T10:00:00Z"},
+                ],
+            }),
+        );
+
+        let result = task_list_with_conn(&conn, &json!({"project": "proj-evidence-summary"}))
+            .expect("task_list");
+
+        let evidence = &result["tasks"][0]["evidence"];
+        assert!(
+            evidence.is_object(),
+            "evidence обязана быть сводкой-объектом, не массивом: {evidence:?}"
+        );
+        assert_eq!(evidence["total"], json!(3));
+        assert_eq!(evidence["green"], json!(2));
+        assert_eq!(evidence["last_green"]["command"], json!("cargo test"));
+        assert_eq!(evidence["last_green"]["at"], json!("2026-08-30T10:00:00Z"));
+    }
+
+    /// `full_notes=true` отдаёт note целиком прямо в списке: по умолчанию
+    /// поведение не меняется, обрезка та же, что и раньше.
+    #[test]
+    fn task_list_full_notes_returns_note_whole() {
+        let (_tmp, conn) = setup();
+        let note = "a".repeat(400);
+        seed_task_with_note(&conn, "proj-full-notes", &note);
+
+        let truncated = task_list_with_conn(&conn, &json!({"project": "proj-full-notes"}))
+            .expect("task_list default");
+        let truncated_task = &truncated["tasks"][0];
+        assert_eq!(truncated_task["note_truncated"], json!(true));
+        assert!(
+            truncated_task["note"]
+                .as_str()
+                .expect("note")
+                .chars()
+                .count()
+                <= TASK_LIST_NOTE_BUDGET,
+            "по умолчанию note обязана резаться бюджетом"
+        );
+
+        let whole = task_list_with_conn(
+            &conn,
+            &json!({"project": "proj-full-notes", "full_notes": true}),
+        )
+        .expect("task_list full_notes");
+        let whole_task = &whole["tasks"][0];
+        assert_eq!(whole_task["note_truncated"], json!(false));
+        assert_eq!(whole_task["note"], json!(note));
+    }
+
+    /// ripe не теряется при сокращении evidence до сводки — то же
+    /// вычисление, что и у `task_ripe` (`seed_active_task` ниже), применённое
+    /// здесь к `task_list`.
+    #[test]
+    fn task_list_still_reports_ripe() {
+        let (_tmp, conn) = setup();
+        seed_active_task(
+            &conn,
+            "proj-list-ripe",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "project": "proj-list-ripe",
+                "last_edit_at": "2026-08-30T09:00:00Z",
+                "evidence": [{
+                    "command": "cargo test",
+                    "exit_code": 0,
+                    "at": "2026-08-30T10:00:00Z",
+                }],
+            }),
+        );
+
+        let result =
+            task_list_with_conn(&conn, &json!({"project": "proj-list-ripe"})).expect("task_list");
+
+        assert_eq!(result["tasks"][0]["ripe"], json!(true));
     }
 
     // -- task_ripe: та же выборка, что и `au task ripe` ----------------------

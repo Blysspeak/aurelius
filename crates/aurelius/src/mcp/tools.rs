@@ -590,7 +590,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "task_list",
-                "description": "List tasks with filters by project, status, and priority. Sorted by priority (critical first), then by creation date. Shows work log count per task, plus each task's activated_at/closed_at timestamps, resolution (how it was solved: commit, PR, files, confirmed), evidence (command runs recorded against it), and the derived 'ripe' flag — true when an active task has passing evidence newer than its last edit and is ready to present for closing.",
+                "description": "List tasks with filters by project, status, and priority. Sorted by priority (critical first), then by creation date. Shows work log count per task, plus each task's activated_at/closed_at timestamps, resolution (how it was solved: commit, PR, files, confirmed), an evidence summary (total runs recorded, how many passed, and the latest passing one — the full run-by-run array with commands, timestamps and artifact paths is only in task_view), and the derived 'ripe' flag — true when an active task has passing evidence newer than its last edit and is ready to present for closing. full_notes=true returns each note in full instead of truncated to the usual budget.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -610,6 +610,11 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "integer",
                             "description": "Max results (default: 20)",
                             "default": 20
+                        },
+                        "full_notes": {
+                            "type": "boolean",
+                            "description": "Return each task's note whole instead of truncated to the note_char_budget. Evidence is always a summary here (total/green/last_green) regardless of this flag — the full array is only in task_view.",
+                            "default": false
                         }
                     },
                     "required": []
