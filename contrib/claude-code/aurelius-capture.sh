@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# DEPRECATED since 3.4.0: replaced by the aurelius Claude Code plugin (plugin/hooks.json calls au <cmd> --hook directly).
+# Kept for hand installs until the next major release. Do not add features here.
 # Captures key terms and decisions from Claude Code sessions into Aurelius.
 # Runs on session Stop hook.
 set -euo pipefail
