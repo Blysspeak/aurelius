@@ -60,7 +60,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 
 | Tool | Description |
 |------|-------------|
-| `memory_status` | Session start — full project snapshot with active tasks. Optional `project` filter. |
+| `memory_status` | Session start — full project snapshot with active tasks and a `server` block (running MCP server version, `started_at`, and `restart_needed` when the binary on disk is newer than this running process — installing a new build over the old one doesn't kill an already-running MCP server). Optional `project` filter. |
 | `memory_session` | Session end — save decisions, problems/solutions, next steps. Links to tasks. Returns active tasks hint. SHA-256 dedup. Accepts the same provenance fields as `memory_add` (`confidence`, `evidence`, `subject`, `volatility`, `claim`, `measured_at`, `verify_with`); spawned decisions/problems/solutions inherit confidence/evidence but never subject/claim. |
 | `memory_recall` | Smart topic recall — FTS + BFS, grouped by type (incl. tasks), skips structural noise. |
 | `memory_search` | Full-text search with `type`, `since`, and `limit` filters. `*` for recent. Words are OR-ed and ranked by how many of them matched, so one bad word form spoils the order rather than the result; `unmatched_terms` names the words that matched nothing, telling "no such knowledge" apart from "the query didn't work". |
