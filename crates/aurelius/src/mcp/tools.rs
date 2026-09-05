@@ -629,7 +629,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "search_web",
-                "description": "Search the web via Brave Search API. Results are cached locally in SQLite — repeat queries don't burn API quota. Optionally saves results to the knowledge graph for future recall.",
+                "description": "Search the web via Brave Search API or Perplexity Search API, selected by 'provider'. Results are cached locally in SQLite, scoped per provider — repeat queries don't burn API quota. Optionally saves results to the knowledge graph for future recall.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -651,6 +651,12 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "boolean",
                             "description": "Save results as a concept node in the knowledge graph (default: false)",
                             "default": false
+                        },
+                        "provider": {
+                            "type": "string",
+                            "enum": ["brave", "perplexity"],
+                            "description": "Which search backend to use (default: brave). 'brave' calls the Brave Search API (src/search/brave.rs, key via BRAVE_API_KEY or ~/.config/aurelius/brave.key); 'perplexity' calls the Perplexity Search API (src/search/perplexity.rs, key via PERPLEXITY_API_KEY or ~/.config/aurelius/perplexity.key).",
+                            "default": "brave"
                         }
                     },
                     "required": ["query"]

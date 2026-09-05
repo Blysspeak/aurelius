@@ -1,14 +1,9 @@
 use anyhow::{bail, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+
+pub use super::SearchResult;
 
 const BRAVE_API_URL: &str = "https://api.search.brave.com/res/v1/web/search";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResult {
-    pub title: String,
-    pub url: String,
-    pub description: String,
-}
 
 #[derive(Deserialize)]
 struct BraveResponse {
@@ -27,26 +22,8 @@ struct BraveResult {
     description: Option<String>,
 }
 
-fn resolve_api_key() -> Result<String> {
-    if let Ok(key) = std::env::var("BRAVE_API_KEY") {
-        return Ok(key);
-    }
-    // Fallback: read from config file
-    let config_path = dirs_next::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("aurelius")
-        .join("brave.key");
-    if config_path.exists() {
-        let key = std::fs::read_to_string(&config_path)?.trim().to_owned();
-        if !key.is_empty() {
-            return Ok(key);
-        }
-    }
-    anyhow::bail!("BRAVE_API_KEY not set and ~/.config/aurelius/brave.key not found")
-}
-
 pub fn search(query: &str, count: usize) -> Result<Vec<SearchResult>> {
-    let api_key = resolve_api_key()?;
+    let api_key = super::resolve_api_key("BRAVE_API_KEY", "brave.key")?;
 
     let client = reqwest::blocking::Client::new();
     let resp = client

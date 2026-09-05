@@ -104,7 +104,7 @@ Reusable procedural "how-to" cards with progressive disclosure — the trigger i
 
 | Tool | Description |
 |------|-------------|
-| `search_web` | Brave Search API with SQLite cache. Repeat queries served from cache. Optional `save_to_graph`. |
+| `search_web` | Brave Search API or Perplexity Search API, picked via `provider` (default `brave`). SQLite cache is scoped per provider. Repeat queries served from cache. Optional `save_to_graph`. |
 | `search_recall` | FTS search through cached web search results from past sessions. |
 
 ### Documents
@@ -631,7 +631,8 @@ crates/
       mod.rs         — JSON-RPC 2.0 server
     src/search/
       brave.rs       — Brave Search API client
-      cache.rs       — SQLite search cache with FTS5
+      perplexity.rs  — Perplexity Search API client
+      cache.rs       — SQLite search cache with FTS5, scoped per provider
   au/                — CLI + web UI server (+ `identity`/`share` sync commands)
 ui/                  — React + TypeScript + Tailwind (graph visualization)
 contrib/
