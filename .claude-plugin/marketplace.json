@@ -1,0 +1,11 @@
+{
+  "name": "blysspeak",
+  "owner": { "name": "Vladislav Rahmanov" },
+  "plugins": [
+    {
+      "name": "aurelius",
+      "source": "./",
+      "description": "Long-term memory for Claude Code: MCP server plus session hooks."
+    }
+  ]
+}

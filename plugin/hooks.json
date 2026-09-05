@@ -1,0 +1,26 @@
+{
+  "description": "aurelius: memory snapshot and skill index at session start, database backup, file-touch and action trace after tool use, reindex and judge on stop. Every command is the au binary from PATH.",
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "", "hooks": [
+        { "type": "command", "command": "au", "args": ["skills", "--hook"], "timeout": 10 },
+        { "type": "command", "command": "au", "args": ["snapshot", "--hook"], "timeout": 10 },
+        { "type": "command", "command": "au", "args": ["db", "backup", "--hook"], "timeout": 30 }
+      ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write", "hooks": [
+        { "type": "command", "command": "au", "args": ["touch", "--hook"], "timeout": 5 }
+      ] },
+      { "matcher": "Bash|PowerShell|Edit|Write|NotebookEdit", "hooks": [
+        { "type": "command", "command": "au", "args": ["trace", "--hook"], "timeout": 5 }
+      ] }
+    ],
+    "Stop": [
+      { "matcher": "", "hooks": [
+        { "type": "command", "command": "au", "args": ["reindex", "--hook"], "timeout": 15 },
+        { "type": "command", "command": "au", "args": ["judge", "--hook"], "timeout": 20 }
+      ] }
+    ]
+  }
+}
