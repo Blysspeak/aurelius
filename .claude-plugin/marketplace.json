@@ -4,7 +4,7 @@
   "plugins": [
     {
       "name": "aurelius",
-      "source": "./",
+      "source": "./plugin",
       "description": "Long-term memory for Claude Code: MCP server plus session hooks."
     }
   ]
