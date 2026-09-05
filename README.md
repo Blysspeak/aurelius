@@ -52,7 +52,7 @@ au 1.11.1
 
 ---
 
-## MCP Tools (32)
+## MCP Tools (33)
 
 Aurelius runs as an MCP server over stdio. `install.sh` configures it automatically, or add manually via `/mcp` in Claude Code (`command: au`, `args: ["mcp"]`).
 
@@ -65,6 +65,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | `memory_recall` | Smart topic recall — FTS + BFS, grouped by type (incl. tasks), skips structural noise. |
 | `memory_search` | Full-text search with `type`, `since`, and `limit` filters. `*` for recent. Words are OR-ed and ranked by how many of them matched, so one bad word form spoils the order rather than the result; `unmatched_terms` names the words that matched nothing, telling "no such knowledge" apart from "the query didn't work". |
 | `memory_context` | Raw BFS graph traversal from FTS seed nodes. |
+| `memory_path` | Directed step ladder over `next_step`/`prerequisite` edges: shortest path between two nodes, or every node that transitively leads to one target. Same computation as `au path`. |
 | `memory_snapshot` | The seven-layer frozen slice as Markdown, under a hard budget. |
 | `memory_consolidate` | Rebuild a project's distillate — open next steps plus unsolved problems. Idempotent. |
 | `memory_add` | Create node with label, type, note, data (JSON), memory_kind. Pass `project` to link it; without a link the response says so instead of reporting a silent success. |
