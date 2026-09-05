@@ -61,7 +61,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | Tool | Description |
 |------|-------------|
 | `memory_status` | Session start — full project snapshot with active tasks. Optional `project` filter. |
-| `memory_session` | Session end — save decisions, problems/solutions, next steps. Links to tasks. Returns active tasks hint. SHA-256 dedup. |
+| `memory_session` | Session end — save decisions, problems/solutions, next steps. Links to tasks. Returns active tasks hint. SHA-256 dedup. Accepts the same provenance fields as `memory_add` (`confidence`, `evidence`, `subject`, `volatility`, `claim`, `measured_at`, `verify_with`); spawned decisions/problems/solutions inherit confidence/evidence but never subject/claim. |
 | `memory_recall` | Smart topic recall — FTS + BFS, grouped by type (incl. tasks), skips structural noise. |
 | `memory_search` | Full-text search with `type`, `since`, and `limit` filters. `*` for recent. Words are OR-ed and ranked by how many of them matched, so one bad word form spoils the order rather than the result; `unmatched_terms` names the words that matched nothing, telling "no such knowledge" apart from "the query didn't work". |
 | `memory_context` | Raw BFS graph traversal from FTS seed nodes. |
@@ -81,10 +81,10 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 
 | Tool | Description |
 |------|-------------|
-| `task_create` | Create structured task — title, description, acceptance criteria, priority, subtask/blocking relations. |
-| `task_update` | Update status, priority, criteria. Auto-tracks `started_at`/`completed_at`. |
+| `task_create` | Create structured task — title, description, acceptance criteria, priority, subtask/blocking relations. Accepts the same provenance fields as `memory_add` (`confidence`, `evidence`, `subject`, `volatility`, `claim`, `measured_at`, `verify_with`). |
+| `task_update` | Update status, priority, criteria. Auto-tracks `started_at`/`completed_at`. Accepts the same provenance fields as `memory_add` — a task's confidence can change after a measurement. |
 | `task_list` | Filter by project, status, priority. Sorted by priority, shows work log count. |
-| `task_log` | Record work done — creates WorkLog + optional Decision/Problem/Solution nodes. Auto-activates backlog tasks. |
+| `task_log` | Record work done — creates WorkLog + optional Decision/Problem/Solution nodes. Auto-activates backlog tasks. Accepts the same provenance fields as `memory_add`; spawned decisions/problems/solutions inherit confidence/evidence but never subject/claim. |
 | `task_view` | Full task branch — timeline of work logs, decisions, problems, solutions, subtasks. |
 | `task_stats` | Task analytics — counts by status/priority, completion rate, avg/median duration, blocked count, oldest active. |
 | `task_ripe` | Tasks ready to close — active, with a passing evidence run newer than the last edit, plus the basis (which run, when, files touched). Same computation as `au task ripe`; closing itself is still `task_update`. |
