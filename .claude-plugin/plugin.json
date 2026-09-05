@@ -1,6 +1,6 @@
 {
   "name": "aurelius",
-  "version": "3.4.0",
+  "version": "3.4.1",
   "description": "Long-term memory for Claude Code: MCP server plus session hooks. Requires the `au` binary in PATH (cargo build --release, then copy target/release/au to ~/.local/bin).",
   "author": { "name": "Vladislav Rahmanov" },
   "homepage": "https://github.com/Blysspeak/aurelius",
