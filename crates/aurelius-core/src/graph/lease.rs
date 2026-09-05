@@ -416,12 +416,15 @@ fn release_done(
 
     let now = Utc::now();
     let mut fields = crate::tasks::TaskFields::from_data(&node.data);
-    let since = fields.activated_at.unwrap_or(node.created_at);
     let project = node.data.get("project").and_then(|p| p.as_str());
     // Наряд не даёт своего commit/pull_request/unconfirmed (у `release` нет
     // таких аргументов, в отличие от `au task done`) — `build_resolution` сам
     // соберёт то, что сможет, из состояния репозитория проекта и трейса правок.
-    let resolution = crate::tasks::build_resolution(conn, since, project, None, None, false);
+    // Без `activated_at` (наряд не был взят в работу явно) — соберёт
+    // намеренно ничего: см. доккомент `build_resolution` (resolution-window
+    // finding).
+    let resolution =
+        crate::tasks::build_resolution(conn, fields.activated_at, project, None, None, false);
     fields.closed_at = Some(now);
     fields.resolution = Some(resolution);
     fields.evidence.push(crate::tasks::EvidenceEntry {

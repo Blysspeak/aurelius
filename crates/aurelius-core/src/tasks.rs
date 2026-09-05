@@ -200,15 +200,39 @@ pub fn current_commit_sha(dir: Option<&Path>) -> Option<String> {
 /// Список файлов (находка 2) ограничен тем же каталогом — см.
 /// `crate::trace::files_edited_since`.
 ///
+/// `activated_at` — `fields.activated_at` of the task being closed, verbatim,
+/// never a fallback to `created_at` (resolution-window finding, measured
+/// 2026-09-05: closing a backlog task through MCP `task_update status=done`
+/// collected 17 and, separately, 61 files into `resolution.files`, including
+/// stale Windows paths and repro tests unrelated to the task). `Some` is
+/// exactly today's behaviour, the work window starts there. `None` means the
+/// task was never taken into work — there is no work window at all, and a
+/// window computed from `created_at` is not a narrower substitute, it is the
+/// entire project history back to whenever the task was filed, which can be
+/// weeks of every other task's edits. So `None` collects no files, reads no
+/// commit from HEAD (there is no work session to read it for — only what the
+/// caller passed in explicitly is kept), and is `confirmed` only when the
+/// caller gave an explicit commit or pull request.
+///
 /// Общая точка для CLI (`au task done`) и MCP (`task_update`, статус `done`).
 pub fn build_resolution(
     conn: &rusqlite::Connection,
-    since: DateTime<Utc>,
+    activated_at: Option<DateTime<Utc>>,
     project: Option<&str>,
     commit: Option<String>,
     pull_request: Option<String>,
     unconfirmed: bool,
 ) -> Resolution {
+    let Some(since) = activated_at else {
+        let confirmed = !unconfirmed && (commit.is_some() || pull_request.is_some());
+        return Resolution {
+            commit,
+            pull_request,
+            files: Vec::new(),
+            confirmed,
+        };
+    };
+
     let root = project.and_then(|p| project_root(conn, p));
     let commit = commit.or_else(|| match project {
         Some(_) => root
@@ -1224,7 +1248,7 @@ mod tests {
 
         let resolution = build_resolution(
             &conn,
-            since,
+            Some(since),
             Some("проект-без-индексации"),
             None,
             None,
@@ -1273,7 +1297,7 @@ mod tests {
         seed_project_with_path(&conn, "proj-b", &repo_b.to_string_lossy());
         let since = "2020-01-01T00:00:00Z".parse().expect("rfc3339");
 
-        let resolution = build_resolution(&conn, since, Some("proj-b"), None, None, false);
+        let resolution = build_resolution(&conn, Some(since), Some("proj-b"), None, None, false);
 
         assert_eq!(resolution.commit.as_deref(), Some(expected_sha.as_str()));
         // Не CWD процесса: каталог теста (`aurelius`) — другой репозиторий с
@@ -1281,6 +1305,143 @@ mod tests {
         assert_ne!(resolution.commit, current_commit_sha(None));
 
         std::fs::remove_dir_all(&repo_b).ok();
+    }
+
+    // -- build_resolution: resolution-window finding, measured 2026-09-05 --
+    //
+    // A backlog task closed through MCP `task_update status=done` without
+    // ever being activated had `since = activated_at.unwrap_or(created_at)`
+    // — a task filed weeks ago and never taken into work turned `created_at`
+    // into a window over every edit trace of the project (17 files in one
+    // observed case, 61 in another, including stale paths and unrelated
+    // repro tests). `build_resolution` now takes `Option<DateTime<Utc>>` and
+    // treats `None` as "no work window at all", not as "window from
+    // creation".
+
+    /// Writes a trace row directly with an explicit timestamp —
+    /// `crate::trace::ingest` always stamps `Utc::now()`, which cannot
+    /// produce a row on either side of a chosen cutoff.
+    fn ingest_file_edit_at(conn: &rusqlite::Connection, path: &str, ts: i64) {
+        conn.execute(
+            "INSERT INTO act_trace
+                 (ts, session_id, kind, payload, exit_code, state_hash_pre, state_hash_post)
+             VALUES (?1, 's1', 'file_edit', ?2, NULL, NULL, NULL)",
+            rusqlite::params![ts, path],
+        )
+        .expect("insert trace");
+    }
+
+    /// (a) Reproduces the finding directly: `activated_at` absent, edit
+    /// traces exist both before and after some reference instant in the
+    /// task's own project root. Under the OLD rule (`since =
+    /// activated_at.unwrap_or(created_at)`) the trace after that instant
+    /// would have been collected as a false positive; the one before it
+    /// never would have been under either rule and is here only as a
+    /// control. The new rule collects neither: no work window means no
+    /// files, no commit read from HEAD, and no confirmation.
+    #[test]
+    fn build_resolution_without_activation_collects_no_files() {
+        let (_tmp, conn) = setup();
+        seed_project_with_path(&conn, "proj-never-activated", "/repos/proj-never-activated");
+        let reference_ts = Utc::now().timestamp();
+        ingest_file_edit_at(
+            &conn,
+            "/repos/proj-never-activated/old.rs",
+            reference_ts - 100,
+        );
+        ingest_file_edit_at(
+            &conn,
+            "/repos/proj-never-activated/new.rs",
+            reference_ts + 100,
+        );
+
+        let resolution =
+            build_resolution(&conn, None, Some("proj-never-activated"), None, None, false);
+
+        assert!(
+            resolution.files.is_empty(),
+            "a task never taken into work has no work window to collect files from: {:?}",
+            resolution.files
+        );
+        assert_eq!(
+            resolution.commit, None,
+            "no work window means no HEAD read either"
+        );
+        assert!(
+            !resolution.confirmed,
+            "no explicit commit and no pull request — must not read as confirmed"
+        );
+    }
+
+    /// (b) Asymmetry of (a): `activated_at` still absent, but the caller
+    /// gave an explicit commit. Files stay empty (still no work window),
+    /// but the explicit commit is kept as-is and the resolution reads
+    /// confirmed — an explicit commit is a real basis for confirmation even
+    /// without a work window.
+    #[test]
+    fn build_resolution_without_activation_keeps_explicit_commit() {
+        let (_tmp, conn) = setup();
+        seed_project_with_path(&conn, "proj-explicit-commit", "/repos/proj-explicit-commit");
+        ingest_file_edit_at(
+            &conn,
+            "/repos/proj-explicit-commit/some.rs",
+            Utc::now().timestamp() - 10,
+        );
+
+        let resolution = build_resolution(
+            &conn,
+            None,
+            Some("proj-explicit-commit"),
+            Some("abc1234".to_owned()),
+            None,
+            false,
+        );
+
+        assert!(resolution.files.is_empty());
+        assert_eq!(resolution.commit.as_deref(), Some("abc1234"));
+        assert!(
+            resolution.confirmed,
+            "an explicit commit is a real basis for confirmation"
+        );
+    }
+
+    /// (c) `activated_at` present — unchanged behaviour: files are those
+    /// edited at or after activation, a trace from before it is excluded.
+    /// Not a duplicate of `build_resolution_uses_task_project_repo_not_process_cwd`
+    /// / `build_resolution_does_not_guess_commit_when_project_root_unknown`
+    /// above — those two exercise the commit side of `Some(since)` only;
+    /// neither exercises the `files` cutoff through `build_resolution`
+    /// itself (that narrowing was previously covered only indirectly, via
+    /// `trace::files_edited_since` unit tests and `gather_ripe` tests).
+    #[test]
+    fn build_resolution_with_activation_collects_only_files_after_activation() {
+        let (_tmp, conn) = setup();
+        seed_project_with_path(&conn, "proj-with-activation", "/repos/proj-with-activation");
+        let activated_at: DateTime<Utc> = "2026-08-30T09:00:00Z".parse().expect("rfc3339");
+        ingest_file_edit_at(
+            &conn,
+            "/repos/proj-with-activation/before.rs",
+            activated_at.timestamp() - 100,
+        );
+        ingest_file_edit_at(
+            &conn,
+            "/repos/proj-with-activation/after.rs",
+            activated_at.timestamp() + 100,
+        );
+
+        let resolution = build_resolution(
+            &conn,
+            Some(activated_at),
+            Some("proj-with-activation"),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            resolution.files,
+            vec!["/repos/proj-with-activation/after.rs".to_owned()]
+        );
     }
 
     // -- gather_ripe: находка 2 — файлы ограничены проектом задачи ----------

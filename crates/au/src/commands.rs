@@ -1719,14 +1719,16 @@ pub async fn task(action: TaskAction) -> Result<()> {
             data["completed_at"] = json!(chrono::Utc::now().to_rfc3339());
 
             let mut fields = task_fields::TaskFields::from_data(&data);
-            let since = fields.activated_at.unwrap_or(task.created_at);
             // Находка 1, FR-004/FR-006: коммит ищется в каталоге ПРОЕКТА
             // ЗАДАЧИ (см. `build_resolution`), а не в CWD процесса — `au`
             // тоже может быть запущен не из каталога проекта задачи.
             let project = task.data.get("project").and_then(|p| p.as_str());
+            // `fields.activated_at` передаётся как есть, без подмены
+            // `created_at` (resolution-window finding): задача, не взятая в
+            // работу, не имеет окна работы вовсе.
             let resolution = task_fields::build_resolution(
                 &conn,
-                since,
+                fields.activated_at,
                 project,
                 commit,
                 pull_request,
