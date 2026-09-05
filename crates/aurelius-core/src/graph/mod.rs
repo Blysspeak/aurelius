@@ -1,12 +1,18 @@
 mod crud;
+mod export;
+mod import;
 mod lease;
+mod path;
 mod search;
 mod session;
 mod snapshot;
 mod traverse;
 
 pub use crud::*;
+pub use export::*;
+pub use import::*;
 pub use lease::*;
+pub use path::*;
 pub use search::*;
 pub use session::*;
 pub use snapshot::*;

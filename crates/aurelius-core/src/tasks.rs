@@ -12,6 +12,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Способ решения задачи (`data.resolution`), пишется при закрытии.
@@ -360,6 +361,272 @@ pub fn refresh_artifact_presence(evidence: &mut [EvidenceEntry]) {
         }
     }
 }
+
+/// Key in `data` holding the met marks: handle -> RFC3339 timestamp of the
+/// moment the criterion was first marked met.
+///
+/// Deliberately a sidecar. `data.acceptance_criteria` stays exactly what it
+/// has always been — a bare JSON array of strings — because it is read by
+/// [`crate::graph::task_acceptance_criteria`], by the MCP `task_show` and
+/// `task_update` handlers, by the sync server and by the fitness gates, and
+/// every one of those reads elements with `as_str()`. Turning a criterion
+/// into an object would make it vanish from all of them at once: the fitness
+/// gates would see a task with zero criteria and reclassify it. A separate
+/// key adds state without a migration and without touching a single one of
+/// the 407 task nodes already in the graph.
+pub const CRITERIA_MET_KEY: &str = "criteria_met";
+
+/// One acceptance criterion, with the handle it is addressed by.
+///
+/// The handle is derived from the criterion text, never from its position in
+/// the list. Position is not a usable handle: inserting a criterion renumbers
+/// every one after it, so a script or a later session marking "criterion 3"
+/// marks a different sentence than the one it meant. A content-derived handle
+/// is stable under insertion, removal and reordering of its neighbours, and
+/// every task already in the graph gets its handles the moment it is read —
+/// no migration, no sweep, no rewrite.
+///
+/// The price of deriving it from the text: editing a criterion's wording
+/// gives it a new handle and orphans the old mark. That is the intended
+/// reading — a criterion whose contract changed is no longer proven by the
+/// evidence that met the old wording — and the orphan is reported by
+/// `au task criterion` rather than silently dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Criterion {
+    /// Stable handle, eight lowercase hex characters.
+    pub handle: String,
+    /// The criterion text, trimmed, exactly as stored.
+    pub text: String,
+    /// When it was first marked met, or `None` if it is not met.
+    pub met_at: Option<DateTime<Utc>>,
+}
+
+/// The stable handle of a criterion: the first four bytes of the SHA-256 of
+/// its trimmed text, as eight lowercase hex characters.
+///
+/// Truncated on purpose — the handle is typed by a human at a terminal, and a
+/// 64-character hash would not be. Eight hex characters is 2^32 of space
+/// against a list that is realistically under twenty entries; the resolver
+/// also accepts an unambiguous prefix, so in practice two or three characters
+/// are typed. Two criteria with identical text share a handle, which is
+/// correct: they are the same criterion written twice.
+pub fn criterion_handle(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.trim().as_bytes());
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
+
+/// Reads a task's criteria with their handles and met state.
+///
+/// Acceptance of `data.acceptance_criteria` is deliberately identical to
+/// [`crate::graph::task_acceptance_criteria`] — array of strings, trimmed,
+/// empties dropped — so the two never disagree about what the criteria of a
+/// task are. A task with no criteria, or with the key holding something other
+/// than an array (four such nodes exist in the live graph, each holding one
+/// multi-line string), yields an empty list here exactly as it does there.
+pub fn task_criteria(data: &Value) -> Vec<Criterion> {
+    let met = data.get(CRITERIA_MET_KEY).and_then(|v| v.as_object());
+    data.get("acceptance_criteria")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|text| {
+                    let handle = criterion_handle(text);
+                    let met_at = met
+                        .and_then(|m| m.get(&handle))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .map(|t| t.with_timezone(&Utc));
+                    Criterion {
+                        handle,
+                        text: text.to_owned(),
+                        met_at,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Met marks whose criterion is no longer in the list — left behind when a
+/// criterion's text was edited or the criterion was removed. Surfaced rather
+/// than swept: a mark that quietly disappears looks like the command failed.
+pub fn orphaned_criteria_marks(data: &Value) -> Vec<String> {
+    let live: std::collections::HashSet<String> =
+        task_criteria(data).into_iter().map(|c| c.handle).collect();
+    data.get(CRITERIA_MET_KEY)
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            m.keys()
+                .filter(|k| !live.contains(k.as_str()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolves what the caller typed to exactly one criterion.
+///
+/// Accepted, in this order: `#N`, an explicit 1-based position; the exact
+/// criterion text; an unambiguous prefix of a handle, the way a short git
+/// hash works. Position sits behind the `#` on purpose — it stays reachable
+/// for a human reading a numbered list, but nothing resolves to it by
+/// accident, so a bare token is always the stable handle.
+///
+/// Every failure is an error, never a silent miss: an unknown handle marking
+/// nothing would look identical to success.
+pub fn resolve_criterion<'a>(
+    criteria: &'a [Criterion],
+    selector: &str,
+) -> anyhow::Result<&'a Criterion> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        anyhow::bail!("criterion selector is empty — pass a handle, the exact text, or #N");
+    }
+    if criteria.is_empty() {
+        anyhow::bail!("task has no acceptance criteria to address");
+    }
+
+    if let Some(rest) = selector.strip_prefix('#') {
+        let n: usize = rest.parse().map_err(|_| {
+            anyhow::anyhow!("'#{rest}' is not a position — #N takes a 1-based number")
+        })?;
+        if n == 0 || n > criteria.len() {
+            anyhow::bail!(
+                "position #{n} is out of range — this task has {} acceptance criteria",
+                criteria.len()
+            );
+        }
+        return criteria.get(n - 1).ok_or_else(|| unreachable_position(n));
+    }
+
+    if let Some(exact) = criteria.iter().find(|c| c.text == selector) {
+        return Ok(exact);
+    }
+
+    let lowered = selector.to_ascii_lowercase();
+    if lowered.len() < 2 || !lowered.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "no acceptance criterion matches '{selector}' — pass a handle (at least two hex \
+             characters), the exact criterion text, or #N. Handles: {}",
+            handle_list(criteria)
+        );
+    }
+
+    let matches: Vec<&Criterion> = criteria
+        .iter()
+        .filter(|c| c.handle.starts_with(&lowered))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => anyhow::bail!(
+            "no acceptance criterion has a handle starting with '{lowered}'. Handles: {}",
+            handle_list(criteria)
+        ),
+        n => anyhow::bail!(
+            "'{lowered}' matches {n} criteria — type more characters. Handles: {}",
+            handle_list(criteria)
+        ),
+    }
+}
+
+fn handle_list(criteria: &[Criterion]) -> String {
+    criteria
+        .iter()
+        .map(|c| c.handle.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unreachable_position(n: usize) -> anyhow::Error {
+    anyhow::anyhow!("position #{n} vanished between the range check and the read")
+}
+
+/// Writes the met mark of one criterion.
+///
+/// Targeted `json_set`/`json_remove` on the single path that changes, not the
+/// read-modify-write of the whole `data` blob that `update_node` performs.
+/// The reason is a real race, not tidiness: `au trace --hook` rewrites
+/// `last_edit_at` on this same node on every file edit while the task is
+/// active, and a whole-blob write from either side silently discards the
+/// other. One path changed, one path written. Same reasoning as
+/// `graph::set_fitness`.
+///
+/// Idempotent in both directions. Marking an already-met criterion keeps the
+/// original timestamp rather than refreshing it — `met_at` records when the
+/// criterion was first met, and a second call carries no new information.
+/// Returns `true` if the stored state actually changed.
+pub fn set_criterion_met(
+    conn: &rusqlite::Connection,
+    task_id: uuid::Uuid,
+    handle: &str,
+    met: bool,
+) -> anyhow::Result<bool> {
+    // The handle is concatenated into a JSON path, so it is checked here
+    // rather than trusted: everything that produces one is `criterion_handle`,
+    // which emits hex only, and anything else is a bug upstream.
+    if handle.is_empty() || !handle.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("criterion handle must be hex characters, got '{handle}'");
+    }
+
+    let id_str = task_id.to_string();
+    let node = crate::graph::get_node(conn, &id_str)?
+        .ok_or_else(|| anyhow::anyhow!("task not found: {task_id}"))?;
+    let already = task_criteria(&node.data)
+        .into_iter()
+        .any(|c| c.handle == handle && c.met_at.is_some());
+    if already == met {
+        return Ok(false);
+    }
+
+    let now = Utc::now();
+    let author = crate::identity::current().map(|i| i.as_author());
+    let affected = if met {
+        conn.execute(
+            SET_CRITERION_MET_SQL,
+            rusqlite::params![handle, now.to_rfc3339(), now.to_rfc3339(), author, id_str],
+        )?
+    } else {
+        conn.execute(
+            CLEAR_CRITERION_MET_SQL,
+            rusqlite::params![handle, now.to_rfc3339(), author, id_str],
+        )?
+    };
+    if affected == 0 {
+        anyhow::bail!("task not found or deleted: {task_id}");
+    }
+    crate::db::mark_write(conn);
+    Ok(true)
+}
+
+/// Creates `data.criteria_met` if it is absent before writing into it —
+/// `json_set` on a nested path whose parent does not exist is a no-op, and no
+/// task in the graph has the key yet.
+const SET_CRITERION_MET_SQL: &str = "
+UPDATE nodes SET
+  data = json_set(
+    json_set(data, '$.criteria_met', json(coalesce(json_extract(data, '$.criteria_met'), '{}'))),
+    '$.criteria_met.\"' || ?1 || '\"',
+    ?2
+  ),
+  updated_at = ?3, updated_by = ?4
+WHERE id = ?5 AND deleted_at IS NULL AND node_type = '\"task\"'
+";
+
+const CLEAR_CRITERION_MET_SQL: &str = "
+UPDATE nodes SET
+  data = json_remove(data, '$.criteria_met.\"' || ?1 || '\"'),
+  updated_at = ?2, updated_by = ?3
+WHERE id = ?4 AND deleted_at IS NULL AND node_type = '\"task\"'
+";
 
 #[cfg(test)]
 mod tests {
