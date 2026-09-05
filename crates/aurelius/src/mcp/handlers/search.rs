@@ -2,9 +2,10 @@ use anyhow::Result;
 use serde_json::json;
 
 use super::open_db;
-use crate::search::{brave, cache};
+use crate::search::{brave, cache, perplexity, Provider, SearchResult};
 
-/// Search the web via Brave Search API with caching and optional graph integration.
+/// Search the web via Brave or Perplexity (selected by `provider`), with
+/// per-provider caching and optional graph integration.
 pub fn search_web(params: &serde_json::Value) -> Result<serde_json::Value> {
     let query = params
         .get("query")
@@ -23,23 +24,35 @@ pub fn search_web(params: &serde_json::Value) -> Result<serde_json::Value> {
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
+    let provider_str = params
+        .get("provider")
+        .and_then(|p| p.as_str())
+        .unwrap_or("brave");
+    let provider = Provider::parse(provider_str).ok_or_else(|| {
+        anyhow::anyhow!("unknown provider '{provider_str}', expected one of: brave, perplexity")
+    })?;
+
     let conn = open_db()?;
 
-    // Check cache first
-    if let Some(cached) = cache::get(&conn, query)? {
+    // Check cache first, scoped to this provider.
+    if let Some(cached) = cache::get(&conn, query, provider.as_str())? {
         return Ok(json!({
             "source": "cache",
+            "provider": provider.as_str(),
             "cached_at": cached.created_at,
             "query": cached.query,
             "results": cached.results,
         }));
     }
 
-    // Cache miss — hit Brave API
-    let results = brave::search(query, count)?;
+    // Cache miss — hit the selected provider's API.
+    let results: Vec<SearchResult> = match provider {
+        Provider::Brave => brave::search(query, count)?,
+        Provider::Perplexity => perplexity::search(query, count)?,
+    };
 
     // Store in cache
-    cache::put(&conn, query, &results, "brave", cache_days)?;
+    cache::put(&conn, query, &results, provider.as_str(), cache_days)?;
 
     // Optionally save to knowledge graph
     if save_to_graph {
@@ -47,7 +60,8 @@ pub fn search_web(params: &serde_json::Value) -> Result<serde_json::Value> {
     }
 
     Ok(json!({
-        "source": "brave",
+        "source": provider.as_str(),
+        "provider": provider.as_str(),
         "query": query,
         "results": results,
     }))
@@ -78,7 +92,7 @@ pub fn search_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
 fn save_search_to_graph(
     conn: &rusqlite::Connection,
     query: &str,
-    results: &[brave::SearchResult],
+    results: &[SearchResult],
 ) -> Result<()> {
     use aurelius_core::{graph, models::NodeType};
 
