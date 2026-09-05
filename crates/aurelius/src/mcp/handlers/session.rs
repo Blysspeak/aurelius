@@ -71,8 +71,8 @@ fn memory_session_with_conn(
 
     // The same guard as memory_add, before the write. Resolution is not
     // supported here: resolving a subject conflict only goes through
-    // memory_add.
-    provenance::guard_subject(conn, prov.subject.as_deref(), false)?;
+    // memory_add. `exclude: None` — a session is always a new node.
+    provenance::guard_subject(conn, prov.subject.as_deref(), false, None)?;
 
     // Сама запись — общий код с `au session` (graph::record_session). Здесь
     // остаётся только то, что есть у инструмента и нет у CLI: привязка к

@@ -420,6 +420,11 @@ const CONFLICTS_SHOWN: usize = 5;
 /// сессии: иначе `au note --subject` и `memory_add` разойдутся в том, что
 /// считается противоречием, — а разошлись бы они молча.
 ///
+/// `exclude` — id узла, который сейчас правится (например, задачи в
+/// `task_update`): он не считается противоречием сам себе. Создатели новых
+/// узлов (`memory_add`, `task_create`, `task_log`, `memory_session`, `au
+/// note`) передают `None` — им нечего исключать.
+///
 /// # Errors
 /// Утверждение о предмете уже есть, а `resolution` не назван. Ничего при этом
 /// не записывается: отказ обязан случиться ДО создания узла, иначе в графе
@@ -428,12 +433,16 @@ pub fn guard_subject(
     conn: &rusqlite::Connection,
     subject: Option<&str>,
     resolution_given: bool,
+    exclude: Option<&str>,
 ) -> Result<Vec<crate::models::Node>> {
     let Some(subject) = subject else {
         return Ok(Vec::new());
     };
-    let existing =
+    let mut existing =
         crate::graph::find_nodes_by_data_field(conn, SUBJECT_KEY, subject, CONFLICTS_SHOWN)?;
+    if let Some(exclude_id) = exclude {
+        existing.retain(|n| n.id.to_string() != exclude_id);
+    }
     if existing.is_empty() || resolution_given {
         return Ok(existing);
     }
