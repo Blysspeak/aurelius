@@ -54,6 +54,45 @@ pub fn db_path() -> PathBuf {
     base.join("aurelius.db")
 }
 
+/// File name of the write marker, kept beside the database it describes.
+pub const WRITE_MARKER: &str = "last-write";
+
+/// Where the write marker for the database behind `conn` lives, or `None` when
+/// that database has no file — `Connection::path` reports `Some("")` for an
+/// in-memory or temporary database.
+///
+/// Derived from the live connection instead of from [`db_path`] on purpose: a
+/// test, or a process pointed at another `AURELIUS_HOME`, must not be able to
+/// stamp the marker belonging to the real graph.
+pub fn write_marker_path(conn: &Connection) -> Option<PathBuf> {
+    let path = conn.path().filter(|p| !p.is_empty())?;
+    Path::new(path).parent().map(|dir| dir.join(WRITE_MARKER))
+}
+
+/// Stamps the write marker — the mtime of that file is the datum, and it
+/// answers "when was a knowledge record last written".
+///
+/// The database file's own mtime cannot answer it. `au trace`, wired to
+/// PostToolUse, appends a row on every single tool call, so `aurelius.db` is
+/// rewritten on the order of a thousand times an hour without a single record
+/// being added; anything reading that mtime sees an age that never leaves
+/// zero. A separate file touched only here is the only signal a caller that
+/// may do nothing but `stat` — the status line is rendered every turn — can
+/// read.
+///
+/// Never propagates a failure: a marker that could not be stamped only leaves
+/// a reader showing a stale age, which is a far smaller harm than refusing to
+/// store the record it accompanies.
+pub fn mark_write(conn: &Connection) {
+    let Some(path) = write_marker_path(conn) else {
+        return;
+    };
+    let _ = std::fs::write(
+        path,
+        b"aurelius write marker - the mtime of this file is when a record was last written\n",
+    );
+}
+
 pub fn open(path: &Path) -> Result<Connection> {
     // Health gate first: never let a connection — let alone the migration
     // chain — touch an image whose own header disagrees with the file.

@@ -78,6 +78,12 @@ pub fn add_node_full(
             node.updated_by,
         ],
     )?;
+    // The one place every record insert passes through, from both binaries:
+    // `add_node`, `upsert_node_by_key` and `record_session` all land here, and
+    // the MCP handlers call the same functions the CLI does. Marking here is
+    // what keeps the marker honest for memory written over MCP, which no hook
+    // and no CLI wrapper can observe.
+    crate::db::mark_write(conn);
     Ok(node)
 }
 
@@ -241,6 +247,27 @@ pub fn update_node(
     let params: Vec<&dyn rusqlite::types::ToSql> =
         param_values.iter().map(|p| p.as_ref()).collect();
     let affected = conn.execute(&sql, params.as_slice())?;
+    Ok(affected > 0)
+}
+
+/// Rename a node — the one column [`update_node`] cannot reach.
+///
+/// A task title is not stored in `data`: it lives in the `label` column as
+/// `[{project}] {title}`, and until `au task update --title` there was no
+/// writer for it at all. Widening [`update_node`] with a `label` parameter
+/// would have touched all sixteen of its call sites for the benefit of one,
+/// so the column gets its own writer instead — same `updated_at`/`updated_by`
+/// stamping, because `sync::merge::apply_push` picks a winner by comparing
+/// `updated_at` and a rename that left it alone would lose to the server's
+/// older copy.
+pub fn update_node_label(conn: &Connection, id: Uuid, label: &str) -> Result<bool> {
+    let now_str = Utc::now().to_rfc3339();
+    let author = identity::current().map(|i| i.as_author());
+    let affected = conn.execute(
+        "UPDATE nodes SET label = ?1, updated_at = ?2, updated_by = ?3
+         WHERE id = ?4 AND deleted_at IS NULL",
+        params![label, now_str, author, id.to_string()],
+    )?;
     Ok(affected > 0)
 }
 

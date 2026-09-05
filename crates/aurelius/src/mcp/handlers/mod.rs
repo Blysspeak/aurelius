@@ -1,5 +1,6 @@
 mod crud;
 mod doc;
+mod path;
 mod search;
 mod secret;
 mod session;
@@ -10,6 +11,7 @@ mod task;
 
 pub use crud::*;
 pub use doc::*;
+pub use path::*;
 pub use search::*;
 pub use secret::*;
 pub use session::*;
@@ -118,12 +120,22 @@ fn provenance_brief(node: &aurelius_core::models::Node) -> serde_json::Value {
         "confidence": p.confidence_or_default().as_str(),
         "evidence": p.evidence,
         "measured_at": p.measured_at.map(|d| d.to_rfc3339()),
+        // Both were written into `data` and neither was ever read back out:
+        // `stale` folds `verify_with` in only once a fact is already overdue,
+        // and `volatility` — the field that decides when that happens — was
+        // invisible until then. A caller asking for a record in full got
+        // silence about how fast it rots.
+        "volatility": p.volatility.map(aurelius_core::provenance::Volatility::as_str),
+        "verify_with": p.verify_with,
         "subject": p.subject,
         "stale": p.staleness(node.created_at, chrono::Utc::now()).map(|s| s.note()),
     })
 }
 
-pub(crate) fn node_detail(node: &aurelius_core::models::Node) -> serde_json::Value {
+/// `pub`, unlike its neighbours: `au recall` renders the same record the MCP
+/// door does. A second renderer in the CLI would drift from this one, and the
+/// drift would show up as two answers to one question.
+pub fn node_detail(node: &aurelius_core::models::Node) -> serde_json::Value {
     json!({
         "id": node.id.to_string(),
         "type": node.node_type,

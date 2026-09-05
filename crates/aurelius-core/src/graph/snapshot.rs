@@ -811,6 +811,113 @@ mod tests {
         assert!(!leaked, "координата секрета просочилась в машинную форму");
     }
 
+    /// FR-013 (spec 008): vendor-doc pages must never reach snapshot layers
+    /// 1-6, no matter how many of them the graph holds — they have their own
+    /// door (`au search`/`au context`), and the whole point of `data.layer =
+    /// "vendor-docs"` is to keep a 332-page import from being visible here at
+    /// all. `gather()` already never queries `NodeType::Doc` for any layer, so
+    /// this asserts a property that holds by construction — but a construction
+    /// this easy to break silently (one `typed_recent(conn, &NodeType::Doc,
+    /// ...)` added to a future layer) needs a guard, not just an absence of
+    /// code today.
+    #[test]
+    fn snapshot_never_surfaces_vendor_doc_nodes() {
+        let conn = test_conn();
+        let project = super::super::add_node(
+            &conn,
+            NodeType::Project,
+            "demo",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add project");
+
+        for i in 0..20 {
+            super::super::add_node(
+                &conn,
+                NodeType::Doc,
+                &format!("vendor page {i:02}"),
+                Some(&format!(
+                    "vendor doc body {i:02} — must never leak into the snapshot"
+                )),
+                "test",
+                serde_json::json!({"layer": "vendor-docs", "project": "demo"}),
+            )
+            .expect("add doc node");
+        }
+
+        let decision = super::super::add_node(
+            &conn,
+            NodeType::Decision,
+            "решение demo",
+            Some("decision body must be visible"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add decision");
+        super::super::add_edge(
+            &conn,
+            decision.id,
+            project.id,
+            crate::models::Relation::BelongsTo,
+            1.0,
+        )
+        .expect("link decision to project");
+
+        let concept = super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "концепт demo",
+            Some("concept body must be visible"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add concept");
+        super::super::add_edge(
+            &conn,
+            concept.id,
+            project.id,
+            crate::models::Relation::BelongsTo,
+            1.0,
+        )
+        .expect("link concept to project");
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+        for i in 0..20 {
+            assert!(
+                !md.contains(&format!("vendor page {i:02}"))
+                    && !md.contains(&format!("vendor doc body {i:02}")),
+                "doc node {i} leaked into the markdown snapshot:\n{md}"
+            );
+        }
+        assert!(md.contains("decision body must be visible"));
+        assert!(md.contains("concept body must be visible"));
+
+        let facts = snapshot_facts(&conn, Some("demo")).expect("facts");
+        assert!(
+            facts
+                .facts
+                .iter()
+                .all(|f| !f.text.contains("vendor doc body")),
+            "doc node leaked into the machine-readable facts: {facts:?}"
+        );
+        assert!(
+            facts
+                .facts
+                .iter()
+                .any(|f| f.kind == "decision" && f.text.contains("decision body")),
+            "decision must still be present: {facts:?}"
+        );
+        assert!(
+            facts
+                .facts
+                .iter()
+                .any(|f| f.kind == "concept" && f.text.contains("concept body")),
+            "concept must still be present: {facts:?}"
+        );
+    }
+
     /// FR-020: сокращение идёт по границе слова. Раньше `clip` рубил по счётчику
     /// символов вслепую — обрезанный текст мог заканчиваться на полуслове.
     #[test]

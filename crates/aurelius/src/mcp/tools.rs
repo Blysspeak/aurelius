@@ -42,6 +42,33 @@ pub fn tool_definitions() -> serde_json::Value {
                 }
             },
             {
+                "name": "memory_path",
+                "description": "Directed step ladder over next_step/prerequisite edges, not a neighbourhood: shortest path between two nodes (from+to), or every node that transitively leads to one target (before), earliest first. Selectors resolve as UUID, then exact subject, then exact label. A missing path comes back as {error:...} in a normal result, not a tool error.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "from": {
+                            "type": "string",
+                            "description": "Start node selector. Required together with 'to'; mutually exclusive with 'before'."
+                        },
+                        "to": {
+                            "type": "string",
+                            "description": "End node selector. Required together with 'from'; mutually exclusive with 'before'."
+                        },
+                        "before": {
+                            "type": "string",
+                            "description": "Target node selector. Returns every ancestor instead of a from/to path; mutually exclusive with 'from'/'to'."
+                        },
+                        "max_depth": {
+                            "type": "integer",
+                            "description": "Walk depth cap (default: 50)",
+                            "default": 50
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
                 "name": "memory_search",
                 "description": "Full-text search across the knowledge graph using FTS5. Use empty string or '*' to list recent nodes. Supports optional type filtering.",
                 "inputSchema": {
