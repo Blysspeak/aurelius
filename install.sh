@@ -12,7 +12,7 @@ RESET='\033[0m'
 
 # Removes hook and MCP-server entries that older versions of this script wrote
 # directly into ~/.claude/settings.json and ~/.claude.json, now that the
-# aurelius Claude Code plugin (plugin/hooks.json, .claude-plugin/plugin.json)
+# aurelius Claude Code plugin (plugin/.claude-plugin/plugin.json, plugin/hooks.json)
 # owns them. A function rather than inline code so `--migrate-only` and the
 # normal install path share it, and so it can be pointed at throwaway copies
 # via CLAUDE_HOME/CLAUDE_JSON instead of the real files (used by tests).
