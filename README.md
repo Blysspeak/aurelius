@@ -83,7 +83,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 |------|-------------|
 | `task_create` | Create structured task — title, description, acceptance criteria, priority, subtask/blocking relations. Accepts the same provenance fields as `memory_add` (`confidence`, `evidence`, `subject`, `volatility`, `claim`, `measured_at`, `verify_with`). |
 | `task_update` | Update status, priority, criteria. Auto-tracks `started_at`/`completed_at`. Accepts the same provenance fields as `memory_add` — a task's confidence can change after a measurement. |
-| `task_list` | Filter by project, status, priority. Sorted by priority, shows work log count. |
+| `task_list` | Filter by project, status, priority. Sorted by priority, shows work log count. Evidence is an `EvidenceSummary` (total/green/last_green), not the full run array — that stays in `task_view`. `full_notes=true` returns each note whole instead of truncated. |
 | `task_log` | Record work done — creates WorkLog + optional Decision/Problem/Solution nodes. Never changes the task's status; the response includes `task_status`, activation is explicit via `task_update status=active`. Accepts the same provenance fields as `memory_add`; spawned decisions/problems/solutions inherit confidence/evidence but never subject/claim. |
 | `task_view` | Full task branch — timeline of work logs, decisions, problems, solutions, subtasks. |
 | `task_stats` | Task analytics — counts by status/priority, completion rate, avg/median duration, blocked count, oldest active. |
