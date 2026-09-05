@@ -617,7 +617,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "task_log",
-                "description": "Record work done on a task. Creates a WorkLog node linked to the task. Optionally records decisions made and problems solved during the work. Auto-activates backlog tasks on first log entry. Accepts the same provenance fields as memory_add (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way — they land on the WorkLog node; the decisions/problems/solutions it spawns inherit confidence/evidence but never subject or claim. resolution is not supported here: to supersede an existing fact by subject, use memory_add with resolution.",
+                "description": "Record work done on a task. Creates a WorkLog node linked to the task. Optionally records decisions made and problems solved during the work. Logging never changes the task's status: the response includes task_status, and activation is explicit, via task_update with status=active. Accepts the same provenance fields as memory_add (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way — they land on the WorkLog node; the decisions/problems/solutions it spawns inherit confidence/evidence but never subject or claim. resolution is not supported here: to supersede an existing fact by subject, use memory_add with resolution.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

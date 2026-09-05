@@ -84,7 +84,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | `task_create` | Create structured task — title, description, acceptance criteria, priority, subtask/blocking relations. Accepts the same provenance fields as `memory_add` (`confidence`, `evidence`, `subject`, `volatility`, `claim`, `measured_at`, `verify_with`). |
 | `task_update` | Update status, priority, criteria. Auto-tracks `started_at`/`completed_at`. Accepts the same provenance fields as `memory_add` — a task's confidence can change after a measurement. |
 | `task_list` | Filter by project, status, priority. Sorted by priority, shows work log count. |
-| `task_log` | Record work done — creates WorkLog + optional Decision/Problem/Solution nodes. Auto-activates backlog tasks. Accepts the same provenance fields as `memory_add`; spawned decisions/problems/solutions inherit confidence/evidence but never subject/claim. |
+| `task_log` | Record work done — creates WorkLog + optional Decision/Problem/Solution nodes. Never changes the task's status; the response includes `task_status`, activation is explicit via `task_update status=active`. Accepts the same provenance fields as `memory_add`; spawned decisions/problems/solutions inherit confidence/evidence but never subject/claim. |
 | `task_view` | Full task branch — timeline of work logs, decisions, problems, solutions, subtasks. |
 | `task_stats` | Task analytics — counts by status/priority, completion rate, avg/median duration, blocked count, oldest active. |
 | `task_ripe` | Tasks ready to close — active, with a passing evidence run newer than the last edit, plus the basis (which run, when, files touched). Same computation as `au task ripe`; closing itself is still `task_update`. |
@@ -228,7 +228,9 @@ backlog → active → done
                  → cancelled
 ```
 
-First `task_log` entry auto-activates a backlog task. `task_update` tracks timestamps automatically.
+`task_log` never activates a task — recording work is an observation, not a decision to take it
+into work. Activation is explicit: `task_update` with `status=active`, or `au task activate`.
+`task_update` tracks timestamps automatically.
 A project has at most one active task at a time — activating another demotes the previous
 active task back to `backlog`, keeping its accumulated timestamps and history intact.
 
@@ -510,7 +512,7 @@ au share disable <project>         # stop syncing (local data kept)
 au task new "Title" -p myapp --priority high -c "Tests pass"
 au task list --project myapp --status active,blocked
 au task show <id>                  # full details with work log branch and three timestamps
-au task log <id> "Did X, Y, Z"    # record work (auto-activates)
+au task log <id> "Did X, Y, Z"    # record work (does not activate; see `au task activate`)
 au task ripe [--project myapp]     # tasks ripe to close, with evidence + what changed
 au task done <id>                  # mark complete; resolution assembled from traces
 au task done <id> --commit <sha> --pr <url>   # override/add to the detected resolution
