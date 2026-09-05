@@ -1,4 +1,5 @@
 mod commands;
+mod hooks;
 mod view;
 
 use anyhow::Result;
@@ -365,8 +366,19 @@ pub enum DbAction {
     /// Safe snapshot via SQLite VACUUM INTO — the only correct way to copy a live database
     Backup {
         /// Destination file (default: aurelius-<UTC timestamp>.db next to the database)
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "hook")]
         out: Option<String>,
+        /// SessionStart-hook mode: snapshot into <data_dir>/backups, throttled
+        /// by --min-hours, verified, rotated to --keep; never fails
+        #[arg(long)]
+        hook: bool,
+        /// Snapshots to keep (default: AURELIUS_BACKUP_KEEP env var, else 7). Requires --hook
+        #[arg(long, requires = "hook")]
+        keep: Option<usize>,
+        /// Minimum age in hours of the newest snapshot before another is taken
+        /// (default: AURELIUS_BACKUP_MIN_HOURS env var, else 24). Requires --hook
+        #[arg(long, requires = "hook")]
+        min_hours: Option<u64>,
     },
 }
 
@@ -525,8 +537,13 @@ enum Commands {
     /// Re-index current project (auto-detects project root)
     Reindex {
         /// Project root path (defaults to git root or cwd)
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "hook")]
         path: Option<String>,
+        /// Stop-hook mode: root comes from the hook payload's `cwd` (raised
+        /// to the git toplevel), then every sync-enabled project is pushed;
+        /// never fails
+        #[arg(long)]
+        hook: bool,
     },
     /// Open interactive graph visualization in browser
     View {
@@ -539,8 +556,14 @@ enum Commands {
     },
     /// Touch a file node — increment access_count (used by hooks)
     Touch {
-        /// Path to the file
-        path: String,
+        /// Path to the file. Required unless --hook
+        #[arg(required_unless_present = "hook", conflicts_with = "hook")]
+        path: Option<String>,
+        /// PostToolUse hook mode: read the file path from Claude Code hook
+        /// JSON on stdin (`tool_input.file_path`, else `tool_input.path`);
+        /// never fails, creates no new nodes
+        #[arg(long)]
+        hook: bool,
     },
     /// Export full graph to JSON
     Export,
@@ -770,9 +793,9 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Commands::Reindex { path } => commands::reindex(path).await,
+        Commands::Reindex { path, hook } => commands::reindex_cmd(path, hook).await,
         Commands::View { port, no_open } => view::serve(port, no_open).await,
-        Commands::Touch { path } => commands::touch(&path).await,
+        Commands::Touch { path, hook } => commands::touch_cmd(path, hook).await,
         Commands::Export => commands::export().await,
         Commands::Task { action } => commands::task(action).await,
         Commands::Secret { action } => commands::secret(action).await,
