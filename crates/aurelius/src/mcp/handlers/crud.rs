@@ -240,8 +240,9 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
     // Противоречие ловится ДО записи. Два утверждения об одном предмете не
     // могут быть истинны одновременно, а граф до сих пор принимал оба молча —
     // ребро supersedes ставилось руками, то есть по памяти.
+    // `exclude: None` — memory_add always creates a new node.
     let conflicts =
-        provenance::guard_subject(&conn, prov.subject.as_deref(), resolution.is_some())?;
+        provenance::guard_subject(&conn, prov.subject.as_deref(), resolution.is_some(), None)?;
 
     let node = graph::add_node_full(
         &conn,
