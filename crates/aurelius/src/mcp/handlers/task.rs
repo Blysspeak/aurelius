@@ -203,7 +203,6 @@ fn task_update_with_conn(
             // состояния репозитория, файлы — из привязанных правок;
             // commit/pull_request/unconfirmed лишь уточняют автособранное.
             let mut fields = aurelius_core::tasks::TaskFields::from_data(&data);
-            let since = fields.activated_at.unwrap_or(node.created_at);
             let project = data.get("project").and_then(|p| p.as_str());
             let commit = params
                 .get("commit")
@@ -220,9 +219,13 @@ fn task_update_with_conn(
             // Находка 1, FR-004/FR-006: коммит закрываемой задачи ищется в
             // каталоге ЕЁ ПРОЕКТА (см. `build_resolution`), не в CWD
             // процесса — процесс тут один на все проекты сразу.
+            // `fields.activated_at` передаётся как есть, без подмены
+            // `node.created_at` (resolution-window finding, measured
+            // 2026-09-05): задача из backlog, ни разу не взятая в работу, не
+            // имеет окна работы вовсе, см. доккомент `build_resolution`.
             let resolution = aurelius_core::tasks::build_resolution(
                 conn,
-                since,
+                fields.activated_at,
                 project,
                 commit,
                 pull_request,

@@ -280,7 +280,10 @@ au task done <id> --unconfirmed            # force "closed without confirmation"
 
 If nothing about the resolution can be determined and `--unconfirmed` isn't passed, the task
 still closes — just marked **closed without confirmation**, so the history never silently
-lies about how sure the record is.
+lies about how sure the record is. A task closed straight from the backlog, without ever
+being taken into work (`activated_at` absent), gets no auto-collected files and no
+auto-detected commit either — there is no work window to read either from, only an
+explicit `--commit`/`--pr` is kept.
 
 ### Acceptance Criteria
 
