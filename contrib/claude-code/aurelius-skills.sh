@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# DEPRECATED since 3.4.0: replaced by the aurelius Claude Code plugin (plugin/hooks.json calls au <cmd> --hook directly).
+# Kept for hand installs until the next major release. Do not add features here.
 # Aurelius hook: injects the skill index into context on SessionStart.
 # Outputs Claude Code hook JSON (hookSpecificOutput.additionalContext) so the
 # agent always knows which reusable skill cards exist — then it can call

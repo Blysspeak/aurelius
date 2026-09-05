@@ -38,12 +38,51 @@ Every AI session starts from zero. You re-explain your projects, your past decis
 
 ## Quick Start
 
+Aurelius ships as a [Claude Code plugin](plugin/hooks.json): one MCP server plus seven session
+hooks, installed with two `claude plugin` commands instead of hand-edited `settings.json`.
+
+**Clean machine (Linux, macOS)**
+
 ```bash
 git clone https://github.com/Blysspeak/aurelius && cd aurelius
-./install.sh
+cargo build --release
+install -m 755 target/release/au target/release/aurelius ~/.local/bin/   # must be in PATH
+au init
+claude plugin marketplace add Blysspeak/aurelius      # or a local clone path: claude plugin marketplace add .
+claude plugin install aurelius@blysspeak -s user
 ```
 
-This builds binaries, installs to `~/.local/bin`, configures Claude Code MCP server and hooks, initializes the database, and indexes the project. Restart Claude Code and you're ready.
+Restart Claude Code. `claude plugin list` shows `aurelius@blysspeak`, and a fresh session gets a
+memory snapshot and skill index at start.
+
+**Existing machine (stood up by hand or by an older `install.sh`)**
+
+```bash
+cd aurelius && git pull && ./install.sh
+```
+
+`install.sh` builds the binaries, installs the plugin, and removes any legacy hook and
+`mcpServers.aurelius` entries it previously wrote into `~/.claude/settings.json` and
+`~/.claude.json` — printing each removed entry with its reason and leaving a `.bak-<UTC date>`
+copy next to each file it touches. Re-running it is a no-op once migrated. Use
+`./install.sh --migrate-only` to run just the cleanup, without building anything.
+
+**Windows**
+
+```powershell
+git clone https://github.com/Blysspeak/aurelius; cd aurelius
+cargo build --release
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin" | Out-Null
+Copy-Item target\release\au.exe "$env:USERPROFILE\.local\bin\"    # must be in PATH
+au init
+claude plugin marketplace add Blysspeak/aurelius
+claude plugin install aurelius@blysspeak -s user
+```
+
+Git Bash and python3 are not required — every plugin hook runs `au` directly. If hooks and the
+MCP server were previously added by hand, remove them from `$env:USERPROFILE\.claude\settings.json`
+(hooks whose command matches `aurelius-*.sh` or `au … --hook`) and `mcpServers.aurelius` there and
+in `$env:USERPROFILE\.claude.json` — copy both files first.
 
 ```
 $ au --version
@@ -675,21 +714,30 @@ deploy/
 
 ## Hooks (Auto-Capture)
 
-Installed automatically by `install.sh` into `~/.claude/settings.json`.
+`plugin/hooks.json` is the single source of truth for Claude Code hooks — shipped by the
+`aurelius` Claude Code plugin (`claude plugin install aurelius@blysspeak`) instead of being
+hand-edited into `settings.json`. Every hook calls the `au` binary directly — no bash, no python3.
 
-| Hook | Event | What it does |
-|------|-------|-------------|
-| `au snapshot --hook` | SessionStart | Injects the seven-layer slice straight into the context |
-| `aurelius-skills.sh` | SessionStart | Injects the skill index |
-| `aurelius-backup.sh` | SessionStart | Rolling database snapshot, throttled to one a day |
-| `aurelius-track-edit.sh` | PostToolUse (Edit/Write) | Increments access_count on file nodes |
-| `au trace --hook` | PostToolUse | Appends what happened to the action journal |
-| `au judge --hook` | Stop | Settles the session: reinforce, erode, fork or null |
-| `aurelius-reindex.sh` | Stop | Re-indexes project on session end |
-| `post-commit` | git commit | Captures commit as Decision node, linked to project via `belongs_to` |
+| Event | Matcher | `au` command | Timeout |
+|-------|---------|-----|---------|
+| SessionStart | `""` | `au skills --hook` | 10s |
+| SessionStart | `""` | `au snapshot --hook` | 10s |
+| SessionStart | `""` | `au db backup --hook` | 30s |
+| PostToolUse | `Edit\|Write` | `au touch --hook` | 5s |
+| PostToolUse | `Bash\|PowerShell\|Edit\|Write\|NotebookEdit` | `au trace --hook` | 5s |
+| Stop | `""` | `au reindex --hook` | 15s |
+| Stop | `""` | `au judge --hook` | 20s |
 
-A failing hook is always swallowed: memory has no right to break the start — or the end —
-of a session.
+`skills` injects the skill index, `snapshot` the seven-layer memory slice, `db backup` a throttled
+rolling database snapshot, `touch` increments access_count on edited files, `trace` appends to the
+action journal, `reindex` re-indexes the project and pushes sync-enabled projects, `judge` settles
+the session (reinforce/erode/fork/null). A failing hook is always swallowed: memory has no right
+to break the start — or the end — of a session.
+
+The bash wrappers in `contrib/claude-code/*.sh` and its own `install.sh` are **deprecated since
+3.4.0** — kept only for hand installs that never adopt the plugin, and removed in the next major
+release. The `post-commit` git hook (`contrib/git-hooks/`) is a separate mechanism, unrelated to
+the Claude Code plugin, and is still installed by `install.sh` for the current repo.
 
 ---
 
@@ -713,6 +761,9 @@ of a session.
 - [x] v1.10 — Seven-layer snapshot; Bit-i-Delo stages 1-4: action journal, ground-truth probes, surprise gate, outcome judge, clearing and obligations
 - [x] v1.11 — Project scoping by edge, not just by label prefix; `au snapshot --json`; `memory_add` warns on unattached nodes
 - [ ] Next — npm distribution, `au repair`, `au doctor`, context-ranked search, git log connector
+
+A release bumps `.claude-plugin/plugin.json` together with `Cargo.toml` — `crates/au/tests/plugin_manifest.rs`
+asserts the two versions are equal, so `cargo test` stays red until both are updated.
 
 ---
 

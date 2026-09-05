@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# DEPRECATED since 3.4.0: replaced by the aurelius Claude Code plugin (plugin/hooks.json calls au <cmd> --hook directly).
+# Kept for hand installs until the next major release. Do not add features here.
 # Aurelius hook: re-indexes the current project on session Stop, then pushes
 # any sync-enabled projects (US2 — CLI-level equivalent of the automatic
 # push memory_session does over MCP, for non-MCP flows).
