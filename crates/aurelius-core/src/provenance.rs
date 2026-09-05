@@ -281,6 +281,30 @@ impl Provenance {
         put(SUBJECT_KEY, self.subject.clone());
     }
 
+    /// What a node created ALONGSIDE the primary record inherits — a decision
+    /// spawned by `task_log`, or a decision/problem/solution spawned by
+    /// `memory_session`.
+    ///
+    /// `confidence`/`evidence`/`measured_at`/`volatility`/`verify_with` carry
+    /// over as-is: whatever backs the call backs every node it spawned.
+    /// `subject` and `claim` do not. `subject` is the key of ONE fact — copy
+    /// it onto several nodes and the first search for a second fact on that
+    /// subject finds a contradiction with itself. `claim` belongs to the
+    /// call's primary node — a spawned node's own text already lives in its
+    /// `note`.
+    #[must_use]
+    pub fn inherited(&self) -> Self {
+        Self {
+            claim: None,
+            subject: None,
+            evidence: self.evidence.clone(),
+            measured_at: self.measured_at,
+            confidence: self.confidence,
+            volatility: self.volatility,
+            verify_with: self.verify_with.clone(),
+        }
+    }
+
     /// Как называть уверенность на выдаче. Отсутствие поля — это `unverified`,
     /// а не «наверное измерено».
     #[must_use]
@@ -574,6 +598,30 @@ mod tests {
 
         let read_back = Provenance::from_data(&data);
         assert_eq!(read_back, parsed);
+    }
+
+    /// A spawned node inherits what backs the record, but not the subject key
+    /// or the claim text — both belong to exactly one node.
+    #[test]
+    fn inherited_drops_subject_and_claim_but_keeps_the_rest() {
+        let p = Provenance::parse(&json!({
+            "claim": "REFUND_REQUESTS_ENABLED=false",
+            "evidence": "cargo test",
+            "confidence": "measured",
+            "volatility": "volatile",
+            "verify_with": "cargo test",
+            "subject": "xhub:.env:REFUND_REQUESTS_ENABLED",
+        }))
+        .expect("parse");
+
+        let inherited = p.inherited();
+        assert_eq!(inherited.subject, None);
+        assert_eq!(inherited.claim, None);
+        assert_eq!(inherited.confidence, p.confidence);
+        assert_eq!(inherited.evidence, p.evidence);
+        assert_eq!(inherited.measured_at, p.measured_at);
+        assert_eq!(inherited.volatility, p.volatility);
+        assert_eq!(inherited.verify_with, p.verify_with);
     }
 
     #[test]

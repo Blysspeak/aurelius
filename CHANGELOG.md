@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Поля происхождения принимают все ручки записи MCP.** `task_log`, `task_create`, `task_update` и `memory_session` берут те же `confidence`, `evidence`, `subject`, volatility, claim, measured_at и verify_with, что `memory_add`, тем же разбором. Раньше агент, только что прогнавший команду, не мог записать `measured` через них: канала не было, и каждый журнал работы, задача и сессия ложились непроверенными — отсюда снимок памяти сплошь unverified. Узлы, которые ручка создаёт попутно (решения, проблемы), наследуют `confidence` и `evidence`, но не `subject`: ключ предмета уникален для одного факта
+
 ## [v3.1.0] — 2026-09-05
 
 ### Added
