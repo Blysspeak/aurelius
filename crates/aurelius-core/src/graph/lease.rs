@@ -746,6 +746,18 @@ fn build_gates() -> FitnessGates {
             re(r"(?i)этап\s*\d"),
             re(r"(?i)stage\s*\d"),
             re(r"(?i)mvp[-\s]?\d"),
+            // Volume named by a number, not a word: a 2-3 digit count (the
+            // digit cap of {2,3} *is* the threshold of 10 — no separate
+            // const, and it excludes 4-digit years), up to three
+            // intervening words (adjectives, e.g. "86 крупных боевых
+            // файлов"), then a countable unit noun stem. Whitespace must
+            // follow the digits, so a number glued to a symbol (90%, #296,
+            // :843) never matches. The trailing `\w*` absorbs whatever
+            // ending follows the stem, so the whole word is consumed and the
+            // echoed marker never gets cut mid-word.
+            re(
+                r"(?i)\b(\d{2,3})(?:\s+[^\s\d]+){0,3}?\s+(файл|вхожден|роут|эндпоинт|таблиц|миграци|модул|компонент|страниц|скрипт|file|route|endpoint|table|module|component|page|occurrence|migration)\w*",
+            ),
         ],
         // FR-005c: публикация, PR, слияние в основную линию, сообщение
         // человеку — исполнителю запрещено закрывать такой критерий честно
@@ -1595,6 +1607,69 @@ mod tests {
     fn epic_task_gives_human() {
         let outcome = evaluate_fitness(
             "[blyss-core] Реализовать Phase 3 (US1): живой голосовой круг",
+            None,
+            &["cargo test --workspace зелёный".to_owned()],
+        );
+        assert_eq!(outcome.verdict, FitnessVerdict::Human);
+        assert!(
+            outcome.why.contains("наряда"),
+            "обоснование обязано называть причину отказа — объём: {}",
+            outcome.why
+        );
+    }
+
+    /// Объём назван числом, а не словом «эпик»: 86 файлов — многоэтапность
+    /// (FR-005b).
+    #[test]
+    fn numeric_volume_marker_gives_human() {
+        let outcome = evaluate_fitness(
+            "[xhub] Разрезать 86 крупных боевых файлов по швам, коммит на файл",
+            None,
+            &["cargo test --workspace зелёный".to_owned()],
+        );
+        assert_eq!(outcome.verdict, FitnessVerdict::Human);
+        assert!(
+            outcome.why.contains("наряда"),
+            "обоснование обязано называть причину отказа — объём: {}",
+            outcome.why
+        );
+        assert!(
+            outcome.why.contains("файлов"),
+            "маркер обязан эхом отдать слово целиком, а не обрубок стема: {}",
+            outcome.why
+        );
+    }
+
+    /// Малое число — не эпик: порог кодируется числом цифр {2,3}, три файла
+    /// под него не попадают.
+    #[test]
+    fn small_count_stays_machine() {
+        let outcome = evaluate_fitness(
+            "[aurelius] Починить 3 файла в crates/au",
+            None,
+            &["cargo test --workspace зелёный".to_owned()],
+        );
+        assert_eq!(outcome.verdict, FitnessVerdict::Machine);
+    }
+
+    /// Год — не количественный оборот: маркер требует единицы измерения
+    /// сразу после числа, «2026 год» под него не попадает.
+    #[test]
+    fn year_is_not_a_count() {
+        let outcome = evaluate_fitness(
+            "[aurelius] Перенести отчёт за 2026 год в новые файлы",
+            None,
+            &["cargo test --workspace зелёный".to_owned()],
+        );
+        assert_eq!(outcome.verdict, FitnessVerdict::Machine);
+    }
+
+    /// Английская единица измерения латиницей — тот же маркер (FR-005b не
+    /// завязан на язык).
+    #[test]
+    fn numeric_volume_marker_matches_english_unit() {
+        let outcome = evaluate_fitness(
+            "[xhub] Переименовать 12 routes в api/v2",
             None,
             &["cargo test --workspace зелёный".to_owned()],
         );
