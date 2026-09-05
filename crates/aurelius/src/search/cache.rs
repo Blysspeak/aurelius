@@ -3,7 +3,7 @@ use chrono::{Duration, Utc};
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
-use super::brave::SearchResult;
+use super::SearchResult;
 
 #[derive(Debug)]
 pub struct CachedSearch {
@@ -14,19 +14,21 @@ pub struct CachedSearch {
     pub created_at: String,
 }
 
-/// Look up cached results for an exact query. Returns None if expired or missing.
-pub fn get(conn: &Connection, query: &str) -> Result<Option<CachedSearch>> {
+/// Look up cached results for an exact query and provider. Returns None if
+/// expired or missing. Scoped by `source` so a Perplexity query never
+/// returns a Brave-cached answer, and vice versa.
+pub fn get(conn: &Connection, query: &str, source: &str) -> Result<Option<CachedSearch>> {
     let now = Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
         "SELECT id, query, results, source, created_at
          FROM search_cache
-         WHERE query = ?1 AND expires_at > ?2
+         WHERE query = ?1 AND source = ?2 AND expires_at > ?3
          ORDER BY created_at DESC
          LIMIT 1",
     )?;
 
     let row = stmt
-        .query_row(params![query, now], |row| {
+        .query_row(params![query, source, now], |row| {
             let results_json: String = row.get(2)?;
             Ok(CachedSearch {
                 id: row.get(0)?,
@@ -123,5 +125,58 @@ impl OptionalRow for Result<CachedSearch, rusqlite::Error> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> (std::path::PathBuf, Connection) {
+        let path =
+            std::env::temp_dir().join(format!("aurelius-search-cache-{}.db", Uuid::new_v4()));
+        let conn = aurelius_core::db::open(&path).expect("open temp db");
+        (path, conn)
+    }
+
+    fn cleanup(path: &std::path::Path, conn: Connection) {
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        }
+    }
+
+    /// Cache lookups are scoped by provider: a Perplexity query must never
+    /// return a Brave-cached answer, and the same query cached under Brave
+    /// must still be found by its own provider.
+    #[test]
+    fn get_is_scoped_by_source() {
+        let (path, conn) = temp_db();
+
+        let results = vec![SearchResult {
+            title: "Result".to_owned(),
+            url: "https://example.com".to_owned(),
+            description: "desc".to_owned(),
+        }];
+
+        put(&conn, "rust async runtimes", &results, "brave", 7).expect("put must succeed");
+
+        let other_provider = get(&conn, "rust async runtimes", "perplexity").expect("get");
+        assert!(
+            other_provider.is_none(),
+            "a different provider must not see another provider's cache entry"
+        );
+
+        let same_provider = get(&conn, "rust async runtimes", "brave")
+            .expect("get")
+            .expect("brave entry must be found");
+        assert_eq!(same_provider.results.len(), results.len());
+        assert_eq!(same_provider.results[0].title, results[0].title);
+        assert_eq!(same_provider.results[0].url, results[0].url);
+        assert_eq!(same_provider.results[0].description, results[0].description);
+
+        cleanup(&path, conn);
     }
 }
