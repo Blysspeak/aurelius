@@ -2,12 +2,23 @@ use anyhow::Result;
 use aurelius_core::{
     graph,
     models::{MemoryKind, NodeType, Relation},
+    provenance::{self, Provenance},
 };
 use serde_json::json;
 
 use super::{node_compact, node_detail, open_db, resolve_task_node, truncate};
 
 pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let conn = open_db()?;
+    task_create_with_conn(&conn, params)
+}
+
+/// The body of `task_create`, taking the connection as an explicit
+/// parameter — the same testability trick as `task_update_with_conn`.
+fn task_create_with_conn(
+    conn: &rusqlite::Connection,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value> {
     let title = params
         .get("title")
         .and_then(|t| t.as_str())
@@ -26,9 +37,16 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
         .cloned()
         .unwrap_or(json!([]));
 
-    let conn = open_db()?;
+    // Provenance is parsed FIRST, as in memory_add: an error in it must not
+    // leave a half-written task behind.
+    let prov = Provenance::parse(params)?;
 
-    let task_data = json!({
+    // The same guard as memory_add, before the write. Resolution is not
+    // supported here: resolving a subject conflict only goes through
+    // memory_add.
+    provenance::guard_subject(conn, prov.subject.as_deref(), false)?;
+
+    let mut task_data = json!({
         "status": "backlog",
         "priority": priority,
         "acceptance_criteria": acceptance_criteria,
@@ -36,10 +54,11 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
         "started_at": null,
         "completed_at": null,
     });
+    prov.write_into(&mut task_data);
 
     let label = format!("[{}] {}", project, title);
     let task = graph::add_node_full(
-        &conn,
+        conn,
         NodeType::Task,
         &label,
         description,
@@ -50,10 +69,10 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
     )?;
 
     // Link to project (auto-create if missing)
-    let proj_node = match graph::find_project_by_label(&conn, project) {
+    let proj_node = match graph::find_project_by_label(conn, project) {
         Ok(Some(n)) => n,
         _ => graph::add_node(
-            &conn,
+            conn,
             NodeType::Project,
             project,
             None,
@@ -61,15 +80,15 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
             json!({"auto_created": true}),
         )?,
     };
-    graph::add_edge(&conn, task.id, proj_node.id, Relation::BelongsTo, 1.0)?;
+    graph::add_edge(conn, task.id, proj_node.id, Relation::BelongsTo, 1.0)?;
 
     // Parent task (subtask_of). Резолв ограничен типом Task по той же причине,
     // что и в `task_update`: обе связи по контракту ручки соединяют задачи, и
     // нестрогий полнотекстовый фолбэк молча привязал бы задачу к решению или
     // проблеме с похожей меткой — связь, которую потом никто не заметит.
     if let Some(parent_id) = params.get("parent").and_then(|p| p.as_str()) {
-        if let Ok(parent) = resolve_task_node(&conn, parent_id) {
-            graph::add_edge(&conn, task.id, parent.id, Relation::SubtaskOf, 1.0)?;
+        if let Ok(parent) = resolve_task_node(conn, parent_id) {
+            graph::add_edge(conn, task.id, parent.id, Relation::SubtaskOf, 1.0)?;
         }
     }
 
@@ -77,8 +96,8 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
     if let Some(blocks) = params.get("blocks").and_then(|b| b.as_array()) {
         for blocked in blocks {
             if let Some(blocked_id) = blocked.as_str() {
-                if let Ok(blocked_node) = resolve_task_node(&conn, blocked_id) {
-                    graph::add_edge(&conn, task.id, blocked_node.id, Relation::Blocks, 1.0)?;
+                if let Ok(blocked_node) = resolve_task_node(conn, blocked_id) {
+                    graph::add_edge(conn, task.id, blocked_node.id, Relation::Blocks, 1.0)?;
                 }
             }
         }
@@ -93,6 +112,10 @@ pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
         "project": project,
         "created": true,
         "created_by": task.created_by,
+        "provenance": {
+            "confidence": prov.confidence_or_default().as_str(),
+            "subject": prov.subject,
+        },
     }))
 }
 
@@ -115,6 +138,13 @@ fn task_update_with_conn(
         .ok_or_else(|| anyhow::anyhow!("missing 'id' parameter"))?;
 
     let node = resolve_task_node(conn, id)?;
+
+    // Provenance is parsed right after resolving the task, before any edits
+    // to `data`: an error in it must not leave a half-applied update behind.
+    // A task can gain measured confidence AFTER a measurement — that is
+    // exactly the case this field exists for.
+    let prov = Provenance::parse(params)?;
+    provenance::guard_subject(conn, prov.subject.as_deref(), false)?;
 
     // Merge data fields
     let mut data = node.data.clone();
@@ -225,11 +255,20 @@ fn task_update_with_conn(
         data["acceptance_criteria"] = criteria.clone();
     }
 
+    // Provenance — alongside the other edits, not a separate call: a task's
+    // confidence can change AFTER a measurement, and this is exactly that
+    // case. Without any fields given, `write_into` leaves `data` untouched.
+    prov.write_into(&mut data);
+
     let new_note = params.get("note").and_then(|n| n.as_str());
 
     graph::update_node(conn, node.id, new_note, Some(data.clone()))?;
 
     let fields = aurelius_core::tasks::TaskFields::from_data(&data);
+    // What actually sits on the task NOW, not just what this call brought —
+    // a call without provenance fields must show what was already recorded
+    // earlier, not pretend the task went back to unverified.
+    let current_prov = Provenance::from_data(&data);
 
     let mut result = json!({
         "id": node.id.to_string(),
@@ -241,6 +280,10 @@ fn task_update_with_conn(
         "activated_at": fields.activated_at.map(|d| d.to_rfc3339()),
         "closed_at": fields.closed_at.map(|d| d.to_rfc3339()),
         "resolution": fields.resolution,
+        "provenance": {
+            "confidence": current_prov.confidence_or_default().as_str(),
+            "subject": current_prov.subject,
+        },
     });
     // T009, симметрия с CLI: молчаливое вытеснение выглядит как потеря
     // задачи — сказать вслух, кого вытеснили.
@@ -374,6 +417,16 @@ fn task_ripe_with_conn(
 }
 
 pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let conn = open_db()?;
+    task_log_with_conn(&conn, params)
+}
+
+/// The body of `task_log`, taking the connection as an explicit parameter —
+/// the same testability trick as `task_update_with_conn`.
+fn task_log_with_conn(
+    conn: &rusqlite::Connection,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value> {
     let task_id = params
         .get("task")
         .and_then(|t| t.as_str())
@@ -383,8 +436,12 @@ pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'text' parameter"))?;
 
-    let conn = open_db()?;
-    let task = resolve_task_node(&conn, task_id)?;
+    let task = resolve_task_node(conn, task_id)?;
+
+    // Provenance is parsed FIRST THING after resolving the task, before any
+    // write: an error in it must not leave a half-written work_log behind.
+    let prov = Provenance::parse(params)?;
+    provenance::guard_subject(conn, prov.subject.as_deref(), false)?;
 
     // Extract project from task data
     let project = task
@@ -402,48 +459,57 @@ pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
     if status == "backlog" {
         task_data["status"] = json!("active");
         task_data["started_at"] = json!(chrono::Utc::now().to_rfc3339());
-        graph::update_node(&conn, task.id, None, Some(task_data))?;
+        graph::update_node(conn, task.id, None, Some(task_data))?;
     }
 
     // Create WorkLog node
     let log_label = format!("[{}] {}", project, truncate(text, 60));
+    let mut log_data = json!({"task_id": task.id.to_string()});
+    prov.write_into(&mut log_data);
     let log_node = graph::add_node_full(
-        &conn,
+        conn,
         NodeType::WorkLog,
         &log_label,
         Some(text),
         "mcp-task",
-        json!({"task_id": task.id.to_string()}),
+        log_data,
         MemoryKind::Episodic,
         None,
     )?;
 
     // Link: task --contains--> worklog
-    graph::add_edge(&conn, task.id, log_node.id, Relation::Contains, 1.0)?;
+    graph::add_edge(conn, task.id, log_node.id, Relation::Contains, 1.0)?;
 
     // Link worklog to project
-    if let Ok(Some(proj_node)) = graph::find_project_by_label(&conn, project) {
-        graph::add_edge(&conn, log_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
+    if let Ok(Some(proj_node)) = graph::find_project_by_label(conn, project) {
+        graph::add_edge(conn, log_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
     }
 
     let mut created_nodes = vec![node_compact(&log_node)];
+
+    // Nodes spawned alongside the call (decisions/problems/solutions) inherit
+    // what backs the record, but not subject/claim — both belong to exactly
+    // one fact, see `Provenance::inherited`.
+    let inherited = prov.inherited();
 
     // Create decision nodes
     if let Some(decisions) = params.get("decisions").and_then(|d| d.as_array()) {
         for decision in decisions {
             if let Some(dec_text) = decision.as_str() {
+                let mut dec_data = json!({"task_id": task.id.to_string()});
+                inherited.write_into(&mut dec_data);
                 let dec_node = graph::add_node(
-                    &conn,
+                    conn,
                     NodeType::Decision,
                     &format!("[{}] {}", project, truncate(dec_text, 60)),
                     Some(dec_text),
                     "mcp-task",
-                    json!({"task_id": task.id.to_string()}),
+                    dec_data,
                 )?;
-                graph::add_edge(&conn, task.id, dec_node.id, Relation::Contains, 1.0)?;
-                graph::add_edge(&conn, log_node.id, dec_node.id, Relation::Contains, 1.0)?;
-                if let Ok(Some(proj_node)) = graph::find_project_by_label(&conn, project) {
-                    graph::add_edge(&conn, dec_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
+                graph::add_edge(conn, task.id, dec_node.id, Relation::Contains, 1.0)?;
+                graph::add_edge(conn, log_node.id, dec_node.id, Relation::Contains, 1.0)?;
+                if let Ok(Some(proj_node)) = graph::find_project_by_label(conn, project) {
+                    graph::add_edge(conn, dec_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
                 }
                 created_nodes.push(node_compact(&dec_node));
             }
@@ -456,29 +522,33 @@ pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
             let prob_text = problem.get("problem").and_then(|p| p.as_str());
             let sol_text = problem.get("solution").and_then(|s| s.as_str());
             if let (Some(prob), Some(sol)) = (prob_text, sol_text) {
+                let mut prob_data = json!({"task_id": task.id.to_string()});
+                inherited.write_into(&mut prob_data);
                 let prob_node = graph::add_node(
-                    &conn,
+                    conn,
                     NodeType::Problem,
                     &format!("[{}] {}", project, truncate(prob, 60)),
                     Some(prob),
                     "mcp-task",
-                    json!({"task_id": task.id.to_string()}),
+                    prob_data,
                 )?;
+                let mut sol_data = json!({"task_id": task.id.to_string()});
+                inherited.write_into(&mut sol_data);
                 let sol_node = graph::add_node(
-                    &conn,
+                    conn,
                     NodeType::Solution,
                     &format!("[{}] {}", project, truncate(sol, 60)),
                     Some(sol),
                     "mcp-task",
-                    json!({"task_id": task.id.to_string()}),
+                    sol_data,
                 )?;
-                graph::add_edge(&conn, sol_node.id, prob_node.id, Relation::Solves, 1.0)?;
-                graph::add_edge(&conn, task.id, prob_node.id, Relation::Contains, 1.0)?;
-                graph::add_edge(&conn, task.id, sol_node.id, Relation::Contains, 1.0)?;
-                graph::add_edge(&conn, log_node.id, prob_node.id, Relation::Contains, 1.0)?;
-                if let Ok(Some(proj_node)) = graph::find_project_by_label(&conn, project) {
-                    graph::add_edge(&conn, prob_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
-                    graph::add_edge(&conn, sol_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
+                graph::add_edge(conn, sol_node.id, prob_node.id, Relation::Solves, 1.0)?;
+                graph::add_edge(conn, task.id, prob_node.id, Relation::Contains, 1.0)?;
+                graph::add_edge(conn, task.id, sol_node.id, Relation::Contains, 1.0)?;
+                graph::add_edge(conn, log_node.id, prob_node.id, Relation::Contains, 1.0)?;
+                if let Ok(Some(proj_node)) = graph::find_project_by_label(conn, project) {
+                    graph::add_edge(conn, prob_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
+                    graph::add_edge(conn, sol_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
                 }
                 created_nodes.push(node_compact(&prob_node));
                 created_nodes.push(node_compact(&sol_node));
@@ -491,6 +561,10 @@ pub fn task_log(params: &serde_json::Value) -> Result<serde_json::Value> {
         "task_label": task.label,
         "created_nodes": created_nodes,
         "total_created": created_nodes.len(),
+        "provenance": {
+            "confidence": prov.confidence_or_default().as_str(),
+            "subject": prov.subject,
+        },
     }))
 }
 
@@ -870,6 +944,144 @@ mod tests {
         )
         .expect("insert task")
         .id
+    }
+
+    // -- task 2c8d25ce: provenance fields in task_create/task_log/task_update --
+
+    /// Exactly what was missing: an agent that just ran a command must be
+    /// able to record that through `task_log`, the same as through
+    /// `memory_add`.
+    #[test]
+    fn task_log_with_measured_and_evidence_writes_provenance_on_worklog_and_inherits_on_decision() {
+        let (_tmp, conn) = setup();
+        let task_id = seed_task(&conn, "proj-prov", "задача под измерение");
+
+        let result = task_log_with_conn(
+            &conn,
+            &json!({
+                "task": task_id.to_string(),
+                "text": "прогнали cargo test",
+                "confidence": "measured",
+                "evidence": "cargo test --workspace",
+                "subject": "aurelius:proj-prov:worklog",
+                "decisions": ["решили не трогать схему"],
+            }),
+        )
+        .expect("task_log");
+
+        assert_eq!(result["provenance"]["confidence"], "measured");
+
+        let created = result["created_nodes"].as_array().expect("created_nodes");
+        let log_id = created[0]["id"].as_str().expect("worklog id");
+        let log_node = graph::get_node(&conn, log_id)
+            .expect("get_node")
+            .expect("worklog exists");
+        let log_prov = aurelius_core::provenance::Provenance::from_data(&log_node.data);
+        assert_eq!(
+            log_prov.confidence,
+            Some(aurelius_core::provenance::Confidence::Measured)
+        );
+        assert_eq!(log_prov.evidence.as_deref(), Some("cargo test --workspace"));
+        assert_eq!(
+            log_prov.subject.as_deref(),
+            Some("aurelius:proj-prov:worklog")
+        );
+
+        // The spawned decision inherits confidence/evidence, but NOT subject:
+        // the subject key is unique to one fact.
+        let dec_id = created[1]["id"].as_str().expect("decision id");
+        let dec_node = graph::get_node(&conn, dec_id)
+            .expect("get_node")
+            .expect("decision exists");
+        let dec_prov = aurelius_core::provenance::Provenance::from_data(&dec_node.data);
+        assert_eq!(
+            dec_prov.confidence,
+            Some(aurelius_core::provenance::Confidence::Measured)
+        );
+        assert_eq!(dec_prov.evidence.as_deref(), Some("cargo test --workspace"));
+        assert_eq!(
+            dec_prov.subject, None,
+            "subject не обязан копироваться на попутный узел: {dec_prov:?}"
+        );
+    }
+
+    /// confidence=measured without evidence — the same refusal as
+    /// `memory_add`, and NOTHING is created: no work_log, task untouched.
+    #[test]
+    fn task_log_measured_without_evidence_is_refused_and_creates_nothing() {
+        let (_tmp, conn) = setup();
+        let task_id = seed_task(&conn, "proj-refused", "задача без улики");
+        let before = graph::get_all_nodes(&conn).expect("nodes before").len();
+
+        let err = task_log_with_conn(
+            &conn,
+            &json!({
+                "task": task_id.to_string(),
+                "text": "прогнали что-то",
+                "confidence": "measured",
+            }),
+        )
+        .expect_err("measured без evidence обязано быть отказом");
+        assert!(format!("{err}").contains("inferred"), "{err}");
+
+        let after = graph::get_all_nodes(&conn).expect("nodes after").len();
+        assert_eq!(before, after, "отказ обязан не создавать ни одного узла");
+    }
+
+    /// Asymmetry: without provenance fields the behavior is unchanged —
+    /// work_log reads as unverified, same as before task 2c8d25ce.
+    #[test]
+    fn task_log_without_provenance_fields_behaves_as_before() {
+        let (_tmp, conn) = setup();
+        let task_id = seed_task(&conn, "proj-plain", "задача без происхождения");
+
+        let result = task_log_with_conn(
+            &conn,
+            &json!({ "task": task_id.to_string(), "text": "работа без provenance" }),
+        )
+        .expect("task_log");
+
+        assert_eq!(result["provenance"]["confidence"], "unverified");
+        let log_id = result["created_nodes"][0]["id"]
+            .as_str()
+            .expect("worklog id");
+        let log_node = graph::get_node(&conn, log_id)
+            .expect("get_node")
+            .expect("worklog exists");
+        let log_prov = aurelius_core::provenance::Provenance::from_data(&log_node.data);
+        assert_eq!(log_prov.confidence, None);
+    }
+
+    /// `task_create` with a subject writes it onto the task node — the same
+    /// parse as `memory_add`.
+    #[test]
+    fn task_create_with_subject_writes_subject_on_the_task_node() {
+        let (_tmp, conn) = setup();
+
+        let result = task_create_with_conn(
+            &conn,
+            &json!({
+                "title": "задача с subject",
+                "project": "proj-create-subject",
+                "subject": "aurelius:proj-create-subject:task",
+            }),
+        )
+        .expect("task_create");
+
+        assert_eq!(
+            result["provenance"]["subject"],
+            "aurelius:proj-create-subject:task"
+        );
+
+        let id = result["id"].as_str().expect("id");
+        let node = graph::get_node(&conn, id)
+            .expect("get_node")
+            .expect("task exists");
+        let prov = aurelius_core::provenance::Provenance::from_data(&node.data);
+        assert_eq!(
+            prov.subject.as_deref(),
+            Some("aurelius:proj-create-subject:task")
+        );
     }
 
     /// Асимметрия задачи 007: до правки MCP `task_update` писал только

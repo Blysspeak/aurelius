@@ -2,6 +2,7 @@ use anyhow::Result;
 use aurelius_core::{
     graph::{self, ProblemSolved, SessionInput},
     models::{NodeType, Relation},
+    provenance::{self, Provenance},
 };
 use serde_json::json;
 
@@ -21,6 +22,18 @@ fn string_list(params: &serde_json::Value, key: &str) -> Vec<String> {
 }
 
 pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let conn = open_db()?;
+    memory_session_with_conn(&conn, params)
+}
+
+/// The body of `memory_session`, taking the connection as an explicit
+/// parameter — the same testability trick as `task_update_with_conn`/
+/// `task_log_with_conn`: a test sets up its own temp database instead of
+/// hitting the real one (`open_db()`).
+fn memory_session_with_conn(
+    conn: &rusqlite::Connection,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value> {
     let summary = params
         .get("summary")
         .and_then(|s| s.as_str())
@@ -52,23 +65,39 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let conn = open_db()?;
+    // Provenance — parsed the same way as `memory_add`: an error in it must
+    // not leave a half-written session behind.
+    let prov = Provenance::parse(params)?;
+
+    // The same guard as memory_add, before the write. Resolution is not
+    // supported here: resolving a subject conflict only goes through
+    // memory_add.
+    provenance::guard_subject(conn, prov.subject.as_deref(), false)?;
 
     // Сама запись — общий код с `au session` (graph::record_session). Здесь
     // остаётся только то, что есть у инструмента и нет у CLI: привязка к
     // задачам, подсказка об активных и авто-push синка.
     let written = graph::record_session(
-        &conn,
+        conn,
         &SessionInput {
             decisions: &decisions,
             problems_solved: &problems_solved,
             next_steps: &next_steps,
             key_files: &key_files,
             agent_session,
+            provenance: prov,
             ..SessionInput::new(project, summary, "mcp")
         },
     )?;
     let session = written.session;
+    // What actually landed on the node — not what the call sent, but what got
+    // written (the two match on a fresh write; on a duplicate this shows the
+    // provenance of the session that already existed).
+    let response_prov = Provenance::from_data(&session.data);
+    let provenance_response = json!({
+        "confidence": response_prov.confidence_or_default().as_str(),
+        "subject": response_prov.subject,
+    });
 
     if written.duplicate {
         return Ok(json!({
@@ -77,6 +106,7 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
             "type": "session",
             "memory_kind": "episodic",
             "duplicate": true,
+            "provenance": provenance_response,
         }));
     }
 
@@ -85,8 +115,8 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
     if let Some(tasks) = params.get("tasks").and_then(|t| t.as_array()) {
         for task_ref in tasks {
             if let Some(task_id) = task_ref.as_str() {
-                if let Ok(task_node) = resolve_node(&conn, task_id) {
-                    graph::add_edge(&conn, session.id, task_node.id, Relation::RelatedTo, 1.0)?;
+                if let Ok(task_node) = resolve_node(conn, task_id) {
+                    graph::add_edge(conn, session.id, task_node.id, Relation::RelatedTo, 1.0)?;
                     linked_tasks.push(json!({
                         "id": task_node.id.to_string(),
                         "label": task_node.label,
@@ -99,7 +129,7 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     // Always show active tasks for this project as a hint
     let active_tasks: Vec<serde_json::Value> = graph::get_tasks_filtered(
-        &conn,
+        conn,
         Some(project),
         Some(graph::OPEN_TASK_STATUSES),
         None,
@@ -118,7 +148,7 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     // US2: push everything new locally for a shared project right after this
     // session write. Best-effort — never fails memory_session (T022).
-    sync_push_if_enabled(&conn, project);
+    sync_push_if_enabled(conn, project);
 
     // Ровно та беда, ради которой это писалось: имена параметров теперь
     // проверены заслонкой, но правильно названный пустой список выглядел
@@ -137,6 +167,7 @@ pub fn memory_session(params: &serde_json::Value) -> Result<serde_json::Value> {
         "dropped_fields": dropped_fields,
         "linked_tasks": linked_tasks,
         "active_tasks_hint": active_tasks,
+        "provenance": provenance_response,
     }))
 }
 
@@ -199,4 +230,106 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         "total_knowledge_nodes": knowledge_count,
         "total_graph_nodes": context_nodes.len(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aurelius_core::db;
+
+    /// The same trick as in `task.rs`: a real temp file, not `:memory:` —
+    /// `db::open` hard-requires WAL, and `memory_session` hits the user's real
+    /// database through `open_db()`, which a test cannot use.
+    struct TmpDb(std::path::PathBuf);
+
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "aurelius-mcp-session-test-{tag}-{}.db",
+                uuid::Uuid::new_v4()
+            )))
+        }
+    }
+
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+            }
+        }
+    }
+
+    fn setup() -> (TmpDb, rusqlite::Connection) {
+        let tmp = TmpDb::new("setup");
+        let conn = db::open(&tmp.0).expect("open temp db");
+        (tmp, conn)
+    }
+
+    /// Task 2c8d25ce: an agent that just ran a command must be able to record
+    /// that through `memory_session` — the same provenance parse as
+    /// `memory_add`.
+    #[test]
+    fn memory_session_with_measured_and_evidence_writes_it_on_the_session_node() {
+        let (_tmp, conn) = setup();
+
+        let result = memory_session_with_conn(
+            &conn,
+            &json!({
+                "summary": "прогнали verify-run для задачи провенанса",
+                "project": "proj-session",
+                "confidence": "measured",
+                "evidence": "cargo test --workspace",
+            }),
+        )
+        .expect("memory_session");
+
+        assert_eq!(result["provenance"]["confidence"], "measured");
+
+        let session_id = result["id"].as_str().expect("id");
+        let node = graph::get_node(&conn, session_id)
+            .expect("get_node")
+            .expect("session exists");
+        let prov = aurelius_core::provenance::Provenance::from_data(&node.data);
+        assert_eq!(
+            prov.confidence,
+            Some(aurelius_core::provenance::Confidence::Measured)
+        );
+        assert_eq!(prov.evidence.as_deref(), Some("cargo test --workspace"));
+    }
+
+    /// Asymmetry: without provenance fields the behavior is unchanged — the
+    /// node reads as unverified, same as before task 2c8d25ce.
+    #[test]
+    fn memory_session_without_provenance_fields_stays_unverified() {
+        let (_tmp, conn) = setup();
+
+        let result = memory_session_with_conn(
+            &conn,
+            &json!({ "summary": "итог без происхождения", "project": "proj-session-plain" }),
+        )
+        .expect("memory_session");
+
+        assert_eq!(result["provenance"]["confidence"], "unverified");
+    }
+
+    /// confidence=measured without evidence — the same refusal as
+    /// `memory_add`: a measurement without the command that made it is
+    /// inferred, not measured.
+    #[test]
+    fn memory_session_measured_without_evidence_is_refused() {
+        let (_tmp, conn) = setup();
+
+        let err = memory_session_with_conn(
+            &conn,
+            &json!({
+                "summary": "итог без evidence",
+                "project": "proj-session-refused",
+                "confidence": "measured",
+            }),
+        )
+        .expect_err("measured без evidence обязано быть отказом");
+        assert!(format!("{err}").contains("inferred"), "{err}");
+    }
 }
