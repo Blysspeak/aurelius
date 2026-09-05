@@ -241,8 +241,10 @@ pub(crate) fn resolve_node(
 
 /// Тот же резолв, что и `resolve_node`, но для мест, где по контракту ручки
 /// узел ОБЯЗАН быть задачей (`task_update`/`task_view`/`task_log`) — как и в
-/// CLI (`find_task` в `crates/au/src/commands.rs`). Разница только в
-/// последнем фолбэке: полнотекстовый поиск ограничен `NodeType::Task`.
+/// CLI (`find_task` в `crates/au/src/commands.rs`). Разница в двух местах:
+/// после полного UUID пробуется уникальный префикс id (`find_node_by_id_prefix`
+/// в ядре), а последний фолбэк — полнотекстовый поиск, ограниченный
+/// `NodeType::Task`.
 ///
 /// Находка 7 (адверсариальный разбор спеки 007): без этого ограничения
 /// нечёткое совпадение по строке могло указать на узел ЛЮБОГО типа — CLI
@@ -258,6 +260,13 @@ pub(crate) fn resolve_task_node(
         if let Some(node) = graph::get_node(conn, &uuid.to_string())? {
             return Ok(node);
         }
+    }
+    if let Some(node) = graph::find_node_by_id_prefix(conn, identifier)? {
+        if matches!(node.node_type, NodeType::Task) {
+            return Ok(node);
+        }
+        let type_label = format!("{:?}", node.node_type).to_lowercase();
+        anyhow::bail!("task not found: {identifier} (id prefix names a {type_label} node)");
     }
     if let Some(node) = graph::find_node_by_label(conn, identifier)? {
         return Ok(node);
