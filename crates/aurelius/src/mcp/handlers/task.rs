@@ -43,8 +43,9 @@ fn task_create_with_conn(
 
     // The same guard as memory_add, before the write. Resolution is not
     // supported here: resolving a subject conflict only goes through
-    // memory_add.
-    provenance::guard_subject(conn, prov.subject.as_deref(), false)?;
+    // memory_add. `exclude: None` — this is a brand-new node, nothing to
+    // exclude from the search.
+    provenance::guard_subject(conn, prov.subject.as_deref(), false, None)?;
 
     let mut task_data = json!({
         "status": "backlog",
@@ -144,7 +145,11 @@ fn task_update_with_conn(
     // A task can gain measured confidence AFTER a measurement — that is
     // exactly the case this field exists for.
     let prov = Provenance::parse(params)?;
-    provenance::guard_subject(conn, prov.subject.as_deref(), false)?;
+    // `exclude`: this call edits `node` itself, so a same-subject fact
+    // already sitting on `node` is not a contradiction with itself — only a
+    // same-subject fact on some OTHER node still needs a `resolution`.
+    let node_id = node.id.to_string();
+    provenance::guard_subject(conn, prov.subject.as_deref(), false, Some(node_id.as_str()))?;
 
     // Merge data fields
     let mut data = node.data.clone();
@@ -461,7 +466,8 @@ fn task_log_with_conn(
     // Provenance is parsed FIRST THING after resolving the task, before any
     // write: an error in it must not leave a half-written work_log behind.
     let prov = Provenance::parse(params)?;
-    provenance::guard_subject(conn, prov.subject.as_deref(), false)?;
+    // `exclude: None` — a work_log is always a new node, nothing to exclude.
+    provenance::guard_subject(conn, prov.subject.as_deref(), false, None)?;
 
     // Extract project from task data
     let project = task
@@ -1929,5 +1935,72 @@ mod tests {
             .expect("task --contains--> worklog edge must exist");
         assert_eq!(edge.from_id, task_id);
         assert_eq!(edge.to_id, log_id);
+    }
+
+    // -- task 7e67e832: guard_subject must not contradict itself --
+
+    /// Before the fix, `guard_subject` searched for ANY node carrying the
+    /// same subject, including the very task node `task_update` was about
+    /// to write to — a second `task_update` with the same subject on the
+    /// SAME task was rejected as a contradiction with itself. Now the
+    /// edited node is excluded from the search, while the same subject on a
+    /// DIFFERENT node is still a real contradiction and still needs a
+    /// `resolution`.
+    #[test]
+    fn task_update_same_subject_twice_on_same_task_is_not_a_self_contradiction() {
+        let (_tmp, conn) = setup();
+
+        let task_a =
+            task_create_with_conn(&conn, &json!({"title": "задача A", "project": "aurelius"}))
+                .expect("create task A");
+        let id_a = task_a["id"].as_str().expect("id A").to_owned();
+
+        let task_b =
+            task_create_with_conn(&conn, &json!({"title": "задача B", "project": "aurelius"}))
+                .expect("create task B");
+        let id_b = task_b["id"].as_str().expect("id B").to_owned();
+
+        // First task_update on A stamps the subject.
+        task_update_with_conn(
+            &conn,
+            &json!({
+                "id": id_a,
+                "note": "первая правка",
+                "subject": "test:guard:self",
+                "confidence": "measured",
+                "evidence": "test",
+            }),
+        )
+        .expect("first task_update on A must succeed");
+
+        // Second task_update on A with the SAME subject: not a
+        // contradiction with itself, so no `resolution` is needed.
+        task_update_with_conn(
+            &conn,
+            &json!({
+                "id": id_a,
+                "note": "вторая правка",
+                "subject": "test:guard:self",
+                "confidence": "measured",
+                "evidence": "test",
+            }),
+        )
+        .expect("second task_update on A with the same subject must succeed");
+
+        // The same subject on a DIFFERENT task (B) is still a genuine
+        // contradiction and is rejected without a `resolution`.
+        let err = task_update_with_conn(
+            &conn,
+            &json!({
+                "id": id_b,
+                "note": "чужая правка",
+                "subject": "test:guard:self",
+            }),
+        )
+        .expect_err("same subject on a different task must still be rejected");
+        assert!(
+            err.to_string().contains("уже сказано"),
+            "expected a subject-conflict message, got: {err}"
+        );
     }
 }
