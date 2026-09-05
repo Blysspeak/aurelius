@@ -32,6 +32,52 @@ pub(crate) fn open_db() -> anyhow::Result<Connection> {
 }
 
 // ---------------------------------------------------------------------------
+// Stale-binary detection: installing a new `aurelius` binary over
+// `~/.local/bin/aurelius` does not touch an already-running MCP server
+// process — Claude Code keeps talking to it until the session restarts, and
+// until then the agent finds out only from an "unknown tool" error or a
+// missing parameter on a tool whose shape changed. The server can tell by
+// itself, by comparing its own executable's mtime against the moment it
+// started, and say so in `memory_status`.
+// ---------------------------------------------------------------------------
+
+/// Set once from `serve()`, before its request loop starts. `server_started_at`
+/// below also falls back to `get_or_init`, so a caller that somehow reaches
+/// `memory_status` without going through `serve()` still gets a real value
+/// instead of a missing `started_at` (no such caller exists today).
+static SERVER_STARTED_AT: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
+
+/// Called once from `serve()` before it starts reading requests.
+pub(crate) fn mark_server_started() {
+    SERVER_STARTED_AT.get_or_init(std::time::SystemTime::now);
+}
+
+/// The moment this process started serving requests.
+pub(crate) fn server_started_at() -> std::time::SystemTime {
+    *SERVER_STARTED_AT.get_or_init(std::time::SystemTime::now)
+}
+
+/// Pure comparison, no filesystem access: `true` means the binary on disk was
+/// written after this server process started, so it's running a stale image
+/// and a restart is due to pick up the new one.
+pub(crate) fn binary_newer_than_start(
+    exe_mtime: std::time::SystemTime,
+    started_at: std::time::SystemTime,
+) -> bool {
+    exe_mtime > started_at
+}
+
+/// Reads the running executable's own mtime and applies
+/// `binary_newer_than_start`. Any failure along the way (no exe path
+/// available, mtime unsupported on this platform) yields `None`: this check
+/// is a nice-to-have inside `memory_status`, never a reason to fail it.
+pub(crate) fn restart_needed() -> Option<bool> {
+    let exe = std::env::current_exe().ok()?;
+    let mtime = std::fs::metadata(exe).ok()?.modified().ok()?;
+    Some(binary_newer_than_start(mtime, server_started_at()))
+}
+
+// ---------------------------------------------------------------------------
 // US2: automatic sync at session boundaries (memory_status pulls, memory_session
 // pushes). Reuses `aurelius_core::sync::client` — the same push/pull logic `au
 // share push/pull` uses — never duplicated here. Best-effort per FR-006/FR-011:
@@ -268,5 +314,31 @@ pub(crate) fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             Some(now - chrono::Duration::hours(hours))
         }
         other => other.parse().ok(),
+    }
+}
+
+#[cfg(test)]
+mod stale_binary_tests {
+    use super::binary_newer_than_start;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn newer_mtime_means_restart_needed() {
+        let started_at = SystemTime::now();
+        let exe_mtime = started_at + Duration::from_secs(1);
+        assert!(binary_newer_than_start(exe_mtime, started_at));
+    }
+
+    #[test]
+    fn older_mtime_means_no_restart_needed() {
+        let started_at = SystemTime::now();
+        let exe_mtime = started_at - Duration::from_secs(1);
+        assert!(!binary_newer_than_start(exe_mtime, started_at));
+    }
+
+    #[test]
+    fn equal_mtime_means_no_restart_needed() {
+        let started_at = SystemTime::now();
+        assert!(!binary_newer_than_start(started_at, started_at));
     }
 }

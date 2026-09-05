@@ -2,7 +2,34 @@ use anyhow::Result;
 use aurelius_core::{graph, indexer, models::NodeType};
 use serde_json::json;
 
-use super::{node_brief, node_detail, open_db, sync_pull_if_enabled};
+use super::{
+    node_brief, node_detail, open_db, restart_needed, server_started_at, sync_pull_if_enabled,
+};
+
+/// `server` block of `memory_status`: which MCP server process answered, and
+/// whether the binary on disk has moved past it. `restart_needed`/`hint` are
+/// omitted rather than `null` when the check couldn't run (see
+/// `super::restart_needed`), so their absence reads as "unknown", not "no".
+fn server_block() -> serde_json::Value {
+    let mut fields = serde_json::Map::new();
+    fields.insert("version".to_owned(), json!(env!("CARGO_PKG_VERSION")));
+    fields.insert(
+        "started_at".to_owned(),
+        json!(chrono::DateTime::<chrono::Utc>::from(server_started_at()).to_rfc3339()),
+    );
+    if let Some(needs_restart) = restart_needed() {
+        fields.insert("restart_needed".to_owned(), json!(needs_restart));
+        if needs_restart {
+            fields.insert(
+                "hint".to_owned(),
+                json!(
+                    "The binary on disk is newer than the running server; restart Claude Code so the MCP server picks it up."
+                ),
+            );
+        }
+    }
+    serde_json::Value::Object(fields)
+}
 
 pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
     let project_filter = params.get("project").and_then(|p| p.as_str());
@@ -62,6 +89,7 @@ pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
         .collect();
 
     Ok(json!({
+        "server": server_block(),
         "summary": {
             "total_nodes": total_nodes,
             "total_edges": total_edges,
