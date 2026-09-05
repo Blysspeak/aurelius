@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Aurelius — one-command install
-# Usage: ./install.sh
+# Usage: ./install.sh [--migrate-only]
 set -euo pipefail
 
 BOLD='\033[1m'
@@ -9,6 +9,133 @@ GREEN='\033[32m'
 RED='\033[31m'
 DIM='\033[2m'
 RESET='\033[0m'
+
+# Removes hook and MCP-server entries that older versions of this script wrote
+# directly into ~/.claude/settings.json and ~/.claude.json, now that the
+# aurelius Claude Code plugin (plugin/hooks.json, .claude-plugin/plugin.json)
+# owns them. A function rather than inline code so `--migrate-only` and the
+# normal install path share it, and so it can be pointed at throwaway copies
+# via CLAUDE_HOME/CLAUDE_JSON instead of the real files (used by tests).
+migrate_legacy() {
+    local claude_home="${CLAUDE_HOME:-$HOME/.claude}"
+    local claude_json="${CLAUDE_JSON:-$HOME/.claude.json}"
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${GOLD}Warning:${RESET} python3 not found — skipping legacy Claude Code entry migration."
+        echo "  Remove aurelius-*.sh hooks and mcpServers.aurelius by hand; see specs/009-claude-code-plugin/quickstart.md"
+        return 0
+    fi
+
+    CLAUDE_HOME="$claude_home" CLAUDE_JSON="$claude_json" python3 - <<'PYEOF'
+import json, os, re, shutil
+from datetime import datetime, timezone
+
+claude_home = os.environ.get("CLAUDE_HOME") or os.path.join(os.path.expanduser("~"), ".claude")
+claude_json = os.environ.get("CLAUDE_JSON") or os.path.join(os.path.expanduser("~"), ".claude.json")
+
+HOOK_RE = re.compile(r"aurelius-(reindex|track-edit|skills|backup|capture)\.sh")
+AU_HOOK_RE = re.compile(r"^au\b.*--hook")
+
+
+def is_legacy(cmd):
+    return bool(HOOK_RE.search(cmd) or AU_HOOK_RE.match(cmd))
+
+
+def backup(path):
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    shutil.copy2(path, f"{path}.bak-{ts}")
+
+
+def mcp_value(entry):
+    if isinstance(entry, dict) and "command" in entry:
+        return entry["command"]
+    return json.dumps(entry)
+
+
+removed = []
+
+settings_path = os.path.join(claude_home, "settings.json")
+if os.path.isfile(settings_path):
+    with open(settings_path) as f:
+        settings = json.load(f)
+    changed = False
+
+    hooks = settings.get("hooks", {})
+    for event in list(hooks.keys()):
+        new_groups = []
+        for group in hooks[event]:
+            entries = group.get("hooks", [])
+            for h in entries:
+                if is_legacy(h.get("command", "")):
+                    removed.append(
+                        'removed: settings.json hooks.{} "{}" -> {} (moved into the aurelius plugin)'.format(
+                            event, group.get("matcher", ""), h.get("command", "")
+                        )
+                    )
+                    changed = True
+            kept = [h for h in entries if not is_legacy(h.get("command", ""))]
+            if kept:
+                group["hooks"] = kept
+                new_groups.append(group)
+        if new_groups:
+            hooks[event] = new_groups
+        else:
+            del hooks[event]
+
+    mcp = settings.get("mcpServers", {})
+    if "aurelius" in mcp:
+        removed.append(
+            "removed: settings.json mcpServers.aurelius -> {} (the plugin registers the server now)".format(
+                mcp_value(mcp["aurelius"])
+            )
+        )
+        del mcp["aurelius"]
+        changed = True
+    if "mcpServers" in settings and not settings["mcpServers"]:
+        del settings["mcpServers"]
+
+    if changed:
+        backup(settings_path)
+        with open(settings_path, "w") as f:
+            json.dump(settings, f, indent=2)
+            f.write("\n")
+
+if os.path.isfile(claude_json):
+    with open(claude_json) as f:
+        data = json.load(f)
+    mcp = data.get("mcpServers", {})
+    if "aurelius" in mcp:
+        removed.append(
+            "removed: ~/.claude.json mcpServers.aurelius -> {} (the plugin registers the server now)".format(
+                mcp_value(mcp["aurelius"])
+            )
+        )
+        del mcp["aurelius"]
+        if not data.get("mcpServers"):
+            data.pop("mcpServers", None)
+        backup(claude_json)
+        with open(claude_json, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+
+if removed:
+    for line in removed:
+        print(line)
+    print("~/.claude/hooks/aurelius-*.sh and ~/.local/share/mcp/aurelius are no longer used and may be deleted by hand.")
+else:
+    print("nothing to migrate: no legacy aurelius entries found")
+PYEOF
+}
+
+MIGRATE_ONLY=0
+if [ "${1:-}" = "--migrate-only" ]; then
+    MIGRATE_ONLY=1
+fi
+
+if [ "$MIGRATE_ONLY" = "1" ]; then
+    migrate_legacy
+    exit 0
+fi
 
 echo ""
 echo -e "${GOLD}${BOLD}"
@@ -42,8 +169,24 @@ cargo build --release 2>&1 | tail -3
 INSTALL_DIR="${HOME}/.local/bin"
 mkdir -p "$INSTALL_DIR"
 
-/usr/bin/cp -f target/release/au "$INSTALL_DIR/au" 2>/dev/null || cp -f target/release/au "$INSTALL_DIR/au"
-/usr/bin/cp -f target/release/aurelius "$INSTALL_DIR/aurelius" 2>/dev/null || cp -f target/release/aurelius "$INSTALL_DIR/aurelius"
+# Replace each binary through a temp file plus `mv`, never `cp` in place:
+# `cp` overwriting a binary that a running MCP server holds open fails with
+# ETXTBSY (text file busy). `mv` instead replaces the directory entry, so a
+# process that already opened the old file keeps running against the old
+# inode until it exits — no crash, no interrupted write.
+install_binary() {
+    local src="$1" name="$2" dest="$INSTALL_DIR/$name"
+    if [ -f "$dest" ]; then
+        local ts
+        ts="$(date -u +%Y%m%dT%H%M%SZ)"
+        /usr/bin/cp -f "$dest" "$dest.bak-$ts" 2>/dev/null || cp -f "$dest" "$dest.bak-$ts"
+    fi
+    /usr/bin/cp -f "$src" "$dest.new" 2>/dev/null || cp -f "$src" "$dest.new"
+    mv -f "$dest.new" "$dest"
+}
+
+install_binary target/release/au au
+install_binary target/release/aurelius aurelius
 echo -e "${GREEN}✓${RESET} Installed au and aurelius to ${INSTALL_DIR}"
 
 # Check PATH
@@ -93,132 +236,44 @@ else
 fi
 echo ""
 
-# --- 6. Install Claude Code hooks ---
-echo -e "${BOLD}Installing Claude Code hooks...${RESET}"
-HOOKS_DIR="${HOME}/.claude/hooks"
-mkdir -p "$HOOKS_DIR"
-
-/usr/bin/cp -f contrib/claude-code/aurelius-reindex.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-reindex.sh "$HOOKS_DIR/"
-/usr/bin/cp -f contrib/claude-code/aurelius-track-edit.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-track-edit.sh "$HOOKS_DIR/"
-/usr/bin/cp -f contrib/claude-code/aurelius-skills.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-skills.sh "$HOOKS_DIR/"
-/usr/bin/cp -f contrib/claude-code/aurelius-backup.sh "$HOOKS_DIR/" 2>/dev/null || cp -f contrib/claude-code/aurelius-backup.sh "$HOOKS_DIR/"
-chmod +x "$HOOKS_DIR/aurelius-reindex.sh" "$HOOKS_DIR/aurelius-track-edit.sh" "$HOOKS_DIR/aurelius-skills.sh" "$HOOKS_DIR/aurelius-backup.sh"
-echo -e "${GREEN}✓${RESET} Hooks installed to ${HOOKS_DIR}"
-
-# --- 7. Auto-configure Claude Code settings ---
-SETTINGS_FILE="${HOME}/.claude/settings.json"
-mkdir -p "${HOME}/.claude"
-
-configure_settings() {
-    local tmp
-    tmp=$(mktemp)
-
-    if [ ! -f "$SETTINGS_FILE" ]; then
-        echo '{}' > "$SETTINGS_FILE"
+# --- 6. Install Claude Code plugin ---
+echo -e "${BOLD}Installing Claude Code plugin...${RESET}"
+if command -v claude >/dev/null 2>&1; then
+    MARKETPLACE_LOG="$(mktemp)"
+    if ! claude plugin marketplace add "$SCRIPT_DIR" >"$MARKETPLACE_LOG" 2>&1; then
+        echo -e "${DIM}  Marketplace already registered — updating instead${RESET}"
+        claude plugin marketplace update blysspeak || cat "$MARKETPLACE_LOG"
     fi
+    rm -f "$MARKETPLACE_LOG"
 
-    python3 -c "
-import json, sys
-
-with open('$SETTINGS_FILE') as f:
-    settings = json.load(f)
-
-# MCP server
-mcp = settings.setdefault('mcpServers', {})
-if 'aurelius' not in mcp:
-    mcp['aurelius'] = {'command': 'au', 'args': ['mcp']}
-    print('  Added MCP server: aurelius', file=sys.stderr)
-else:
-    print('  MCP server already configured', file=sys.stderr)
-
-# --- Hooks ---
-# Claude Code hook format: [{matcher: 'string', hooks: [{type, command, timeout}]}]
-hooks = settings.setdefault('hooks', {})
-reindex_cmd = '$HOOKS_DIR/aurelius-reindex.sh'
-track_cmd = '$HOOKS_DIR/aurelius-track-edit.sh'
-skills_cmd = '$HOOKS_DIR/aurelius-skills.sh'
-backup_cmd = '$HOOKS_DIR/aurelius-backup.sh'
-
-def has_hook_cmd(hook_list, cmd):
-    \"\"\"Check if command already exists anywhere in the hook entries.\"\"\"
-    for entry in hook_list:
-        # New format: {matcher, hooks: [...]}
-        for h in entry.get('hooks', []):
-            if h.get('command', '') == cmd:
-                return True
-        # Bare format (shouldn't be used, but check anyway)
-        if entry.get('command', '') == cmd:
-            return True
-    return True if not hook_list else False  # skip if empty, we handle below
-
-def add_hook_to_group(hook_list, matcher, cmd, timeout):
-    \"\"\"Add a hook command to the correct matcher group, or create one.\"\"\"
-    # Check if command already exists in any entry
-    for entry in hook_list:
-        for h in entry.get('hooks', []):
-            if h.get('command', '') == cmd:
-                return False  # already exists
-    # Find existing entry with matching matcher
-    for entry in hook_list:
-        if entry.get('matcher', '') == matcher:
-            entry.setdefault('hooks', []).append({
-                'type': 'command', 'command': cmd, 'timeout': timeout
-            })
-            return True
-    # No matching group — create new entry
-    hook_list.append({
-        'matcher': matcher,
-        'hooks': [{'type': 'command', 'command': cmd, 'timeout': timeout}]
-    })
-    return True
-
-# Stop hook — reindex on session end (matcher: '' = match all)
-stop_hooks = hooks.setdefault('Stop', [])
-if add_hook_to_group(stop_hooks, '', reindex_cmd, 15):
-    print('  Added Stop hook: aurelius-reindex', file=sys.stderr)
-else:
-    print('  Stop hook already configured', file=sys.stderr)
-
-# PostToolUse hook — track file edits (matcher: 'Edit|Write')
-post_hooks = hooks.setdefault('PostToolUse', [])
-if add_hook_to_group(post_hooks, 'Edit|Write', track_cmd, 5):
-    print('  Added PostToolUse hook: aurelius-track-edit', file=sys.stderr)
-else:
-    print('  PostToolUse hook already configured', file=sys.stderr)
-
-# SessionStart hook — inject the skill index into context (matcher: '' = all)
-session_hooks = hooks.setdefault('SessionStart', [])
-if add_hook_to_group(session_hooks, '', skills_cmd, 10):
-    print('  Added SessionStart hook: aurelius-skills', file=sys.stderr)
-else:
-    print('  SessionStart hook already configured', file=sys.stderr)
-
-# SessionStart hook — rolling database snapshot (throttled to one a day)
-if add_hook_to_group(session_hooks, '', backup_cmd, 30):
-    print('  Added SessionStart hook: aurelius-backup', file=sys.stderr)
-else:
-    print('  Backup hook already configured', file=sys.stderr)
-
-with open('$tmp', 'w') as f:
-    json.dump(settings, f, indent=2)
-    f.write('\n')
-" 2>&1
-
-    if [ -s "$tmp" ]; then
-        mv "$tmp" "$SETTINGS_FILE"
-        echo -e "${GREEN}✓${RESET} Claude Code settings configured"
-    else
-        rm -f "$tmp"
-        echo -e "${DIM}  Could not auto-configure settings. Configure manually.${RESET}"
+    INSTALL_LOG="$(mktemp)"
+    if ! claude plugin install aurelius@blysspeak -s user -y >"$INSTALL_LOG" 2>&1; then
+        if grep -qi "already installed" "$INSTALL_LOG"; then
+            echo -e "${DIM}  Plugin already installed — updating instead${RESET}"
+            if claude plugin --help 2>&1 | grep -q '  update '; then
+                claude plugin update aurelius
+            else
+                claude plugin install aurelius@blysspeak -s user -y
+            fi
+        else
+            cat "$INSTALL_LOG"
+        fi
     fi
-}
+    rm -f "$INSTALL_LOG"
 
-if command -v python3 >/dev/null 2>&1; then
-    configure_settings
+    claude plugin list || true
+    echo -e "${GREEN}✓${RESET} Claude Code plugin ready"
 else
-    echo -e "${DIM}  python3 not found — configure MCP and hooks manually${RESET}"
-    echo -e "${DIM}  MCP: /mcp in Claude Code → command: au, args: [\"mcp\"]${RESET}"
+    echo -e "${GOLD}Warning:${RESET} claude CLI not found on PATH — install the plugin by hand:"
+    echo "    claude plugin marketplace add \"$SCRIPT_DIR\""
+    echo "    claude plugin install aurelius@blysspeak -s user"
 fi
+echo ""
+
+# --- 7. Migrate legacy Claude Code entries ---
+echo -e "${BOLD}Migrating legacy Claude Code entries...${RESET}"
+migrate_legacy
+echo ""
 
 # --- 8. Install git hooks (for current repo) ---
 if [ -d .git ]; then

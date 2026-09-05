@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# DEPRECATED since 3.4.0: replaced by the aurelius Claude Code plugin (plugin/hooks.json calls au <cmd> --hook directly).
+# Kept for hand installs until the next major release. Do not add features here.
 # Aurelius hook: touches file nodes on edit to track access frequency.
 # Increments access_count on existing File nodes — creates NO new nodes.
 # Runs on PostToolUse for Edit/Write tools.
