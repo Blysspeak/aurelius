@@ -67,14 +67,42 @@ pub(crate) fn binary_newer_than_start(
     exe_mtime > started_at
 }
 
-/// Reads the running executable's own mtime and applies
-/// `binary_newer_than_start`. Any failure along the way (no exe path
-/// available, mtime unsupported on this platform) yields `None`: this check
-/// is a nice-to-have inside `memory_status`, never a reason to fail it.
+/// Decides staleness for a given executable path, in two steps:
+///
+/// (a) If `exe`'s string form ends with the literal suffix `" (deleted)"`,
+///     return `Some(true)` without touching the filesystem. On Linux,
+///     `current_exe()` resolves through `/proc/self/exe`, and the kernel
+///     appends that suffix once the running image has been unlinked or
+///     replaced — which is exactly what happens when a new binary is
+///     installed over this one via `mv` while the server is still holding
+///     the old inode open (`cp` alone fails with `ETXTBSY` for that reason).
+///     A deleted running image is proof of staleness by itself; there is no
+///     mtime left to compare against, and none is needed. This branch runs
+///     first so it never falls through to a metadata call that would just
+///     fail on the same path.
+/// (b) Otherwise, fall back to reading `exe`'s mtime and comparing it against
+///     `started_at` via `binary_newer_than_start`, exactly as before. On
+///     Windows a running executable cannot be unlinked or overwritten out
+///     from under the process holding it, so branch (a) never applies there
+///     and this is the branch that actually runs.
+pub(crate) fn restart_needed_for(
+    exe: &std::path::Path,
+    started_at: std::time::SystemTime,
+) -> Option<bool> {
+    if exe.to_string_lossy().ends_with(" (deleted)") {
+        return Some(true);
+    }
+    let mtime = std::fs::metadata(exe).ok()?.modified().ok()?;
+    Some(binary_newer_than_start(mtime, started_at))
+}
+
+/// Reads the running executable's own path and applies `restart_needed_for`.
+/// Any failure along the way (no exe path available, mtime unsupported on
+/// this platform) yields `None`: this check is a nice-to-have inside
+/// `memory_status`, never a reason to fail it.
 pub(crate) fn restart_needed() -> Option<bool> {
     let exe = std::env::current_exe().ok()?;
-    let mtime = std::fs::metadata(exe).ok()?.modified().ok()?;
-    Some(binary_newer_than_start(mtime, server_started_at()))
+    restart_needed_for(&exe, server_started_at())
 }
 
 // ---------------------------------------------------------------------------
@@ -328,7 +356,8 @@ pub(crate) fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 #[cfg(test)]
 mod stale_binary_tests {
-    use super::binary_newer_than_start;
+    use super::{binary_newer_than_start, restart_needed_for};
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
     #[test]
@@ -349,5 +378,34 @@ mod stale_binary_tests {
     fn equal_mtime_means_no_restart_needed() {
         let started_at = SystemTime::now();
         assert!(!binary_newer_than_start(started_at, started_at));
+    }
+
+    #[test]
+    fn deleted_suffix_means_restart_needed() {
+        let path = PathBuf::from("/nonexistent/dir/aurelius (deleted)");
+        assert_eq!(restart_needed_for(&path, SystemTime::now()), Some(true));
+    }
+
+    #[test]
+    fn missing_path_without_suffix_is_unknown() {
+        let path = PathBuf::from("/nonexistent/dir/aurelius");
+        assert_eq!(restart_needed_for(&path, SystemTime::now()), None);
+    }
+
+    #[test]
+    fn existing_file_compares_mtime() {
+        let path = std::env::temp_dir().join(format!("aurelius-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"test").expect("write temp file");
+
+        assert_eq!(
+            restart_needed_for(&path, SystemTime::UNIX_EPOCH),
+            Some(true)
+        );
+        assert_eq!(
+            restart_needed_for(&path, SystemTime::now() + Duration::from_secs(3600)),
+            Some(false)
+        );
+
+        std::fs::remove_file(&path).expect("remove temp file");
     }
 }
