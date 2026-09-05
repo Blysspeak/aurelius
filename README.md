@@ -762,7 +762,7 @@ the Claude Code plugin, and is still installed by `install.sh` for the current r
 - [x] v1.11 — Project scoping by edge, not just by label prefix; `au snapshot --json`; `memory_add` warns on unattached nodes
 - [ ] Next — npm distribution, `au repair`, `au doctor`, context-ranked search, git log connector
 
-A release bumps `.claude-plugin/plugin.json` together with `Cargo.toml` — `crates/au/tests/plugin_manifest.rs`
+A release bumps `plugin/.claude-plugin/plugin.json` together with `Cargo.toml` — `crates/au/tests/plugin_manifest.rs`
 asserts the two versions are equal, so `cargo test` stays red until both are updated.
 
 ---

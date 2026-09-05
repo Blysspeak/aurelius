@@ -10,7 +10,7 @@
   "mcpServers": {
     "aurelius": { "command": "au", "args": ["mcp"] }
   },
-  "hooks": "./plugin/hooks.json",
-  "skills": "./plugin/skills",
-  "commands": "./plugin/commands"
+  "hooks": "./hooks.json",
+  "skills": "./skills",
+  "commands": "./commands"
 }

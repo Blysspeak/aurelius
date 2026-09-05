@@ -2,7 +2,7 @@
 
 Файлы, которые появляются в репозитории, и их содержимое. Всё — данные, кода нет.
 
-## `.claude-plugin/plugin.json`
+## `plugin/.claude-plugin/plugin.json`
 
 ```json
 {
@@ -17,9 +17,9 @@
   "mcpServers": {
     "aurelius": { "command": "au", "args": ["mcp"] }
   },
-  "hooks": "./plugin/hooks.json",
-  "skills": "./plugin/skills",
-  "commands": "./plugin/commands"
+  "hooks": "./hooks.json",
+  "skills": "./skills",
+  "commands": "./commands"
 }
 ```
 
@@ -36,12 +36,18 @@
   "plugins": [
     {
       "name": "aurelius",
-      "source": "./",
+      "source": "./plugin",
       "description": "Long-term memory for Claude Code: MCP server plus session hooks."
     }
   ]
 }
 ```
+
+Корень плагина — каталог `plugin/`, а не корень репозитория: `claude plugin install` копирует
+корень плагина целиком в `~/.claude/plugins/cache`, и корень репозитория утащил бы за собой
+`target/` на десятки гигабайт (установка 3.4.1 записала 17 ГБ и не завершилась). Манифест
+маркетплейса остаётся в корне — там его ищет `claude plugin marketplace add <клон>`. Размер
+каталога `plugin/` сторожит тест `plugin_root_stays_small`.
 
 Схема валидируется командой `claude plugin marketplace add ./` из корня клона — её вывод и есть
 приёмка этого файла. Если Claude Code требует поля, не перечисленные здесь, они добавляются, а
