@@ -3,6 +3,10 @@
 //! drives it over real HTTP with `reqwest`, per
 //! `specs/002-project-sync/contracts/sync-api.md`.
 
+// Integration test — the whole file is test code, not a runtime path;
+// unwrap/expect here are the assertion mechanism itself.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use aurelius_core::models::{Edge, MemoryKind, Node, NodeType, Relation};
 use aurelius_core::sync::{SyncPullResponse, SyncPushRequest, SyncPushResponse};
 use aurelius_sync_server::{build_router, AppState};

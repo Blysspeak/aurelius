@@ -92,11 +92,20 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
 /// Слова соединены через `OR` (см. [`crate::fts`]), поэтому порядок здесь и
 /// делает выдачу осмысленной: сначала записи, где совпало больше слов, внутри
 /// группы — по релевантности bm25.
+///
+/// Координаты секретов (`secret::is_secret_ref`) отфильтрованы на всех трёх
+/// путях выдачи (находка 11, FR-027): узел-координата — обычный `Config`,
+/// который FTS индексирует наравне со всеми (label+note+data, см. `db.rs`),
+/// и без фильтра здесь он утекал в любой запрос, задевший его метку,
+/// назначение или место хранения. Явный `secret_list` идёт другим путём
+/// (`typed_in_project` внутри `list_secret_refs`) и фильтр не задевает.
 pub fn search_ranked(conn: &Connection, query: &str, limit: usize) -> Result<SearchOutcome> {
     let trimmed = query.trim();
     if trimmed.is_empty() || trimmed == "*" {
+        let mut nodes = get_recent_nodes(conn, limit)?;
+        nodes.retain(|n| !crate::secret::is_secret_ref(n));
         return Ok(SearchOutcome {
-            nodes: get_recent_nodes(conn, limit)?,
+            nodes,
             terms: Vec::new(),
             unmatched_terms: Vec::new(),
         });
@@ -104,8 +113,10 @@ pub fn search_ranked(conn: &Connection, query: &str, limit: usize) -> Result<Sea
     // Строка от человека — текст, а не выражение FTS5 (см. crate::fts).
     let parsed = crate::fts::parse(trimmed);
     if parsed.expr.is_empty() {
+        let mut nodes = get_recent_nodes(conn, limit)?;
+        nodes.retain(|n| !crate::secret::is_secret_ref(n));
         return Ok(SearchOutcome {
-            nodes: get_recent_nodes(conn, limit)?,
+            nodes,
             terms: Vec::new(),
             unmatched_terms: Vec::new(),
         });
@@ -126,6 +137,7 @@ pub fn search_ranked(conn: &Connection, query: &str, limit: usize) -> Result<Sea
             row_to_node,
         )?
         .collect::<Result<Vec<_>, _>>()?;
+    nodes.retain(|n| !crate::secret::is_secret_ref(n));
 
     rank_by_matched_terms(&mut nodes, &parsed.terms);
     nodes.truncate(limit);
@@ -234,9 +246,12 @@ pub fn search_typed(
                     created_by, updated_by, deleted_at, sync_seq
              FROM nodes WHERE node_type = ?1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?2",
         )?;
-        let nodes = stmt
+        let mut nodes = stmt
             .query_map(params![type_str, limit as i64], row_to_node)?
             .collect::<Result<Vec<_>, _>>()?;
+        // Находка 11: тип "config" наравне с обычными настройками включает
+        // координаты секретов — им сюда нельзя (FR-027).
+        nodes.retain(|n| !crate::secret::is_secret_ref(n));
         return Ok(nodes);
     }
     let mut stmt = conn.prepare(
@@ -255,6 +270,7 @@ pub fn search_typed(
             row_to_node,
         )?
         .collect::<Result<Vec<_>, _>>()?;
+    nodes.retain(|n| !crate::secret::is_secret_ref(n));
     rank_by_matched_terms(&mut nodes, &parsed.terms);
     nodes.truncate(limit);
     Ok(nodes)
@@ -686,6 +702,56 @@ mod tests {
             Some("Горячая перезагрузка флагов доведена до алертов и разбита на модули"),
             "запись, у которой запрос почти целиком в заголовке, обязана быть первой: {:?}",
             found.iter().map(|n| &n.label).collect::<Vec<_>>()
+        );
+
+        cleanup(&path, conn);
+    }
+
+    /// Находка 11: координата секрета — обычный узел `Config`, и старый
+    /// `nodes_fts` индексирует его наравне со всеми (label+note+data). До
+    /// фильтра в `search_ranked`/`search_typed` запрос по слову из назначения
+    /// или места хранения секрета отдавал координату целиком — то, что
+    /// FR-025/FR-027 разрешают доставать только явным `secret_list`.
+    #[test]
+    fn secret_ref_never_surfaces_through_general_search() {
+        let (path, conn) = temp_db();
+        super::super::add_secret_ref(
+            &conn,
+            Some("proj-leak"),
+            "STRIPE_SECRET_KEY",
+            Some("charge webhooks"),
+            "1password://Private/Stripe/api-key",
+        )
+        .expect("add secret ref");
+        // Обычный узел с тем же словом — контроль, что фильтр не глушит
+        // поиск целиком, а бьёт только по координате секрета.
+        super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "интеграция с Stripe обсуждалась на созвоне",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+
+        let found = search(&conn, "stripe", 10).expect("поиск");
+        assert!(
+            !found.is_empty(),
+            "фильтр не должен глушить поиск целиком: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|n| n.data.get("kind").and_then(|v| v.as_str()) != Some("secret_ref")),
+            "координата секрета не должна попадать в общий поиск: {found:?}"
+        );
+
+        let typed =
+            search_typed(&conn, "stripe", &NodeType::Config, 10).expect("типизированный поиск");
+        assert!(
+            typed.is_empty(),
+            "координата секрета не должна попадать и в поиск по типу config: {typed:?}"
         );
 
         cleanup(&path, conn);

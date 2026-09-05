@@ -39,3 +39,11 @@ open = "5"
 rust-embed = "8"
 anydoc = "0.1.7"
 htmd = "0.5"
+
+# Принцип III: unwrap/expect на рантайм-путях запрещены. "deny", а не "warn" —
+# иначе `-D warnings` на CI не отличит их от косметики. Законные точки выхода
+# (статический regex в OnceLock) накрыты точечным `#[allow(clippy::expect_used)]`
+# с обоснованием на месте, а не общим глушением модуля/крейта.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

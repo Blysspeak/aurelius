@@ -28,6 +28,9 @@ pub enum NodeType {
     /// Слой 7 памяти: дистиллят проекта — структурная выжимка сессий и
     /// незакрытых проблем, пересобирается memory_consolidate. Один на проект.
     Digest,
+    /// One anchor of external vendor documentation (spec 008); lives in
+    /// `data.layer = "vendor-docs"` and stays out of snapshot layers 1-6.
+    Doc,
     Custom(String),
 }
 
@@ -55,6 +58,7 @@ impl NodeType {
         "skill",
         "user_fact",
         "digest",
+        "doc",
     ];
 
     /// Строгий разбор: только известные имена. `None` оставляет решение
@@ -81,6 +85,7 @@ impl NodeType {
             "skill" => Self::Skill,
             "user_fact" => Self::UserFact,
             "digest" => Self::Digest,
+            "doc" => Self::Doc,
             _ => return None,
         })
     }
@@ -116,6 +121,18 @@ pub enum Relation {
     TrackedBy,
     SubtaskOf,
     Blocks,
+    /// Задача → узел прогона, подтвердившего её уликой (спека 007,
+    /// data-model.md «Ребро»). Улика лежит и в `data.evidence` задачи —
+    /// это ребро лишь даёт обратный путь, от прогона к задаче.
+    VerifiedBy,
+    /// Must be known before the target (spec 008, FR-007).
+    Prerequisite,
+    /// Ordered successor; the edge weight carries the step number (spec 008, FR-003).
+    NextStep,
+    /// Section defines a term or entity (spec 008, FR-007).
+    Defines,
+    /// Section mentions the target (spec 008, FR-007).
+    References,
 }
 
 impl Relation {
@@ -142,6 +159,11 @@ impl Relation {
         "tracked_by",
         "subtask_of",
         "blocks",
+        "verified_by",
+        "prerequisite",
+        "next_step",
+        "defines",
+        "references",
     ];
 
     /// Строгий разбор имени связи. Дефис принимается наравне с подчёркиванием
@@ -172,6 +194,11 @@ impl Relation {
             "tracked_by" => Self::TrackedBy,
             "subtask_of" => Self::SubtaskOf,
             "blocks" => Self::Blocks,
+            "verified_by" => Self::VerifiedBy,
+            "prerequisite" => Self::Prerequisite,
+            "next_step" => Self::NextStep,
+            "defines" => Self::Defines,
+            "references" => Self::References,
             _ => return None,
         })
     }
@@ -328,6 +355,27 @@ mod tests {
             Some("related_to".to_owned())
         );
         assert!(Relation::parse_known("солвес").is_none());
+    }
+
+    /// Spec 008, FR-012: `doc` must round-trip like every other node type —
+    /// checked by name rather than relying only on the `KNOWN` loop above, so
+    /// a future edit to `KNOWN` can't silently drop the doc-graph coverage.
+    #[test]
+    fn spec_008_doc_node_type_round_trips() {
+        let parsed = NodeType::parse_known("doc").expect("doc must parse");
+        let serialized = serde_json::to_value(&parsed).expect("doc serializes");
+        assert_eq!(serialized.as_str(), Some("doc"));
+    }
+
+    /// Spec 008, FR-007: the doc-graph edge vocabulary must round-trip like
+    /// every other relation, named explicitly for the same reason as
+    /// `spec_008_doc_node_type_round_trips`.
+    #[test]
+    fn spec_008_relation_names_round_trip() {
+        for name in ["prerequisite", "next_step", "defines", "references"] {
+            let parsed = Relation::parse_known(name).expect("spec 008 relation must parse");
+            assert_eq!(parsed.to_string(), name);
+        }
     }
 
     #[test]
