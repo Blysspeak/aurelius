@@ -3,12 +3,15 @@ use aurelius_core::{
     db, graph, identity, indexer,
     models::{MemoryKind, NodeType, Relation},
     provenance::{self, Provenance, Resolution},
-    timeforged,
+    tasks as task_fields,
 };
 use serde_json::json;
 use std::path::PathBuf;
 
-use crate::{DbAction, DocAction, HomeAction, IdentityAction, ShareAction, TaskAction};
+use crate::{
+    DbAction, DocAction, GraphAction, HomeAction, IdentityAction, SecretAction, ShareAction,
+    TaskAction,
+};
 
 use aurelius_core::db::db_path;
 
@@ -721,41 +724,239 @@ pub async fn search(query: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn sync() -> Result<()> {
+// ---------------------------------------------------------------------------
+// au recall — exact lookup, one record, printed whole
+// ---------------------------------------------------------------------------
+
+/// Read one record back by its exact key.
+///
+/// Neither existing read command can do this. `au search` and `au context`
+/// both go through the FTS5 index, which covers `label`, `note` and `data` —
+/// the `id` column is not in it, so a raw UUID can never match. And a fuzzy
+/// answer is the wrong shape here anyway: a mistyped id must come back as a
+/// miss, not as the nearest node the index happened to rank first.
+///
+/// So there is no fallback ladder. Either the primary key or the exact
+/// `subject` string matches, or nothing does.
+#[derive(clap::Args)]
+pub struct RecallArgs {
+    /// Node UUID, or the exact `--subject` a fact was written with
+    pub query: String,
+    /// Print the record as one JSON object instead of human-readable lines
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// How many facts about one subject to look at. A second live fact about the
+/// same subject can only exist through `--resolution coexist`, and coexist is
+/// the one resolution that deliberately leaves no edge behind — so those
+/// siblings have to be named outright or they stay invisible.
+const SUBJECT_SIBLINGS: usize = 5;
+
+pub async fn recall(args: RecallArgs) -> Result<()> {
+    // Plain `db::open`, not `open_and_ensure`: a read has no business indexing
+    // the current folder as a side effect. Same reason `au export` and
+    // `au touch` open the database directly.
     let conn = db::open(&db_path())?;
 
-    println!("Syncing connectors...");
-
-    // TimeForged connector
-    let since = chrono::Utc::now() - chrono::Duration::days(7);
-    let tf = timeforged::TimeForgedConnector::new(since);
-
-    use aurelius_core::connector::Connector;
-    match tf.pull().await {
-        Ok(events) => {
-            if events.is_empty() {
-                println!("  timeforged — no new events");
-            } else {
-                match timeforged::sync_events(&conn, &events) {
-                    Ok(result) => {
-                        println!(
-                            "  timeforged — {} sessions, {} projects, {} languages",
-                            result.sessions, result.projects, result.languages
-                        );
-                    }
-                    Err(e) => println!("  timeforged — sync error: {e}"),
-                }
-            }
+    let (node, siblings, found_by) = match args.query.parse::<uuid::Uuid>() {
+        // Re-rendered from the parsed UUID rather than used as typed: rows
+        // store the canonical hyphenated form, and a braced or upper-case id
+        // would otherwise miss a node that is right there.
+        Ok(uuid) => {
+            let found = graph::get_node(&conn, &uuid.to_string())?
+                .ok_or_else(|| anyhow::anyhow!("no node with id {}", args.query))?;
+            (found, Vec::new(), "id")
         }
-        Err(e) => println!("  timeforged — offline ({e})"),
+        Err(_) => {
+            let mut found = graph::find_nodes_by_data_field(
+                &conn,
+                provenance::SUBJECT_KEY,
+                &args.query,
+                SUBJECT_SIBLINGS,
+            )?;
+            if found.is_empty() {
+                anyhow::bail!("no node with subject '{}'", args.query);
+            }
+            // Newest first (the query orders by `created_at DESC`), and the
+            // newest fact about a subject is the one that supersedes the rest.
+            (found.remove(0), found, "subject")
+        }
+    };
+
+    let (neighbours, edges) = graph::context_from_id(&conn, &node.id.to_string(), 1)?;
+    let by_id: std::collections::HashMap<_, _> = neighbours.iter().map(|n| (n.id, n)).collect();
+
+    // Project and resolution live as edges, not as fields on the node, so both
+    // are read off the same one-hop neighbourhood rather than with two more
+    // queries.
+    let project = edges.iter().find_map(|e| {
+        (e.from_id == node.id && matches!(e.relation, Relation::BelongsTo))
+            .then(|| by_id.get(&e.to_id).map(|n| n.label.clone()))
+            .flatten()
+    });
+
+    let mut chain = Vec::new();
+    for edge in &edges {
+        let relation = match edge.relation {
+            Relation::Supersedes => "supersedes",
+            Relation::Refines => "refines",
+            _ => continue,
+        };
+        // Direction is the whole meaning of these two edges: "this replaced
+        // that" and "that replaced this" are opposite facts about the record
+        // being read, and an undirected list of neighbours states neither.
+        let (other_id, direction) = if edge.from_id == node.id {
+            (edge.to_id, "outgoing")
+        } else if edge.to_id == node.id {
+            (edge.from_id, "incoming")
+        } else {
+            continue;
+        };
+        let other = by_id.get(&other_id);
+        chain.push(json!({
+            "relation": relation,
+            "direction": direction,
+            "id": other_id.to_string(),
+            "label": other.map(|n| n.label.clone()),
+            "claim": other.and_then(|n| Provenance::from_data(&n.data).claim),
+        }));
     }
 
-    // TODO: git, beads, beacon connectors
-    println!("  git        — TODO");
-    println!("  beads      — TODO");
-    println!("  beacon     — TODO");
+    // The record itself is the MCP renderer's, not a second one written here.
+    // What gets added are the three things that are not on the node: the
+    // project it belongs to, the run that wrote it, and the resolution chain.
+    let mut record = aurelius::mcp::node_detail(&node);
+    let Some(fields) = record.as_object_mut() else {
+        anyhow::bail!("node renderer returned something other than an object");
+    };
+    fields.insert("found_by".to_owned(), json!(found_by));
+    fields.insert("query".to_owned(), json!(args.query));
+    fields.insert("project".to_owned(), json!(project));
+    fields.insert(
+        "session".to_owned(),
+        json!(node
+            .data
+            .get(graph::AGENT_SESSION_KEY)
+            .and_then(serde_json::Value::as_str)),
+    );
+    // Only the siblings the chain does NOT already account for. A superseded
+    // fact is listed once, as what it is; listing it a second time under
+    // "no edge between them" would contradict the line above it.
+    let resolved: std::collections::HashSet<_> = chain
+        .iter()
+        .filter_map(|link| link.get("id").and_then(serde_json::Value::as_str))
+        .collect();
+    let unresolved = siblings
+        .iter()
+        .filter(|n| !resolved.contains(n.id.to_string().as_str()))
+        .map(|n| json!({ "id": n.id.to_string(), "label": n.label }))
+        .collect::<Vec<_>>();
 
+    fields.insert("also_with_subject".to_owned(), json!(unresolved));
+    fields.insert("resolution".to_owned(), json!(chain));
+
+    if args.json {
+        println!("{}", serde_json::to_string(&record)?);
+        return Ok(());
+    }
+    print_record(&record);
     Ok(())
+}
+
+/// Human-readable form of the record `node_detail` produced — rendered FROM
+/// that JSON, not from the node a second time. Anything added to the record
+/// but forgotten here shows up as a missing line, never as two answers that
+/// disagree.
+fn print_record(record: &serde_json::Value) {
+    let field = |key: &str| scalar(record.get(key));
+    let prov = |key: &str| scalar(record.get("provenance").and_then(|p| p.get(key)));
+
+    line("id", field("id").as_deref());
+    line("type", field("type").as_deref());
+    line("label", field("label").as_deref());
+    line("project", field("project").as_deref());
+    line("subject", prov("subject").as_deref());
+    line("claim", field("claim").as_deref());
+    line("evidence", prov("evidence").as_deref());
+    line("confidence", prov("confidence").as_deref());
+    line("volatility", prov("volatility").as_deref());
+    line("verify-with", prov("verify_with").as_deref());
+    line("memory kind", field("memory_kind").as_deref());
+    line("session", field("session").as_deref());
+    line("created", field("created_at").as_deref());
+    line("stale", prov("stale").as_deref());
+
+    // The note is printed as its own block and never clipped: a record read
+    // back in halves is the failure this command exists to end.
+    if let Some(note) = field("note") {
+        println!();
+        println!("note:");
+        println!("{note}");
+    }
+
+    if let Some(chain) = record.get("resolution").and_then(|v| v.as_array()) {
+        if !chain.is_empty() {
+            println!();
+            println!("resolution:");
+            for link in chain {
+                let at = |key: &str| scalar(link.get(key)).unwrap_or_default();
+                let arrow = if at("direction") == "outgoing" {
+                    "→"
+                } else {
+                    "←"
+                };
+                println!(
+                    "  {arrow} {} {} — {}",
+                    at("relation"),
+                    at("id"),
+                    scalar(link.get("claim")).unwrap_or_else(|| at("label"))
+                );
+            }
+        }
+    }
+
+    if let Some(others) = record.get("also_with_subject").and_then(|v| v.as_array()) {
+        if !others.is_empty() {
+            println!();
+            println!("also with this subject (coexisting, no edge between them):");
+            for other in others {
+                println!(
+                    "  {} — {}",
+                    scalar(other.get("id")).unwrap_or_default(),
+                    scalar(other.get("label")).unwrap_or_default()
+                );
+            }
+        }
+    }
+}
+
+/// One labelled line, skipped entirely when there is nothing to say. An empty
+/// `verify-with:` would read as "no command needed" rather than "not said".
+fn line(name: &str, value: Option<&str>) {
+    if let Some(v) = value {
+        println!("{name:<13}{v}");
+    }
+}
+
+/// A JSON value as a printable string. Strings lose their quotes; everything
+/// else keeps its JSON form, because `NodeType::Custom` serialises as an
+/// object and printing it raw beats printing nothing.
+fn scalar(value: Option<&serde_json::Value>) -> Option<String> {
+    match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(other) => Some(other.to_string()),
+    }
+}
+
+/// Т045-Т048 (US5, спека 007, `contracts/cli.md` §«Изымается»): точка входа
+/// для изъятых команд. `au sync`/`au capture` остаются разбираемыми
+/// подкомандами clap — старый вызов получает это сообщение и код 1
+/// (классифицируется как ошибка вызова, см. `main::classify`), а не
+/// generic-ошибку разбора аргументов, которую дал бы неизвестный сабкоманд.
+pub async fn removed(name: &str, reason: &str) -> Result<()> {
+    anyhow::bail!("`au {name}` изъята: {reason}. См. specs/007-task-evidence-loop/contracts/cli.md")
 }
 
 pub async fn reindex(path: Option<String>) -> Result<()> {
@@ -820,6 +1021,330 @@ pub async fn export() -> Result<()> {
     });
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// au graph — bulk import / mermaid export of an external doc graph (spec 008)
+// ---------------------------------------------------------------------------
+
+pub async fn graph(action: GraphAction) -> Result<()> {
+    match action {
+        GraphAction::Import { file, json } => graph_import(&file, json).await,
+        GraphAction::Export { format, source_id } => {
+            graph_export(&format, source_id.as_deref()).await
+        }
+    }
+}
+
+/// FR-001/FR-004: one file, one transaction, one report. The file is read and
+/// parsed before the database is even opened — a malformed `graph.json` must
+/// fail before it can touch a connection, the same ordering `note()` uses for
+/// provenance.
+async fn graph_import(file: &str, as_json: bool) -> Result<()> {
+    let raw = std::fs::read_to_string(file).with_context(|| format!("could not read {file}"))?;
+    let import_file: graph::ImportFile = serde_json::from_str(&raw).with_context(|| {
+        format!("{file} is not a valid graph.json — see spec 008 for the shape")
+    })?;
+
+    let conn = open_and_ensure(&db_path())?;
+    let report = graph::import_graph(&conn, &import_file)?;
+
+    if as_json {
+        println!("{}", serde_json::to_string(&report)?);
+        return Ok(());
+    }
+
+    println!("✓ Imported {file}");
+    println!("  nodes created:   {}", report.nodes_created);
+    println!("  nodes updated:   {}", report.nodes_updated);
+    println!("  nodes unchanged: {}", report.nodes_unchanged);
+    println!("  edges created:   {}", report.edges_created);
+    println!("  edges existing:  {}", report.edges_existing);
+    println!("  elapsed:         {} ms", report.elapsed_ms);
+    Ok(())
+}
+
+/// FR-015. `format=json` is deliberately the same code path as the bare
+/// `au export` — a second JSON renderer here would drift from it the moment
+/// either one grows a field.
+async fn graph_export(format: &str, source_id: Option<&str>) -> Result<()> {
+    match format {
+        "json" => export().await,
+        "mermaid" => {
+            let conn = db::open(&db_path())?;
+            let out = graph::mermaid(&conn, source_id)?;
+            print!("{out}");
+            Ok(())
+        }
+        other => anyhow::bail!("unknown export format '{other}' — known: json, mermaid"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// au path — step ladder over next_step/prerequisite edges (spec 008, FR-008..FR-010)
+// ---------------------------------------------------------------------------
+
+/// Same shape mermaid's weight formatting uses (`graph::export`), kept as its
+/// own tiny copy: a step number is always whole, but the two live in
+/// different crates and neither depends on the other's private helper.
+fn fmt_weight(weight: f32) -> String {
+    if weight.fract() == 0.0 {
+        format!("{}", weight as i64)
+    } else {
+        format!("{weight}")
+    }
+}
+
+pub async fn path(
+    from: Option<String>,
+    to: Option<String>,
+    before: Option<String>,
+    max_depth: usize,
+    as_json: bool,
+) -> Result<()> {
+    // Read-only, like `recall`/`search` — a path query has no business
+    // indexing the current folder as a side effect.
+    let conn = db::open(&db_path())?;
+
+    match (from, to, before) {
+        (Some(from), Some(to), None) => path_between(&conn, &from, &to, max_depth, as_json),
+        (None, None, Some(before)) => path_before(&conn, &before, max_depth, as_json),
+        (from, to, before) => anyhow::bail!(
+            "au path needs either both `from` and `to`, or `--before` — got from={from:?} to={to:?} before={before:?}"
+        ),
+    }
+}
+
+fn path_between(
+    conn: &rusqlite::Connection,
+    from: &str,
+    to: &str,
+    max_depth: usize,
+    as_json: bool,
+) -> Result<()> {
+    let from_node = graph::resolve_selector(conn, from)?;
+    let to_node = graph::resolve_selector(conn, to)?;
+    let path = graph::shortest_path(conn, &from_node, &to_node, max_depth)?;
+
+    // No neighbours-as-consolation-prize (US2): a miss is reported as exactly
+    // that, on stderr, with the caller's own exit code (main::classify —
+    // plain anyhow errors read as usage errors, code 1).
+    let Some(steps) = path else {
+        anyhow::bail!("no path from {from} to {to}");
+    };
+
+    if as_json {
+        let out = json!({
+            "steps": steps.iter().map(|s| json!({
+                "index": s.index,
+                "id": s.node.id.to_string(),
+                "label": s.node.label,
+                "subject": s.node.data.get("subject"),
+                "relation": s.via.as_ref().map(ToString::to_string),
+                "weight": s.weight,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    for step in &steps {
+        match &step.via {
+            Some(relation) => println!(
+                "{}. {} [{relation}, {}]",
+                step.index,
+                step.node.label,
+                fmt_weight(step.weight)
+            ),
+            None => println!("{}. {}", step.index, step.node.label),
+        }
+    }
+    Ok(())
+}
+
+fn path_before(
+    conn: &rusqlite::Connection,
+    target: &str,
+    max_depth: usize,
+    as_json: bool,
+) -> Result<()> {
+    let target_node = graph::resolve_selector(conn, target)?;
+    let result = graph::before(conn, &target_node, max_depth)?;
+
+    if as_json {
+        let out = json!({
+            "before": result.ordered.iter().map(|n| json!({
+                "id": n.id.to_string(),
+                "label": n.label,
+                "subject": n.data.get("subject"),
+            })).collect::<Vec<_>>(),
+            "cycle": result.cycle,
+        });
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    if result.ordered.is_empty() {
+        println!("nothing leads to {target}");
+        return Ok(());
+    }
+    for (i, node) in result.ordered.iter().enumerate() {
+        println!("{}. {}", i + 1, node.label);
+    }
+    if result.cycle {
+        println!(
+            "⚠ a cycle was detected among the ancestors — each node above is still listed exactly once"
+        );
+    }
+    Ok(())
+}
+
+/// Тело `au task activate` — вынесена отдельной функцией ради тестируемости
+/// (`task()` целиком завязан на `db_path()`, реальный путь БД пользователя,
+/// не подменяемый в тесте; эта логика — нет, она принимает соединение явно).
+///
+/// T008/FR-031: в проекте не более одной активной задачи — взятие этой
+/// снимает прежнюю активную того же проекта. FR-001/FR-021c: пишем новое
+/// время взятия в работу, не трогая `closed_at`/`resolution` — при
+/// переоткрытии они остаются историей, а не стираются.
+///
+/// Находка 4 (адверсариальный разбор спеки 007): `activated_at` ставится
+/// ОДИН РАЗ, на переход в active — не на каждый вызов `au task activate` на
+/// уже активной задаче. Симметрия с MCP `task_update` (`handlers/task.rs`).
+fn activate_task(
+    conn: &rusqlite::Connection,
+    task: &aurelius_core::models::Node,
+) -> Result<Option<graph::EvictedTask>> {
+    let project = task
+        .data
+        .get("project")
+        .and_then(|p| p.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    let evicted = graph::evict_active(conn, &project, task.id)?;
+
+    let was_active = task.data.get("status").and_then(|s| s.as_str()) == Some("active");
+    let mut data = task.data.clone();
+    data["status"] = json!("active");
+    if data.get("started_at").and_then(|s| s.as_str()).is_none() {
+        data["started_at"] = json!(chrono::Utc::now().to_rfc3339());
+    }
+    data.as_object_mut().map(|o| o.remove("blocked_by"));
+
+    if !was_active {
+        let mut fields = task_fields::TaskFields::from_data(&data);
+        fields.activated_at = Some(chrono::Utc::now());
+        data = fields.merge_into(&data);
+    }
+
+    graph::update_node(conn, task.id, None, Some(data))?;
+    Ok(evicted)
+}
+
+/// What `au task update` actually changed, for the two printers below.
+struct TaskUpdate {
+    id: uuid::Uuid,
+    label: String,
+    priority: String,
+    /// Field names in a fixed order, so the output does not depend on the
+    /// order the flags were typed in.
+    changed: Vec<&'static str>,
+    /// The acceptance criteria AFTER the append — the appended ones are not
+    /// distinguishable from the ones `au task new` wrote.
+    criteria: Vec<serde_json::Value>,
+}
+
+/// The criteria already on the task, in whatever shape the node happens to
+/// hold, kept verbatim.
+///
+/// `acceptance_criteria` is a bare array of strings — position is the only
+/// thing telling two criteria apart, and `tasks::task_acceptance_criteria`
+/// reads them with `filter_map(|v| v.as_str())`. Appending must not change
+/// that shape, or every reader (`evaluate_fitness` above all) stops seeing
+/// the criteria at all.
+///
+/// Two shapes exist in the graph besides the array: the key can be missing,
+/// and it can hold one bare multi-line string (written by an MCP caller that
+/// passed a string where a list belongs). Overwriting that string with a
+/// fresh array would destroy the text, so it becomes the first element
+/// instead — the same characters, now visible to the reader that was
+/// silently dropping them.
+fn existing_criteria(data: &serde_json::Value) -> Vec<serde_json::Value> {
+    match data.get("acceptance_criteria") {
+        Some(serde_json::Value::Array(items)) => items.clone(),
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => vec![json!(s)],
+        _ => Vec::new(),
+    }
+}
+
+/// The whole of `au task update`, so the caller can wrap it in one
+/// transaction and roll the lot back on any failure.
+///
+/// The mutation itself is the same read-modify-write of the whole `data`
+/// blob that `done`, `block`, `evidence` and `ripe --decline` do: read the
+/// node, edit the fields, hand the blob to `graph::update_node`. Nothing is
+/// removed on the way, so the work log, the evidence, the resolution and all
+/// three timestamps survive a retitle untouched.
+fn update_task(
+    conn: &rusqlite::Connection,
+    id: &str,
+    priority: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    added_criteria: &[String],
+) -> Result<TaskUpdate> {
+    let task = find_task(conn, id)?;
+    let mut data = task.data.clone();
+    let mut changed: Vec<&'static str> = Vec::new();
+
+    if let Some(priority) = &priority {
+        data["priority"] = json!(priority);
+        changed.push("priority");
+    }
+    if title.is_some() {
+        changed.push("title");
+    }
+    if description.is_some() {
+        changed.push("description");
+    }
+    if !added_criteria.is_empty() {
+        let mut criteria = existing_criteria(&data);
+        criteria.extend(added_criteria.iter().map(|c| json!(c)));
+        data["acceptance_criteria"] = serde_json::Value::Array(criteria);
+        changed.push("criteria");
+    }
+
+    // `update_node` writes `note` only when it is `Some`, so passing the
+    // description through leaves it alone when the flag was not given.
+    graph::update_node(conn, task.id, description.as_deref(), Some(data.clone()))?;
+
+    let label = match &title {
+        // The label is the composite `[{project}] {title}`, and `find_task`
+        // resolves by exact label — rewriting it without re-deriving the
+        // prefix would sever the task from its project.
+        Some(title) => {
+            let project = data
+                .get("project")
+                .and_then(|p| p.as_str())
+                .unwrap_or("unknown");
+            let label = format!("[{project}] {title}");
+            graph::update_node_label(conn, task.id, &label)?;
+            label
+        }
+        None => task.label.clone(),
+    };
+
+    Ok(TaskUpdate {
+        id: task.id,
+        label,
+        priority: data
+            .get("priority")
+            .and_then(|p| p.as_str())
+            .unwrap_or("?")
+            .to_owned(),
+        changed,
+        criteria: existing_criteria(&data),
+    })
 }
 
 pub async fn task(action: TaskAction) -> Result<()> {
@@ -910,7 +1435,16 @@ pub async fn task(action: TaskAction) -> Result<()> {
                     "cancelled" => "✗",
                     _ => "○",
                 };
-                println!("  {icon} [{pri}] {} — {st}", t.label);
+                // T021b: помечаем созревшие — предъявление не ждёт вопроса
+                // человека (FR-012), список задач не должен врать о том, что
+                // уже готово к закрытию.
+                let ripe_mark =
+                    if task_fields::is_ripe(&task_fields::TaskFields::from_data(&t.data), st) {
+                        " 🟢 ready-to-close"
+                    } else {
+                        ""
+                    };
+                println!("  {icon} [{pri}] {} — {st}{ripe_mark}", t.label);
                 println!("    id: {}", t.id);
                 if let Some(created_by) = &t.created_by {
                     print!("    by: {created_by}");
@@ -919,6 +1453,69 @@ pub async fn task(action: TaskAction) -> Result<()> {
                             println!(" (last: {updated_by})")
                         }
                         _ => println!(),
+                    }
+                }
+            }
+        }
+
+        TaskAction::Update {
+            id,
+            priority,
+            title,
+            description,
+            criteria,
+            json: as_json,
+        } => {
+            // A call with no mutating flag is refused before the database is
+            // touched, and the refusal names the flags: a silent no-op reads
+            // as "the edit went through" to both a human and a script.
+            if priority.is_none() && title.is_none() && description.is_none() && criteria.is_empty()
+            {
+                anyhow::bail!(
+                    "nothing to update: pass at least one of --priority, --title, --description, -c/--criteria"
+                );
+            }
+
+            // The read-modify-write of the whole `data` blob has a
+            // lost-update window: `graph::update_node` has no
+            // compare-and-swap, so a writer that read the blob before us and
+            // commits after us wipes our edit. `BEGIN IMMEDIATE` (the same
+            // guard `graph::claim` uses) takes the write lock for the read
+            // AND both writes, so nothing can commit in between — that
+            // closes our half of the race, and keeps the `data` write and
+            // the `label` write atomic with each other. It cannot close the
+            // other half: `au task log`, which reads and writes without a
+            // transaction of its own, can still overwrite us with a blob it
+            // read first. Fixing that means changing `log`, not `update`.
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let updated = update_task(&conn, &id, priority, title, description, &criteria);
+            if updated.is_ok() {
+                conn.execute_batch("COMMIT")?;
+            } else {
+                // A failed rollback must not hide why the update failed.
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+            let updated = updated?;
+
+            if as_json {
+                let out = json!({
+                    "id": updated.id.to_string(),
+                    "label": updated.label,
+                    "priority": updated.priority,
+                    "changed": updated.changed,
+                    "acceptance_criteria": updated.criteria,
+                    "updated": true,
+                });
+                println!("{}", serde_json::to_string(&out)?);
+            } else {
+                println!("✓ Task updated: {}", updated.label);
+                println!("  changed: {}", updated.changed.join(", "));
+                if !criteria.is_empty() {
+                    println!("  Acceptance criteria:");
+                    for c in &updated.criteria {
+                        if let Some(text) = c.as_str() {
+                            println!("    ☐ {text}");
+                        }
                     }
                 }
             }
@@ -941,6 +1538,20 @@ pub async fn task(action: TaskAction) -> Result<()> {
             println!("  ID:       {}", task.id);
             println!("  Status:   {st}");
             println!("  Priority: {pri}");
+
+            // T021b/FR-001/FR-002: три времени, всегда все три — незаполненное
+            // печатается явным прочерком, а не молчанием.
+            let fields = task_fields::TaskFields::from_data(&task.data);
+            let fmt_time = |t: Option<chrono::DateTime<chrono::Utc>>| {
+                t.map(|t| t.to_rfc3339()).unwrap_or_else(|| "—".to_owned())
+            };
+            println!("  Заведена: {}", task.created_at.to_rfc3339());
+            println!("  Взята:    {}", fmt_time(fields.activated_at));
+            println!("  Закрыта:  {}", fmt_time(fields.closed_at));
+            if task_fields::is_ripe(&fields, st) {
+                println!("  🟢 Созрела к закрытию — есть зелёная улика свежее правки");
+            }
+
             if let Some(created_by) = &task.created_by {
                 println!("  Created by: {created_by}");
             }
@@ -949,6 +1560,43 @@ pub async fn task(action: TaskAction) -> Result<()> {
             }
             if let Some(note) = &task.note {
                 println!("  Note:     {note}");
+            }
+
+            if let Some(resolution) = &fields.resolution {
+                println!("\n  Способ решения:");
+                if let Some(commit) = &resolution.commit {
+                    println!("    коммит: {commit}");
+                }
+                if let Some(pr) = &resolution.pull_request {
+                    println!("    PR: {pr}");
+                }
+                if !resolution.files.is_empty() {
+                    println!("    файлы: {}", resolution.files.join(", "));
+                }
+                println!(
+                    "    подтверждено: {}",
+                    if resolution.confirmed {
+                        "да"
+                    } else {
+                        "нет"
+                    }
+                );
+            }
+            if !fields.evidence.is_empty() {
+                println!("\n  Улики ({}):", fields.evidence.len());
+                for e in &fields.evidence {
+                    let artifact = match (&e.artifact, e.artifact_present) {
+                        (Some(path), Some(false)) => format!(" [{path} — утрачен]"),
+                        (Some(path), _) => format!(" [{path}]"),
+                        (None, _) => String::new(),
+                    };
+                    println!(
+                        "    {} → exit {} @ {}{artifact}",
+                        e.command,
+                        e.exit_code,
+                        e.at.to_rfc3339()
+                    );
+                }
             }
 
             // Acceptance criteria
@@ -1049,13 +1697,42 @@ pub async fn task(action: TaskAction) -> Result<()> {
             println!("✓ Logged work on: {}", task.label);
         }
 
-        TaskAction::Done { id } => {
+        TaskAction::Done {
+            id,
+            commit,
+            pull_request,
+            unconfirmed,
+        } => {
             let task = find_task(&conn, &id)?;
             let mut data = task.data.clone();
             data["status"] = json!("done");
+            // Легаси-поле: читатели до этой фичи ждут именно его.
             data["completed_at"] = json!(chrono::Utc::now().to_rfc3339());
+
+            let mut fields = task_fields::TaskFields::from_data(&data);
+            let since = fields.activated_at.unwrap_or(task.created_at);
+            // Находка 1, FR-004/FR-006: коммит ищется в каталоге ПРОЕКТА
+            // ЗАДАЧИ (см. `build_resolution`), а не в CWD процесса — `au`
+            // тоже может быть запущен не из каталога проекта задачи.
+            let project = task.data.get("project").and_then(|p| p.as_str());
+            let resolution = task_fields::build_resolution(
+                &conn,
+                since,
+                project,
+                commit,
+                pull_request,
+                unconfirmed,
+            );
+            let confirmed = resolution.confirmed;
+            fields.closed_at = Some(chrono::Utc::now());
+            fields.resolution = Some(resolution);
+            let data = fields.merge_into(&data);
+
             graph::update_node(&conn, task.id, None, Some(data))?;
             println!("✓ Task done: {}", task.label);
+            if !confirmed {
+                println!("  ⚠ закрыта без подтверждения — способ решения неизвестен (FR-005)");
+            }
         }
 
         TaskAction::Block { id, reason } => {
@@ -1069,14 +1746,109 @@ pub async fn task(action: TaskAction) -> Result<()> {
 
         TaskAction::Activate { id } => {
             let task = find_task(&conn, &id)?;
-            let mut data = task.data.clone();
-            data["status"] = json!("active");
-            if data.get("started_at").and_then(|s| s.as_str()).is_none() {
-                data["started_at"] = json!(chrono::Utc::now().to_rfc3339());
-            }
-            data.as_object_mut().map(|o| o.remove("blocked_by"));
-            graph::update_node(&conn, task.id, None, Some(data))?;
+            let evicted = activate_task(&conn, &task)?;
             println!("▶ Task activated: {}", task.label);
+            // T009: молчаливое вытеснение выглядит как потеря задачи.
+            if let Some(evicted) = evicted {
+                println!(
+                    "  ↩ вытеснена в backlog: {} [{}]",
+                    evicted.label, evicted.id
+                );
+            }
+        }
+
+        TaskAction::Evidence {
+            id,
+            project,
+            command,
+            exit,
+            artifact,
+            json: as_json,
+        } => {
+            // FR-008/FR-009: без явного id улика уходит активной задаче
+            // НАЗВАННОГО проекта — не угадываем проект по текущему каталогу,
+            // как это делает `trace --hook`, потому что вызывающий (хук
+            // ulika) знает свой проект точно, а закрытие ошибкой при
+            // отсутствии активной задачи здесь уместно: явного вызова
+            // человека тут нет, но и молчать о непривязанной улике нельзя.
+            let task = match (&id, &project) {
+                (Some(id), _) => find_task(&conn, id)?,
+                (None, Some(project)) => {
+                    let mut active =
+                        graph::get_tasks_filtered(&conn, Some(project), Some("active"), None, 1)?;
+                    active.pop().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "в проекте '{project}' нет активной задачи — улику не к чему привязать"
+                        )
+                    })?
+                }
+                (None, None) => {
+                    anyhow::bail!("нужно указать задачу либо --project с активной задачей")
+                }
+            };
+            let at = chrono::Utc::now();
+            let artifact_present = artifact
+                .as_deref()
+                .map(|p| std::path::Path::new(p).exists());
+
+            let mut fields = task_fields::TaskFields::from_data(&task.data);
+            fields.evidence.push(task_fields::EvidenceEntry {
+                command: command.clone(),
+                exit_code: exit,
+                at,
+                artifact: artifact.clone(),
+                artifact_present,
+            });
+            let data = fields.merge_into(&task.data);
+            graph::update_node(&conn, task.id, None, Some(data))?;
+            let run_id =
+                graph::link_evidence_run(&conn, task.id, &command, exit, artifact.as_deref())?;
+
+            if as_json {
+                let out = json!({
+                    "id": task.id.to_string(),
+                    "run_id": run_id.to_string(),
+                    "command": command,
+                    "exit_code": exit,
+                });
+                println!("{}", serde_json::to_string(&out)?);
+            } else {
+                println!(
+                    "✓ Улика привязана: {} → {command} (exit {exit})",
+                    task.label
+                );
+            }
+        }
+
+        TaskAction::Ripe {
+            project,
+            json: as_json,
+            decline,
+        } => {
+            if let Some(id) = decline {
+                let task = find_task(&conn, &id)?;
+                let mut fields = task_fields::TaskFields::from_data(&task.data);
+                fields.declined_ripe_at = Some(chrono::Utc::now());
+                let data = fields.merge_into(&task.data);
+                graph::update_node(&conn, task.id, None, Some(data))?;
+                println!(
+                    "Отказ зафиксирован: {} — не предъявится снова без новой правки (FR-015)",
+                    task.label
+                );
+                return Ok(());
+            }
+
+            let ripe = gather_ripe(&conn, project.as_deref())?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&ripe_to_json(&ripe))?);
+            } else if ripe.is_empty() {
+                println!("Созревших задач нет.");
+            } else {
+                println!("{} задач(и) созрели к закрытию:", ripe.len());
+                for r in &ripe {
+                    print_ripe_entry(r);
+                }
+            }
         }
 
         TaskAction::Stats {
@@ -1084,6 +1856,45 @@ pub async fn task(action: TaskAction) -> Result<()> {
             since_days,
         } => {
             task_stats_cli(&conn, project.as_deref(), since_days)?;
+        }
+
+        TaskAction::Criterion { id, met, unmet } => {
+            let task = find_task(&conn, &id)?;
+            if met.is_some() && unmet.is_some() {
+                anyhow::bail!("pass only one of --met or --unmet, not both");
+            }
+
+            let criteria = task_fields::task_criteria(&task.data);
+            if let Some(selector) = met.or(unmet.clone()) {
+                let mark = unmet.is_none();
+                let criterion = task_fields::resolve_criterion(&criteria, &selector)?;
+                let handle = criterion.handle.clone();
+                let text = criterion.text.clone();
+                let changed = task_fields::set_criterion_met(&conn, task.id, &handle, mark)?;
+                let state = if mark { "met" } else { "unmet" };
+                if changed {
+                    println!("{state} [{handle}] {text}");
+                } else {
+                    println!("already {state} [{handle}] {text}");
+                }
+            } else {
+                println!("Task: {}", task.label);
+                if criteria.is_empty() {
+                    println!("  No acceptance criteria.");
+                } else {
+                    for c in &criteria {
+                        let glyph = if c.met_at.is_some() { "☑" } else { "☐" };
+                        println!("  {glyph} [{}] {}", c.handle, c.text);
+                    }
+                }
+                let orphans = task_fields::orphaned_criteria_marks(&task.data);
+                if !orphans.is_empty() {
+                    println!(
+                        "  Warning: met marks with no matching criterion: {}",
+                        orphans.join(", ")
+                    );
+                }
+            }
         }
 
         TaskAction::Claim {
@@ -1244,6 +2055,114 @@ pub async fn task(action: TaskAction) -> Result<()> {
                     );
                 } else {
                     println!("✓ Вердикт поставлен: {task_id} — {fitness_verdict} ({why})");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Координаты секретов (спека 007, US4, T040): `au secret add / list / rm`.
+/// FR-025 запрещает хранить значение — `Add` прогоняет `--where` через
+/// `secret::detect_lookalike` (T041) ДО записи; попадание отклоняет вызов с
+/// объяснением, какой признак сработал (FR-026), обычной ошибкой (код 1),
+/// а не паникой.
+pub async fn secret(action: SecretAction) -> Result<()> {
+    let conn = open_and_ensure(&db_path())?;
+
+    match action {
+        SecretAction::Add {
+            name,
+            location,
+            purpose,
+            project,
+        } => {
+            if let Some(hit) = aurelius_core::secret::detect_lookalike(&location) {
+                anyhow::bail!(
+                    "координата отклонена: {} — исправь --where на место хранения, а не сам секрет",
+                    hit.explain()
+                );
+            }
+            let node = graph::add_secret_ref(
+                &conn,
+                project.as_deref(),
+                &name,
+                purpose.as_deref(),
+                &location,
+            )?;
+            let kind = node
+                .data
+                .get("location_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            println!("✓ Координата записана: {name} ({kind})");
+            if let Some(p) = &purpose {
+                println!("  назначение: {p}");
+            }
+            println!("  место: {location}");
+        }
+
+        SecretAction::List {
+            project,
+            json: as_json,
+        } => {
+            let refs = graph::list_secret_refs(&conn, project.as_deref())?;
+            if as_json {
+                let out: Vec<_> = refs
+                    .iter()
+                    .map(|n| {
+                        json!({
+                            "name": n.data.get("name"),
+                            "purpose": n.data.get("purpose"),
+                            "location": n.data.get("location"),
+                            "location_kind": n.data.get("location_kind"),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else if refs.is_empty() {
+                println!("Координат нет.");
+            } else {
+                println!("{} координат(ы):", refs.len());
+                for n in &refs {
+                    let name = n.data.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let kind = n
+                        .data
+                        .get("location_kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let location = n
+                        .data
+                        .get("location")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    println!("  {name} [{kind}]");
+                    if let Some(purpose) = n.data.get("purpose").and_then(|v| v.as_str()) {
+                        println!("    назначение: {purpose}");
+                    }
+                    println!("    место: {location}");
+                }
+            }
+        }
+
+        SecretAction::Rm { name, project } => {
+            let matches: Vec<_> = graph::list_secret_refs(&conn, project.as_deref())?
+                .into_iter()
+                .filter(|n| n.data.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+                .collect();
+            match matches.len() {
+                0 => anyhow::bail!("координата '{name}' не найдена"),
+                1 => {
+                    graph::delete_node(&conn, matches[0].id)?;
+                    println!("✓ Координата удалена: {name}");
+                }
+                _ => {
+                    let labels: Vec<_> = matches.iter().map(|n| n.label.as_str()).collect();
+                    anyhow::bail!(
+                        "имя '{name}' неоднозначно без --project: {}",
+                        labels.join(", ")
+                    );
                 }
             }
         }
@@ -1459,6 +2378,52 @@ fn find_task(conn: &rusqlite::Connection, id: &str) -> Result<aurelius_core::mod
         .ok_or_else(|| anyhow::anyhow!("task not found: {id}"))
 }
 
+// `RipeReport`/`gather_ripe`/`ripe_to_json` перенесены в
+// `aurelius_core::tasks` — MCP (`task_ripe`) обязана звать то же
+// вычисление, что и `au task ripe`, а не вторую копию правила. Импортированы
+// ниже как `task_fields::{RipeReport, gather_ripe, ripe_to_json}`.
+use task_fields::{gather_ripe, ripe_to_json, RipeReport};
+
+fn print_ripe_entry(r: &RipeReport) {
+    println!("  🟢 {} [{}]", r.label, r.id);
+    println!(
+        "     улика: {} → exit {} @ {}",
+        r.evidence.command,
+        r.evidence.exit_code,
+        r.evidence.at.to_rfc3339()
+    );
+    if r.files.is_empty() {
+        println!("     изменено: (список правок недоступен)");
+    } else {
+        println!("     изменено: {}", r.files.join(", "));
+    }
+}
+
+/// Блок для `au judge --hook` (T019, FR-012): печатается только когда есть
+/// что предъявить — молчание не хуже шума по пустому месту, а лишний вопрос
+/// без созревших задач был бы именно шумом.
+fn format_ripe_hook_block(ripe: &[RipeReport]) -> Option<String> {
+    if ripe.is_empty() {
+        return None;
+    }
+    let mut out = format!("### Созревшие задачи ({})\n", ripe.len());
+    for r in ripe {
+        out.push_str(&format!(
+            "- {} [{}] — улика: {} → exit {} @ {}",
+            r.label,
+            r.id,
+            r.evidence.command,
+            r.evidence.exit_code,
+            r.evidence.at.to_rfc3339()
+        ));
+        if !r.files.is_empty() {
+            out.push_str(&format!("; изменено: {}", r.files.join(", ")));
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
 /// Print the skill index. Plain text by default; with `hook=true` emits the
 /// Claude Code SessionStart hook JSON that injects the index into context.
 pub async fn skills(hook: bool) -> Result<()> {
@@ -1628,6 +2593,25 @@ pub async fn trace_cmd(
                     state_hash_post: hash_post,
                 },
             )?;
+
+            // T012/FR-032: правка кода привязывается к активной задаче
+            // текущего проекта. Активной нет — ничего не делаем, не
+            // угадываем: хук не имеет права мешать работе, а неверная
+            // привязка хуже отсутствующей.
+            if matches!(kind, TraceKind::FileEdit) {
+                if let Some(project) = current_dir_name() {
+                    if let Ok(mut active) =
+                        graph::get_tasks_filtered(&conn, Some(&project), Some("active"), None, 1)
+                    {
+                        if let Some(task) = active.pop() {
+                            let mut fields = task_fields::TaskFields::from_data(&task.data);
+                            fields.last_edit_at = Some(chrono::Utc::now());
+                            let data = fields.merge_into(&task.data);
+                            let _ = graph::update_node(&conn, task.id, None, Some(data));
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -1661,51 +2645,6 @@ pub async fn trace_cmd(
     }
 }
 
-/// Поймать момент открытия: команда только что вернула данные о мире — предложить
-/// сохранить это как измеренный факт, положив саму команду в `evidence`.
-///
-/// Ничего не пишет. `--hook` печатает Claude-JSON с `additionalContext` и всегда
-/// выходит с нулём: хук не имеет права мешать работе.
-pub async fn capture_cmd(hook: bool, command: Option<String>) -> Result<()> {
-    use crate::capture;
-
-    if hook {
-        let mut raw = String::new();
-        if std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw).is_err() {
-            return Ok(());
-        }
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            return Ok(());
-        };
-        if let Some(catch) = capture::from_hook_event(&event) {
-            println!(
-                "{}",
-                json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PostToolUse",
-                        "additionalContext": capture::suggestion(&catch),
-                    }
-                })
-            );
-        }
-        return Ok(());
-    }
-
-    let command = command.ok_or_else(|| anyhow::anyhow!("нужен --command или --hook"))?;
-    match capture::classify(&command) {
-        Some(tool) => {
-            let catch = capture::Catch {
-                tool,
-                command,
-                lines: 0,
-            };
-            println!("{}", capture::suggestion(&catch));
-        }
-        None => println!("не добыча данных — предлагать нечего"),
-    }
-    Ok(())
-}
-
 /// Полная Stop-цепочка «Бит-и-Дело»: судья исхода (ступень 4) → обязательства
 /// из следов сессии: гашение погашающими событиями и intake комиссивов
 /// (ступень 6) → клиринг гроссбуха (ступень 5). `--hook` — режим Stop-хука:
@@ -1713,7 +2652,7 @@ pub async fn capture_cmd(hook: bool, command: Option<String>) -> Result<()> {
 pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
     use aurelius_core::{differ, ledger, obligations};
 
-    let run = || -> Result<differ::JudgeStats> {
+    let run = || -> Result<(differ::JudgeStats, Vec<RipeReport>)> {
         let conn = db::open(&db_path())?;
         // 4. Судья закрывает созревшие окна и реконсолидирует узлы.
         let stats = differ::close_ripe_windows(&conn, min_age_secs)?;
@@ -1758,16 +2697,27 @@ pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
         for s in &sessions {
             let _ = ledger::clear_session(&conn, s);
         }
-        Ok(stats)
+
+        // T019: блок созревших задач — только в режиме хука, где он и
+        // предъявляется без вопроса человека (FR-012); ручной вызов уже
+        // отвечает своим текстом ниже.
+        let ripe = if hook {
+            gather_ripe(&conn, None).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok((stats, ripe))
     };
 
     match run() {
-        Ok(s) => {
+        Ok((s, ripe)) => {
             if !hook {
                 println!(
                     "закрыто окон: {} (reinforce {}, erode {}, fork {})",
                     s.closed, s.reinforced, s.eroded, s.forked
                 );
+            } else if let Some(block) = format_ripe_hook_block(&ripe) {
+                println!("{block}");
             }
             Ok(())
         }
@@ -2427,4 +3377,126 @@ async fn share_disable(project: &str) -> Result<()> {
     }
     println!("✓ Sync disabled for '{project}' (local data untouched)");
     Ok(())
+}
+
+// `au` — бинарная цель без `lib.rs`, поэтому здесь нет общего для крейта
+// `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]`,
+// как в `aurelius-core`/`aurelius` (их `lib.rs` — не в списке файлов этой
+// правки). Разрешение ставится локально на сам тестовый модуль, а не через
+// правку `main.rs`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Тот же приём, что и в тестах ядра (`aurelius-core::tasks`): настоящий
+    /// temp-файл, не `:memory:` — `db::open` жёстко требует WAL.
+    struct TmpDb(PathBuf);
+
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "aurelius-au-commands-test-{tag}-{}.db",
+                uuid::Uuid::new_v4()
+            )))
+        }
+    }
+
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(PathBuf::from(p));
+            }
+        }
+    }
+
+    fn setup() -> (TmpDb, rusqlite::Connection) {
+        let tmp = TmpDb::new("setup");
+        let conn = db::open(&tmp.0).expect("open temp db");
+        (tmp, conn)
+    }
+
+    fn seed_task(
+        conn: &rusqlite::Connection,
+        project: &str,
+        data: serde_json::Value,
+    ) -> uuid::Uuid {
+        graph::add_node_full(
+            conn,
+            NodeType::Task,
+            &format!("[{project}] задача"),
+            None,
+            "test",
+            data,
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("insert task")
+        .id
+    }
+
+    /// Находка 4 (адверсариальный разбор спеки 007), сторона CLI: повторный
+    /// `au task activate` на УЖЕ активной задаче не имеет права сдвигать
+    /// `activated_at` вперёд — симметрично починке в MCP `task_update`
+    /// (`handlers/task.rs`). Тест падал на прежней реализации, ставившей
+    /// `activated_at` на каждый вызов `TaskAction::Activate`.
+    #[test]
+    fn activate_task_on_already_active_task_keeps_original_activated_at() {
+        let (_tmp, conn) = setup();
+        let original_activated_at = "2026-08-30T08:00:00Z";
+        let id = seed_task(
+            &conn,
+            "proj-cli",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "project": "proj-cli",
+                "activated_at": original_activated_at,
+            }),
+        );
+        let task = graph::get_node(&conn, &id.to_string())
+            .expect("get_node")
+            .expect("node exists");
+
+        activate_task(&conn, &task).expect("activate_task");
+
+        let after = graph::get_node(&conn, &id.to_string())
+            .expect("get_node")
+            .expect("node exists");
+        let fields = task_fields::TaskFields::from_data(&after.data);
+        assert_eq!(
+            fields.activated_at,
+            Some(original_activated_at.parse().expect("rfc3339")),
+            "повторная активация уже активной задачи не обязана сдвигать activated_at"
+        );
+    }
+
+    /// Асимметрия предыдущего теста: НАСТОЯЩИЙ переход backlog → active
+    /// обязан ставить `activated_at` — иначе первая активация вообще
+    /// осталась бы без времени взятия в работу.
+    #[test]
+    fn activate_task_from_backlog_sets_activated_at() {
+        let (_tmp, conn) = setup();
+        let id = seed_task(
+            &conn,
+            "proj-cli-2",
+            json!({"status": "backlog", "priority": "medium", "project": "proj-cli-2"}),
+        );
+        let task = graph::get_node(&conn, &id.to_string())
+            .expect("get_node")
+            .expect("node exists");
+
+        activate_task(&conn, &task).expect("activate_task");
+
+        let after = graph::get_node(&conn, &id.to_string())
+            .expect("get_node")
+            .expect("node exists");
+        let fields = task_fields::TaskFields::from_data(&after.data);
+        assert!(
+            fields.activated_at.is_some(),
+            "первая активация обязана выставить activated_at"
+        );
+    }
 }

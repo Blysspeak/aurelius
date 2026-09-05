@@ -42,6 +42,11 @@ pub struct ProbeReport {
     pub failed: Vec<Probe>,
 }
 
+// `.expect` на этих трёх регэкспах не бьёт по принципу III: шаблон — литерал,
+// известный правильным на этапе написания кода, а не данные прогона. Упасть
+// он может только на опечатке в исходнике (поймает любой тест, вызвавший
+// пробу), никогда — на вводе пользователя.
+#[allow(clippy::expect_used)]
 fn path_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // Абсолютные пути Windows (A:\..., C:/...) и Unix (/home/...). Расширение
@@ -52,11 +57,13 @@ fn path_re() -> &'static Regex {
     })
 }
 
+#[allow(clippy::expect_used)]
 fn sha_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\b[0-9a-f]{40}\b").expect("статический регэксп"))
 }
 
+#[allow(clippy::expect_used)]
 fn url_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // Адрес — не путь в файловой системе, но выглядит как два сразу: «https://»

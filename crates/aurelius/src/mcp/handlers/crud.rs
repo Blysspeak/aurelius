@@ -87,24 +87,60 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     }))
 }
 
+/// Тот же хаб-узел, что и в `task_view` (см. `graph::context_from_id`): узел
+/// проекта копит рёбра `belongs_to` от КАЖДОЙ задачи/решения/проблемы этого
+/// проекта. BFS глубины 2 от FTS-посева проходит на первом шаге в проект, а
+/// на втором — расходится обратно на ВСЕ остальные узлы проекта, выдавая их
+/// как «контекст» темы, к которой они на деле отношения не имеют.
+///
+/// Живое измерение 30.08.2026 (`au context`, проект aurelius, тема из
+/// задачи 67c9a2bb): глубина 2 — 2809 узлов, 2844 рёбра, 2.4 МБ вывода,
+/// причём затронуты чужие проекты (boostix, xhub) — потому что каждый из
+/// пяти FTS-посевов сам оказывается новым хабом. Глубина 1 на той же теме —
+/// 12 узлов, 9 КБ. `memory_recall` (session.rs), который зовёт тот же
+/// `graph::context`, уже стоит на глубине 1 по умолчанию; здесь она была
+/// вторым, более старым путём к той же функции с более старым дефолтом.
+const MEMORY_CONTEXT_DEFAULT_DEPTH: u32 = 1;
+
+/// Бюджет `note` одного узла в символах (по границе слова) — то же
+/// `aurelius_core::graph::clip`, что режет ветку `task_view`. Раньше note
+/// отдавался сырым: при глубине 2 это и добивало ответ до мегабайт, но
+/// проблема отдельная от хаба — сырой note раздувает ответ даже на честных
+/// 12 узлах глубины 1, если хоть один из них содержит длинную запись.
+const MEMORY_CONTEXT_NOTE_BUDGET: usize = 300;
+
 pub fn memory_context(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let conn = open_db()?;
+    memory_context_with_conn(&conn, params)
+}
+
+/// Тело `memory_context` с явным соединением — тот же приём тестируемости,
+/// что и у `task_view_with_conn`: тесты сеют граф и проверяют BFS без
+/// обхода через файл базы.
+fn memory_context_with_conn(
+    conn: &rusqlite::Connection,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value> {
     let topic = params
         .get("topic")
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'topic' parameter"))?;
-    let depth = params.get("depth").and_then(|d| d.as_u64()).unwrap_or(2) as u32;
+    let depth = params
+        .get("depth")
+        .and_then(|d| d.as_u64())
+        .unwrap_or(u64::from(MEMORY_CONTEXT_DEFAULT_DEPTH)) as u32;
     let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
 
-    let conn = open_db()?;
-    let (nodes, edges) = graph::context(&conn, topic, depth)?;
+    let (nodes, edges) = graph::context(conn, topic, depth)?;
 
     let total = nodes.len();
     let capped_nodes: Vec<_> = nodes.iter().take(limit).collect();
+    let hidden = total.saturating_sub(capped_nodes.len());
 
     for node in &capped_nodes {
         // Best effort by design: an access counter must never fail a read.
         // Logged rather than discarded so a failing write is still visible.
-        if let Err(e) = graph::touch_node(&conn, node.id) {
+        if let Err(e) = graph::touch_node(conn, node.id) {
             tracing::warn!("could not record access for {}: {e}", node.id);
         }
     }
@@ -116,7 +152,7 @@ pub fn memory_context(params: &serde_json::Value) -> Result<serde_json::Value> {
                 "id": n.id.to_string(),
                 "type": n.node_type,
                 "label": n.label,
-                "note": n.note,
+                "note": n.note.as_deref().map(|note| graph::clip(note, MEMORY_CONTEXT_NOTE_BUDGET)),
             })
         })
         .collect();
@@ -139,6 +175,23 @@ pub fn memory_context(params: &serde_json::Value) -> Result<serde_json::Value> {
         "edges": relevant_edges,
         "returned": capped_nodes.len(),
         "total": total,
+        // Честный отчёт об урезании — молчаливая обрезка хуже длинного
+        // ответа: читатель обязан узнать, сколько осталось за кадром и как
+        // это достать, а не догадываться по разнице returned/total.
+        "truncation": {
+            "applied": hidden > 0,
+            "limit": limit,
+            "hidden": hidden,
+            "how_to_see_more": if hidden > 0 {
+                serde_json::Value::String(
+                    "memory_context с limit побольше (сейчас видно ровно limit узлов из total), \
+                     либо topic поуже, чтобы BFS-посев не расходился так широко"
+                        .to_owned(),
+                )
+            } else {
+                serde_json::Value::Null
+            },
+        },
     }))
 }
 
@@ -492,4 +545,180 @@ pub fn memory_gc() -> Result<serde_json::Value> {
         "bankrupt_scanned": gc.scanned,
         "bankrupt_absorbed": gc.absorbed,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aurelius_core::db;
+
+    struct TmpDb(std::path::PathBuf);
+
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "aurelius-mcp-crud-test-{tag}-{}.db",
+                uuid::Uuid::new_v4()
+            )))
+        }
+    }
+
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+            }
+        }
+    }
+
+    fn setup() -> (TmpDb, rusqlite::Connection) {
+        let tmp = TmpDb::new("setup");
+        let conn = db::open(&tmp.0).expect("open temp db");
+        (tmp, conn)
+    }
+
+    fn seed_task_in_project(conn: &rusqlite::Connection, project: &str, label: &str) -> Uuid {
+        let task = graph::add_node_full(
+            conn,
+            NodeType::Task,
+            label,
+            None,
+            "test",
+            json!({"status": "backlog", "priority": "medium", "project": project}),
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("insert task")
+        .id;
+        let proj = match graph::find_project_by_label(conn, project) {
+            Ok(Some(n)) => n,
+            _ => graph::add_node(conn, NodeType::Project, project, None, "test", json!({}))
+                .expect("insert project"),
+        };
+        graph::add_edge(conn, task, proj.id, Relation::BelongsTo, 1.0).expect("belongs_to");
+        task
+    }
+
+    fn add_decision(conn: &rusqlite::Connection, task_id: Uuid, project: &str, text: &str) -> Uuid {
+        let dec = graph::add_node(
+            conn,
+            NodeType::Decision,
+            &format!("[{project}] {text}"),
+            Some(text),
+            "test",
+            json!({"task_id": task_id.to_string()}),
+        )
+        .expect("decision");
+        graph::add_edge(conn, task_id, dec.id, Relation::Contains, 1.0).expect("contains");
+        dec.id
+    }
+
+    /// Тот же дефект, что и в `task_view` (см. `graph::context_from_id`), в
+    /// генерике `graph::context`: живое измерение на реальной базе
+    /// (30.08.2026, `au context`, тема из задачи 67c9a2bb) дало на глубине 2
+    /// 2809 узлов из 12 при глубине 1 — BFS прошёл через узел проекта и
+    /// вернулся на весь проект. Этот тест — та же утечка на синтетическом
+    /// графе: до правки дефолта (глубина 2) падал, после (глубина 1) —
+    /// проходит.
+    #[test]
+    fn memory_context_does_not_leak_sibling_task_via_shared_project_at_default_depth() {
+        let (_tmp, conn) = setup();
+        let task_a = seed_task_in_project(&conn, "proj-x", "уникальная тема альфа про морковь");
+        let task_b = seed_task_in_project(&conn, "proj-x", "task B — сосед по проекту, не альфа");
+        add_decision(&conn, task_b, "proj-x", "решение, принадлежащее только B");
+
+        let result =
+            memory_context_with_conn(&conn, &json!({"topic": "морковь"})).expect("memory_context");
+
+        let nodes = result["nodes"].as_array().expect("nodes array");
+        assert!(
+            nodes.iter().any(|n| n["id"] == json!(task_a.to_string())),
+            "искомая задача обязана быть в ответе: {nodes:?}"
+        );
+        assert!(
+            !nodes.iter().any(|n| n["id"] == json!(task_b.to_string())),
+            "сосед по проекту не обязан выглядеть контекстом темы A: {nodes:?}"
+        );
+    }
+
+    /// Симметрия предыдущему тесту: явно запрошенная глубина 2 — сознательный
+    /// выбор вызывающего, и утечка через хаб на ней ожидаема и не является
+    /// багом обработчика (сам обход не трогаем, чинили только дефолт).
+    #[test]
+    fn memory_context_leaks_via_project_hub_when_depth_two_requested_explicitly() {
+        let (_tmp, conn) = setup();
+        let _task_a = seed_task_in_project(&conn, "proj-y", "уникальная тема бета про капуста");
+        let task_b = seed_task_in_project(&conn, "proj-y", "task B — сосед, не бета");
+
+        let result = memory_context_with_conn(&conn, &json!({"topic": "капуста", "depth": 2}))
+            .expect("memory_context");
+
+        let nodes = result["nodes"].as_array().expect("nodes array");
+        assert!(
+            nodes.iter().any(|n| n["id"] == json!(task_b.to_string())),
+            "на явно запрошенной глубине 2 хаб-эффект воспроизводится (это ожидаемо для этого теста): {nodes:?}"
+        );
+    }
+
+    /// FR из тикета: note режется по границе слова через ту же
+    /// `aurelius_core::graph::clip`, что и `task_view` — вторая копия не
+    /// заводится. До правки note отдавался сырым целиком.
+    #[test]
+    fn memory_context_clips_note_at_word_boundary() {
+        let (_tmp, conn) = setup();
+        let words: Vec<String> = (0..150).map(|i| format!("слово{i}")).collect();
+        let long_note = words.join(" ");
+        graph::add_node(
+            &conn,
+            NodeType::Concept,
+            "уникальнаяметкагамма",
+            Some(&long_note),
+            "test",
+            json!({}),
+        )
+        .expect("concept");
+
+        let result = memory_context_with_conn(&conn, &json!({"topic": "уникальнаяметкагамма"}))
+            .expect("memory_context");
+        let nodes = result["nodes"].as_array().expect("nodes array");
+        let note = nodes[0]["note"].as_str().expect("note");
+        assert!(
+            note.ends_with('…'),
+            "длинная note обязана быть обрезана: {note}"
+        );
+        assert!(
+            note.chars().count() <= MEMORY_CONTEXT_NOTE_BUDGET,
+            "note обязана укладываться в бюджет {MEMORY_CONTEXT_NOTE_BUDGET}: {} символов",
+            note.chars().count()
+        );
+    }
+
+    /// Молчаливая обрезка хуже длинного ответа: сработавший `limit` обязан
+    /// сказать, сколько узлов скрыто и как это достать, а не только поменять
+    /// `returned` относительно `total`.
+    #[test]
+    fn memory_context_reports_hidden_count_honestly_when_limit_hits() {
+        let (_tmp, conn) = setup();
+        let task = seed_task_in_project(&conn, "proj-z", "уникальнаяметкадельта");
+        for i in 0..5 {
+            add_decision(&conn, task, "proj-z", &format!("решение {i}"));
+        }
+
+        let result = memory_context_with_conn(
+            &conn,
+            &json!({"topic": "уникальнаяметкадельта", "limit": 2}),
+        )
+        .expect("memory_context");
+
+        assert_eq!(result["returned"], json!(2));
+        assert!(result["total"].as_u64().expect("total") > 2);
+        assert_eq!(result["truncation"]["applied"], json!(true));
+        assert!(result["truncation"]["hidden"].as_u64().expect("hidden") > 0);
+        assert!(
+            !result["truncation"]["how_to_see_more"].is_null(),
+            "обязан быть указан способ достать скрытое: {result:?}"
+        );
+    }
 }

@@ -3,6 +3,10 @@
 //! The `.docx` is assembled here rather than checked in: a binary fixture in
 //! the repository is a fixture nobody can review in a diff.
 
+// Integration test — the whole file is test code, not a runtime path;
+// unwrap/expect here are the assertion mechanism itself.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 

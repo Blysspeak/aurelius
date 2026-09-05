@@ -1,6 +1,8 @@
 mod crud;
 mod doc;
+mod path;
 mod search;
+mod secret;
 mod session;
 mod skill;
 mod snapshot;
@@ -9,7 +11,9 @@ mod task;
 
 pub use crud::*;
 pub use doc::*;
+pub use path::*;
 pub use search::*;
+pub use secret::*;
 pub use session::*;
 pub use skill::*;
 pub use snapshot::*;
@@ -116,12 +120,22 @@ fn provenance_brief(node: &aurelius_core::models::Node) -> serde_json::Value {
         "confidence": p.confidence_or_default().as_str(),
         "evidence": p.evidence,
         "measured_at": p.measured_at.map(|d| d.to_rfc3339()),
+        // Both were written into `data` and neither was ever read back out:
+        // `stale` folds `verify_with` in only once a fact is already overdue,
+        // and `volatility` — the field that decides when that happens — was
+        // invisible until then. A caller asking for a record in full got
+        // silence about how fast it rots.
+        "volatility": p.volatility.map(aurelius_core::provenance::Volatility::as_str),
+        "verify_with": p.verify_with,
         "subject": p.subject,
         "stale": p.staleness(node.created_at, chrono::Utc::now()).map(|s| s.note()),
     })
 }
 
-pub(crate) fn node_detail(node: &aurelius_core::models::Node) -> serde_json::Value {
+/// `pub`, unlike its neighbours: `au recall` renders the same record the MCP
+/// door does. A second renderer in the CLI would drift from this one, and the
+/// drift would show up as two answers to one question.
+pub fn node_detail(node: &aurelius_core::models::Node) -> serde_json::Value {
     json!({
         "id": node.id.to_string(),
         "type": node.node_type,
@@ -177,6 +191,36 @@ pub(crate) fn resolve_node(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("node not found: {identifier}"))
+}
+
+/// Тот же резолв, что и `resolve_node`, но для мест, где по контракту ручки
+/// узел ОБЯЗАН быть задачей (`task_update`/`task_view`/`task_log`) — как и в
+/// CLI (`find_task` в `crates/au/src/commands.rs`). Разница только в
+/// последнем фолбэке: полнотекстовый поиск ограничен `NodeType::Task`.
+///
+/// Находка 7 (адверсариальный разбор спеки 007): без этого ограничения
+/// нечёткое совпадение по строке могло указать на узел ЛЮБОГО типа — CLI
+/// в этом случае честно отвечает «задача не найдена», а MCP молча находил и
+/// мутировал первый попавшийся узел другого типа (например, Decision).
+/// `resolve_node` выше не трогаем: там любой тип узла законен (общие ручки
+/// вроде `memory_relate`).
+pub(crate) fn resolve_task_node(
+    conn: &Connection,
+    identifier: &str,
+) -> anyhow::Result<aurelius_core::models::Node> {
+    if let Ok(uuid) = identifier.parse::<Uuid>() {
+        if let Some(node) = graph::get_node(conn, &uuid.to_string())? {
+            return Ok(node);
+        }
+    }
+    if let Some(node) = graph::find_node_by_label(conn, identifier)? {
+        return Ok(node);
+    }
+    let results = graph::search_typed(conn, identifier, &NodeType::Task, 1)?;
+    results
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("task not found: {identifier}"))
 }
 
 /// Разбор живёт в ядре (`NodeType::parse`), чтобы CLI и MCP не расходились в

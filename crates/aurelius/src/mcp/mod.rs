@@ -3,6 +3,11 @@ mod params;
 mod protocol;
 mod tools;
 
+/// The node renderer, and nothing else out of `handlers`. `au recall` needs
+/// this one function; `pub mod handlers` would have published every MCP
+/// handler with it, since the module re-exports its submodules by glob.
+pub use handlers::node_detail;
+
 use anyhow::Result;
 use protocol::{JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR, METHOD_NOT_FOUND};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -122,6 +127,7 @@ async fn handle_tools_call(
     let result = tokio::task::spawn_blocking(move || match tool_name.as_str() {
         "memory_status" => handlers::memory_status(&arguments),
         "memory_context" => handlers::memory_context(&arguments),
+        "memory_path" => handlers::memory_path(&arguments),
         "memory_search" => handlers::memory_search(&arguments),
         "memory_add" => handlers::memory_add(&arguments),
         "memory_relate" => handlers::memory_relate(&arguments),
@@ -141,6 +147,8 @@ async fn handle_tools_call(
         "task_log" => handlers::task_log(&arguments),
         "task_view" => handlers::task_view(&arguments),
         "task_stats" => handlers::task_stats(&arguments),
+        "task_ripe" => handlers::task_ripe(&arguments),
+        "secret_list" => handlers::secret_list(&arguments),
         "search_web" => handlers::search_web(&arguments),
         "search_recall" => handlers::search_recall(&arguments),
         "doc_convert" => handlers::doc_convert(&arguments),

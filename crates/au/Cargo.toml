@@ -13,6 +13,9 @@ workspace = true
 [package.repository]
 workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "au"
 path = "src/main.rs"

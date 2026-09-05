@@ -13,6 +13,7 @@ use chrono::Utc;
 use rusqlite::Connection;
 
 use crate::models::{MemoryKind, Node, NodeType};
+use crate::secret::is_secret_ref;
 
 /// Бюджеты слоёв в символах. Сумма ~4500 — порядка 1.5К токенов.
 const B_IDENTITY: usize = 600;
@@ -22,13 +23,37 @@ const B_SEMANTIC: usize = 900;
 const B_PROCEDURAL: usize = 500;
 const B_DIGEST: usize = 500;
 
-fn clip(s: &str, budget: usize) -> String {
+/// Аварийный предел слоя активных задач (FR-018): сколько задач в состоянии
+/// `active` показывается, даже если их заведено больше. Инвариант «одна
+/// активная на проект» держит это число маленьким на практике; предел —
+/// защита от чужого проекта или бага, а не рабочий режим.
+const ACTIVE_TASK_CAP: usize = 20;
+
+/// Резать по границе слова, а не посреди него (FR-020). Раньше `chars().take(n)`
+/// рубил вслепую — девять из семнадцати записей дампа обрывались на полуслове.
+///
+/// `pub`, а не приватная: та же обрезка нужна `mcp::handlers::task::task_view`
+/// для длинных `note` вложенных узлов (decision/problem/solution/work_log) —
+/// заводить вторую копию того же правила ради модульной границы бессмысленно.
+pub fn clip(s: &str, budget: usize) -> String {
     let one = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() <= budget {
         return one;
     }
-    let cut: String = one.chars().take(budget.saturating_sub(1)).collect();
-    format!("{cut}…")
+    let limit = budget.saturating_sub(1);
+    let chars: Vec<char> = one.chars().collect();
+    let mut end = limit.min(chars.len());
+    let cuts_mid_word = end < chars.len()
+        && end > 0
+        && !chars[end - 1].is_whitespace()
+        && !chars[end].is_whitespace();
+    if cuts_mid_word {
+        if let Some(boundary) = chars[..end].iter().rposition(|c| c.is_whitespace()) {
+            end = boundary;
+        }
+    }
+    let cut: String = chars[..end].iter().collect::<String>();
+    format!("{}…", cut.trim_end())
 }
 
 /// Текст узла для выдачи.
@@ -61,9 +86,18 @@ fn annotate(node: &Node, text: String) -> String {
 }
 
 /// Строки слоя: по одной на узел, суммарно не больше budget.
+///
+/// Координаты секретов ([`is_secret_ref`]) отсеиваются — FR-027: они отдаются
+/// по запросу (`au secret list`) и НЕ ДОЛЖНЫ попадать в подаваемую память
+/// автоматически. Ни один из типов, перечисленных в [`gather`], сегодня не
+/// выбирает `Config`, так что фильтр здесь — граница, а не текущая
+/// необходимость: он держит инвариант верным и тогда, когда слой снапшота
+/// однажды расширят. Правило живёт в `secret`, рядом с остальными правилами о
+/// секретах, и переиспользуется отсюда и из поиска — двух копий у него быть не
+/// должно, иначе они разойдутся молча.
 fn layer(nodes: &[Node], per_line: usize, budget: usize) -> String {
     let mut out = String::new();
-    for n in nodes {
+    for n in nodes.iter().filter(|n| !is_secret_ref(n)) {
         let line = format!("- {}\n", annotate(n, body(n, per_line)));
         if out.chars().count() + line.chars().count() > budget {
             break;
@@ -92,8 +126,8 @@ fn typed_recent(
 /// так же тихо, как молчал сам канал. Здесь форма зафиксирована.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Fact {
-    /// Слой-источник: `userfact` | `task` | `problem` | `obligation` |
-    /// `session` | `decision` | `concept` | `skill` | `digest`.
+    /// Слой-источник: `userfact` | `active_task` | `task` | `problem` |
+    /// `obligation` | `session` | `decision` | `concept` | `skill` | `digest`.
     pub kind: &'static str,
     /// Полный текст, без бюджетной обрезки: у потребителя свой бюджет, а молча
     /// укороченный факт неотличим от короткого.
@@ -128,11 +162,34 @@ pub struct SnapshotFacts {
 /// проект отдавал бы одну строку-заглушку вместо пустого массива.
 const EMPTY_DIGEST: &str = "Хвостов нет — чисто.";
 
+/// Открытые задачи не в работе: `active` уже выбрана отдельным, приоритетным
+/// слоем (см. [`gather`]), здесь — только то, что ждёт своей очереди.
+const OTHER_OPEN_TASK_STATUSES: &str = "blocked,backlog";
+
+/// Момент, по которому активные задачи ранжируются под аварийным пределом:
+/// когда взята в работу, а не когда заведена. Узел без `activated_at`
+/// (переход в `active` до этой фичи) считается наименее свежим.
+fn activated_key(n: &Node) -> String {
+    n.data
+        .get("activated_at")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or_default()
+}
+
 /// Всё, что снапшот читает из графа. Одно место сбора на обе формы вывода —
 /// иначе markdown и JSON разойдутся, и разойдутся молча.
 struct Gathered {
     identity: Vec<Node>,
-    tasks: Vec<Node>,
+    /// Задачи в состоянии `active`: по FR-017 обязаны попасть в дамп целиком,
+    /// поэтому отделены от прочих открытых и режутся не общим лимитом выборки,
+    /// а собственным аварийным пределом [`ACTIVE_TASK_CAP`].
+    active_tasks: Vec<Node>,
+    /// Сколько активных задач не поместилось под аварийный предел (FR-018) —
+    /// печатается явно, а не молчаливо теряется.
+    active_overflow: usize,
+    /// Прочие открытые задачи (`blocked`, `backlog`) — ниже приоритетом.
+    other_tasks: Vec<Node>,
     problems: Vec<Node>,
     pressure: Vec<String>,
     sessions: Vec<Node>,
@@ -143,9 +200,24 @@ struct Gathered {
 }
 
 fn gather(conn: &Connection, project: Option<&str>) -> Result<Gathered> {
+    // Аварийный предел применяется в Rust, не в SQL: выборка сортирует по
+    // приоритету/дате заведения, а предел FR-018 — по времени взятия в работу.
+    let mut active_tasks = super::get_tasks_filtered(conn, project, Some("active"), None, 200)?;
+    active_tasks.sort_by_key(|n| std::cmp::Reverse(activated_key(n)));
+    let active_overflow = active_tasks.len().saturating_sub(ACTIVE_TASK_CAP);
+    active_tasks.truncate(ACTIVE_TASK_CAP);
+
     Ok(Gathered {
         identity: typed_recent(conn, &NodeType::UserFact, None, 12)?,
-        tasks: super::get_tasks_filtered(conn, project, Some(super::OPEN_TASK_STATUSES), None, 8)?,
+        active_tasks,
+        active_overflow,
+        other_tasks: super::get_tasks_filtered(
+            conn,
+            project,
+            Some(OTHER_OPEN_TASK_STATUSES),
+            None,
+            8,
+        )?,
         problems: super::get_unsolved_problems(conn, project, 6)?,
         // Гроссбух давления (ступень 6): открытые обязательства по напряжению —
         // недоделанное лезет наверх само. Best-effort: пусто при отсутствии таблиц.
@@ -172,7 +244,7 @@ fn gather(conn: &Connection, project: Option<&str>) -> Result<Gathered> {
 
 fn push_facts(facts: &mut Vec<Fact>, kind: &'static str, nodes: &[Node]) {
     let now = Utc::now();
-    facts.extend(nodes.iter().map(|n| {
+    facts.extend(nodes.iter().filter(|n| !is_secret_ref(n)).map(|n| {
         let p = crate::provenance::Provenance::from_data(&n.data);
         Fact {
             kind,
@@ -197,7 +269,10 @@ pub fn snapshot_facts(conn: &Connection, project: Option<&str>) -> Result<Snapsh
     let g = gather(conn, project)?;
     let mut facts = Vec::new();
     push_facts(&mut facts, "userfact", &g.identity);
-    push_facts(&mut facts, "task", &g.tasks);
+    // Активные — приоритетный вид факта: потребитель различает «в работе
+    // прямо сейчас» от «открыта, но не взята» без разбора текста.
+    push_facts(&mut facts, "active_task", &g.active_tasks);
+    push_facts(&mut facts, "task", &g.other_tasks);
     push_facts(&mut facts, "problem", &g.problems);
     facts.extend(g.pressure.iter().map(|line| Fact {
         kind: "obligation",
@@ -229,11 +304,39 @@ pub fn build_snapshot(conn: &Connection, project: Option<&str>) -> Result<String
     let nodes = super::count_nodes(conn)?;
     let edges = super::count_edges(conn)?;
 
-    let mut working = layer(&g.tasks, 160, B_WORKING / 2);
-    working.push_str(&layer(&g.problems, 160, B_WORKING / 2));
+    // Активные задачи — высший приоритет слоя «В работе» (FR-017): рендерятся
+    // без бюджетного среза, так что ни одна не теряется из-за нехватки места;
+    // защита от неограниченного разрастания — аварийный предел ACTIVE_TASK_CAP
+    // уже применён в gather(). Здесь просто печатаем, сколько не поместилось.
+    let mut working = layer(&g.active_tasks, 160, usize::MAX);
+    if g.active_overflow > 0 {
+        working.push_str(&format!(
+            "- …и ещё {} активных не поместилось\n",
+            g.active_overflow
+        ));
+    }
+    let active_used = working.chars().count();
 
-    let mut semantic = layer(&g.decisions, 150, B_SEMANTIC * 2 / 3);
-    semantic.push_str(&layer(&g.concepts, 150, B_SEMANTIC / 3));
+    // Остаток бюджета «В работе» — прочим открытым задачам (FR-019), а то, что
+    // они не выбрали, — проблемам. Раньше половины делились поровну и
+    // фиксированно: пустая проблема не отдавала место задачам и наоборот.
+    let working_rest = B_WORKING.saturating_sub(active_used);
+    let other = layer(&g.other_tasks, 160, working_rest);
+    let other_used = other.chars().count();
+    working.push_str(&other);
+    working.push_str(&layer(
+        &g.problems,
+        160,
+        working_rest.saturating_sub(other_used),
+    ));
+
+    // Если активные перебрали весь бюджет слоя, разница вычитается у слоя ниже
+    // приоритетом (FR-017), а не у активных: «Решения и знания» отдаёт ровно
+    // столько, сколько не хватило.
+    let semantic_budget = B_SEMANTIC.saturating_sub(active_used.saturating_sub(B_WORKING));
+
+    let mut semantic = layer(&g.decisions, 150, semantic_budget * 2 / 3);
+    semantic.push_str(&layer(&g.concepts, 150, semantic_budget / 3));
 
     let pressure = g
         .pressure
@@ -545,5 +648,318 @@ mod tests {
             )
             .expect("count");
         assert_eq!(n, 1);
+    }
+
+    /// Регресс: раньше слой «В работе» брал 8 самых свежих открытых задач ОДНИМ
+    /// общим запросом, и активная задача среди 200 бэклога терялась. Активные
+    /// теперь выбираются отдельно от прочих открытых — им конкуренция за место
+    /// в выборке не грозит.
+    #[test]
+    fn active_task_survives_whole_among_two_hundred_open_tasks() {
+        let conn = test_conn();
+        for i in 0..200 {
+            super::super::add_node(
+                &conn,
+                NodeType::Task,
+                &format!("[demo] фоновая задача {i}"),
+                None,
+                "test",
+                serde_json::json!({ "status": "backlog", "priority": "high" }),
+            )
+            .expect("add backlog task");
+        }
+        super::super::add_node(
+            &conn,
+            NodeType::Task,
+            "[demo] актуальная работа",
+            Some("чиним слой активных задач в снапшоте"),
+            "test",
+            serde_json::json!({ "status": "active", "activated_at": "2020-01-01T00:00:00Z" }),
+        )
+        .expect("add active task");
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+
+        assert!(
+            md.contains("чиним слой активных задач в снапшоте"),
+            "активная задача обязана присутствовать целиком среди 200 открытых:\n{md}"
+        );
+    }
+
+    /// Находка 10 (адверсариальный разбор спеки 007): аварийный предел
+    /// `ACTIVE_TASK_CAP` и текст сообщения о переполнении не были покрыты ни
+    /// одним тестом — единственный существующий тест на активные задачи
+    /// (`active_task_survives_whole_among_two_hundred_open_tasks`) держит
+    /// только ОДНУ активную задачу и до этой ветки арифметики не доходит.
+    /// Здесь — `ACTIVE_TASK_CAP + 3` активных задач: три самые старые по
+    /// `activated_at` обязаны уйти в overflow, а сообщение — назвать точное
+    /// число.
+    #[test]
+    fn active_task_overflow_reports_correct_count_and_keeps_most_recent() {
+        let conn = test_conn();
+        let total = ACTIVE_TASK_CAP + 3;
+        for i in 0..total {
+            super::super::add_node(
+                &conn,
+                NodeType::Task,
+                &format!("[demo] активная задача {i:02}"),
+                Some(&format!("нота активной задачи {i:02}")),
+                "test",
+                serde_json::json!({
+                    "status": "active",
+                    // Чем больше i, тем свежее взятие в работу — самые
+                    // свежие ACTIVE_TASK_CAP обязаны остаться, самые старые
+                    // (i < 3) — уйти в overflow.
+                    "activated_at": format!("2020-01-{:02}T00:00:00Z", i + 1),
+                }),
+            )
+            .expect("add active task");
+        }
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+
+        assert!(
+            md.contains("- …и ещё 3 активных не поместилось"),
+            "сообщение о переполнении обязано назвать точное число:\n{md}"
+        );
+
+        for i in 0..3 {
+            let note = format!("нота активной задачи {i:02}");
+            assert!(
+                !md.contains(&note),
+                "самая старая активная задача {i} обязана уйти в overflow, а не остаться в дампе:\n{md}"
+            );
+        }
+        let newest_note = format!("нота активной задачи {:02}", total - 1);
+        assert!(
+            md.contains(&newest_note),
+            "самая свежая активная задача обязана остаться в дампе:\n{md}"
+        );
+    }
+
+    /// Находка 10: когда активные задачи съедают весь бюджет «В работе» и
+    /// ещё сверху, разница вычитается у бюджета «Решения и знания» (FR-017)
+    /// — ветка `semantic_budget = B_SEMANTIC.saturating_sub(...)` тоже не
+    /// была покрыта ни одним тестом. 15 активных задач с длинными note
+    /// (печатаются без бюджетного среза — FR-017) суммарно намного больше
+    /// `B_WORKING + B_SEMANTIC`, так что семантический бюджет обязан
+    /// обнулиться, а слой решений — исчезнуть целиком, а не просто ужаться.
+    #[test]
+    fn active_tasks_overrunning_working_budget_shrink_semantic_layer() {
+        let conn = test_conn();
+        let long_note = "слово ".repeat(40); // ~240 символов — больше per_line=160
+        for i in 0..15 {
+            super::super::add_node(
+                &conn,
+                NodeType::Task,
+                &format!("[demo] активная {i}"),
+                Some(&format!("{long_note}{i}")),
+                "test",
+                serde_json::json!({
+                    "status": "active",
+                    "activated_at": format!("2021-01-{:02}T00:00:00Z", i + 1),
+                }),
+            )
+            .expect("add active task");
+        }
+        let decision_text = "заметное решение, которое обязано пропасть при нулевом бюджете";
+        super::super::add_node(
+            &conn,
+            NodeType::Decision,
+            "[demo] решение",
+            Some(decision_text),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add decision");
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+
+        assert!(
+            !md.contains(decision_text),
+            "decision обязан пропасть при обнулённом семантическом бюджете:\n{md}"
+        );
+        assert!(
+            !md.contains("5 · Решения и знания"),
+            "пустой слой решений не обязан печатать заголовок:\n{md}"
+        );
+    }
+
+    /// T044/FR-027: снапшот проекта с записанными координатами секретов не
+    /// содержит ни одного значения — ни в markdown, ни в машинной форме.
+    /// Координата сама по себе не значение (T041 отклоняет такую запись
+    /// раньше, чем она попадёт в граф), поэтому здесь под подозрением
+    /// `location` — единственное поле, где реальный секрет мог бы просочиться.
+    #[test]
+    fn snapshot_excludes_secret_coordinates() {
+        let conn = test_conn();
+        let location = "1password://Private/Stripe/api-key";
+        super::super::add_secret_ref(&conn, Some("demo"), "STRIPE_SECRET_KEY", None, location)
+            .expect("add secret ref");
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+        assert!(
+            !md.contains(location) && !md.contains("STRIPE_SECRET_KEY"),
+            "координата секрета просочилась в markdown-снапшот:\n{md}"
+        );
+
+        let facts = snapshot_facts(&conn, Some("demo")).expect("facts");
+        let leaked = facts
+            .facts
+            .iter()
+            .any(|f| f.text.contains(location) || f.text.contains("STRIPE_SECRET_KEY"));
+        assert!(!leaked, "координата секрета просочилась в машинную форму");
+    }
+
+    /// FR-013 (spec 008): vendor-doc pages must never reach snapshot layers
+    /// 1-6, no matter how many of them the graph holds — they have their own
+    /// door (`au search`/`au context`), and the whole point of `data.layer =
+    /// "vendor-docs"` is to keep a 332-page import from being visible here at
+    /// all. `gather()` already never queries `NodeType::Doc` for any layer, so
+    /// this asserts a property that holds by construction — but a construction
+    /// this easy to break silently (one `typed_recent(conn, &NodeType::Doc,
+    /// ...)` added to a future layer) needs a guard, not just an absence of
+    /// code today.
+    #[test]
+    fn snapshot_never_surfaces_vendor_doc_nodes() {
+        let conn = test_conn();
+        let project = super::super::add_node(
+            &conn,
+            NodeType::Project,
+            "demo",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add project");
+
+        for i in 0..20 {
+            super::super::add_node(
+                &conn,
+                NodeType::Doc,
+                &format!("vendor page {i:02}"),
+                Some(&format!(
+                    "vendor doc body {i:02} — must never leak into the snapshot"
+                )),
+                "test",
+                serde_json::json!({"layer": "vendor-docs", "project": "demo"}),
+            )
+            .expect("add doc node");
+        }
+
+        let decision = super::super::add_node(
+            &conn,
+            NodeType::Decision,
+            "решение demo",
+            Some("decision body must be visible"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add decision");
+        super::super::add_edge(
+            &conn,
+            decision.id,
+            project.id,
+            crate::models::Relation::BelongsTo,
+            1.0,
+        )
+        .expect("link decision to project");
+
+        let concept = super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "концепт demo",
+            Some("concept body must be visible"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add concept");
+        super::super::add_edge(
+            &conn,
+            concept.id,
+            project.id,
+            crate::models::Relation::BelongsTo,
+            1.0,
+        )
+        .expect("link concept to project");
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+        for i in 0..20 {
+            assert!(
+                !md.contains(&format!("vendor page {i:02}"))
+                    && !md.contains(&format!("vendor doc body {i:02}")),
+                "doc node {i} leaked into the markdown snapshot:\n{md}"
+            );
+        }
+        assert!(md.contains("decision body must be visible"));
+        assert!(md.contains("concept body must be visible"));
+
+        let facts = snapshot_facts(&conn, Some("demo")).expect("facts");
+        assert!(
+            facts
+                .facts
+                .iter()
+                .all(|f| !f.text.contains("vendor doc body")),
+            "doc node leaked into the machine-readable facts: {facts:?}"
+        );
+        assert!(
+            facts
+                .facts
+                .iter()
+                .any(|f| f.kind == "decision" && f.text.contains("decision body")),
+            "decision must still be present: {facts:?}"
+        );
+        assert!(
+            facts
+                .facts
+                .iter()
+                .any(|f| f.kind == "concept" && f.text.contains("concept body")),
+            "concept must still be present: {facts:?}"
+        );
+    }
+
+    /// FR-020: сокращение идёт по границе слова. Раньше `clip` рубил по счётчику
+    /// символов вслепую — обрезанный текст мог заканчиваться на полуслове.
+    #[test]
+    fn dump_lines_never_cut_mid_word() {
+        let conn = test_conn();
+        let long_note = (0..40)
+            .map(|i| format!("слово{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        super::super::add_node(
+            &conn,
+            NodeType::UserFact,
+            "владелец",
+            Some(&long_note),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add user fact");
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+
+        let mut checked = 0;
+        for line in md.lines().filter(|l| l.contains('…')) {
+            let clipped = line
+                .split('…')
+                .next()
+                .expect("в строке есть многоточие")
+                .trim_start_matches("- ");
+            assert!(
+                long_note.starts_with(clipped),
+                "обрезанный текст обязан быть точным словесным префиксом исходника: {line:?}"
+            );
+            let boundary = long_note.chars().nth(clipped.chars().count());
+            assert!(
+                boundary.is_none() || boundary == Some(' '),
+                "после отрезанного текста в оригинале обязан идти пробел, а не хвост слова: {line:?}"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "тест ничего не проверил — ни одна запись не была обрезана"
+        );
     }
 }

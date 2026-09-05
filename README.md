@@ -13,12 +13,12 @@
   <img src="https://img.shields.io/badge/v1.11.1-stable-a6e3a1?style=flat-square" alt="v1.11.1">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
-  <img src="https://img.shields.io/badge/MCP-30_tools-a6e3a1?style=flat-square" alt="MCP">
+  <img src="https://img.shields.io/badge/MCP-32_tools-a6e3a1?style=flat-square" alt="MCP">
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#mcp-tools-30">MCP Tools</a> ·
+  <a href="#mcp-tools-32">MCP Tools</a> ·
   <a href="#memory-snapshot">Snapshot</a> ·
   <a href="#task-management">Tasks</a> ·
   <a href="#project-sync">Sync</a> ·
@@ -52,7 +52,7 @@ au 1.11.1
 
 ---
 
-## MCP Tools (30)
+## MCP Tools (32)
 
 Aurelius runs as an MCP server over stdio. `install.sh` configures it automatically, or add manually via `/mcp` in Claude Code (`command: au`, `args: ["mcp"]`).
 
@@ -86,6 +86,7 @@ Aurelius runs as an MCP server over stdio. `install.sh` configures it automatica
 | `task_log` | Record work done — creates WorkLog + optional Decision/Problem/Solution nodes. Auto-activates backlog tasks. |
 | `task_view` | Full task branch — timeline of work logs, decisions, problems, solutions, subtasks. |
 | `task_stats` | Task analytics — counts by status/priority, completion rate, avg/median duration, blocked count, oldest active. |
+| `task_ripe` | Tasks ready to close — active, with a passing evidence run newer than the last edit, plus the basis (which run, when, files touched). Same computation as `au task ripe`; closing itself is still `task_update`. |
 
 ### Skills
 
@@ -115,6 +116,18 @@ Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV, PDF, HTML and plain text 
 | `doc_read` | Paginated read of an already-converted document, by content hash or path. |
 | `doc_recall` | FTS search across every document ever converted. |
 
+### Secrets
+
+Read-only on MCP, deliberately: Aurelius stores where a secret lives, never the value (see
+[Secrets](#secrets-1) below), and recording a coordinate is a human act — `au secret add`/`rm`
+stay CLI-only. Only the read side is exposed here, because it answers a question an assistant
+gets asked directly ("where's the Stripe key?") and the coordinate is otherwise unreachable
+through MCP: it never appears in `memory_snapshot` or any other automatic dump.
+
+| Tool | Description |
+|------|-------------|
+| `secret_list` | Name, purpose, and location of every recorded secret coordinate — never the value. |
+
 ---
 
 ## Memory Snapshot
@@ -137,6 +150,15 @@ cache — rather than a large JSON blob fetched on demand.
 Every layer has a hard character budget (~4.5K in total, on the order of 1.5K tokens),
 and empty layers are omitted entirely.
 
+**Active tasks are the one exception.** A task actually in progress — status `active` —
+is pulled out of layer 2 before the budget is applied and rendered in full, uncut by the
+per-layer character limit that trims everything else. There is still a hard ceiling (20
+active tasks per project) purely against unbounded growth; past it the snapshot says how
+many did not fit rather than dropping them silently. Whatever an active task's own
+rendering costs beyond the layer's normal budget is taken from **layer 5 (Decisions and
+knowledge)**, not from the active tasks themselves and not from the layers in between —
+the layer immediately below "In progress" in priority pays for it.
+
 ```bash
 au snapshot --project myapp          # Markdown, for humans and for context
 au snapshot --project myapp --json   # fixed shape, for programs
@@ -153,9 +175,12 @@ would break the consumer silently. `--json` fixes the shape instead:
 {"project":"myapp","facts":[{"kind":"decision","text":"chose SQLite over Postgres","at":"2026-08-15T21:30:40Z"}]}
 ```
 
-`kind` names the source layer: `userfact`, `task`, `problem`, `obligation`, `session`,
-`decision`, `concept`, `skill`, `digest`. Text is returned whole — the budget belongs to
-the consumer, and a silently shortened fact reads exactly like a short one.
+`kind` names the source layer: `userfact`, `active_task`, `task`, `problem`, `obligation`,
+`session`, `decision`, `concept`, `skill`, `digest`. `active_task` is the guaranteed,
+uncut form of a task in progress described above; plain `task` covers everything else
+still open (`backlog`, `blocked`) and is subject to the ordinary budget. Text is returned
+whole — the budget belongs to the consumer, and a silently shortened fact reads exactly
+like a short one.
 
 The contract distinguishes the two states that a silent channel confuses:
 
@@ -203,6 +228,56 @@ backlog → active → done
 ```
 
 First `task_log` entry auto-activates a backlog task. `task_update` tracks timestamps automatically.
+A project has at most one active task at a time — activating another demotes the previous
+active task back to `backlog`, keeping its accumulated timestamps and history intact.
+
+### Three Timestamps
+
+Every task carries three moments: when it was **created** (Заведена), when it was **taken
+into work** (Взята — first activation), and when it was **closed** (Закрыта). `au task show`
+and `task_view` print all three, an unfilled one as an explicit dash (`—`), never blank space:
+
+```
+Заведена: 2026-08-30T11:32:11+00:00
+Взята:    —
+Закрыта:  —
+```
+
+Reopening a closed task never erases these, or the resolution recorded at close time; they
+become history the task carries forward.
+
+### Evidence and Ripening
+
+A verify run (`ulika`'s gate, e.g. `node scripts/verify-run.mjs …`) reports its outcome back
+to Aurelius with `au task evidence` — command, exit code, and artifact path, attached to the
+project's active task. **This is not a command you run by hand**: the ulika hook
+(`record-verify.mjs`) calls it after every gate run, because it is the one thing that knows a
+run just happened. You will see it in scripts and hook logs, not type it yourself.
+
+A task **ripens** once it has at least one code edit *and* a green (exit-0) evidence run newer
+than that edit — discussing a task without touching code never ripens it, and a later edit
+un-ripens it again until a fresh green run covers it. `au task ripe` lists what's ripe along
+with why: which evidence, when, what changed. `au judge --hook` (the Stop hook run at the end
+of a turn) surfaces the same list unprompted, so a finished task gets presented for closing
+without anyone having to ask — closing itself still requires a human decision (`au task done`).
+`au task list` marks a ripe task inline too. Declining a proposal (`au task ripe --decline
+<id>`) suppresses it on that task until new work lands.
+
+### Closing with a Resolution
+
+`au task done <id>` records *how* a task was closed, assembled from existing traces of work
+rather than asked of the human:
+
+```bash
+au task done <id>                          # commit auto-detected via `git rev-parse --short HEAD`
+au task done <id> --commit abc1234         # override the detected commit
+au task done <id> --pr https://github.com/…/pull/42
+au task done <id> --unconfirmed            # force "closed without confirmation", even if a commit was detected
+```
+
+If nothing about the resolution can be determined and `--unconfirmed` isn't passed, the task
+still closes — just marked **closed without confirmation**, so the history never silently
+lies about how sure the record is.
 
 ### Acceptance Criteria
 
@@ -215,12 +290,79 @@ au task new "Implement auth" --project myapp --priority high \
   -c "Rate limiting active"
 ```
 
+### Task Leasing (`au task claim` / `renew` / `release` / `give-up`)
+
+A task handed to a runner used to be indistinguishable from one still sitting in the
+queue — two processes could grab the same one, and an abandoned one never came back.
+`au task claim` leases one machine-fit task to an owner for a fixed number of minutes
+and hands it to nobody else while that lease holds; `au task renew` extends the lease
+while the runner is still alive; `au task release` records the outcome. The grant is a
+single `UPDATE … RETURNING`, so two concurrent `claim` calls cannot land on the same
+task — not "unlikely", but structurally impossible.
+
+`claim` also honours the one-active-task-per-project rule the other two entry points
+(`au task activate`, MCP `task_update`) enforce: if the project already has a different
+active task, that one is evicted back to the queue first. The exception is an active task
+still under someone else's live lease — there `claim` declines instead, and the task it
+had just taken is rolled back untouched. Evicting would return that task to the pool
+while its lease still holds, so a third owner could claim it: one double-grant would be
+traded for another.
+
+```bash
+au task claim --owner smena@host/123 --run 42 --lease-minutes 50   # take one machine-fit task
+au task renew --id <id> --owner smena@host/123 --lease-minutes 50  # keep the lease alive
+au task release --id <id> --owner smena@host/123 \
+  --verdict done --evidence "cargo test — 186 passed"              # or --verdict failed
+au task give-up --id <id> --owner smena@host/123 \
+  --why "needs a human decision"                                   # blocks, does not requeue
+```
+
+`release --verdict done` closes the task through the same rule as `au task done` and the
+MCP `task_update`: it stamps the close time and assembles the resolution from traces of
+the work, and the `--evidence` text is kept as an ordinary run record, visible under
+`au task show`. It does **not** yet judge the verdict it is handed — the runner's word
+that the work is done is taken at face value. Gating the close on the run's exit code, on
+a green check postdating the lease, and on every acceptance criterion having a recorded
+check is designed but not implemented; until it is, that judgement lives in the driver
+that calls these commands. `--verdict failed` always requeues and starts a cooldown. A
+lease that simply expires is picked up again by the next `claim` the same way, attempts
+climbing each time; a task claimed three times without a `done` verdict drops out of
+`claim`'s selection instead of cycling through the queue forever. `give-up` is the one
+exit that does **not** requeue: the runner recognized the block needs a human, so the
+task is left in place with a reason attached rather than retried. These four are
+**dispatcher-only** commands — a single external driver is meant to call them in a loop
+against the whole queue; that outer loop is not shipped yet, only the primitives it will
+call.
+
+### Fitness Gate (`au task fitness`)
+
+Before a task can be leased at all, something has to decide whether a machine could
+possibly finish it. `au task fitness` writes that verdict onto `fitness` and nothing
+else. A criterion counts as machine-checkable only when the check itself reads as a
+command — at the start of a line, wrapped in backticks, or next to an explicit pass/fail
+marker — not merely mentioned in prose (an earlier pass over the live queue counted
+"reads NodeInbound" as if it were a runnable check and overstated the machine-fit pool by
+half). A task with no such criterion is marked `human`; one with a mix of checkable and
+non-checkable criteria is marked `split` rather than partially auto-run. Every verdict
+requires a non-empty reason and is stamped with a hash of the task's content — edit the
+task afterward and the verdict goes stale instead of quietly outliving the text it judged.
+
+```bash
+au task fitness --id <id> --verdict machine --why "single command, exit code checked"
+au task fitness --dry-run --project myapp   # verdict + reason for every open task, writes nothing
+```
+
+`--dry-run` writes nothing; it exists to be read for the *why* — the verdict is
+unattended, nobody confirms it before a task becomes claimable.
+
 ### Integration
 
 - **`memory_status`** shows active/blocked tasks at session start
 - **`memory_session`** accepts `tasks` parameter to link sessions to tasks, returns active tasks as hints
 - **`memory_recall`** includes tasks in search results
 - **`task_view`** aggregates the full work branch via BFS traversal
+- **`au judge --hook`** surfaces ripe tasks unprompted at the end of a turn — see
+  [Evidence and Ripening](#evidence-and-ripening)
 
 ---
 
@@ -272,7 +414,6 @@ au note "flag is on" --confidence measured \
   --volatility volatile --verify-with "cat app/.env" \
   --subject xhub:.env:REFUND_REQUESTS_ENABLED  # where it came from, how fast it rots, what it is about
 au journal --session $SESSION_ID    # everything that run wrote — the selection a session-end hook needs
-au capture --hook                   # PostToolUse: a command returned data → offer to save it as measured
 au context beacon                  # graph around a topic
 au search "redis"                  # full-text search
 au reindex                         # index current project
@@ -289,7 +430,19 @@ au db backup                       # safe snapshot via VACUUM INTO
 au doc convert report.docx         # document → Markdown on stdout
 au doc convert ./contracts -r      # convert a whole tree, cached by content hash
 au doc recall "termination"        # search everything ever converted
+au task claim --owner … --run … --lease-minutes 50   # dispatcher-only: lease one machine-fit task
+au task renew --id … --owner … --lease-minutes 50    # dispatcher-only: extend a held lease
+au task release --id … --owner … --verdict done --evidence "…"  # dispatcher-only: report the outcome
+au task give-up --id … --owner … --why "…"           # dispatcher-only: block, don't requeue
+au task fitness --dry-run [--project myapp]           # is the open queue machine-checkable? read-only
 ```
+
+> **Removed:** `au sync` (the TimeForged connector — spec 007 found zero calls to it across
+> hooks and 19 repositories) and `au capture` (its calling hook was never wired into any
+> project) were pulled after a usage audit found no consumer for either. Both subcommands
+> still parse — calling one prints an explanation and what replaced it, and exits `1`, rather
+> than failing as an unknown-argument error. If a script of yours still calls `au sync` or
+> `au capture`, that script is dead weight: nothing downstream was reading their output either.
 
 ### Exit codes
 
@@ -302,9 +455,9 @@ fixed by calling differently, the second by hand — retrying it is pointless.
 | `1` | bad call — unknown `--type`, missing argument, node not found, malformed JSON on stdin |
 | `2` | storage unreachable — no database, damaged image, locked SQLite |
 
-The `--hook` variants (`au snapshot --hook`, `au trace --hook`, `au judge --hook`,
-`au capture --hook`) are the deliberate exception: they never fail and stay silent on
-error. A broken hook is worse than a missing snapshot.
+The `--hook` variants (`au snapshot --hook`, `au trace --hook`, `au judge --hook`) are the
+deliberate exception: they never fail and stay silent on error. A broken hook is worse than
+a missing snapshot.
 
 ### Provenance
 
@@ -334,6 +487,9 @@ Both doors take the same fields and share one parser: `au note --confidence …`
 
 ### Sync Commands
 
+Project sync (`identity`/`share`, below) — not the removed `au sync` TimeForged connector
+(see the CLI section's removal note).
+
 ```bash
 au identity set --name "Name" --email you@example.com          # once per machine
 
@@ -352,12 +508,34 @@ au share disable <project>         # stop syncing (local data kept)
 ```bash
 au task new "Title" -p myapp --priority high -c "Tests pass"
 au task list --project myapp --status active,blocked
-au task show <id>                  # full details with work log branch
+au task show <id>                  # full details with work log branch and three timestamps
 au task log <id> "Did X, Y, Z"    # record work (auto-activates)
-au task done <id>                  # mark complete
+au task ripe [--project myapp]     # tasks ripe to close, with evidence + what changed
+au task done <id>                  # mark complete; resolution assembled from traces
+au task done <id> --commit <sha> --pr <url>   # override/add to the detected resolution
+au task done <id> --unconfirmed    # force "closed without confirmation"
 au task block <id> "waiting on API keys"
-au task activate <id>              # resume blocked task
+au task activate <id>              # resume blocked task, demotes any other active task
+
+# called by the ulika verify hook, not by hand:
+au task evidence --project myapp --command "npm test" --exit 0 --artifact run.log
 ```
+
+### Secrets
+
+Aurelius stores where a secret lives, never the value. `--where` is checked for strings that
+look like the value itself (a key, a token, a connection string with credentials embedded) and
+the write is refused, with an explanation, when it matches.
+
+```bash
+au secret add --name STRIPE_SECRET_KEY --where "env:STRIPE_SECRET_KEY" \
+  --purpose "charge webhooks" --project myapp
+au secret list --project myapp     # coordinates only — values were never stored
+au secret rm STRIPE_SECRET_KEY --project myapp
+```
+
+Coordinates are returned on request only; they never appear in the memory snapshot or any
+other automatic dump.
 
 ### Backups
 
@@ -499,7 +677,6 @@ Installed automatically by `install.sh` into `~/.claude/settings.json`.
 | `aurelius-backup.sh` | SessionStart | Rolling database snapshot, throttled to one a day |
 | `aurelius-track-edit.sh` | PostToolUse (Edit/Write) | Increments access_count on file nodes |
 | `au trace --hook` | PostToolUse | Appends what happened to the action journal |
-| `au capture --hook` | PostToolUse (Bash) | A command returned data about the world → offers to save it as a measured fact, with the command already in `evidence`. Writes nothing itself |
 | `au judge --hook` | Stop | Settles the session: reinforce, erode, fork or null |
 | `aurelius-reindex.sh` | Stop | Re-indexes project on session end |
 | `post-commit` | git commit | Captures commit as Decision node, linked to project via `belongs_to` |

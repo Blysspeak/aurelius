@@ -78,6 +78,12 @@ pub fn add_node_full(
             node.updated_by,
         ],
     )?;
+    // The one place every record insert passes through, from both binaries:
+    // `add_node`, `upsert_node_by_key` and `record_session` all land here, and
+    // the MCP handlers call the same functions the CLI does. Marking here is
+    // what keeps the marker honest for memory written over MCP, which no hook
+    // and no CLI wrapper can observe.
+    crate::db::mark_write(conn);
     Ok(node)
 }
 
@@ -244,6 +250,27 @@ pub fn update_node(
     Ok(affected > 0)
 }
 
+/// Rename a node — the one column [`update_node`] cannot reach.
+///
+/// A task title is not stored in `data`: it lives in the `label` column as
+/// `[{project}] {title}`, and until `au task update --title` there was no
+/// writer for it at all. Widening [`update_node`] with a `label` parameter
+/// would have touched all sixteen of its call sites for the benefit of one,
+/// so the column gets its own writer instead — same `updated_at`/`updated_by`
+/// stamping, because `sync::merge::apply_push` picks a winner by comparing
+/// `updated_at` and a rename that left it alone would lose to the server's
+/// older copy.
+pub fn update_node_label(conn: &Connection, id: Uuid, label: &str) -> Result<bool> {
+    let now_str = Utc::now().to_rfc3339();
+    let author = identity::current().map(|i| i.as_author());
+    let affected = conn.execute(
+        "UPDATE nodes SET label = ?1, updated_at = ?2, updated_by = ?3
+         WHERE id = ?4 AND deleted_at IS NULL",
+        params![label, now_str, author, id.to_string()],
+    )?;
+    Ok(affected > 0)
+}
+
 /// Soft-delete: sets `deleted_at` (rather than issuing a `DELETE`) so the
 /// tombstone can propagate through sync, and cascades the same timestamp
 /// onto the node's edges instead of deleting them. Also bumps `updated_at`
@@ -361,6 +388,26 @@ pub fn find_node_by_label(conn: &Connection, label: &str) -> Result<Option<Node>
          FROM nodes WHERE label = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query_map(params![label], row_to_node)?;
+    Ok(rows.next().transpose()?)
+}
+
+/// Рабочий каталог проекта — из первого его узла, у которого путь вообще
+/// записан. Отдельный запрос, а не `find_project_by_label(...).data.path`:
+/// узлов проекта с одной меткой в живой базе несколько (индексатор заводит
+/// свой, автосоздание при заведении задачи — свой), и путь есть не у всех.
+/// Взяв первый попавшийся, мы получали бы каталог то есть, то нет — в
+/// зависимости от порядка строк, а от него зависит, соберутся ли файлы в
+/// способ решения.
+pub fn find_project_path(conn: &Connection, label: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(data,'$.path') AS path
+           FROM nodes
+          WHERE label = ?1 AND (node_type = 'project' OR node_type = '\"project\"')
+            AND deleted_at IS NULL AND path IS NOT NULL AND path != ''
+          ORDER BY created_at
+          LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(params![label], |row| row.get::<_, String>(0))?;
     Ok(rows.next().transpose()?)
 }
 

@@ -1,4 +1,3 @@
-mod capture;
 mod commands;
 mod view;
 
@@ -44,7 +43,36 @@ pub enum TaskAction {
         #[arg(long)]
         priority: Option<String>,
     },
-    /// Show full task details with work log branch
+    /// Edit an existing task: priority, title, description, and added
+    /// acceptance criteria. Flags are independent — any combination in one
+    /// call; a call with no mutating flag is an error, not a silent no-op.
+    /// Criteria are appended, never replaced, and an appended one is stored
+    /// exactly like one given to `au task new`
+    Update {
+        /// Task UUID or label
+        id: String,
+        /// New priority: critical, high, medium, low
+        #[arg(long)]
+        priority: Option<String>,
+        /// New title — the `[project]` prefix of the label is re-derived, so
+        /// project attribution is preserved
+        #[arg(long)]
+        title: Option<String>,
+        /// New description, replacing the current one
+        #[arg(short, long)]
+        description: Option<String>,
+        /// Acceptance criterion to append (can be specified multiple times)
+        #[arg(short = 'c', long = "criteria")]
+        criteria: Vec<String>,
+        /// Print one line of JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show full task details with work log branch: prints the three
+    /// timestamps (created/started/closed), the resolution and the evidence
+    /// (spec 007, FR-002). The contract `contracts/cli.md` calls it
+    /// `au task view` — an alias, not a rename (principle VI)
+    #[command(alias = "view")]
     Show {
         /// Task UUID or label
         id: String,
@@ -56,10 +84,25 @@ pub enum TaskAction {
         /// Description of work done
         text: String,
     },
-    /// Mark task as done
+    /// Mark task as done. The resolution is assembled from the traces of the
+    /// work — the commit from the repository state, the files from linked
+    /// edits; the flags here only refine it (spec 007, FR-004…006). With no
+    /// details and without `--unconfirmed` the close still goes through, but
+    /// is marked as closed without confirmation (FR-005)
     Done {
         /// Task UUID or label
         id: String,
+        /// Commit that resolved the task. When absent, the system tries to
+        /// determine it on its own (`git rev-parse --short HEAD`)
+        #[arg(long)]
+        commit: Option<String>,
+        /// Link to the pull request
+        #[arg(long = "pr")]
+        pull_request: Option<String>,
+        /// Explicitly mark "closed without confirmation", even if part of the
+        /// resolution was determined on its own
+        #[arg(long)]
+        unconfirmed: bool,
     },
     /// Block a task with a reason
     Block {
@@ -68,10 +111,52 @@ pub enum TaskAction {
         /// Reason for blocking
         reason: String,
     },
-    /// Activate a task (set status to active)
+    /// Activate a task (set status to active). Evicts the project's
+    /// previously active task back into `backlog` — a project holds no more
+    /// than one active task (spec 007, FR-031)
     Activate {
         /// Task UUID or label
         id: String,
+    },
+    /// Attach evidence of a run to a task. Called by the ulika hook
+    /// (`record-verify.mjs`), not by a person. The hook knows which project
+    /// the run happened in, but not the id of the active task — so instead
+    /// of `id` you may name `--project`: the evidence goes to the active
+    /// task of that project (spec 007, FR-007…010; FR-008, attaching without
+    /// a separate human action; FR-009, never crosses a project boundary —
+    /// resolution is strictly by `data.project`)
+    Evidence {
+        /// Task UUID or label. May be omitted when `--project` is given
+        id: Option<String>,
+        /// Project whose active task receives the evidence — an alternative
+        /// to `id`
+        #[arg(long)]
+        project: Option<String>,
+        /// The command that was run
+        #[arg(long)]
+        command: String,
+        /// Exit code of the run
+        #[arg(long)]
+        exit: i64,
+        /// Path to the artifact of the run, if there is one
+        #[arg(long)]
+        artifact: Option<String>,
+        /// Print a single JSON line instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show tasks ripe for closing, each with its grounds: which piece of
+    /// evidence, when, and what was changed (spec 007, FR-011…013)
+    Ripe {
+        /// Filter by project
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+        /// Decline the offer to close this task — do not present it again
+        /// until a new edit appears on it (FR-015)
+        #[arg(long)]
+        decline: Option<String>,
     },
     /// Show task analytics (completion rate, avg duration, blocked, etc.)
     Stats {
@@ -82,32 +167,59 @@ pub enum TaskAction {
         #[arg(long)]
         since_days: Option<u64>,
     },
-    /// Наряд: взять один машинный наряд из пула (спека 006, фаза 2). Только
-    /// смена вызывает это, не исполнитель — контракт contracts/au-task-cli.md
+    /// Mark one acceptance criterion of a task met, or unmark it. With
+    /// neither flag, lists the task's criteria and the handle each one is
+    /// addressed by.
+    ///
+    /// A criterion is addressed by a stable handle derived from its text, not
+    /// by its position in the list: adding a criterion renumbers every one
+    /// after it, so a position written down in a script or in an earlier
+    /// session points at a different sentence than it did. `#N` is still
+    /// accepted for an explicit one-off position.
+    ///
+    /// Marking a criterion met is a record of progress, not a closing
+    /// condition: readiness stays `spec 007, FR-011` — an edit plus a green
+    /// run newer than that edit — and closing stays a human decision
+    /// (FR-014). Neither `au task ripe` nor `au task done` reads these marks.
+    Criterion {
+        /// Task UUID or label
+        id: String,
+        /// Criterion to mark met: a handle prefix, the exact criterion text, or `#N`
+        #[arg(long, value_name = "CRITERION")]
+        met: Option<String>,
+        /// Criterion to unmark, addressed the same way as `--met`
+        #[arg(long, value_name = "CRITERION")]
+        unmet: Option<String>,
+    },
+    /// Work order: take one machine work order out of the pool. Only the
+    /// shift calls this, not the executor — contract
+    /// contracts/au-task-cli.md (spec 006, phase 2)
     Claim {
-        /// Кто берёт: `smena@<host>/<pid>`
+        /// Who is taking it: `smena@<host>/<pid>`
         #[arg(long)]
         owner: String,
-        /// Номер прогона, выдавшего наряд
+        /// Number of the run that issued the work order
         #[arg(long)]
         run: String,
-        /// Срок аренды в минутах (вдвое больше стены по времени на наряд)
+        /// Lease duration in minutes (twice the wall-clock budget of one
+        /// work order)
         #[arg(long = "lease-minutes")]
         lease_minutes: i64,
-        /// Фильтр по проекту (не входит в контракт волны 1 — задел на fitness)
+        /// Filter by project (not part of the wave 1 contract — groundwork
+        /// for fitness)
         #[arg(long)]
         project: Option<String>,
-        /// JSON вместо человекочитаемого текста
+        /// JSON instead of human-readable text
         #[arg(long)]
         json: bool,
     },
-    /// Наряд: продлить аренду взятого наряда. Вызывает смена, пока дочерний
-    /// процесс жив, — не исполнитель (FR-009)
+    /// Work order: extend the lease on a taken work order. Called by the
+    /// shift while the child process is alive — not by the executor (FR-009)
     Renew {
-        /// Идентификатор наряда, выданный `claim`
+        /// Identifier of the work order issued by `claim`
         #[arg(long)]
         id: String,
-        /// Тот же владелец, что взял наряд
+        /// The same owner that took the work order
         #[arg(long)]
         owner: String,
         #[arg(long = "lease-minutes")]
@@ -115,8 +227,8 @@ pub enum TaskAction {
         #[arg(long)]
         json: bool,
     },
-    /// Наряд: заявить исход работы. Решение принимает смена — эта команда
-    /// только записывает заявку (FR-012)
+    /// Work order: report the outcome of the work. The shift makes the
+    /// decision — this command only records the report (FR-012)
     Release {
         #[arg(long)]
         id: String,
@@ -125,47 +237,89 @@ pub enum TaskAction {
         /// done | failed
         #[arg(long)]
         verdict: String,
-        /// Команда или проверка, которой подтверждён исход
+        /// Command or check that confirmed the outcome
         #[arg(long)]
         evidence: String,
         #[arg(long)]
         json: bool,
     },
-    /// Наряд: сдать наряд — исполнитель распознал упор в человека. Блокирует
-    /// задачу и НЕ возвращает её в очередь (FR-014)
+    /// Work order: hand the work order back — the executor recognised that
+    /// it is stuck on a human. Blocks the task and does NOT return it to the
+    /// queue (FR-014)
     GiveUp {
         #[arg(long)]
         id: String,
         #[arg(long)]
         owner: String,
-        /// Причина, по которой задача не может быть закрыта машиной
+        /// Reason why the task cannot be closed by a machine
         #[arg(long)]
         why: String,
         #[arg(long)]
         json: bool,
     },
-    /// Наряд: поставить вердикт исполнимости, либо сухо прогнать разметку по
-    /// всей очереди. Пишет только `data.fitness` — контракт
-    /// `au-task-cli.md`, раздел `au task fitness` (FR-003, спека 006, фаза 3)
+    /// Work order: set a verdict on executability, or dry-run the labelling
+    /// across the whole queue. Writes only `data.fitness` — contract
+    /// `au-task-cli.md`, section `au task fitness` (FR-003, spec 006,
+    /// phase 3)
     Fitness {
-        /// Идентификатор задачи — вместе с --verdict и --why ставит вердикт
-        /// вручную. Обязателен без --dry-run
+        /// Task identifier — together with --verdict and --why it sets the
+        /// verdict by hand. Required unless --dry-run is given
         #[arg(long)]
         id: Option<String>,
-        /// machine | human | split — обязателен вместе с --id
+        /// machine | human | split — required together with --id
         #[arg(long)]
         verdict: Option<String>,
-        /// Обоснование — обязательно и непусто вместе с --id (FR-003a)
+        /// Rationale — required and non-empty together with --id (FR-003a)
         #[arg(long)]
         why: Option<String>,
-        /// Сухой прогон по всем открытым задачам — ничего не пишет (SC-001)
+        /// Dry run across all open tasks — writes nothing (SC-001)
         #[arg(long = "dry-run")]
         dry_run: bool,
-        /// Фильтр по проекту — действует только вместе с --dry-run
+        /// Filter by project — takes effect only together with --dry-run
         #[arg(long)]
         project: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// Координаты секретов (спека 007, US4). Хранится место, где лежит секрет —
+/// не сам секрет: FR-025 запрещает хранить значение в любом виде, включая
+/// зашифрованный.
+#[derive(Subcommand)]
+pub enum SecretAction {
+    /// Записать координату секрета. Строка `--where` проверяется на признаки
+    /// «похоже на само значение» (FR-026) — совпадение отклоняет запись с
+    /// кодом 1 и объяснением, какой признак сработал.
+    Add {
+        /// Имя секрета, например STRIPE_SECRET_KEY
+        #[arg(long)]
+        name: String,
+        /// Место хранения: переменная окружения, путь к файлу или запись в
+        /// менеджере паролей — НЕ само значение
+        #[arg(long = "where")]
+        location: String,
+        /// Назначение секрета человеческим языком
+        #[arg(long)]
+        purpose: Option<String>,
+        /// Проект, которому принадлежит секрет
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Показать записанные координаты — без значений, их здесь и не было
+    List {
+        /// Filter by project
+        #[arg(short, long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Удалить координату по имени
+    Rm {
+        /// Имя секрета
+        name: String,
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -301,6 +455,33 @@ pub enum ShareAction {
     Connect(Vec<OsString>),
 }
 
+/// Bulk graph operations for external vendor documentation (spec 008).
+#[derive(Subcommand)]
+pub enum GraphAction {
+    /// Import a `graph.json` file (nodes + edges) in one transaction — either
+    /// everything lands, or nothing does (FR-001..FR-006). Re-running the
+    /// same file is a no-op; a changed body updates only that node (FR-002).
+    Import {
+        /// Path to the graph.json file (see specs/008-doc-graph/spec.md,
+        /// "Key Entities", for the shape)
+        file: String,
+        /// Print the report as one JSON line instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a (sub)graph in mermaid syntax (FR-015). `--format json` prints
+    /// the same full dump as the bare `au export` command.
+    Export {
+        /// json | mermaid
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Mermaid only: restrict to one import's nodes (`data.source_id`)
+        /// and the edges between them, instead of the whole graph
+        #[arg(long = "source-id")]
+        source_id: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize Aurelius in current environment
@@ -329,7 +510,17 @@ enum Commands {
     },
     /// Search the knowledge graph
     Search { query: String },
-    /// Sync from all connectors (git, beads, timeforged, beacon)
+    /// Read one record back by exact key — a node UUID, or the exact
+    /// `--subject` a fact was written with. Nothing here is fuzzy: `search`
+    /// and `context` go through the full-text index, which does not cover the
+    /// `id` column at all, and would answer a mistyped key with a neighbour
+    /// instead of a miss.
+    Recall(commands::RecallArgs),
+    /// Изъята (спека 007, US5, T047, `contracts/cli.md` §«Изымается»):
+    /// TimeForged-коннектор не имел ни одного вызова ни в хуках, ни в
+    /// журналах 19 репозиториев (разведка 30.08.2026). Подкоманда остаётся
+    /// разбираемой — старый вызов получает внятное сообщение и код 1, а не
+    /// ошибку разбора аргументов clap.
     Sync,
     /// Re-index current project (auto-detects project root)
     Reindex {
@@ -357,6 +548,11 @@ enum Commands {
     Task {
         #[command(subcommand)]
         action: TaskAction,
+    },
+    /// Координаты секретов проекта — место хранения, не значение (спека 007, US4)
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
     },
     /// Merge two duplicate nodes — rewires edges from source to target, deletes source
     Merge {
@@ -389,15 +585,14 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
-    /// Offer to save a measured fact right after a command returned data
-    /// (PostToolUse hook). Never writes anything itself — the command lands in
-    /// `evidence` and the decision stays with the caller.
+    /// Изъята (спека 007, US5, T046, `contracts/cli.md` §«Изымается»): хук,
+    /// который её звал, не подключён ни в одном проекте (разведка
+    /// 30.08.2026). Флаги ниже приняты только ради совместимости разбора —
+    /// подкоманда остаётся разбираемой, старый вызов получает внятное
+    /// сообщение об изъятии и код 1, а не ошибку разбора аргументов clap.
     Capture {
-        /// PostToolUse hook mode: read hook JSON from stdin, emit
-        /// additionalContext, never fail
         #[arg(long)]
         hook: bool,
-        /// Check one command by hand instead of reading a hook event
         #[arg(short, long, conflicts_with = "hook")]
         command: Option<String>,
     },
@@ -452,6 +647,34 @@ enum Commands {
     },
     /// Start MCP server (used by Claude Code)
     Mcp,
+    /// Bulk import and mermaid export of an external documentation graph
+    /// (spec 008) — hundreds of nodes/edges in one call instead of one
+    /// `au note`/`au relate` per page.
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
+    },
+    /// Directed step ladder over `next_step`/`prerequisite` edges (spec 008,
+    /// FR-008..FR-010): shortest path between two nodes, or every ancestor of
+    /// one node in topological order. Exactly one of the two forms — pass
+    /// both `from` and `to`, or `--before`, never neither nor both.
+    Path {
+        /// Start node: UUID, exact `subject`, or exact `label`. Required
+        /// unless `--before` is given
+        from: Option<String>,
+        /// End node — same forms as `from`. Required unless `--before` is given
+        to: Option<String>,
+        /// List every node that transitively leads to X, in "earliest first"
+        /// order, instead of a path between two named nodes
+        #[arg(long, conflicts_with_all = ["from", "to"])]
+        before: Option<String>,
+        /// Walk depth cap — guards against a runaway search on a malformed graph
+        #[arg(long, default_value = "50")]
+        max_depth: usize,
+        /// Print machine-readable JSON instead of the human-readable ladder
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Договор о кодах возврата. Вызывающий обязан различать «я позвал
@@ -539,12 +762,20 @@ async fn run(cli: Cli) -> Result<()> {
             verbose,
         } => commands::context(&topic, depth, verbose).await,
         Commands::Search { query } => commands::search(&query).await,
-        Commands::Sync => commands::sync().await,
+        Commands::Recall(args) => commands::recall(args).await,
+        Commands::Sync => {
+            commands::removed(
+                "sync",
+                "TimeForged-коннектор не имел ни одного вызова ни в хуках, ни в журналах 19 репозиториев",
+            )
+            .await
+        }
         Commands::Reindex { path } => commands::reindex(path).await,
         Commands::View { port, no_open } => view::serve(port, no_open).await,
         Commands::Touch { path } => commands::touch(&path).await,
         Commands::Export => commands::export().await,
         Commands::Task { action } => commands::task(action).await,
+        Commands::Secret { action } => commands::secret(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,
         Commands::Trace {
@@ -554,7 +785,15 @@ async fn run(cli: Cli) -> Result<()> {
             exit_code,
             hook,
         } => commands::trace_cmd(kind, payload, session, exit_code, hook).await,
-        Commands::Capture { hook, command } => commands::capture_cmd(hook, command).await,
+        Commands::Capture { hook, command } => {
+            // Флаги старого вызова принимаются разбором (иначе это была бы
+            // ошибка разбора аргументов, которую запрещает T048), но здесь
+            // только называются в сообщении — команда ничего не делает.
+            let reason = format!(
+                "хук, который её звал, не подключён ни в одном проекте (--hook={hook}, --command={command:?})"
+            );
+            commands::removed("capture", &reason).await
+        }
         Commands::Judge { min_age, hook } => commands::judge_cmd(min_age, hook).await,
         Commands::Snapshot {
             project,
@@ -567,5 +806,13 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Db { action } => commands::db(action).await,
         Commands::Doc { action } => commands::doc(action).await,
         Commands::Mcp => commands::mcp().await,
+        Commands::Graph { action } => commands::graph(action).await,
+        Commands::Path {
+            from,
+            to,
+            before,
+            max_depth,
+            json,
+        } => commands::path(from, to, before, max_depth, json).await,
     }
 }
