@@ -14,6 +14,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, info};
 
 pub async fn serve() -> Result<()> {
+    // Recorded before the request loop starts: `memory_status` compares this
+    // against the running binary's own mtime to detect a stale image (see
+    // `handlers::restart_needed`).
+    handlers::mark_server_started();
+
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
     let reader = BufReader::new(stdin);
