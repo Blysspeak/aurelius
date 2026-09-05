@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Режим `--hook` у `au touch`, `au reindex` и `au db backup`.** Три хука Claude Code были bash-обёртками из `contrib/claude-code`, которым нужны bash и python3; на Windows без Git Bash они не работали. Теперь au сам читает JSON события из stdin: touch `--hook` отмечает правку файла из tool_input.file_path, reindex `--hook` переиндексирует корень проекта из cwd события и публикует sync-проекты, db backup `--hook` снимает бэкап базы не чаще раза в сутки и хранит семь снимков, проверяя каждый. В режиме хука код возврата всегда 0; причина отказа — в stderr при `AURELIUS_HOOK_DEBUG`=1. Обёртки остаются до следующего мажора
+
 ## [v3.3.1] — 2026-09-05
 
 ### Fixed

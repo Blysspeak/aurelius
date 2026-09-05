@@ -9,7 +9,7 @@ use serde_json::json;
 use std::path::PathBuf;
 
 use crate::{
-    DbAction, DocAction, GraphAction, HomeAction, IdentityAction, SecretAction, ShareAction,
+    hooks, DbAction, DocAction, GraphAction, HomeAction, IdentityAction, SecretAction, ShareAction,
     TaskAction,
 };
 
@@ -960,6 +960,17 @@ pub async fn removed(name: &str, reason: &str) -> Result<()> {
     anyhow::bail!("`au {name}` изъята: {reason}. См. specs/007-task-evidence-loop/contracts/cli.md")
 }
 
+/// Dispatch for `au reindex [--path] [--hook]`: `--hook` and `--path` are
+/// clap-`conflicts_with`, so at most one of them is ever set here. The
+/// non-hook path is untouched — same call as before this flag existed.
+pub async fn reindex_cmd(path: Option<String>, hook: bool) -> Result<()> {
+    if hook {
+        hooks::reindex_hook().await;
+        return Ok(());
+    }
+    reindex(path).await
+}
+
 pub async fn reindex(path: Option<String>) -> Result<()> {
     let project_root = match path {
         Some(p) => PathBuf::from(p),
@@ -995,6 +1006,19 @@ fn detect_project_root() -> Result<PathBuf> {
     }
     // Fallback to cwd
     Ok(std::env::current_dir()?)
+}
+
+/// Dispatch for `au touch <PATH> | --hook`: clap's `conflicts_with` /
+/// `required_unless_present` on the `Touch` variant guarantee `path` is
+/// `Some` whenever `hook` is `false`; the `unwrap_or_default()` below is
+/// therefore dead code on that branch, not a real fallback, and exists only
+/// so this never panics if that guarantee is ever loosened.
+pub async fn touch_cmd(path: Option<String>, hook: bool) -> Result<()> {
+    if hook {
+        hooks::touch_hook().await;
+        return Ok(());
+    }
+    touch(&path.unwrap_or_default()).await
 }
 
 pub async fn touch(file_path: &str) -> Result<()> {
@@ -2789,7 +2813,19 @@ pub async fn db(action: DbAction) -> Result<()> {
         DbAction::Check { path, full } => {
             db_check_cli(&path.map_or_else(db_path, PathBuf::from), full)
         }
-        DbAction::Backup { out } => db_backup_cli(&db_path(), out),
+        DbAction::Backup {
+            out,
+            hook,
+            keep,
+            min_hours,
+        } => {
+            if hook {
+                hooks::db_backup_hook(keep, min_hours);
+                Ok(())
+            } else {
+                db_backup_cli(&db_path(), out)
+            }
+        }
     }
 }
 
@@ -3054,7 +3090,7 @@ pub async fn identity(action: IdentityAction) -> Result<()> {
 // `aurelius_core::sync::client`, shared with `aurelius`'s MCP handlers
 // (memory_status/memory_session automatic sync) — not duplicated here.
 use aurelius_core::sync::client as sync_client;
-use aurelius_core::sync::SyncPullResponse;
+use aurelius_core::sync::{SyncPullResponse, SyncPushResponse};
 
 pub async fn share(action: ShareAction) -> Result<()> {
     match action {
@@ -3311,32 +3347,43 @@ async fn share_connect(server: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
-async fn share_push(project: Option<String>) -> Result<()> {
+/// The pure half of `share_push`: pushes every sync-enabled project's
+/// outstanding changes and prints nothing, so `au reindex --hook` can call it
+/// without leaking output into a Claude Code session (contract:
+/// `au-cli-hooks.md`, common rule 3). Returns one entry per resolved target,
+/// in target order, label first — the vector's length is the "no
+/// sync-enabled projects" signal the caller used to get from a separate
+/// count, and each entry's `Result` is that target's own outcome instead of
+/// a side channel of failures.
+pub(crate) async fn push_targets(
+    project: Option<String>,
+) -> Result<Vec<(String, Result<SyncPushResponse>)>> {
     let conn = db::open(&db_path())?;
     let targets = sync_client::resolve_sync_targets(&conn, project.as_deref())?;
-    if targets.is_empty() {
+    let client = reqwest::Client::new();
+    let mut results = Vec::new();
+    for cfg in &targets {
+        let result = sync_client::push_project(&client, &conn, cfg).await;
+        results.push((cfg.project_label.clone(), result));
+    }
+    Ok(results)
+}
+
+async fn share_push(project: Option<String>) -> Result<()> {
+    let results = push_targets(project).await?;
+    if results.is_empty() {
         println!("No sync-enabled projects.");
         return Ok(());
     }
-    let client = reqwest::Client::new();
-    for cfg in &targets {
-        if let Err(e) = push_one(&client, &conn, cfg).await {
-            eprintln!("⚠ push to '{}' failed: {e}", cfg.project_label);
+    for (label, result) in &results {
+        match result {
+            Ok(push) => println!(
+                "✓ Pushed '{label}': {} accepted, {} conflicts, server_seq={}",
+                push.accepted, push.conflicts, push.server_seq
+            ),
+            Err(e) => eprintln!("⚠ push to '{label}' failed: {e}"),
         }
     }
-    Ok(())
-}
-
-async fn push_one(
-    client: &reqwest::Client,
-    conn: &rusqlite::Connection,
-    cfg: &sync_client::SyncConfig,
-) -> Result<()> {
-    let push = sync_client::push_project(client, conn, cfg).await?;
-    println!(
-        "✓ Pushed '{}': {} accepted, {} conflicts, server_seq={}",
-        cfg.project_label, push.accepted, push.conflicts, push.server_seq
-    );
     Ok(())
 }
 
