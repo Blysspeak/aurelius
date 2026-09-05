@@ -450,40 +450,20 @@ fn task_log_with_conn(
         .and_then(|p| p.as_str())
         .unwrap_or("unknown");
 
-    // Auto-activate backlog tasks
-    let mut task_data = task.data.clone();
-    let status = task_data
+    // Recording a log line is an observation, not a decision to take the
+    // task into work — status is read here only to report it back, never
+    // written. Activation is explicit, via `task_update status=active`.
+    let status = task
+        .data
         .get("status")
         .and_then(|s| s.as_str())
-        .unwrap_or("backlog");
-    if status == "backlog" {
-        task_data["status"] = json!("active");
-        task_data["started_at"] = json!(chrono::Utc::now().to_rfc3339());
-        graph::update_node(conn, task.id, None, Some(task_data))?;
-    }
+        .unwrap_or("backlog")
+        .to_owned();
 
     // Create WorkLog node
-    let log_label = format!("[{}] {}", project, truncate(text, 60));
     let mut log_data = json!({"task_id": task.id.to_string()});
     prov.write_into(&mut log_data);
-    let log_node = graph::add_node_full(
-        conn,
-        NodeType::WorkLog,
-        &log_label,
-        Some(text),
-        "mcp-task",
-        log_data,
-        MemoryKind::Episodic,
-        None,
-    )?;
-
-    // Link: task --contains--> worklog
-    graph::add_edge(conn, task.id, log_node.id, Relation::Contains, 1.0)?;
-
-    // Link worklog to project
-    if let Ok(Some(proj_node)) = graph::find_project_by_label(conn, project) {
-        graph::add_edge(conn, log_node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
-    }
+    let log_node = aurelius_core::tasks::log_work(conn, &task, text, "mcp-task", log_data)?;
 
     let mut created_nodes = vec![node_compact(&log_node)];
 
@@ -556,16 +536,25 @@ fn task_log_with_conn(
         }
     }
 
-    Ok(json!({
+    let mut response = json!({
         "task_id": task.id.to_string(),
         "task_label": task.label,
         "created_nodes": created_nodes,
         "total_created": created_nodes.len(),
+        "task_status": status,
         "provenance": {
             "confidence": prov.confidence_or_default().as_str(),
             "subject": prov.subject,
         },
-    }))
+    });
+    if status == "backlog" {
+        response["hint"] = json!(
+            "This task was not activated: logging never changes status. \
+             Use task_update status=active or `au task activate` to take it into work."
+        );
+    }
+
+    Ok(response)
 }
 
 pub fn task_stats(params: &serde_json::Value) -> Result<serde_json::Value> {
@@ -1700,5 +1689,127 @@ mod tests {
 
         assert_eq!(result["total"], json!(0));
         assert!(result["ripe"].as_array().expect("ripe array").is_empty());
+    }
+
+    // -- task 311cae6a: task_log no longer auto-activates --
+
+    /// Before the fix, `task_log` on a backlog task wrote `status=active`
+    /// and the legacy `started_at` straight into the node, bypassing the
+    /// real activation rule (`activate_task`/`task_update status=active`):
+    /// no `activated_at`, no eviction of the project's real active task —
+    /// so a project could end up with two active tasks at once. Recording
+    /// a log line is an observation; taking a task into work is a separate,
+    /// explicit decision.
+    #[test]
+    fn task_log_on_backlog_task_leaves_it_backlog_and_does_not_touch_the_active_task() {
+        let (_tmp, conn) = setup();
+        let active_id = seed_active_task(
+            &conn,
+            "proj-no-auto-activate",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "project": "proj-no-auto-activate",
+            }),
+        );
+        let backlog_id = seed_task(
+            &conn,
+            "proj-no-auto-activate",
+            "[proj-no-auto-activate] задача в очереди",
+        );
+
+        let result = task_log_with_conn(
+            &conn,
+            &json!({"task": backlog_id.to_string(), "text": "просто отметка о наблюдении"}),
+        )
+        .expect("task_log");
+
+        assert_eq!(result["task_status"], "backlog");
+        assert_eq!(
+            result["hint"]
+                .as_str()
+                .expect("hint present on backlog task"),
+            "This task was not activated: logging never changes status. \
+             Use task_update status=active or `au task activate` to take it into work."
+        );
+
+        let backlog_node = graph::get_node(&conn, &backlog_id.to_string())
+            .expect("get_node")
+            .expect("backlog task still exists");
+        assert_eq!(
+            backlog_node.data.get("status").and_then(|s| s.as_str()),
+            Some("backlog"),
+            "task_log must not activate the task"
+        );
+        assert!(
+            backlog_node.data.get("activated_at").is_none(),
+            "task_log must not stamp activated_at"
+        );
+
+        let active_node = graph::get_node(&conn, &active_id.to_string())
+            .expect("get_node")
+            .expect("active task still exists");
+        assert_eq!(
+            active_node.data.get("status").and_then(|s| s.as_str()),
+            Some("active"),
+            "the project's real active task must not be evicted by a log entry on another task"
+        );
+    }
+
+    /// The mirror case: logging on an already-active task reports its
+    /// status without a hint — there is nothing to activate.
+    #[test]
+    fn task_log_on_active_task_reports_status_without_hint() {
+        let (_tmp, conn) = setup();
+        let active_id = seed_active_task(
+            &conn,
+            "proj-active-log",
+            json!({
+                "status": "active",
+                "priority": "medium",
+                "project": "proj-active-log",
+            }),
+        );
+
+        let result = task_log_with_conn(
+            &conn,
+            &json!({"task": active_id.to_string(), "text": "прогресс по задаче"}),
+        )
+        .expect("task_log");
+
+        assert_eq!(result["task_status"], "active");
+        assert!(
+            result.get("hint").is_none(),
+            "an already-active task has nothing to activate, got: {:?}",
+            result.get("hint")
+        );
+    }
+
+    /// `log_work` (aurelius-core) wires the `contains` edge from the task to
+    /// the new work-log node — the one place both CLI and MCP get this edge
+    /// from now, instead of two separate copies of the same four lines.
+    #[test]
+    fn task_log_creates_work_log_node_with_contains_edge_from_task() {
+        let (_tmp, conn) = setup();
+        let task_id = seed_task(&conn, "proj-edges", "[proj-edges] задача под ребро");
+
+        let result = task_log_with_conn(
+            &conn,
+            &json!({"task": task_id.to_string(), "text": "запись для проверки ребра"}),
+        )
+        .expect("task_log");
+
+        let created = result["created_nodes"].as_array().expect("created_nodes");
+        let log_id: uuid::Uuid = created[0]["id"]
+            .as_str()
+            .expect("worklog id")
+            .parse()
+            .expect("uuid");
+
+        let edge = graph::find_edge(&conn, task_id, log_id, &Relation::Contains)
+            .expect("find_edge")
+            .expect("task --contains--> worklog edge must exist");
+        assert_eq!(edge.from_id, task_id);
+        assert_eq!(edge.to_id, log_id);
     }
 }
