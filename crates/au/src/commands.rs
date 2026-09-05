@@ -216,8 +216,9 @@ pub async fn note(args: NoteArgs) -> Result<()> {
 
     // Противоречие ловится до записи — как и в memory_add: два утверждения об
     // одном предмете не могут быть истинны одновременно.
+    // `exclude: None` — `au note` always creates a new node.
     let conflicts =
-        provenance::guard_subject(&conn, prov.subject.as_deref(), resolution.is_some())?;
+        provenance::guard_subject(&conn, prov.subject.as_deref(), resolution.is_some(), None)?;
 
     let (node, created) = match args.key.as_deref() {
         Some(key) => graph::upsert_node_by_key(
