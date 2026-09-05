@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [v3.1.0] — 2026-09-05
 
 ### Added
 - **Perplexity Search как второй провайдер `search_web`.** Параметр `provider` (`brave` по умолчанию, `perplexity`) выбирает, куда идёт запрос; ответ говорит, кто его дал. Кэш стал различать провайдеров: раньше он искал только по строке запроса, и запрос к Perplexity получил бы ответ Brave. Ключ читается из `PERPLEXITY_API_KEY` или `~/.config/aurelius/perplexity.key`, той же схемой, что у Brave; резолвер ключа один на обоих
