@@ -175,7 +175,8 @@ mkdir -p "$INSTALL_DIR"
 # process that already opened the old file keeps running against the old
 # inode until it exits — no crash, no interrupted write.
 install_binary() {
-    local src="$1" name="$2" dest="$INSTALL_DIR/$name"
+    local src="$1" name="$2"
+    local dest="$INSTALL_DIR/$name"
     if [ -f "$dest" ]; then
         local ts
         ts="$(date -u +%Y%m%dT%H%M%SZ)"
