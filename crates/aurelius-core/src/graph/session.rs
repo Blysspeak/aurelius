@@ -15,6 +15,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::models::{MemoryKind, Node, NodeType, Relation};
+use crate::provenance::Provenance;
 
 /// Ключ в `data`, под которым лежит идентификатор ПРОГОНА — той сессии агента,
 /// что сделала запись.
@@ -104,6 +105,11 @@ pub struct SessionInput<'a> {
     /// она породила: без метки хук конца сессии не отличит свои записи от
     /// вчерашних. См. [`AGENT_SESSION_KEY`].
     pub agent_session: Option<&'a str>,
+    /// Provenance of the record: the same parse as `memory_add` (see
+    /// `Provenance::parse`). Lands on the session node whole; the decision and
+    /// problem/solution nodes the session spawns alongside it only get
+    /// [`Provenance::inherited`] from it — without `subject` or `claim`.
+    pub provenance: Provenance,
 }
 
 impl<'a> SessionInput<'a> {
@@ -119,6 +125,7 @@ impl<'a> SessionInput<'a> {
             key_files: &[],
             source,
             agent_session: None,
+            provenance: Provenance::default(),
         }
     }
 }
@@ -185,6 +192,8 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
     if !input.key_files.is_empty() {
         data.insert("key_files".to_owned(), input.key_files.into());
     }
+    let mut session_data = serde_json::Value::Object(data);
+    input.provenance.write_into(&mut session_data);
 
     let label = format!("[{project}] {}", Utc::now().format("%Y-%m-%d %H:%M"));
     let session = super::add_node_full(
@@ -193,7 +202,7 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
         &label,
         Some(summary),
         input.source,
-        with_agent_session(serde_json::Value::Object(data), input.agent_session),
+        with_agent_session(session_data, input.agent_session),
         MemoryKind::Episodic,
         Some(&hash),
     )?;
@@ -211,22 +220,27 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
     };
     super::add_edge(conn, session.id, proj_node.id, Relation::BelongsTo, 1.0)?;
 
+    // Task 2c8d25ce: nodes the session spawns alongside it inherit what backs
+    // the record (confidence/evidence/measured_at/...), but not
+    // subject/claim — both belong to exactly one fact, see
+    // `Provenance::inherited`.
+    let inherited = input.provenance.inherited();
+
     let mut decisions = 0;
     for text in input.decisions {
         let text = text.trim();
         if text.is_empty() {
             continue;
         }
+        let mut node_data = serde_json::json!({ "session_id": session.id.to_string() });
+        inherited.write_into(&mut node_data);
         let node = super::add_node(
             conn,
             NodeType::Decision,
             &format!("[{project}] {}", truncate(text, 60)),
             Some(text),
             input.source,
-            with_agent_session(
-                serde_json::json!({ "session_id": session.id.to_string() }),
-                input.agent_session,
-            ),
+            with_agent_session(node_data, input.agent_session),
         )?;
         super::add_edge(conn, session.id, node.id, Relation::Contains, 1.0)?;
         super::add_edge(conn, node.id, proj_node.id, Relation::BelongsTo, 1.0)?;
@@ -239,27 +253,25 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
         if problem.is_empty() || solution.is_empty() {
             continue;
         }
+        let mut prob_data = serde_json::json!({ "session_id": session.id.to_string() });
+        inherited.write_into(&mut prob_data);
         let prob = super::add_node(
             conn,
             NodeType::Problem,
             &format!("[{project}] {}", truncate(problem, 60)),
             Some(problem),
             input.source,
-            with_agent_session(
-                serde_json::json!({ "session_id": session.id.to_string() }),
-                input.agent_session,
-            ),
+            with_agent_session(prob_data, input.agent_session),
         )?;
+        let mut sol_data = serde_json::json!({ "session_id": session.id.to_string() });
+        inherited.write_into(&mut sol_data);
         let sol = super::add_node(
             conn,
             NodeType::Solution,
             &format!("[{project}] {}", truncate(solution, 60)),
             Some(solution),
             input.source,
-            with_agent_session(
-                serde_json::json!({ "session_id": session.id.to_string() }),
-                input.agent_session,
-            ),
+            with_agent_session(sol_data, input.agent_session),
         )?;
         super::add_edge(conn, sol.id, prob.id, Relation::Solves, 1.0)?;
         super::add_edge(conn, session.id, prob.id, Relation::Contains, 1.0)?;
