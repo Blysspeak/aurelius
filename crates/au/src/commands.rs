@@ -1656,45 +1656,34 @@ pub async fn task(action: TaskAction) -> Result<()> {
 
         TaskAction::Log { id, text } => {
             let task = find_task(&conn, &id)?;
-            let project = task
-                .data
-                .get("project")
-                .and_then(|p| p.as_str())
-                .unwrap_or("unknown");
 
-            // Auto-activate
+            // Recording a log line is an observation, not a decision to take
+            // the task into work — status is read here only to print it
+            // back, never written. Activation is explicit, via
+            // `au task activate`.
             let status = task
                 .data
                 .get("status")
                 .and_then(|s| s.as_str())
-                .unwrap_or("backlog");
-            if status == "backlog" {
-                let mut data = task.data.clone();
-                data["status"] = json!("active");
-                data["started_at"] = json!(chrono::Utc::now().to_rfc3339());
-                graph::update_node(&conn, task.id, None, Some(data))?;
-                println!("  ▶ Task auto-activated");
-            }
+                .unwrap_or("backlog")
+                .to_owned();
 
-            let truncated: String = text.chars().take(60).collect();
-            let log_label = format!("[{}] {}", project, truncated);
-            let log_node = graph::add_node_full(
+            aurelius_core::tasks::log_work(
                 &conn,
-                NodeType::WorkLog,
-                &log_label,
-                Some(&text),
+                &task,
+                &text,
                 "cli-task",
                 json!({"task_id": task.id.to_string()}),
-                MemoryKind::Episodic,
-                None,
             )?;
-            graph::add_edge(&conn, task.id, log_node.id, Relation::Contains, 1.0)?;
-
-            if let Ok(Some(proj_node)) = graph::find_project_by_label(&conn, project) {
-                graph::add_edge(&conn, log_node.id, proj_node.id, Relation::BelongsTo, 1.0).ok();
-            }
 
             println!("✓ Logged work on: {}", task.label);
+            println!("  status: {status}");
+            if status == "backlog" {
+                println!(
+                    "  hint: this task was not activated: logging never changes status. \
+                     Use `au task activate` or task_update status=active to take it into work."
+                );
+            }
         }
 
         TaskAction::Done {

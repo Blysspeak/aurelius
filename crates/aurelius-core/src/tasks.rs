@@ -628,6 +628,69 @@ UPDATE nodes SET
 WHERE id = ?4 AND deleted_at IS NULL AND node_type = '\"task\"'
 ";
 
+/// First `max` characters of `text`, cut on a character boundary so a
+/// multi-byte character never gets split in half.
+fn truncate_label(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// Builds the work-log node for a task and wires it into the graph — the one
+/// place both `au task log` (CLI) and MCP `task_log` build a work-log node,
+/// so the two stop keeping their own copies of the same label/note/source/
+/// edges construction.
+///
+/// Recording an observation is a different action from taking a task into
+/// work, so this function never touches `task.data["status"]`: the caller
+/// passes `data` with `task_id` (and provenance, if any) already written
+/// into it, and activation goes through `activate_task` (CLI) or
+/// `task_update status=active` (MCP) only — see the task-log-activation
+/// decision in project memory.
+pub fn log_work(
+    conn: &rusqlite::Connection,
+    task: &crate::models::Node,
+    text: &str,
+    source: &str,
+    data: Value,
+) -> anyhow::Result<crate::models::Node> {
+    let project = task
+        .data
+        .get("project")
+        .and_then(|p| p.as_str())
+        .unwrap_or("unknown");
+    let label = format!("[{project}] {}", truncate_label(text, 60));
+
+    let log_node = crate::graph::add_node_full(
+        conn,
+        crate::models::NodeType::WorkLog,
+        &label,
+        Some(text),
+        source,
+        data,
+        crate::models::MemoryKind::Episodic,
+        None,
+    )?;
+
+    crate::graph::add_edge(
+        conn,
+        task.id,
+        log_node.id,
+        crate::models::Relation::Contains,
+        1.0,
+    )?;
+
+    if let Ok(Some(proj_node)) = crate::graph::find_project_by_label(conn, project) {
+        crate::graph::add_edge(
+            conn,
+            log_node.id,
+            proj_node.id,
+            crate::models::Relation::BelongsTo,
+            1.0,
+        )?;
+    }
+
+    Ok(log_node)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1227,5 +1290,85 @@ mod tests {
         assert_eq!(out[0]["evidence"]["exit_code"], 0);
         assert_eq!(out[0]["evidence"]["artifact"], "run.log");
         assert!(out[0]["files"].is_array());
+    }
+
+    // -- task 311cae6a: `log_work` is the one function both `au task log`
+    // (CLI) and MCP `task_log` call — the CLI match arm itself is inline in
+    // `pub async fn task`, bound to the real `db_path()`, so it is not
+    // testable without spawning a process; this exercises the shared helper
+    // directly instead, which is what the CLI arm now delegates to.
+
+    /// `log_work` records an observation, not a decision to take the task
+    /// into work: it must never touch `data.status` or stamp `activated_at`,
+    /// no matter what status the task was in.
+    #[test]
+    fn log_work_does_not_change_task_status() {
+        let (_tmp, conn) = setup();
+        let task_id = seed_task(
+            &conn,
+            "задача в очереди",
+            json!({"status": "backlog", "priority": "medium", "project": "proj-log-work"}),
+        );
+        let task = crate::graph::get_node(&conn, &task_id.to_string())
+            .expect("get_node")
+            .expect("task exists");
+
+        log_work(
+            &conn,
+            &task,
+            "текст записи",
+            "test",
+            json!({"task_id": task_id.to_string()}),
+        )
+        .expect("log_work");
+
+        let after = crate::graph::get_node(&conn, &task_id.to_string())
+            .expect("get_node")
+            .expect("task still exists");
+        assert_eq!(
+            after.data.get("status").and_then(|s| s.as_str()),
+            Some("backlog"),
+            "log_work must not activate the task"
+        );
+        assert!(
+            after.data.get("activated_at").is_none(),
+            "log_work must not stamp activated_at"
+        );
+    }
+
+    /// The work-log node it creates is wired to the task with a `contains`
+    /// edge — both callers relied on this edge existing before the two
+    /// inline copies were replaced by this one function.
+    #[test]
+    fn log_work_wires_contains_edge_from_task() {
+        let (_tmp, conn) = setup();
+        let task_id = seed_task(
+            &conn,
+            "задача под ребро",
+            json!({"status": "active", "priority": "medium", "project": "proj-log-work-edge"}),
+        );
+        let task = crate::graph::get_node(&conn, &task_id.to_string())
+            .expect("get_node")
+            .expect("task exists");
+
+        let log_node = log_work(
+            &conn,
+            &task,
+            "текст записи",
+            "test",
+            json!({"task_id": task_id.to_string()}),
+        )
+        .expect("log_work");
+
+        let edge = crate::graph::find_edge(
+            &conn,
+            task_id,
+            log_node.id,
+            &crate::models::Relation::Contains,
+        )
+        .expect("find_edge")
+        .expect("task --contains--> worklog edge must exist");
+        assert_eq!(edge.from_id, task_id);
+        assert_eq!(edge.to_id, log_node.id);
     }
 }
