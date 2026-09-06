@@ -38,8 +38,11 @@ Every AI session starts from zero. You re-explain your projects, your past decis
 
 ## Quick Start
 
-Aurelius ships as a [Claude Code plugin](plugin/hooks.json): one MCP server plus seven session
-hooks, installed with two `claude plugin` commands instead of hand-edited `settings.json`.
+Aurelius ships as a [Claude Code plugin](plugin/hooks.json): seven session hooks, skill cards and
+the `/pickup` command, installed with two `claude plugin` commands instead of hand-edited
+`settings.json`. The MCP server is registered separately, user-scope, by `install.sh` (`claude mcp
+add -s user aurelius au mcp`) — a plugin-bundled server would rename every tool to
+`mcp__plugin_aurelius_aurelius__*`.
 
 **Clean machine (Linux, macOS)**
 
@@ -48,6 +51,7 @@ git clone https://github.com/Blysspeak/aurelius && cd aurelius
 cargo build --release
 install -m 755 target/release/au target/release/aurelius ~/.local/bin/   # must be in PATH
 au init
+claude mcp add -s user aurelius au mcp   # MCP server, user scope: tools stay mcp__aurelius__*
 claude plugin marketplace add Blysspeak/aurelius      # or a local clone path: claude plugin marketplace add .
 claude plugin install aurelius@blysspeak -s user
 ```
@@ -61,11 +65,14 @@ memory snapshot and skill index at start.
 cd aurelius && git pull && ./install.sh
 ```
 
-`install.sh` builds the binaries, installs the plugin, and removes any legacy hook and
-`mcpServers.aurelius` entries it previously wrote into `~/.claude/settings.json` and
-`~/.claude.json` — printing each removed entry with its reason and leaving a `.bak-<UTC date>`
-copy next to each file it touches. Re-running it is a no-op once migrated. Use
-`./install.sh --migrate-only` to run just the cleanup, without building anything.
+`install.sh` builds the binaries, installs the plugin, registers the MCP server user-scope with
+`claude mcp add -s user aurelius au mcp`, and removes any legacy hook and `mcpServers.aurelius`
+entries it previously wrote into `~/.claude/settings.json` and `~/.claude.json` — printing each
+removed entry with its reason and leaving a `.bak-<UTC date>` copy next to each file it touches.
+Migration keeps a canonical `au mcp` entry in `~/.claude.json` and removes only the old
+wrapper-path entry; re-running the whole script, including the MCP registration, is a no-op once
+migrated. Use `./install.sh --migrate-only` to run just the cleanup, without building anything or
+registering the server.
 
 **Windows**
 
@@ -75,14 +82,17 @@ cargo build --release
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.local\bin" | Out-Null
 Copy-Item target\release\au.exe "$env:USERPROFILE\.local\bin\"    # must be in PATH
 au init
+claude mcp add -s user aurelius au mcp
 claude plugin marketplace add Blysspeak/aurelius
 claude plugin install aurelius@blysspeak -s user
 ```
 
-Git Bash and python3 are not required — every plugin hook runs `au` directly. If hooks and the
-MCP server were previously added by hand, remove them from `$env:USERPROFILE\.claude\settings.json`
-(hooks whose command matches `aurelius-*.sh` or `au … --hook`) and `mcpServers.aurelius` there and
-in `$env:USERPROFILE\.claude.json` — copy both files first.
+Git Bash and python3 are not required — every plugin hook runs `au` directly. If hooks were
+previously added by hand, remove them from `$env:USERPROFILE\.claude\settings.json` (hooks whose
+command matches `aurelius-*.sh` or `au … --hook`) — copy the file first. A `mcpServers.aurelius`
+entry in `$env:USERPROFILE\.claude.json` is now the right place, when its command is `au mcp`;
+only an entry pointing at the old wrapper script is stale — replace it with
+`claude mcp add -s user aurelius au mcp`.
 
 ```
 $ au --version
@@ -93,7 +103,8 @@ au 1.11.1
 
 ## MCP Tools (33)
 
-Aurelius runs as an MCP server over stdio. `install.sh` configures it automatically, or add manually via `/mcp` in Claude Code (`command: au`, `args: ["mcp"]`).
+Aurelius runs as an MCP server over stdio. `install.sh` registers it user-scope with
+`claude mcp add -s user aurelius au mcp`, and the same command adds it by hand.
 
 ### Knowledge Graph
 
