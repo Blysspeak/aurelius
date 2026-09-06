@@ -38,8 +38,8 @@ python3-блок `migrate_legacy()`:
 | Файл | Что снимается | Признак |
 |---|---|---|
 | `~/.claude/settings.json` | элементы `hooks.<event>[].hooks[]` | `command` содержит `aurelius-(reindex\|track-edit\|skills\|backup\|capture)\.sh`, или начинается с `au ` и содержит `--hook` |
-| `~/.claude/settings.json` | `mcpServers.aurelius` | ключ |
-| `~/.claude.json` | `mcpServers.aurelius` | ключ |
+| `~/.claude/settings.json` | `mcpServers.aurelius` | ключ — снимается всегда |
+| `~/.claude.json` | `mcpServers.aurelius` | ключ — снимается, только если запись не каноническая (`command` не `au mcp`) |
 
 Правила:
 
@@ -58,6 +58,17 @@ python3-блок `migrate_legacy()`:
 
 Идемпотентность: второй запуск на тех же файлах не создаёт новых `.bak-*` и печатает «миграция не
 требуется».
+
+## Регистрация MCP-сервера
+
+Функция `register_mcp_server` выполняется после `migrate_legacy`. Если `claude mcp get aurelius`
+уже показывает команду `au` с аргументом `mcp` — ничего не делает и говорит об этом. Иначе снимает
+старую запись (`claude mcp remove aurelius -s user`, ошибка игнорируется) и выполняет
+`claude mcp add -s user aurelius au mcp`; запись ложится в `~/.claude.json` как
+`mcpServers.aurelius`. Отказ команды — предупреждение с ручной командой, установка продолжается.
+Режим `--migrate-only` сервер не регистрирует. Миграция не удаляет такую каноническую запись:
+удаляются только записи с другой командой (старая обёртка) и любая `mcpServers.aurelius` в
+`settings.json`.
 
 ## Проверка (принцип V)
 

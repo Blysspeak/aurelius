@@ -7,6 +7,11 @@
 //! copies the plugin root into its cache, and the repo root drags along
 //! `target/` build output.
 //!
+//! The aurelius MCP server is not declared in `plugin.json`: `install.sh`
+//! registers it user-scope (`claude mcp add -s user aurelius au mcp`) so its
+//! tools keep the `mcp__aurelius__` prefix instead of the plugin-scoped
+//! `mcp__plugin_aurelius_aurelius__` prefix.
+//!
 //! No binary under test here — these are static data files, read directly
 //! off disk relative to the repo root.
 
@@ -47,20 +52,33 @@ fn plugin_json_version_matches_workspace() {
 }
 
 #[test]
-fn plugin_json_registers_au_mcp_server() {
+fn plugin_json_bundles_no_mcp_server() {
     let plugin_json_path = plugin_root().join(".claude-plugin/plugin.json");
     let plugin = read_json(&plugin_json_path);
 
-    let server = &plugin["mcpServers"]["aurelius"];
-    assert_eq!(
-        server["command"].as_str(),
-        Some("au"),
-        "plugin/.claude-plugin/plugin.json: field `mcpServers.aurelius.command` must be \"au\""
+    assert!(
+        plugin.get("mcpServers").is_none(),
+        "plugin/.claude-plugin/plugin.json must not declare mcpServers: a plugin-bundled server surfaces as mcp__plugin_aurelius_aurelius__*, the server is registered user-scope by install.sh so tools stay mcp__aurelius__*"
     );
-    assert_eq!(
-        server["args"],
-        serde_json::json!(["mcp"]),
-        "plugin/.claude-plugin/plugin.json: field `mcpServers.aurelius.args` must be [\"mcp\"]"
+}
+
+#[test]
+fn install_sh_registers_mcp_server_user_scope() {
+    let install_sh_path = repo_root().join("install.sh");
+    let install_sh = std::fs::read_to_string(&install_sh_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", install_sh_path.display()));
+
+    assert!(
+        install_sh.contains("claude mcp add -s user aurelius au mcp"),
+        "install.sh must run `claude mcp add -s user aurelius au mcp` to register the MCP server user-scope"
+    );
+    assert!(
+        install_sh.contains("register_mcp_server() {"),
+        "install.sh must define a register_mcp_server() function"
+    );
+    assert!(
+        install_sh.matches("register_mcp_server").count() >= 2,
+        "install.sh must both define and call register_mcp_server"
     );
 }
 
@@ -121,6 +139,12 @@ fn hooks_json_has_exactly_seven_au_commands() {
 fn marketplace_json_lists_single_aurelius_plugin() {
     let marketplace_json_path = repo_root().join(".claude-plugin/marketplace.json");
     let marketplace = read_json(&marketplace_json_path);
+
+    let description = marketplace["description"].as_str().unwrap_or("");
+    assert!(
+        !description.is_empty(),
+        ".claude-plugin/marketplace.json: top-level field description must be a non-empty string, claude plugin validate warns without it"
+    );
 
     let plugins = marketplace["plugins"]
         .as_array()

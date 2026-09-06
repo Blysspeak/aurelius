@@ -11,7 +11,7 @@
 | `version` | `X.Y.Z` | равно `[workspace.package].version`; проверяется тестом |
 | `description` | одна строка | называет шаг установки бинарников (`cargo build --release`, PATH) |
 | `author`, `homepage`, `repository`, `license`, `keywords` | из `Cargo.toml` | информационные |
-| `mcpServers.aurelius` | `{ "command": "au", "args": ["mcp"] }` | единственное место регистрации сервера |
+| `mcpServers` | отсутствует | в манифесте плагина сервер не объявлен: местом регистрации служит `~/.claude.json` → `mcpServers.aurelius` (пользовательская область, пишет `install.sh` командой `claude mcp add`) |
 | `hooks` | `./plugin/hooks.json` | путь относительно корня плагина |
 | `skills` | `./plugin/skills` | каталог скиллов |
 | `commands` | `./plugin/commands` | каталог команд |
@@ -71,8 +71,8 @@
 | Где | Что | Признак |
 |---|---|---|
 | `~/.claude/settings.json` → `hooks.*[].hooks[]` | хук aurelius | `command` содержит `aurelius-(reindex\|track-edit\|skills\|backup\|capture)\.sh`, или начинается с `au ` и содержит `--hook` |
-| `~/.claude/settings.json` → `mcpServers.aurelius` | сервер | ключ `aurelius` |
-| `~/.claude.json` → `mcpServers.aurelius` | сервер | ключ `aurelius` |
+| `~/.claude/settings.json` → `mcpServers.aurelius` | сервер | ключ `aurelius` — наследная всегда |
+| `~/.claude.json` → `mcpServers.aurelius` | сервер | ключ `aurelius` — наследная, только если `command` не `au mcp` |
 
 Не признак (не трогать): `aurelius-save-reminder.mjs`, любые команды без `au`/`aurelius-*.sh`,
 хуки ulika. Пустая группа хуков после снятия удаляется целиком.

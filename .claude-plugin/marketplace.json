@@ -1,11 +1,12 @@
 {
   "name": "blysspeak",
   "owner": { "name": "Vladislav Rahmanov" },
+  "description": "Blysspeak plugins for Claude Code: aurelius, long-term memory with session hooks and skill cards.",
   "plugins": [
     {
       "name": "aurelius",
       "source": "./plugin",
-      "description": "Long-term memory for Claude Code: MCP server plus session hooks."
+      "description": "Long-term memory for Claude Code: session hooks, skill cards and /pickup; the MCP server is registered by install.sh."
     }
   ]
 }
