@@ -1,15 +1,12 @@
 {
   "name": "aurelius",
   "version": "3.4.2",
-  "description": "Long-term memory for Claude Code: MCP server plus session hooks. Requires the `au` binary in PATH (cargo build --release, then copy target/release/au to ~/.local/bin).",
+  "description": "Long-term memory for Claude Code: session hooks, skill cards and the /pickup command. The MCP server is not bundled here: install.sh registers it user-scope (claude mcp add -s user aurelius au mcp) so its tools keep the mcp__aurelius__ prefix. Requires the au binary in PATH.",
   "author": { "name": "Vladislav Rahmanov" },
   "homepage": "https://github.com/Blysspeak/aurelius",
   "repository": "https://github.com/Blysspeak/aurelius",
   "license": "MIT",
   "keywords": ["memory", "knowledge-graph", "mcp", "hooks"],
-  "mcpServers": {
-    "aurelius": { "command": "au", "args": ["mcp"] }
-  },
   "hooks": "./hooks.json",
   "skills": "./skills",
   "commands": "./commands"

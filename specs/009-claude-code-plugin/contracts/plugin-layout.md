@@ -8,20 +8,24 @@
 {
   "name": "aurelius",
   "version": "3.4.0",
-  "description": "Long-term memory for Claude Code: MCP server plus session hooks. Requires the `au` binary in PATH (cargo build --release, then copy target/release/au to ~/.local/bin).",
+  "description": "Long-term memory for Claude Code: session hooks, skill cards and the /pickup command. The MCP server is not bundled here: install.sh registers it user-scope (claude mcp add -s user aurelius au mcp) so its tools keep the mcp__aurelius__ prefix. Requires the au binary in PATH.",
   "author": { "name": "Vladislav Rahmanov" },
   "homepage": "https://github.com/Blysspeak/aurelius",
   "repository": "https://github.com/Blysspeak/aurelius",
   "license": "MIT",
   "keywords": ["memory", "knowledge-graph", "mcp", "hooks"],
-  "mcpServers": {
-    "aurelius": { "command": "au", "args": ["mcp"] }
-  },
   "hooks": "./hooks.json",
   "skills": "./skills",
   "commands": "./commands"
 }
 ```
+
+Блока `mcpServers` в манифесте нет намеренно: серверу, объявленному внутри плагина, Claude Code
+даёт инструментам имена `mcp__plugin_aurelius_aurelius__*`, и все записанные ссылки на
+`mcp__aurelius__*` переставали бы совпадать. Сервер регистрирует `install.sh` в пользовательской
+области командой `claude mcp add -s user aurelius au mcp` (решение 05.09.2026, вариант B).
+Отсутствие блока сторожит тест `plugin_json_bundles_no_mcp_server`, наличие регистрации в
+`install.sh` — тест `install_sh_registers_mcp_server_user_scope`.
 
 `version` совпадает с `[workspace.package].version` в `Cargo.toml` — проверяет тест
 `crates/au/tests/plugin_manifest.rs`. `license` — как в `Cargo.toml` workspace (проверить при
@@ -33,11 +37,12 @@
 {
   "name": "blysspeak",
   "owner": { "name": "Vladislav Rahmanov" },
+  "description": "Blysspeak plugins for Claude Code: aurelius, long-term memory with session hooks and skill cards.",
   "plugins": [
     {
       "name": "aurelius",
       "source": "./plugin",
-      "description": "Long-term memory for Claude Code: MCP server plus session hooks."
+      "description": "Long-term memory for Claude Code: session hooks, skill cards and /pickup; the MCP server is registered by install.sh."
     }
   ]
 }
