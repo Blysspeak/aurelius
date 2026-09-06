@@ -7,6 +7,7 @@ git clone https://github.com/Blysspeak/aurelius && cd aurelius
 cargo build --release
 install -m 755 target/release/au target/release/aurelius ~/.local/bin/   # каталог должен быть в PATH
 au init
+claude mcp add -s user aurelius au mcp
 claude plugin marketplace add Blysspeak/aurelius      # или путь к клону: claude plugin marketplace add .
 claude plugin install aurelius@blysspeak -s user
 ```
@@ -35,13 +36,15 @@ git clone https://github.com/Blysspeak/aurelius; cd aurelius
 cargo build --release
 copy target\release\au.exe %USERPROFILE%\.local\bin\      # каталог должен быть в PATH
 au init
+claude mcp add -s user aurelius au mcp
 claude plugin marketplace add Blysspeak/aurelius
 claude plugin install aurelius@blysspeak -s user
 ```
 
 Если раньше хуки и сервер были прописаны руками: удалить из `%USERPROFILE%\.claude\settings.json`
 хуки с командами `aurelius-*.sh` или `au … --hook`, и ключ `mcpServers.aurelius` там и в
-`%USERPROFILE%\.claude.json` (сначала скопировать оба файла). Git Bash и python3 не нужны: все
+`%USERPROFILE%\.claude.json` (сначала скопировать оба файла). Запись с командой `au mcp` в
+`~/.claude.json` — новая каноническая, остаётся как есть. Git Bash и python3 не нужны: все
 команды хуков — `au`.
 
 ## Проверка хуков вручную

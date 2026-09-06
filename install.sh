@@ -10,19 +10,22 @@ RED='\033[31m'
 DIM='\033[2m'
 RESET='\033[0m'
 
-# Removes hook and MCP-server entries that older versions of this script wrote
-# directly into ~/.claude/settings.json and ~/.claude.json, now that the
-# aurelius Claude Code plugin (plugin/.claude-plugin/plugin.json, plugin/hooks.json)
-# owns them. A function rather than inline code so `--migrate-only` and the
-# normal install path share it, and so it can be pointed at throwaway copies
-# via CLAUDE_HOME/CLAUDE_JSON instead of the real files (used by tests).
+# Removes hook and legacy MCP-server entries that older versions of this
+# script wrote directly into ~/.claude/settings.json and ~/.claude.json: the
+# aurelius Claude Code plugin (plugin/.claude-plugin/plugin.json,
+# plugin/hooks.json) owns the hooks now, and install.sh owns the user-scope
+# MCP registration (see register_mcp_server() below) — settings.json is the
+# wrong file for an MCP server either way. A function rather than inline code
+# so `--migrate-only` and the normal install path share it, and so it can be
+# pointed at throwaway copies via CLAUDE_HOME/CLAUDE_JSON instead of the real
+# files (used by tests).
 migrate_legacy() {
     local claude_home="${CLAUDE_HOME:-$HOME/.claude}"
     local claude_json="${CLAUDE_JSON:-$HOME/.claude.json}"
 
     if ! command -v python3 >/dev/null 2>&1; then
         echo -e "${GOLD}Warning:${RESET} python3 not found — skipping legacy Claude Code entry migration."
-        echo "  Remove aurelius-*.sh hooks and mcpServers.aurelius by hand; see specs/009-claude-code-plugin/quickstart.md"
+        echo "  Remove aurelius-*.sh hooks and legacy mcpServers.aurelius entries by hand; see specs/009-claude-code-plugin/quickstart.md"
         return 0
     fi
 
@@ -39,6 +42,14 @@ AU_HOOK_RE = re.compile(r"^au\b.*--hook")
 
 def is_legacy(cmd):
     return bool(HOOK_RE.search(cmd) or AU_HOOK_RE.match(cmd))
+
+
+def is_canonical(entry):
+    return (
+        isinstance(entry, dict)
+        and entry.get("command") == "au"
+        and entry.get("args") == ["mcp"]
+    )
 
 
 def backup(path):
@@ -85,7 +96,7 @@ if os.path.isfile(settings_path):
     mcp = settings.get("mcpServers", {})
     if "aurelius" in mcp:
         removed.append(
-            "removed: settings.json mcpServers.aurelius -> {} (the plugin registers the server now)".format(
+            "removed: settings.json mcpServers.aurelius -> {} (install.sh registers the server user-scope with claude mcp add now)".format(
                 mcp_value(mcp["aurelius"])
             )
         )
@@ -104,9 +115,9 @@ if os.path.isfile(claude_json):
     with open(claude_json) as f:
         data = json.load(f)
     mcp = data.get("mcpServers", {})
-    if "aurelius" in mcp:
+    if "aurelius" in mcp and not is_canonical(mcp["aurelius"]):
         removed.append(
-            "removed: ~/.claude.json mcpServers.aurelius -> {} (the plugin registers the server now)".format(
+            "removed: ~/.claude.json mcpServers.aurelius -> {} (install.sh registers the server user-scope with claude mcp add now)".format(
                 mcp_value(mcp["aurelius"])
             )
         )
@@ -125,6 +136,45 @@ if removed:
 else:
     print("nothing to migrate: no legacy aurelius entries found")
 PYEOF
+}
+
+# Registers the aurelius MCP server user-scope (`claude mcp add -s user`)
+# instead of bundling it in plugin/.claude-plugin/plugin.json: a server
+# declared inside a plugin manifest surfaces its tools as
+# mcp__plugin_aurelius_aurelius__*, not mcp__aurelius__*, which would break
+# every mcp__aurelius__ reference recorded in skill cards, order templates,
+# ulika hook text and CLAUDE.md. This runs after migrate_legacy(): migration
+# removes legacy entries first, so registering afterwards in the same run
+# never deletes what it just wrote.
+register_mcp_server() {
+    if ! command -v claude >/dev/null 2>&1; then
+        echo -e "${GOLD}Warning:${RESET} claude CLI not found on PATH — register the MCP server by hand:"
+        echo "    claude mcp add -s user aurelius au mcp"
+        return 0
+    fi
+
+    local get_output
+    local get_status
+
+    if get_output="$(claude mcp get aurelius 2>&1)"; then
+        get_status=0
+    else
+        get_status=$?
+    fi
+
+    if [ "$get_status" -eq 0 ] && echo "$get_output" | grep -q "Command: au$" && echo "$get_output" | grep -q "Args: mcp$"; then
+        echo -e "${DIM}  MCP server aurelius already registered (user scope)${RESET}"
+        return 0
+    fi
+
+    claude mcp remove aurelius -s user >/dev/null 2>&1 || true
+    if claude mcp add -s user aurelius au mcp; then
+        echo -e "${GREEN}✓${RESET} MCP server registered: aurelius -> au mcp (user scope, tools mcp__aurelius__*)"
+    else
+        echo -e "${GOLD}Warning:${RESET} could not register the MCP server automatically — register it by hand:"
+        echo "    claude mcp add -s user aurelius au mcp"
+        return 0
+    fi
 }
 
 MIGRATE_ONLY=0
@@ -276,7 +326,12 @@ echo -e "${BOLD}Migrating legacy Claude Code entries...${RESET}"
 migrate_legacy
 echo ""
 
-# --- 8. Install git hooks (for current repo) ---
+# --- 8. Register MCP server (user scope) ---
+echo -e "${BOLD}Registering MCP server...${RESET}"
+register_mcp_server
+echo ""
+
+# --- 9. Install git hooks (for current repo) ---
 if [ -d .git ]; then
     echo -e "${BOLD}Installing git hooks...${RESET}"
     /usr/bin/cp -f contrib/git-hooks/post-commit .git/hooks/post-commit 2>/dev/null || cp -f contrib/git-hooks/post-commit .git/hooks/post-commit
@@ -284,7 +339,7 @@ if [ -d .git ]; then
     echo -e "${GREEN}✓${RESET} Git post-commit hook installed"
 fi
 
-# --- 9. Index current project ---
+# --- 10. Index current project ---
 echo -e "${BOLD}Indexing project...${RESET}"
 "$INSTALL_DIR/au" reindex --path "$SCRIPT_DIR" 2>/dev/null || true
 echo -e "${GREEN}✓${RESET} Project indexed"
@@ -293,7 +348,7 @@ echo -e "${GREEN}✓${RESET} Project indexed"
 echo ""
 echo -e "${GOLD}${BOLD}Aurelius v${VERSION:-?} installed!${RESET}"
 echo ""
-echo "  MCP tools ready for Claude Code."
+echo "  MCP server registered user-scope as aurelius (tools mcp__aurelius__*). Restart Claude Code to pick it up."
 echo "  Database: ~/.local/share/aurelius/aurelius.db"
 if [ -f "$BRAVE_KEY_FILE" ] && [ -s "$BRAVE_KEY_FILE" ]; then
 echo "  Brave Search: configured (2 search tools active)"
