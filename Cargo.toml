@@ -47,3 +47,10 @@ htmd = "0.5"
 [workspace.lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+
+# Полная отладочная информация раздувала каждый debug-бинарник до ~200M,
+# target/ вырос до 27G за два дня verify-run'ов (2026-09-06). Таблицы строк
+# оставляют file:line в панике и backtrace; выкидывается только то, что нужно
+# отладчику (типы, переменные). Профиль `test` наследует `dev`.
+[profile.dev]
+debug = "line-tables-only"
