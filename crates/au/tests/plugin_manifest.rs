@@ -83,6 +83,22 @@ fn install_sh_registers_mcp_server_user_scope() {
 }
 
 #[test]
+fn install_sh_updates_installed_plugin() {
+    let install_sh_path = repo_root().join("install.sh");
+    let install_sh = std::fs::read_to_string(&install_sh_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", install_sh_path.display()));
+
+    assert!(
+        install_sh.contains("already installed"),
+        "install.sh must check the install output for \"already installed\": claude plugin install exits 0 without updating an installed plugin"
+    );
+    assert!(
+        install_sh.contains("claude plugin update aurelius"),
+        "install.sh must run `claude plugin update aurelius` when the plugin is already installed: claude plugin install exits 0 without updating an installed plugin"
+    );
+}
+
+#[test]
 fn hooks_json_has_exactly_seven_au_commands() {
     let root = plugin_root();
     let plugin_json_path = root.join(".claude-plugin/plugin.json");
