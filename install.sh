@@ -297,18 +297,16 @@ if command -v claude >/dev/null 2>&1; then
     fi
     rm -f "$MARKETPLACE_LOG"
 
+    # claude plugin install exits 0 without updating when the plugin is
+    # already installed, so the update is explicit here.
     INSTALL_LOG="$(mktemp)"
-    if ! claude plugin install aurelius@blysspeak -s user -y >"$INSTALL_LOG" 2>&1; then
+    if claude plugin install aurelius@blysspeak -s user -y >"$INSTALL_LOG" 2>&1; then
         if grep -qi "already installed" "$INSTALL_LOG"; then
-            echo -e "${DIM}  Plugin already installed — updating instead${RESET}"
-            if claude plugin --help 2>&1 | grep -q '  update '; then
-                claude plugin update aurelius
-            else
-                claude plugin install aurelius@blysspeak -s user -y
-            fi
-        else
-            cat "$INSTALL_LOG"
+            echo -e "${DIM}  Plugin already installed — checking for updates${RESET}"
+            claude plugin update aurelius || cat "$INSTALL_LOG"
         fi
+    else
+        cat "$INSTALL_LOG"
     fi
     rm -f "$INSTALL_LOG"
 
