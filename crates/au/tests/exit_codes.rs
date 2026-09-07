@@ -24,6 +24,11 @@ const STORAGE: i32 = 2;
 const LEASE_EMPTY: i32 = 10;
 /// Наряд: база занята другим писателем. FR-010.
 const LEASE_BUSY: i32 = 11;
+/// `au task evidence` без активной задачи в проекте. Отдельно от `USAGE`:
+/// код `1` заставляет вызывающего чинить свой вызов, тогда как чинить надо
+/// состояние проекта. Измерено 07.09.2026: мост улик ulika отказывал всегда
+/// (30 задач, ни одной активной), и каждая зелёная улика падала на пол.
+const NO_ACTIVE_TASK: i32 = 12;
 
 /// Временный домен данных: каталог для рабочих тестов, файл — для теста
 /// недоступного хранилища (`<файл>/aurelius.db` открыть нельзя).
@@ -624,4 +629,64 @@ fn section<'a>(snapshot: &'a str, title: &str) -> &'a str {
         Some(end) => &rest[..=end],
         None => rest,
     }
+}
+
+/// Законная ситуация не имеет права выглядеть кривым вызовом: у «нет активной
+/// задачи» свой код, а сама улика при этом СОХРАНЕНА узлом без ребра.
+#[test]
+fn evidence_without_an_active_task_has_its_own_code() {
+    let home = TmpHome::dir("evidence-noactive");
+    let (code, _) = run(
+        &home,
+        &[
+            "task",
+            "evidence",
+            "--project",
+            "пустой",
+            "--command",
+            "cargo test",
+            "--exit",
+            "0",
+        ],
+        None,
+    );
+    assert_eq!(
+        code, NO_ACTIVE_TASK,
+        "отсутствие активной задачи — состояние проекта, а не ошибка вызова"
+    );
+}
+
+/// Обратная сторона: настоящая ошибка вызова обязана остаться единицей, иначе
+/// новый код проглотил бы и её.
+#[test]
+fn evidence_without_a_target_is_still_a_usage_error() {
+    let home = TmpHome::dir("evidence-notarget");
+    let (code, _) = run(
+        &home,
+        &["task", "evidence", "--command", "cargo test", "--exit", "0"],
+        None,
+    );
+    assert_eq!(code, USAGE, "ни id, ни --project — это кривой вызов");
+}
+
+/// `--claim` несёт утверждение целиком; требовать вдобавок позиционный текст
+/// значит требовать пересказать сказанное. На этом падала команда чекпоинта из
+/// карточки `agent-checkpoint`.
+#[test]
+fn a_claim_is_enough_without_positional_text() {
+    let home = TmpHome::dir("claim-only");
+    let (code, out) = run(
+        &home,
+        &[
+            "note",
+            "--claim",
+            "утверждение целиком",
+            "--confidence",
+            "reported",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "claim без позиционного текста — валидный вызов");
+    assert!(out.contains("утверждение целиком"), "{out}");
 }

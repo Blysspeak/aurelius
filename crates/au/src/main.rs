@@ -725,6 +725,11 @@ mod exit {
     /// `LEASE_EMPTY` — иначе ручная сессия владельца выглядит как пустая
     /// очередь, и смена выходит, отчитавшись об успехе.
     pub const LEASE_BUSY: u8 = 11;
+    /// `au task evidence`: улику не к чему привязать, в проекте нет активной
+    /// задачи. Не ошибка вызова: чинить надо состояние проекта, а не вызов.
+    /// Улика при этом СОХРАНЕНА узлом без ребра — код говорит «не привязано»,
+    /// а не «не записано».
+    pub const NO_ACTIVE_TASK: u8 = 12;
 }
 
 /// Хранилищем считается всё, что пришло из слоя базы: `DbError` (открытие,
@@ -743,6 +748,12 @@ fn classify(err: &anyhow::Error) -> u8 {
             aurelius_core::graph::LeaseError::NoTasksAvailable
             | aurelius_core::graph::LeaseError::NotOwner => exit::LEASE_EMPTY,
         };
+    }
+    if err
+        .chain()
+        .any(|c| c.is::<aurelius_core::graph::NoActiveTask>())
+    {
+        return exit::NO_ACTIVE_TASK;
     }
     let storage = err
         .chain()
