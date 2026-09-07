@@ -5,13 +5,17 @@ pub fn tool_definitions() -> serde_json::Value {
         "tools": [
             {
                 "name": "memory_status",
-                "description": "Full project snapshot for session start. Returns project structure, recent decisions with reasoning, open problems, solved problems, session history with summaries, graph stats, and a 'server' block (running MCP server version, started_at, and restart_needed when the binary on disk is newer than this running process). Call this first in every new session.",
+                "description": "Project snapshot for session start. Compact by default: notes are word-boundary excerpts (a note_truncated flag marks the cut ones), task evidence is summarized to total/green/last_green instead of the full run array, and a truncation block counts items hidden beyond the per-section cap — server block, summary and project lists are never truncated. full=true returns the legacy complete shape (full notes and every field on every item). Call this first in every new session; task_view with a task id returns that task's full notes and evidence runs.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "project": {
                             "type": "string",
                             "description": "Filter by project name (e.g. 'aurelius'). Shows only decisions, problems, sessions for this project."
+                        },
+                        "full": {
+                            "type": "boolean",
+                            "description": "Return the full legacy response: complete notes and every field on every item. Default false — compact excerpts."
                         }
                     },
                     "required": []
