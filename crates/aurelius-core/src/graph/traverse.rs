@@ -9,45 +9,51 @@ use super::{row_to_edge, row_to_node, search};
 /// ответ дважды: счётчик «N edges» врал, а печать связей показывала близнеца.
 type SeenEdges = std::collections::HashSet<uuid::Uuid>;
 
+/// Hard ceiling on the total number of nodes one traversal may return,
+/// seeds included. The project node is a hub everything hangs on, so an
+/// uncapped BFS at depth 2 used to fan out across the whole database and
+/// into other projects (measured 2026-08-30: 2809 nodes, 2.4 MB for one
+/// memory_recall call). The cap lives here, not at the call sites, so
+/// every caller inherits it and no per-caller default can reintroduce the
+/// blow-up.
+pub const MAX_TRAVERSAL_NODES: usize = 200;
+
+/// Depth clamp for every traversal. Explicit depths above this are clamped
+/// silently; smaller requested depths stay as they are. Three call sites
+/// already had to lower their own defaults to 1 to survive hub nodes — the
+/// clamp belongs to the walk itself, one defect, one fix.
+pub const MAX_TRAVERSAL_DEPTH: u32 = 3;
+
+/// Traversal outcome with the truncation report. Callers that only need
+/// the graph use [`context`] / [`context_from_id`]; call sites that answer
+/// to a model should surface `hidden_nodes`, so a cut answer can say so
+/// instead of posing as the complete picture.
+#[derive(Default)]
+pub struct Traversal {
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+    /// Nodes discovered by BFS but dropped because the node budget ran
+    /// out. A lower bound: once the budget is gone the walk stops
+    /// exploring, so anything further is unmeasured.
+    pub hidden_nodes: usize,
+    /// 1-based BFS depth at which the budget cut the walk, if it did.
+    /// `Some(0)` would mean even the seed set did not fit.
+    pub truncated_at_depth: Option<u32>,
+}
+
 pub fn context(conn: &Connection, topic: &str, depth: u32) -> Result<(Vec<Node>, Vec<Edge>)> {
+    let traversal = context_with_report(conn, topic, depth)?;
+    Ok((traversal.nodes, traversal.edges))
+}
+
+/// Same walk as [`context`], but keeps the truncation report: how many
+/// nodes the cap hid and at which BFS depth the cut happened.
+pub fn context_with_report(conn: &Connection, topic: &str, depth: u32) -> Result<Traversal> {
     let seeds = search(conn, topic, 5)?;
     if seeds.is_empty() {
-        return Ok((vec![], vec![]));
+        return Ok(Traversal::default());
     }
-    let mut visited_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut seen_edges = SeenEdges::new();
-    let mut all_nodes: Vec<Node> = vec![];
-    let mut all_edges: Vec<Edge> = vec![];
-    let mut queue: Vec<String> = seeds.iter().map(|n| n.id.to_string()).collect();
-    for node in &seeds {
-        visited_nodes.insert(node.id.to_string());
-        all_nodes.push(node.clone());
-    }
-    for _ in 0..depth {
-        if queue.is_empty() {
-            break;
-        }
-        let edges = get_edges_batch(conn, &queue)?;
-        let mut neighbor_ids = vec![];
-        for edge in edges {
-            let neighbor_id = if queue.contains(&edge.from_id.to_string()) {
-                edge.to_id.to_string()
-            } else {
-                edge.from_id.to_string()
-            };
-            if !visited_nodes.contains(&neighbor_id) {
-                visited_nodes.insert(neighbor_id.clone());
-                neighbor_ids.push(neighbor_id);
-            }
-            if seen_edges.insert(edge.id) {
-                all_edges.push(edge);
-            }
-        }
-        let neighbors = get_nodes_batch(conn, &neighbor_ids)?;
-        queue = neighbors.iter().map(|n| n.id.to_string()).collect();
-        all_nodes.extend(neighbors);
-    }
-    Ok((all_nodes, all_edges))
+    walk(conn, seeds, depth)
 }
 
 /// BFS traversal from a specific node ID (no FTS search — starts from a known node).
@@ -56,23 +62,52 @@ pub fn context_from_id(
     node_id: &str,
     depth: u32,
 ) -> Result<(Vec<Node>, Vec<Edge>)> {
-    let seed = super::crud::get_node(conn, node_id)?;
-    let seed = match seed {
-        Some(n) => n,
-        None => return Ok((vec![], vec![])),
-    };
+    let traversal = context_from_id_with_report(conn, node_id, depth)?;
+    Ok((traversal.nodes, traversal.edges))
+}
 
+/// Same walk as [`context_from_id`] with the truncation report attached.
+pub fn context_from_id_with_report(
+    conn: &Connection,
+    node_id: &str,
+    depth: u32,
+) -> Result<Traversal> {
+    let seed = super::crud::get_node(conn, node_id)?;
+    match seed {
+        Some(n) => walk(conn, vec![n], depth),
+        None => Ok(Traversal::default()),
+    }
+}
+
+/// BFS shared by every entry point. Depth is clamped to
+/// [`MAX_TRAVERSAL_DEPTH`]; the node budget stops the walk mid-level and
+/// every discovered-but-dropped node lands in `hidden_nodes`.
+fn walk(conn: &Connection, seeds: Vec<Node>, depth: u32) -> Result<Traversal> {
+    let depth = depth.min(MAX_TRAVERSAL_DEPTH);
     let mut visited_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_edges = SeenEdges::new();
-    let mut all_nodes: Vec<Node> = vec![];
-    let mut all_edges: Vec<Edge> = vec![];
-    let mut queue: Vec<String> = vec![seed.id.to_string()];
-
-    visited_nodes.insert(seed.id.to_string());
-    all_nodes.push(seed);
-
-    for _ in 0..depth {
+    let mut out = Traversal::default();
+    let mut queue: Vec<String> = vec![];
+    for node in seeds {
+        if !visited_nodes.insert(node.id.to_string()) {
+            continue;
+        }
+        if out.nodes.len() < MAX_TRAVERSAL_NODES {
+            queue.push(node.id.to_string());
+            out.nodes.push(node);
+        } else {
+            out.hidden_nodes += 1;
+            out.truncated_at_depth.get_or_insert(0);
+        }
+    }
+    for level in 0..depth {
         if queue.is_empty() {
+            break;
+        }
+        if out.nodes.len() >= MAX_TRAVERSAL_NODES {
+            // The budget ran out before this level: deeper neighborhoods
+            // are not explored at all, so nothing can be counted there.
+            out.truncated_at_depth.get_or_insert(level + 1);
             break;
         }
         let edges = get_edges_batch(conn, &queue)?;
@@ -88,15 +123,23 @@ pub fn context_from_id(
                 neighbor_ids.push(neighbor_id);
             }
             if seen_edges.insert(edge.id) {
-                all_edges.push(edge);
+                out.edges.push(edge);
             }
         }
         let neighbors = get_nodes_batch(conn, &neighbor_ids)?;
-        queue = neighbors.iter().map(|n| n.id.to_string()).collect();
-        all_nodes.extend(neighbors);
+        let mut next_queue: Vec<String> = vec![];
+        for node in neighbors {
+            if out.nodes.len() < MAX_TRAVERSAL_NODES {
+                next_queue.push(node.id.to_string());
+                out.nodes.push(node);
+            } else {
+                out.hidden_nodes += 1;
+                out.truncated_at_depth.get_or_insert(level + 1);
+            }
+        }
+        queue = next_queue;
     }
-
-    Ok((all_nodes, all_edges))
+    Ok(out)
 }
 
 fn get_edges_batch(conn: &Connection, node_ids: &[String]) -> Result<Vec<Edge>> {
