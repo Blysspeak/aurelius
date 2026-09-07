@@ -179,7 +179,11 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
     let depth = params.get("depth").and_then(|d| d.as_u64()).unwrap_or(1) as u32;
 
     let conn = open_db()?;
-    let (context_nodes, _) = graph::context(&conn, topic, depth)?;
+    // The traversal itself is capped (MAX_TRAVERSAL_NODES / depth clamp), so
+    // an explicit depth=2 can no longer expand a hub node into megabytes.
+    // The report travels back to the caller: a cut answer says it is cut.
+    let traversal = graph::context_with_report(&conn, topic, depth)?;
+    let context_nodes = traversal.nodes;
 
     let mut decisions = vec![];
     let mut problems = vec![];
@@ -229,6 +233,11 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         "skills_hint": if skills.is_empty() { serde_json::Value::Null } else { json!("Relevant skill cards found — call skill_get <name> for full instructions.") },
         "total_knowledge_nodes": knowledge_count,
         "total_graph_nodes": context_nodes.len(),
+        "truncation": {
+            "truncated": traversal.truncated_at_depth.is_some(),
+            "hidden_nodes": traversal.hidden_nodes,
+            "truncated_at_depth": traversal.truncated_at_depth,
+        },
     }))
 }
 
