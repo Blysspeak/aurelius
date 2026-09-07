@@ -1,12 +1,21 @@
 use anyhow::Result;
 use aurelius_core::{
     graph::{self, ProblemSolved, SessionInput},
-    models::{NodeType, Relation},
+    models::{MemoryKind, NodeType, Relation},
     provenance::{self, Provenance},
 };
 use serde_json::json;
 
-use super::{node_compact, open_db, resolve_node, sync_push_if_enabled};
+use super::{node_recall, open_db, resolve_node, sync_push_if_enabled};
+
+/// Сколько записей знания отдаёт `memory_recall`. Ответ читает модель с
+/// ограниченным окном: двенадцать отранжированных записей она использует, сто
+/// — пролистывает.
+const RECALL_LIMIT: usize = 12;
+
+/// Хвост эпизодического. Двух хватает, чтобы ответить «чем занимались
+/// последний раз»; больше — это уже журнал, а за ним идут в `au journal`.
+const RECALL_TAIL_LIMIT: usize = 2;
 
 /// Строки массива параметра, пустой вектор при отсутствии или чужом типе.
 fn string_list(params: &serde_json::Value, key: &str) -> Vec<String> {
@@ -176,62 +185,78 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         .get("topic")
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'topic' parameter"))?;
-    let depth = params.get("depth").and_then(|d| d.as_u64()).unwrap_or(1) as u32;
+    // Глубина 2 по умолчанию, а не 1. Единица отвечала темой, до узла-хаба
+    // которой обход не доходил: измерено 07.09.2026 на теме «ulika» — 6 узлов
+    // при 672 связанных с проектом. Разрастание, из-за которого глубину когда-то
+    // опустили до единицы, теперь держит `MAX_TRAVERSAL_NODES`, а не заниженная
+    // глубина: потолок в 200 узлов стоит внутри самой прогулки.
+    let depth = params.get("depth").and_then(|d| d.as_u64()).unwrap_or(2) as u32;
 
     let conn = open_db()?;
-    // The traversal itself is capped (MAX_TRAVERSAL_NODES / depth clamp), so
-    // an explicit depth=2 can no longer expand a hub node into megabytes.
-    // The report travels back to the caller: a cut answer says it is cut.
-    let traversal = graph::context_with_report(&conn, topic, depth)?;
+    let traversal = graph::context_with_report_seeded(&conn, topic, depth, graph::RECALL_SEEDS)?;
     let context_nodes = traversal.nodes;
 
-    let mut decisions = vec![];
-    let mut problems = vec![];
-    let mut solutions = vec![];
-    let mut sessions = vec![];
-    let mut concepts = vec![];
-    let mut tasks = vec![];
-    let mut skills = vec![];
+    // Степень внутри найденного подграфа — мера того, насколько запись держит
+    // тему, а не насколько часто в её теле встретилось слово. BM25 по телу
+    // поднимал наверх дампы сессий: в каждом мёртвом пути `A:\workSpace\ulika\`
+    // имя проекта повторяется десятки раз, и частота терма отвечала за
+    // релевантность вместо связей.
+    let mut degree: std::collections::HashMap<uuid::Uuid, usize> = std::collections::HashMap::new();
+    for edge in &traversal.edges {
+        *degree.entry(edge.from_id).or_default() += 1;
+        *degree.entry(edge.to_id).or_default() += 1;
+    }
+
+    let mut knowledge = vec![];
+    let mut episodic_tail = vec![];
 
     for node in &context_nodes {
-        match &node.node_type {
-            NodeType::Decision => decisions.push(node_compact(node)),
-            NodeType::Problem => problems.push(node_compact(node)),
-            NodeType::Solution => solutions.push(node_compact(node)),
-            NodeType::Session => sessions.push(node_compact(node)),
-            NodeType::Task => tasks.push(node_compact(node)),
-            NodeType::Concept | NodeType::Project => concepts.push(node_compact(node)),
-            NodeType::Skill => skills.push(node_compact(node)),
-            _ => {}
+        // Карточки навыков приходят на SessionStart через `au skills --hook` и
+        // в выдаче recall были бы вторым экземпляром того же текста.
+        if matches!(node.node_type, NodeType::Skill) {
+            continue;
+        }
+        // Узел проекта — навигация, а не знание: у него нет ни claim, ни note,
+        // метка равна имени проекта. По степени он всегда первый (673 ребра у
+        // ulika), то есть занимал бы верхнюю строку ответа, ничего не сообщая.
+        if matches!(node.node_type, NodeType::Project) {
+            continue;
+        }
+        // Эпизодическое — снимок момента: сессия, срез перед компакцией. Оно
+        // отвечает на «что происходило», а спрашивают «что известно», поэтому
+        // уходит в хвост, а не смешивается со знанием.
+        if matches!(node.memory_kind, MemoryKind::Episodic) {
+            episodic_tail.push(node);
+        } else {
+            knowledge.push(node);
         }
     }
 
-    for node in &context_nodes {
+    let rank = |a: &&aurelius_core::models::Node, b: &&aurelius_core::models::Node| {
+        let da = degree.get(&a.id).copied().unwrap_or(0);
+        let db = degree.get(&b.id).copied().unwrap_or(0);
+        db.cmp(&da).then(b.created_at.cmp(&a.created_at))
+    };
+    knowledge.sort_by(rank);
+    episodic_tail.sort_by(rank);
+
+    let shown: Vec<_> = knowledge.iter().take(RECALL_LIMIT).collect();
+    let tail: Vec<_> = episodic_tail.iter().take(RECALL_TAIL_LIMIT).collect();
+
+    for node in shown.iter().chain(tail.iter()) {
         // Best effort by design: an access counter must never fail a read.
         if let Err(e) = graph::touch_node(&conn, node.id) {
             tracing::warn!("could not record access for {}: {e}", node.id);
         }
     }
 
-    let knowledge_count = decisions.len()
-        + problems.len()
-        + solutions.len()
-        + sessions.len()
-        + concepts.len()
-        + tasks.len()
-        + skills.len();
-
     Ok(json!({
         "topic": topic,
-        "decisions": decisions,
-        "problems": problems,
-        "solutions": solutions,
-        "sessions": sessions,
-        "tasks": tasks,
-        "concepts": concepts,
-        "skills": skills,
-        "skills_hint": if skills.is_empty() { serde_json::Value::Null } else { json!("Relevant skill cards found — call skill_get <name> for full instructions.") },
-        "total_knowledge_nodes": knowledge_count,
+        "knowledge": shown.iter().map(|n| node_recall(n, topic)).collect::<Vec<_>>(),
+        "recent": tail.iter().map(|n| node_recall(n, topic)).collect::<Vec<_>>(),
+        "shown": shown.len(),
+        "matched_knowledge": knowledge.len(),
+        "matched_recent": episodic_tail.len(),
         "total_graph_nodes": context_nodes.len(),
         "truncation": {
             "truncated": traversal.truncated_at_depth.is_some(),

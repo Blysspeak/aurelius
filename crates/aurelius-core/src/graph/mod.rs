@@ -26,9 +26,16 @@ use uuid::Uuid;
 /// (спека 007, T013/T014, data-model.md «Ребро»). Улика внутри `data.evidence`
 /// задачи — для быстрого чтения без обхода графа; этот узел и ребро — для
 /// обратного пути: от прогона к задаче, которую он подтвердил.
+/// `task_id: None` — улика прогона, которой не к чему прицепиться: в проекте
+/// нет активной задачи. Узел всё равно пишется, и именно поэтому в него кладётся
+/// `project`: у сироты нет ребра `verified_by`, а значит нет и пути
+/// `run → task → belongs_to → project`, которым проект доставался раньше. Без
+/// поля такая улика не нашлась бы ни одной проектной выборкой.
 pub fn link_evidence_run(
     conn: &rusqlite::Connection,
-    task_id: Uuid,
+    task_id: Option<Uuid>,
+    project: Option<&str>,
+    subject: Option<&str>,
     command: &str,
     exit_code: i64,
     artifact: Option<&str>,
@@ -38,6 +45,14 @@ pub fn link_evidence_run(
         "command": command,
         "exit_code": exit_code,
         "artifact": artifact,
+        "project": project,
+        "subject": subject,
+        // Провенанс прогона не спрашивается у вызывающего, а выводится: раз
+        // улика существует, прогон состоялся, командой служит он сам. Просить
+        // хук передать `--confidence measured` значило бы просить его ввести
+        // то, что уже известно отсюда.
+        "confidence": "measured",
+        "evidence": command,
     });
     let run = crud::add_node(
         conn,
@@ -47,7 +62,9 @@ pub fn link_evidence_run(
         "au-task-evidence",
         data,
     )?;
-    crud::add_edge(conn, task_id, run.id, Relation::VerifiedBy, 1.0)?;
+    if let Some(task_id) = task_id {
+        crud::add_edge(conn, task_id, run.id, Relation::VerifiedBy, 1.0)?;
+    }
     Ok(run.id)
 }
 

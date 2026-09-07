@@ -108,6 +108,21 @@ pub struct NoteArgs {
     /// Falls back to `AURELIUS_SESSION_ID`.
     #[arg(long)]
     pub session: Option<String>,
+    #[command(flatten)]
+    pub provenance: ProvenanceArgs,
+    /// How this relates to an existing fact about the same subject:
+    /// supersede | refine | coexist
+    #[arg(long)]
+    pub resolution: Option<String>,
+}
+
+/// Провенанс одним набором на все команды, которые пишут узел. Отдельные
+/// копии этих флагов у `note` и у `session` разошлись бы описаниями и
+/// умолчаниями, а разойдясь — начали бы по-разному отвечать на вопрос, что
+/// такое измеренный факт. `resolution` сюда не входит: он говорит не о факте,
+/// а о том, как факт относится к УЖЕ записанному, и живёт только у `note`.
+#[derive(clap::Args, Debug, Default)]
+pub struct ProvenanceArgs {
     /// The assertion in one or two lines — returned whole, never clipped
     /// mid-word. Max 240 chars; long reasoning stays in the note text.
     #[arg(long)]
@@ -129,16 +144,12 @@ pub struct NoteArgs {
     /// A second fact about the same subject is refused until resolved.
     #[arg(long)]
     pub subject: Option<String>,
-    /// How this relates to an existing fact about the same subject:
-    /// supersede | refine | coexist
-    #[arg(long)]
-    pub resolution: Option<String>,
 }
 
 /// Собрать из флагов тот же JSON, что приходит по MCP, и разобрать его тем же
 /// разбором. Симметрия здесь не украшение: разъехавшись, две двери начали бы
 /// по-разному понимать, что такое измеренный факт.
-fn provenance_from_flags(args: &NoteArgs) -> Result<Provenance> {
+fn provenance_from_flags(args: &ProvenanceArgs) -> Result<Provenance> {
     let mut params = serde_json::Map::new();
     let mut put = |key: &str, value: Option<&String>| {
         if let Some(v) = value {
@@ -193,7 +204,7 @@ fn read_note_text(text: Option<String>, from_stdin: bool) -> Result<String> {
 pub async fn note(args: NoteArgs) -> Result<()> {
     // Происхождение и разрешение разбираются ПЕРВЫМИ: ошибка в них не имеет
     // права оставить за собой ни полузаписанный узел, ни съеденный stdin.
-    let prov = provenance_from_flags(&args)?;
+    let prov = provenance_from_flags(&args.provenance)?;
     let resolution = Resolution::parse_arg(args.resolution.as_deref())?;
 
     let text = read_note_text(args.text, args.stdin)?;
@@ -317,6 +328,17 @@ fn current_dir_name() -> Option<String> {
         .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
 }
 
+/// Проект задачи по её метке — том же составном виде `[project] title`, на
+/// который опирается `find_task`. Через ребро `belongs_to` было бы честнее, но
+/// здесь нужен только ярлык для поля `project` у узла прогона, а метка есть
+/// всегда и не требует обхода.
+fn project_of_task(task: &aurelius_core::models::Node) -> Option<String> {
+    let rest = task.label.strip_prefix('[')?;
+    let (project, _) = rest.split_once(']')?;
+    let project = project.trim();
+    (!project.is_empty()).then(|| project.to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // au session — итог сессии, слой 4 снапшота
 // ---------------------------------------------------------------------------
@@ -351,6 +373,15 @@ pub struct SessionArgs {
     /// it spawns. Falls back to `AURELIUS_SESSION_ID`.
     #[arg(long)]
     pub session: Option<String>,
+    /// Idempotency key: the OCCASION of the record, not its text. Without it
+    /// a repeat is recognised only when `summary` matches the previous one
+    /// word for word — and a hook that reports running totals rewrites that
+    /// line every time, so the twin was never caught. With a key the repeat
+    /// rewrites its own node, exactly like `au note --key`.
+    #[arg(long)]
+    pub key: Option<String>,
+    #[command(flatten)]
+    pub provenance: ProvenanceArgs,
 }
 
 /// Тело записи. Форма намеренно совпадает с параметрами `memory_session`:
@@ -411,6 +442,8 @@ pub async fn session(args: SessionArgs) -> Result<()> {
     let agent_session =
         resolve_agent_session(args.session.as_deref().or(payload.session.as_deref()));
 
+    let prov = provenance_from_flags(&args.provenance)?;
+
     let conn = open_and_ensure(&db_path())?;
     let written = graph::record_session(
         &conn,
@@ -420,6 +453,8 @@ pub async fn session(args: SessionArgs) -> Result<()> {
             next_steps: &payload.next_steps,
             key_files: &payload.key_files,
             agent_session: agent_session.as_deref(),
+            provenance: prov,
+            key: args.key.as_deref(),
             ..graph::SessionInput::new(&project, &payload.summary, "cli")
         },
     )?;
@@ -1799,6 +1834,7 @@ pub async fn task(action: TaskAction) -> Result<()> {
             command,
             exit,
             artifact,
+            subject,
             json: as_json,
         } => {
             // FR-008/FR-009: без явного id улика уходит активной задаче
@@ -1812,11 +1848,30 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 (None, Some(project)) => {
                     let mut active =
                         graph::get_tasks_filtered(&conn, Some(project), Some("active"), None, 1)?;
-                    active.pop().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "в проекте '{project}' нет активной задачи — улику не к чему привязать"
-                        )
-                    })?
+                    match active.pop() {
+                        Some(task) => task,
+                        // Отказ, но не потеря. Прогон состоялся, и его улика —
+                        // единственное, чего нельзя восстановить: артефакт
+                        // сотрут, код возврата не воспроизведёшь. Раньше здесь
+                        // стоял голый bail, и улика исчезала вместе с ним, а
+                        // вызывающий об этом не узнавал: `record-verify.mjs`
+                        // выбрасывает результат. Пишем сироту, потом отказываем.
+                        None => {
+                            let run = graph::link_evidence_run(
+                                &conn,
+                                None,
+                                Some(project),
+                                subject.as_deref(),
+                                &command,
+                                exit,
+                                artifact.as_deref(),
+                            )?;
+                            anyhow::bail!(
+                                "в проекте '{project}' нет активной задачи — улика сохранена \
+                                 без привязки: {run}"
+                            )
+                        }
+                    }
                 }
                 (None, None) => {
                     anyhow::bail!("нужно указать задачу либо --project с активной задачей")
@@ -1837,8 +1892,19 @@ pub async fn task(action: TaskAction) -> Result<()> {
             });
             let data = fields.merge_into(&task.data);
             graph::update_node(&conn, task.id, None, Some(data))?;
-            let run_id =
-                graph::link_evidence_run(&conn, task.id, &command, exit, artifact.as_deref())?;
+            // Проект берётся из аргумента, а при вызове по id — из метки
+            // задачи (`[project] …`), чтобы поле стояло на КАЖДОЙ улике, а не
+            // только на тех, что пришли от хука с `--project`.
+            let run_project = project.clone().or_else(|| project_of_task(&task));
+            let run_id = graph::link_evidence_run(
+                &conn,
+                Some(task.id),
+                run_project.as_deref(),
+                subject.as_deref(),
+                &command,
+                exit,
+                artifact.as_deref(),
+            )?;
 
             if as_json {
                 let out = json!({
