@@ -121,6 +121,10 @@ fn memory_session_with_conn(
 
     // Link session to tasks if specified
     let mut linked_tasks = vec![];
+    // Ссылка, которая никуда не привела, раньше просто пропускалась: `tasks`
+    // при этом оставался в `stored_fields`, то есть ответ утверждал, что поле
+    // принято. Теперь несопоставленные ссылки называются поимённо.
+    let mut unresolved_tasks: Vec<String> = vec![];
     if let Some(tasks) = params.get("tasks").and_then(|t| t.as_array()) {
         for task_ref in tasks {
             if let Some(task_id) = task_ref.as_str() {
@@ -131,6 +135,8 @@ fn memory_session_with_conn(
                         "label": task_node.label,
                         "status": task_node.data.get("status"),
                     }));
+                } else {
+                    unresolved_tasks.push(task_id.to_owned());
                 }
             }
         }
@@ -162,7 +168,18 @@ fn memory_session_with_conn(
     // Ровно та беда, ради которой это писалось: имена параметров теперь
     // проверены заслонкой, но правильно названный пустой список выглядел
     // переданным — и решения терялись при ответе "created": true.
-    let (stored_fields, dropped_fields) = super::super::params::field_report(params);
+    let (mut stored_fields, mut dropped_fields) = super::super::params::field_report(params);
+
+    // `field_report` смотрит на ЗАПРОС, а не на запись: он делит присланное на
+    // непустое и пустое. Непустой список задач, из которого не сопоставилась ни
+    // одна ссылка, попадал в `stored_fields` — поле числилось принятым, хотя не
+    // легло никуда. Пустой `dropped_fields` читается как «всё принято», и
+    // опереться на него было нельзя.
+    if !unresolved_tasks.is_empty() && linked_tasks.is_empty() {
+        stored_fields.retain(|f| f != "tasks");
+        dropped_fields.push("tasks".to_owned());
+        dropped_fields.sort();
+    }
 
     Ok(json!({
         "id": session.id.to_string(),
@@ -175,6 +192,7 @@ fn memory_session_with_conn(
         "stored_fields": stored_fields,
         "dropped_fields": dropped_fields,
         "linked_tasks": linked_tasks,
+        "unresolved_tasks": unresolved_tasks,
         "active_tasks_hint": active_tasks,
         "provenance": provenance_response,
     }))
@@ -365,5 +383,84 @@ mod tests {
         )
         .expect_err("measured без evidence обязано быть отказом");
         assert!(format!("{err}").contains("inferred"), "{err}");
+    }
+
+    /// Пустой `dropped_fields` читается как «всё принято», и на нём строят
+    /// решения. Ссылка на задачу, которая никуда не привела, раньше молча
+    /// пропускалась, а `tasks` оставался среди принятых полей — ответ утверждал
+    /// то, чего не сделал.
+    #[test]
+    fn an_unresolvable_task_reference_is_named_not_swallowed() {
+        let (_tmp, conn) = setup();
+
+        let result = memory_session_with_conn(
+            &conn,
+            &json!({
+                "summary": "итог со ссылкой в никуда",
+                "project": "proj-session-tasks",
+                "tasks": ["нет-такой-задачи-12345"],
+            }),
+        )
+        .expect("memory_session");
+
+        let stored: Vec<&str> = result["stored_fields"]
+            .as_array()
+            .expect("stored_fields")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        let dropped: Vec<&str> = result["dropped_fields"]
+            .as_array()
+            .expect("dropped_fields")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            !stored.contains(&"tasks"),
+            "непривязанные задачи не должны числиться принятыми: {stored:?}"
+        );
+        assert!(
+            dropped.contains(&"tasks"),
+            "непринятое поле обязано быть названо: {dropped:?}"
+        );
+        assert_eq!(
+            result["unresolved_tasks"][0], "нет-такой-задачи-12345",
+            "ссылка называется поимённо, а не общим числом"
+        );
+    }
+
+    /// Обратная сторона: сопоставившаяся ссылка оставляет `tasks` принятым.
+    #[test]
+    fn a_resolvable_task_reference_keeps_the_field_stored() {
+        let (_tmp, conn) = setup();
+        let task = graph::add_node(
+            &conn,
+            NodeType::Task,
+            "[proj-session-tasks] живая задача",
+            None,
+            "test",
+            json!({ "status": "active" }),
+        )
+        .expect("task");
+
+        let result = memory_session_with_conn(
+            &conn,
+            &json!({
+                "summary": "итог с живой ссылкой",
+                "project": "proj-session-tasks",
+                "tasks": [task.id.to_string()],
+            }),
+        )
+        .expect("memory_session");
+
+        let dropped: Vec<&str> = result["dropped_fields"]
+            .as_array()
+            .expect("dropped_fields")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(!dropped.contains(&"tasks"), "{dropped:?}");
+        assert_eq!(result["linked_tasks"].as_array().map(Vec::len), Some(1));
     }
 }
