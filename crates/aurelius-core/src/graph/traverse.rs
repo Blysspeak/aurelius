@@ -49,7 +49,27 @@ pub fn context(conn: &Connection, topic: &str, depth: u32) -> Result<(Vec<Node>,
 /// Same walk as [`context`], but keeps the truncation report: how many
 /// nodes the cap hid and at which BFS depth the cut happened.
 pub fn context_with_report(conn: &Connection, topic: &str, depth: u32) -> Result<Traversal> {
-    let seeds = search(conn, topic, 5)?;
+    context_with_report_seeded(conn, topic, depth, DEFAULT_SEEDS)
+}
+
+/// Сколько записей FTS берётся посевом по умолчанию.
+pub const DEFAULT_SEEDS: usize = 5;
+
+/// Посев для ответа, который потом ранжируется по подграфу. Пяти сидов хватало,
+/// пока ответом служили они сами; для ранжирования нужен запас. Измерено
+/// 07.09.2026 на теме «ulika»: у всех пяти сидов FTS степень 0 или 1, узел-хаб
+/// проекта с 671 ребром в посев не попадал вовсе, и ответ строился из
+/// случайных листьев.
+pub const RECALL_SEEDS: usize = 12;
+
+/// Та же прогулка, что и [`context_with_report`], но с явным размером посева.
+pub fn context_with_report_seeded(
+    conn: &Connection,
+    topic: &str,
+    depth: u32,
+    seeds: usize,
+) -> Result<Traversal> {
+    let seeds = search(conn, topic, seeds)?;
     if seeds.is_empty() {
         return Ok(Traversal::default());
     }

@@ -142,6 +142,12 @@ pub enum TaskAction {
         /// Path to the artifact of the run, if there is one
         #[arg(long)]
         artifact: Option<String>,
+        /// What this run asserts, e.g. `aurelius:verify:cargo`. Only this
+        /// field is asked of the caller: `confidence` and `evidence` are
+        /// derived here — a run that happened is measured, and the command
+        /// is its own evidence.
+        #[arg(long)]
+        subject: Option<String>,
         /// Print a single JSON line instead of human-readable text
         #[arg(long)]
         json: bool,

@@ -227,6 +227,65 @@ pub fn node_detail(node: &aurelius_core::models::Node) -> serde_json::Value {
     })
 }
 
+/// Бюджет окна вокруг совпадения. Ставится только там, где `claim` пуст:
+/// заполненный claim — это и есть суть, и добавлять к нему кусок тела значит
+/// возвращать одно и то же дважды.
+const RECALL_WINDOW: usize = 200;
+
+/// Форма ответа `memory_recall`: суть, а не дамп. От [`node_detail`] отличается
+/// тем, чего здесь НЕТ — `data` не отдаётся никогда. Именно она раздувала
+/// выдачу: тело карточки навыка уходило целиком, и три записи стоили тысячи
+/// токенов. За телом идут по `id`, отдельным вызовом и осознанно.
+pub(crate) fn node_recall(node: &aurelius_core::models::Node, query: &str) -> serde_json::Value {
+    let p = aurelius_core::provenance::Provenance::from_data(&node.data);
+    let claim = p.claim.clone();
+    // Окно — замена сути, а не приложение к ней.
+    let window = match &claim {
+        Some(_) => None,
+        None => node
+            .note
+            .as_deref()
+            .map(|note| window_around(note, query, RECALL_WINDOW)),
+    };
+    json!({
+        "id": node.id.to_string(),
+        "type": node.node_type,
+        "label": node.label,
+        "claim": claim,
+        "window": window,
+        "subject": p.subject,
+        "confidence": p.confidence_or_default().as_str(),
+        "created_at": node.created_at.to_rfc3339(),
+    })
+}
+
+/// Кусок текста вокруг первого совпадения любого слова запроса, по границе
+/// слова. Совпадения нет — берётся начало: запись всё равно отобрана обходом,
+/// и показать её начало честнее, чем не показать ничего.
+fn window_around(text: &str, query: &str, budget: usize) -> String {
+    let haystack = text.to_lowercase();
+    let hit = query
+        .split_whitespace()
+        .filter(|term| term.chars().count() > 2)
+        .filter_map(|term| haystack.find(&term.to_lowercase()))
+        .min();
+
+    let Some(hit) = hit else {
+        return aurelius_core::graph::clip(text, budget);
+    };
+    // `find` вернул смещение в БАЙТАХ, а резать надо по символам: иначе на
+    // кириллице граница попадёт в середину кодовой точки.
+    let hit_chars = text[..hit].chars().count();
+    let start = hit_chars.saturating_sub(budget / 3);
+    let tail: String = text.chars().skip(start).collect();
+    let body = aurelius_core::graph::clip(&tail, budget);
+    if start > 0 {
+        format!("…{body}")
+    } else {
+        body
+    }
+}
+
 pub(crate) fn node_compact(node: &aurelius_core::models::Node) -> serde_json::Value {
     json!({
         "id": node.id.to_string(),
@@ -407,5 +466,49 @@ mod stale_binary_tests {
         );
 
         std::fs::remove_file(&path).expect("remove temp file");
+    }
+}
+
+#[cfg(test)]
+mod recall_window_tests {
+    use super::window_around;
+
+    /// `find` возвращает смещение в байтах, а окно режется по символам. На
+    /// кириллице байт и символ не совпадают, и наивный `&text[start..]` здесь
+    /// паникует на границе кодовой точки — проверяется именно этот случай.
+    #[test]
+    fn window_lands_on_the_match_without_splitting_a_letter() {
+        let text = "начало записи, потом длинная середина, и где-то тут слово улика, \
+                    а дальше снова текст";
+        let window = window_around(text, "улика", 40);
+
+        assert!(
+            window.contains("улика"),
+            "окно обязано содержать совпадение: {window}"
+        );
+        assert!(
+            window.starts_with('…'),
+            "срезанное начало обязано быть помечено: {window}"
+        );
+    }
+
+    /// Совпадения нет — окно всё равно должно быть текстом, а не пустотой:
+    /// запись отобрана обходом графа, и её начало информативнее тишины.
+    #[test]
+    fn window_without_a_match_falls_back_to_the_head() {
+        let window = window_around("совсем про другое", "ulika", 40);
+        assert_eq!(window, "совсем про другое");
+    }
+
+    /// Короткие слова запроса игнорируются: по «и» или «в» совпадение находится
+    /// в любой строке и окно уезжает в случайное место.
+    #[test]
+    fn short_terms_do_not_steer_the_window() {
+        let text = "и в на длинный текст про улику в самом конце строки";
+        let window = window_around(text, "и в улику", 30);
+        assert!(
+            window.contains("улик"),
+            "окно должно вести длинное слово, а не предлог: {window}"
+        );
     }
 }
