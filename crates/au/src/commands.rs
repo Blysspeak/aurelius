@@ -73,8 +73,9 @@ fn parse_memory_kind_arg(s: &str) -> Result<MemoryKind, String> {
 
 #[derive(clap::Args)]
 pub struct NoteArgs {
-    /// The note content (decision, observation, etc.). Omit it when using --stdin.
-    #[arg(required_unless_present = "stdin")]
+    /// The note content (decision, observation, etc.). Omit it when using
+    /// --stdin, or when --claim already carries the whole assertion.
+    #[arg(required_unless_present_any = ["stdin", "claim"])]
     pub text: Option<String>,
     /// Node type — the same set the MCP tools accept
     #[arg(short, long, default_value = "decision", value_parser = parse_node_type_arg)]
@@ -185,14 +186,21 @@ fn resolve_agent_session(flag: Option<&str>) -> Option<String> {
     })
 }
 
-fn read_note_text(text: Option<String>, from_stdin: bool) -> Result<String> {
+/// `claim` — запасной источник текста. Утверждение на одну-две строки и есть
+/// вся запись: требовать вдобавок позиционный текст значило бы требовать
+/// пересказать сказанное. Ровно на этом падала команда чекпоинта из карточки
+/// `agent-checkpoint` в том виде, в каком её раздают исполнителям, — то есть
+/// часть чекпоинтов не записывалась вовсе.
+fn read_note_text(text: Option<String>, from_stdin: bool, claim: Option<&str>) -> Result<String> {
     let raw = if from_stdin {
         let mut buf = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buf)
             .context("не удалось прочитать текст заметки из stdin")?;
         buf
     } else {
-        text.ok_or_else(|| anyhow::anyhow!("нужен текст заметки: аргументом или --stdin"))?
+        text.or_else(|| claim.map(str::to_owned)).ok_or_else(|| {
+            anyhow::anyhow!("нужен текст заметки: аргументом, --claim или --stdin")
+        })?
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -207,7 +215,7 @@ pub async fn note(args: NoteArgs) -> Result<()> {
     let prov = provenance_from_flags(&args.provenance)?;
     let resolution = Resolution::parse_arg(args.resolution.as_deref())?;
 
-    let text = read_note_text(args.text, args.stdin)?;
+    let text = read_note_text(args.text, args.stdin, prov.claim.as_deref())?;
     let conn = open_and_ensure(&db_path())?;
     let label = args.label.unwrap_or_else(|| {
         let t = text.chars().take(60).collect::<String>();
@@ -1866,10 +1874,11 @@ pub async fn task(action: TaskAction) -> Result<()> {
                                 exit,
                                 artifact.as_deref(),
                             )?;
-                            anyhow::bail!(
-                                "в проекте '{project}' нет активной задачи — улика сохранена \
-                                 без привязки: {run}"
-                            )
+                            return Err(graph::NoActiveTask {
+                                project: project.clone(),
+                                run,
+                            }
+                            .into());
                         }
                     }
                 }
