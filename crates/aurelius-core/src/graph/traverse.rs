@@ -1,4 +1,4 @@
-use crate::models::{Edge, Node};
+use crate::models::{Edge, MemoryKind, Node, NodeType};
 use anyhow::Result;
 use rusqlite::Connection;
 
@@ -62,6 +62,15 @@ pub const DEFAULT_SEEDS: usize = 5;
 /// случайных листьев.
 pub const RECALL_SEEDS: usize = 12;
 
+/// Сколько записей знания отдаёт recall. Ответ читает модель с ограниченным
+/// окном: двенадцать отранжированных записей она использует, сто —
+/// пролистывает.
+pub const RECALL_LIMIT: usize = 12;
+
+/// Хвост эпизодического. Двух хватает, чтобы ответить «чем занимались
+/// последний раз»; больше — это уже журнал, а за ним идут в `au journal`.
+pub const RECALL_TAIL_LIMIT: usize = 2;
+
 /// Та же прогулка, что и [`context_with_report`], но с явным размером посева.
 pub fn context_with_report_seeded(
     conn: &Connection,
@@ -74,6 +83,104 @@ pub fn context_with_report_seeded(
         return Ok(Traversal::default());
     }
     walk(conn, seeds, depth)
+}
+
+/// Готовая выдача recall: что показывают читателю и чем ответ признаётся
+/// неполным. Счётчики совпадений считаются до срезов — `knowledge.len()`
+/// после [`recall_selection`] говорит, сколько показано, а
+/// `matched_knowledge` — сколько нашлось.
+pub struct RecallSelection {
+    /// Знание, порядок ответа. Не длиннее [`RECALL_LIMIT`].
+    pub knowledge: Vec<Node>,
+    /// Эпизодический хвост. Не длиннее [`RECALL_TAIL_LIMIT`].
+    pub recent: Vec<Node>,
+    /// Сколько записей знания нашлось до среза.
+    pub matched_knowledge: usize,
+    /// Сколько эпизодических записей нашлось до среза.
+    pub matched_recent: usize,
+    /// Размер обхода целиком, до отсева типов: и `Skill`, и `Project`.
+    pub total_graph_nodes: usize,
+    /// Перенесено из [`Traversal::hidden_nodes`].
+    pub hidden_nodes: usize,
+    /// Перенесено из [`Traversal::truncated_at_depth`].
+    pub truncated_at_depth: Option<u32>,
+}
+
+/// Сборка выдачи recall целиком: обход, степень в подграфе, отсев, раскладка
+/// по [`MemoryKind`], порядок и срезы. Всё, что MCP-инструмент `memory_recall`
+/// делал у себя внутри.
+///
+/// Живёт здесь, а не в обработчике, по той же причине, что и
+/// [`super::subgraph_degree`]: `memory_recall` лежит в крейте `aurelius`,
+/// который зависит от `aurelius-core`, а не наоборот. Пока сборка была внутри
+/// обработчика, ни `au recall`, ни прогон `au eval` не могли её позвать и
+/// мерили бы копию боевого пути вместо самого пути.
+///
+/// **Счётчик обращений эта функция не трогает.** `touch_node` остаётся ровно
+/// одним вызовом в MCP-обработчике: фикстура прогона открыта только на чтение,
+/// и одна запись здесь роняла бы каждый кейс `recall_top5`.
+pub fn recall_selection(conn: &Connection, topic: &str, depth: u32) -> Result<RecallSelection> {
+    let Traversal {
+        nodes: context_nodes,
+        edges,
+        hidden_nodes,
+        truncated_at_depth,
+    } = context_with_report_seeded(conn, topic, depth, RECALL_SEEDS)?;
+    let total_graph_nodes = context_nodes.len();
+
+    // Степень внутри найденного подграфа — мера того, насколько запись держит
+    // тему, а не насколько часто в её теле встретилось слово. BM25 по телу
+    // поднимал наверх дампы сессий: в каждом мёртвом пути `A:\workSpace\ulika\`
+    // имя проекта повторяется десятки раз, и частота терма отвечала за
+    // релевантность вместо связей.
+    let mut degree: std::collections::HashMap<uuid::Uuid, usize> = std::collections::HashMap::new();
+    for edge in &edges {
+        *degree.entry(edge.from_id).or_default() += 1;
+        *degree.entry(edge.to_id).or_default() += 1;
+    }
+
+    let mut knowledge = vec![];
+    let mut recent = vec![];
+
+    for node in context_nodes {
+        // Карточки навыков приходят на SessionStart через `au skills --hook` и
+        // в выдаче recall были бы вторым экземпляром того же текста.
+        if matches!(node.node_type, NodeType::Skill) {
+            continue;
+        }
+        // Узел проекта — навигация, а не знание: у него нет ни claim, ни note,
+        // метка равна имени проекта. По степени он всегда первый (673 ребра у
+        // ulika), то есть занимал бы верхнюю строку ответа, ничего не сообщая.
+        if matches!(node.node_type, NodeType::Project) {
+            continue;
+        }
+        // Эпизодическое — снимок момента: сессия, срез перед компакцией. Оно
+        // отвечает на «что происходило», а спрашивают «что известно», поэтому
+        // уходит в хвост, а не смешивается со знанием.
+        if matches!(node.memory_kind, MemoryKind::Episodic) {
+            recent.push(node);
+        } else {
+            knowledge.push(node);
+        }
+    }
+
+    knowledge.sort_by(|a, b| super::by_degree_then_recency(&degree, a, b));
+    recent.sort_by(|a, b| super::by_degree_then_recency(&degree, a, b));
+
+    let matched_knowledge = knowledge.len();
+    let matched_recent = recent.len();
+    knowledge.truncate(RECALL_LIMIT);
+    recent.truncate(RECALL_TAIL_LIMIT);
+
+    Ok(RecallSelection {
+        knowledge,
+        recent,
+        matched_knowledge,
+        matched_recent,
+        total_graph_nodes,
+        hidden_nodes,
+        truncated_at_depth,
+    })
 }
 
 /// BFS traversal from a specific node ID (no FTS search — starts from a known node).
@@ -260,5 +367,184 @@ mod tests {
             p.push(suffix);
             let _ = std::fs::remove_file(std::path::PathBuf::from(p));
         }
+    }
+
+    /// Уборка за тестом: файл базы вместе с WAL и SHM. `:memory:` здесь не
+    /// годится — `db::open` жёстко требует WAL.
+    struct TmpDb(std::path::PathBuf);
+
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+            }
+        }
+    }
+
+    /// Кто есть кто в графе под [`recall_selection`].
+    struct RecallFixture {
+        /// Наибольшая степень в подграфе — обязан стоять первым в знании.
+        anchor: uuid::Uuid,
+        /// Вторая степень — обязан стоять вторым.
+        second: uuid::Uuid,
+        skill: uuid::Uuid,
+        project: uuid::Uuid,
+        /// Наибольшая степень среди эпизодических — первый в хвосте.
+        ep_top: uuid::Uuid,
+    }
+
+    /// Граф построен так, чтобы порядок по степени **расходился** с порядком
+    /// обхода: `anchor`, `second` и `ep_top` слова `квазар` не несут, в посев
+    /// не попадают и приходят уже вторым-третьим шагом BFS — то есть в конце
+    /// `traversal.nodes`. Без сортировки первыми окажутся сеятельные узлы, и
+    /// проверка порядка провалится; на фикстуре, где степень совпадает с
+    /// порядком обхода, снятая сортировка тестом не ловится (проверено
+    /// удалением `sort_by`).
+    ///
+    /// Степени попарно различны там, где тест утверждает позицию: разрыв по
+    /// `created_at` в утверждения не входит.
+    fn recall_fixture(tag: &str) -> (TmpDb, Connection, RecallFixture) {
+        let tmp = TmpDb(
+            std::env::temp_dir().join(format!("aurelius-recall-{tag}-{}.db", uuid::Uuid::new_v4())),
+        );
+        let conn = crate::db::open(&tmp.0).expect("open temp db");
+
+        let add = |node_type: NodeType, label: &str, kind: MemoryKind| {
+            super::super::add_node_full(
+                &conn,
+                node_type,
+                label,
+                None,
+                "test",
+                serde_json::json!({}),
+                kind,
+                None,
+            )
+            .expect("node")
+            .id
+        };
+        let link = |from: uuid::Uuid, to: uuid::Uuid| {
+            super::super::add_edge(&conn, from, to, Relation::RelatedTo, 1.0).expect("edge");
+        };
+
+        // Посев: только эти узлы находит FTS по теме.
+        let seed_a = add(NodeType::Concept, "квазар первый", MemoryKind::Semantic);
+        let seed_b = add(NodeType::Concept, "квазар второй", MemoryKind::Semantic);
+        let skill = add(NodeType::Skill, "квазар карточка", MemoryKind::Semantic);
+        let project = add(NodeType::Project, "квазар", MemoryKind::Semantic);
+        let ep_a = add(NodeType::Session, "квазар сессия A", MemoryKind::Episodic);
+        let ep_b = add(NodeType::Session, "квазар сессия B", MemoryKind::Episodic);
+
+        // Первый шаг BFS: до них тема не дотягивается, дотягиваются рёбра.
+        let anchor = add(NodeType::Concept, "лист опора", MemoryKind::Semantic);
+        let second = add(NodeType::Concept, "лист связка", MemoryKind::Semantic);
+        for node in [seed_a, seed_b, skill, project, ep_a, ep_b, second] {
+            link(anchor, node);
+        }
+        link(second, seed_a);
+        link(second, seed_b);
+
+        // Второй шаг: знания больше среза на четыре, `matched_knowledge`
+        // обязан считать до него, а не после.
+        for i in 0..RECALL_LIMIT {
+            let leaf = add(
+                NodeType::Concept,
+                &format!("лист {i}"),
+                MemoryKind::Semantic,
+            );
+            link(anchor, leaf);
+        }
+
+        // Эпизодических на одну больше хвоста — по той же причине.
+        let ep_top = add(NodeType::Session, "лист сессия", MemoryKind::Episodic);
+        link(anchor, ep_top);
+        link(second, ep_top);
+
+        (
+            tmp,
+            conn,
+            RecallFixture {
+                anchor,
+                second,
+                skill,
+                project,
+                ep_top,
+            },
+        )
+    }
+
+    /// Сборка, переехавшая из MCP-обработчика: карточки навыков и узел
+    /// проекта выброшены, эпизодическое ушло в хвост, порядок — по степени в
+    /// подграфе, срезы стоят на 12 и 2, а счётчики совпадений считаются до
+    /// срезов.
+    #[test]
+    fn recall_selection_filters_splits_orders_and_slices() {
+        let (_tmp, conn, f) = recall_fixture("assembly");
+
+        let out = recall_selection(&conn, "квазар", 2).expect("recall");
+
+        let ids: Vec<uuid::Uuid> = out.knowledge.iter().map(|n| n.id).collect();
+        assert_eq!(
+            ids.first(),
+            Some(&f.anchor),
+            "первым идёт узел с наибольшей степенью, а не первый найденный обходом"
+        );
+        assert_eq!(
+            ids.get(1),
+            Some(&f.second),
+            "вторая степень — вторая строка"
+        );
+        assert_eq!(out.knowledge.len(), RECALL_LIMIT, "срез знания — 12");
+        assert_eq!(
+            out.matched_knowledge,
+            RECALL_LIMIT + 4,
+            "совпадения считаются до среза: двенадцать листьев, два посева, опора и связка"
+        );
+
+        assert!(
+            !ids.contains(&f.skill) && !ids.contains(&f.project),
+            "карточка навыка и узел проекта не показываются"
+        );
+
+        let tail: Vec<uuid::Uuid> = out.recent.iter().map(|n| n.id).collect();
+        assert_eq!(
+            tail.first(),
+            Some(&f.ep_top),
+            "эпизодическое ранжируется той же степенью и тем же порядком"
+        );
+        assert_eq!(out.recent.len(), RECALL_TAIL_LIMIT, "срез хвоста — 2");
+        assert_eq!(out.matched_recent, 3, "и здесь счётчик до среза");
+
+        assert_eq!(
+            out.total_graph_nodes,
+            RECALL_LIMIT + 4 + 3 + 2,
+            "размер обхода — до отсева типов: знание, эпизодическое, навык и проект"
+        );
+    }
+
+    /// Общая функция ядра не пишет в базу ни строки. Фикстура прогона
+    /// `au eval` открывается только на чтение, и один `touch_node` здесь
+    /// ронял бы каждый кейс `recall_top5`; инкремент `access_count` живёт
+    /// ровно в одном месте — в MCP-обработчике `memory_recall`.
+    #[test]
+    fn recall_selection_never_touches_access_count() {
+        let (_tmp, conn, _f) = recall_fixture("readonly");
+
+        let out = recall_selection(&conn, "квазар", 2).expect("recall");
+        assert!(
+            !out.knowledge.is_empty(),
+            "выдача не пуста — есть что портить"
+        );
+
+        let touched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE access_count != 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(touched, 0, "ни одного инкремента на общем пути");
     }
 }

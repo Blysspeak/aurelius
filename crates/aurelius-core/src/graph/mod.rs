@@ -3,6 +3,7 @@ mod export;
 mod import;
 mod lease;
 mod path;
+mod pickup;
 mod search;
 mod session;
 mod snapshot;
@@ -13,6 +14,7 @@ pub use export::*;
 pub use import::*;
 pub use lease::*;
 pub use path::*;
+pub use pickup::*;
 pub use search::*;
 pub use session::*;
 pub use snapshot::*;
@@ -22,10 +24,6 @@ use crate::models::{Edge, MemoryKind, Node, NodeType, Relation};
 use chrono::Utc;
 use uuid::Uuid;
 
-/// Заводит узел прогона и связывает его с задачей ребром `verified_by`
-/// (спека 007, T013/T014, data-model.md «Ребро»). Улика внутри `data.evidence`
-/// задачи — для быстрого чтения без обхода графа; этот узел и ребро — для
-/// обратного пути: от прогона к задаче, которую он подтвердил.
 /// Улика прогона, которую не к чему привязать: в проекте нет активной задачи.
 ///
 /// Своё значение, а не `USAGE`. Код `1` означает «вызвали неправильно», и
@@ -43,6 +41,10 @@ pub struct NoActiveTask {
     pub run: uuid::Uuid,
 }
 
+/// Заводит узел прогона и связывает его с задачей ребром `verified_by`
+/// (спека 007, T013/T014, data-model.md «Ребро»). Улика внутри `data.evidence`
+/// задачи — для быстрого чтения без обхода графа; этот узел и ребро — для
+/// обратного пути: от прогона к задаче, которую он подтвердил.
 /// `task_id: None` — улика прогона, которой не к чему прицепиться: в проекте
 /// нет активной задачи. Узел всё равно пишется, и именно поэтому в него кладётся
 /// `project`: у сироты нет ребра `verified_by`, а значит нет и пути
@@ -128,6 +130,38 @@ pub fn list_secret_refs(
     let mut nodes = search::typed_in_project(conn, &NodeType::Config, project, 500)?;
     nodes.retain(crate::secret::is_secret_ref);
     Ok(nodes)
+}
+
+/// Степень каждого узла внутри уже найденного подграфа обхода: по скольким
+/// рёбрам из `edges` он виден. Мера того, насколько запись держит тему обхода,
+/// а не того, как часто слово встретилось в её теле — по этой причине
+/// ранжирование `memory_recall` (MCP) отказалось от BM25 по телу в пользу
+/// именно этого сигнала (найдено 07.09.2026 на теме «ulika»: мёртвые
+/// windows-пути повторяли имя проекта десятками раз и выигрывали по частоте
+/// терма). Живёт здесь, а не рядом с тем ранжированием: `memory_recall` лежит
+/// в крейте `aurelius`, который зависит от `aurelius-core`, а не наоборот, и
+/// `au pickup` (этот крейт) той функции достать не может. Здесь — общее место
+/// для обоих, а не вторая копия одной и той же формулы.
+pub fn subgraph_degree(edges: &[Edge]) -> std::collections::HashMap<Uuid, usize> {
+    let mut degree = std::collections::HashMap::new();
+    for edge in edges {
+        *degree.entry(edge.from_id).or_insert(0usize) += 1;
+        *degree.entry(edge.to_id).or_insert(0usize) += 1;
+    }
+    degree
+}
+
+/// Тот же компаратор, что ранжирует `memory_recall`: выше степень в найденном
+/// подграфе первой, при равенстве — новее `created_at` первым. Узел вне карты
+/// степеней (не встретился в обходе) читается как степень 0, а не как ошибка.
+pub fn by_degree_then_recency(
+    degree: &std::collections::HashMap<Uuid, usize>,
+    a: &Node,
+    b: &Node,
+) -> std::cmp::Ordering {
+    let da = degree.get(&a.id).copied().unwrap_or(0);
+    let db = degree.get(&b.id).copied().unwrap_or(0);
+    db.cmp(&da).then(b.created_at.cmp(&a.created_at))
 }
 
 pub(crate) fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {

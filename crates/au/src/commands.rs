@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use aurelius_core::{
-    db, graph, identity, indexer,
+    db, eval, graph, identity, indexer,
     models::{MemoryKind, NodeType, Relation},
     provenance::{self, Provenance, Resolution},
     tasks as task_fields,
@@ -109,6 +109,13 @@ pub struct NoteArgs {
     /// Falls back to `AURELIUS_SESSION_ID`.
     #[arg(long)]
     pub session: Option<String>,
+    /// Bypass the secret-lookalike refusal at the write boundary
+    /// (`add_node_full`, subject `aurelius:write:secret-guard`). The bypass
+    /// is marked in the node's `data` (`secret::BYPASS_MARKER_KEY`), not
+    /// merely allowed silently — a bypass nobody can find afterwards is the
+    /// same as having no guard at all.
+    #[arg(long)]
+    pub allow_secret: bool,
     #[command(flatten)]
     pub provenance: ProvenanceArgs,
     /// How this relates to an existing fact about the same subject:
@@ -226,6 +233,12 @@ pub async fn note(args: NoteArgs) -> Result<()> {
     let mut data = serde_json::Map::new();
     if let Some(id) = agent_session.as_deref() {
         data.insert(graph::AGENT_SESSION_KEY.to_owned(), id.into());
+    }
+    if args.allow_secret {
+        data.insert(
+            aurelius_core::secret::BYPASS_MARKER_KEY.to_owned(),
+            serde_json::Value::Bool(true),
+        );
     }
     let mut prov_data = serde_json::Value::Object(serde_json::Map::new());
     prov.write_into(&mut prov_data);
@@ -782,10 +795,22 @@ pub async fn search(query: &str) -> Result<()> {
 ///
 /// So there is no fallback ladder. Either the primary key or the exact
 /// `subject` string matches, or nothing does.
+///
+/// `--prefix` is the third way in, for a different question: not "what does
+/// this exact key say" but "is there already a family of facts under this
+/// facet". `query` and `prefix` are mutually exclusive and exactly one is
+/// required — clap enforces it (`conflicts_with` / `required_unless_present`)
+/// rather than a hand check after parsing, so a bad combination never reaches
+/// the handler at all.
 #[derive(clap::Args)]
 pub struct RecallArgs {
     /// Node UUID, or the exact `--subject` a fact was written with
-    pub query: String,
+    #[arg(required_unless_present = "prefix", conflicts_with = "prefix")]
+    pub query: Option<String>,
+    /// List every live node whose `subject` starts with this facet, one
+    /// entry per distinct subject, newest family member first
+    #[arg(long)]
+    pub prefix: Option<String>,
     /// Print the record as one JSON object instead of human-readable lines
     #[arg(long)]
     pub json: bool,
@@ -803,24 +828,36 @@ pub async fn recall(args: RecallArgs) -> Result<()> {
     // `au touch` open the database directly.
     let conn = db::open(&db_path())?;
 
-    let (node, siblings, found_by) = match args.query.parse::<uuid::Uuid>() {
+    if let Some(prefix) = args.prefix.as_deref() {
+        return recall_prefix(&conn, prefix, args.json);
+    }
+    // clap's `required_unless_present`/`conflicts_with` on `RecallArgs`
+    // already guarantee `query` is `Some` here; this `ok_or_else` is a
+    // defensive second line, not the contract's enforcement point — a
+    // runtime path never gets to `unwrap`/`expect` in this workspace.
+    let query = args
+        .query
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("recall requires either a query or --prefix"))?;
+
+    let (node, siblings, found_by) = match query.parse::<uuid::Uuid>() {
         // Re-rendered from the parsed UUID rather than used as typed: rows
         // store the canonical hyphenated form, and a braced or upper-case id
         // would otherwise miss a node that is right there.
         Ok(uuid) => {
             let found = graph::get_node(&conn, &uuid.to_string())?
-                .ok_or_else(|| anyhow::anyhow!("no node with id {}", args.query))?;
+                .ok_or_else(|| anyhow::anyhow!("no node with id {}", query))?;
             (found, Vec::new(), "id")
         }
         Err(_) => {
             let mut found = graph::find_nodes_by_data_field(
                 &conn,
                 provenance::SUBJECT_KEY,
-                &args.query,
+                query,
                 SUBJECT_SIBLINGS,
             )?;
             if found.is_empty() {
-                anyhow::bail!("no node with subject '{}'", args.query);
+                anyhow::bail!("no node with subject '{}'", query);
             }
             // Newest first (the query orders by `created_at DESC`), and the
             // newest fact about a subject is the one that supersedes the rest.
@@ -875,7 +912,7 @@ pub async fn recall(args: RecallArgs) -> Result<()> {
         anyhow::bail!("node renderer returned something other than an object");
     };
     fields.insert("found_by".to_owned(), json!(found_by));
-    fields.insert("query".to_owned(), json!(args.query));
+    fields.insert("query".to_owned(), json!(query));
     fields.insert("project".to_owned(), json!(project));
     fields.insert(
         "session".to_owned(),
@@ -905,6 +942,65 @@ pub async fn recall(args: RecallArgs) -> Result<()> {
         return Ok(());
     }
     print_record(&record);
+    Ok(())
+}
+
+/// `au recall --prefix` — facet lookup, the third way into `recall`.
+///
+/// Why this exists: the session-start snapshot ranks by freshness, not by
+/// subject family, so a family such as `xhub:bank131:refunds` holding several
+/// August notes never surfaces because nothing groups by prefix. All the
+/// grouping (subject, count, newest member) happens in
+/// `graph::find_subject_families_by_prefix` — this function only shapes the
+/// two output forms, no SQL here.
+///
+/// Same exit contract as the exact lookup above: a non-empty result is `0`,
+/// an empty one `bail!`s into `exit::USAGE` (see `main::classify`) exactly
+/// like a missed exact subject does, so the ulika lock can key its rule off
+/// the exit code alone rather than parsing printed text.
+fn recall_prefix(conn: &rusqlite::Connection, prefix: &str, as_json: bool) -> Result<()> {
+    let families = graph::find_subject_families_by_prefix(conn, prefix)?;
+    if families.is_empty() {
+        anyhow::bail!("no subject starting with '{prefix}'");
+    }
+
+    if as_json {
+        let families_json: Vec<_> = families
+            .iter()
+            .map(|family| {
+                json!({
+                    "subject": family.subject,
+                    "count": family.count,
+                    "claim": Provenance::from_data(&family.newest.data).claim,
+                    "id": family.newest.id.to_string(),
+                    "created_at": family.newest.created_at.to_rfc3339(),
+                })
+            })
+            .collect();
+        let record = json!({
+            "prefix": prefix,
+            "count": families.len(),
+            "families": families_json,
+        });
+        println!("{}", serde_json::to_string(&record)?);
+        return Ok(());
+    }
+
+    // Same `line` helper `print_record` uses, one block per family instead
+    // of one block for a single node.
+    line("prefix", Some(prefix));
+    line("families", Some(&families.len().to_string()));
+    for family in &families {
+        println!();
+        line("subject", Some(&family.subject));
+        line("count", Some(&family.count.to_string()));
+        line(
+            "claim",
+            Provenance::from_data(&family.newest.data).claim.as_deref(),
+        );
+        line("id", Some(&family.newest.id.to_string()));
+        line("created", Some(&family.newest.created_at.to_rfc3339()));
+    }
     Ok(())
 }
 
@@ -2544,8 +2640,9 @@ fn format_ripe_hook_block(ripe: &[RipeReport]) -> Option<String> {
     Some(out)
 }
 
-/// Print the skill index. Plain text by default; with `hook=true` emits the
-/// Claude Code SessionStart hook JSON that injects the index into context.
+/// Print the skill index. Plain text by default, with trigger sentence and
+/// tags per card; with `hook=true` emits the Claude Code SessionStart hook
+/// JSON that injects the index into context, listing names only.
 pub async fn skills(hook: bool) -> Result<()> {
     let conn = db::open(&db_path())?;
     let mut skills = graph::get_nodes_by_type(&conn, &NodeType::Skill)?;
@@ -2563,23 +2660,15 @@ pub async fn skills(hook: bool) -> Result<()> {
         "Aurelius skills ({}) — reusable how-to cards. Call skill_get <name> for the full body.\n",
         skills.len()
     );
-    for n in &skills {
-        let trigger = n.note.as_deref().unwrap_or("");
-        let tags: Vec<&str> = n
-            .data
-            .get("tags")
-            .and_then(|t| t.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-        let tag_suffix = if tags.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", tags.join(", "))
-        };
-        text.push_str(&format!("- {}: {}{}\n", n.label, trigger, tag_suffix));
-    }
 
     if hook {
+        // Hook form drops trigger sentence and tags: skill_get fetches the body on
+        // demand anyway, so at session start only the name (the lookup key) earns
+        // its bytes — the trigger text is prose the model never acts on until it
+        // already decided to look the card up by name.
+        for n in &skills {
+            text.push_str(&format!("- {}\n", n.label));
+        }
         let out = json!({
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
@@ -2588,6 +2677,23 @@ pub async fn skills(hook: bool) -> Result<()> {
         });
         println!("{}", serde_json::to_string(&out)?);
     } else {
+        // Plain form is a human running `au skills` to decide what to load —
+        // here the trigger sentence and tags are exactly what earns their space.
+        for n in &skills {
+            let trigger = n.note.as_deref().unwrap_or("");
+            let tags: Vec<&str> = n
+                .data
+                .get("tags")
+                .and_then(|t| t.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let tag_suffix = if tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", tags.join(", "))
+            };
+            text.push_str(&format!("- {}: {}{}\n", n.label, trigger, tag_suffix));
+        }
         print!("{text}");
     }
     Ok(())
@@ -2651,6 +2757,428 @@ pub async fn snapshot(project: Option<String>, hook: bool, json_out: bool) -> Re
         }
         Err(e) => Err(e),
     }
+}
+
+/// `au pickup` — bounded, ranked reassembly of working state after a context
+/// wipe (see `graph::build_pickup` for the assembly and per-section
+/// character ceilings). Plain `db::open`, not `open_and_ensure`: a read has
+/// no business indexing the current folder as a side effect.
+pub async fn pickup(project: String, json_out: bool) -> Result<()> {
+    let conn = db::open(&db_path())?;
+    let payload = graph::build_pickup(&conn, &project)?;
+
+    if json_out {
+        println!("{}", serde_json::to_string(&payload)?);
+        return Ok(());
+    }
+
+    line("anchor", Some(&payload.anchor));
+    println!();
+    line("tail session", payload.tail.session_id.as_deref());
+    line("tail source", payload.tail.source.as_deref());
+    line("tail at", payload.tail.at.as_deref());
+    for step in &payload.tail.next_steps {
+        println!("  - {step}");
+    }
+    if payload.tail.truncated {
+        println!("  (обрезан по бюджету)");
+    }
+
+    println!();
+    println!(
+        "facets ({}{}):",
+        payload.facets.items.len(),
+        if payload.facets.truncated {
+            ", обрезано"
+        } else {
+            ""
+        }
+    );
+    for f in &payload.facets.items {
+        println!("  {} — {} ({})", f.subject, f.count, f.id8);
+    }
+
+    println!();
+    println!("records ({}):", payload.records.len());
+    for r in &payload.records {
+        println!(
+            "  [{}] {} {} — {}",
+            r.kind,
+            r.id8,
+            r.subject.as_deref().unwrap_or("-"),
+            r.claim.as_deref().unwrap_or("-")
+        );
+    }
+
+    println!();
+    println!(
+        "critical ({}{}):",
+        payload.critical.items.len(),
+        if payload.critical.truncated {
+            ", обрезано"
+        } else {
+            ""
+        }
+    );
+    for c in &payload.critical.items {
+        println!(
+            "  {} {} ({})",
+            c.id8,
+            c.label,
+            c.status.as_deref().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// au eval
+// ---------------------------------------------------------------------------
+
+/// Файл кейсов по умолчанию — от корня репозитория (`contracts/cli.md` §2).
+const EVAL_DEFAULT_CASES: &str = "fixtures/eval/cases.jsonl";
+
+/// Пометка прогона, числа которого нельзя класть рядом с прежними. Печатается
+/// и в шапке, и в конце (`eval-cases.md` §5, пункт 8): отчёт читают с обоих
+/// концов, а пометка, увиденная только одним читателем, не пометка.
+const EVAL_INCOMPARABLE: &str = "НЕСРАВНИМО: живая база";
+
+/// `au eval` — прогон кейсов по замороженной фикстуре: спор «стало лучше или
+/// хуже» получает число, и это число повторяется завтра.
+///
+/// Фикстура открывается `db::open_readonly`, а **не** `open_and_ensure`: тот
+/// индексирует текущий каталог побочным эффектом, то есть пишет в то, что
+/// измеряет. Показ узла к тому же инкрементирует `access_count`, а он —
+/// множитель ранга: один прогон менял бы вход следующего.
+///
+/// Длительностей отчёт не несёт ни одной (`eval-cases.md`, D-8): секунды
+/// прогона делают вывод неповторяемым побайтово, а eval меряет качество
+/// выдачи, а не скорость машины.
+pub async fn eval(
+    cases: Option<String>,
+    db: Option<String>,
+    now: Option<String>,
+    live: bool,
+    json_out: bool,
+) -> Result<()> {
+    let cases_path = match cases {
+        Some(path) => PathBuf::from(path),
+        None => eval_from_repo_root(EVAL_DEFAULT_CASES),
+    };
+    let (meta, case_list) = eval::load(&cases_path)?;
+
+    // Момент — параметр, а не системные часы (FR-030): свежесть считается от
+    // «сейчас», и без опорного момента у пары близких кандидатов порядок на
+    // границе пятой позиции переворачивается между прогонами.
+    let (moment, now_source) = match now.as_deref() {
+        Some(raw) => (
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .with_context(|| format!("--now не RFC3339: {raw}"))?
+                .with_timezone(&chrono::Utc),
+            "--now",
+        ),
+        None => (meta.as_of, "meta.as_of"),
+    };
+
+    // Названный путь и открываемый — разные вещи. Отчёт печатает названный:
+    // имя временного файла распаковки меняется от прогона к прогону и сломало
+    // бы побайтовое равенство двух прогонов подряд.
+    let named = if live {
+        // `--live` называет базу сам, поэтому `--db` рядом с ним не читается;
+        // молчаливой подменой это не становится — шапка печатает тот путь, по
+        // которому прогон действительно шёл, и рядом стоит «НЕСРАВНИМО».
+        db_path()
+    } else {
+        match db.as_deref() {
+            Some(path) => PathBuf::from(path),
+            None if meta.fixture.trim().is_empty() => anyhow::bail!(
+                "фикстура не названа: нет ни --db, ни meta.fixture в {} — угадывать нечего",
+                cases_path.display()
+            ),
+            None => eval_from_repo_root(meta.fixture.trim()),
+        }
+    };
+
+    // Распакованная копия живёт до конца прогона и удаляется сама. Объявлена
+    // раньше соединения, поэтому удаляется позже него: локальные значения
+    // уходят в обратном порядке объявления.
+    let unpacked = match named.extension() {
+        Some(ext) if ext == "zst" => Some(eval_unpack_zst(&named)?),
+        _ => None,
+    };
+    let opened = unpacked
+        .as_ref()
+        .map_or(named.as_path(), UnpackedFixture::path);
+
+    // Соединение открывается до сверки, хотя сверка и не зависит от него:
+    // ненайденный или неоткрываемый файл обязан дать код 2 («фикстура не
+    // открывается»), а сверка на нём назвала бы причиной несошедшуюся sha —
+    // код 14 и ложный диагноз. Первого кейса при этом ещё не было, а именно
+    // это, а не порядок с соединением, требует контракт.
+    let conn = db::open_readonly(opened)?;
+
+    // Сверка ДО первого кейса: половина отчёта, напечатанная перед тем, как
+    // несовпадение вскрылось, — это ровно то несравнимое число, которое потом
+    // ляжет в `research.md`. Живая база не сверяется: она растёт на каждом
+    // ходу, совпадения sha не бывает по построению, и её несравнимость
+    // называется пометкой, а не кодом 14.
+    let sha256 = if live {
+        None
+    } else {
+        eval::verify_fixture(opened, &meta.fixture_sha256)?;
+        Some(meta.fixture_sha256.clone())
+    };
+
+    let report = eval::run(&conn, &meta, &case_list, moment)?;
+
+    let head = EvalHeader {
+        cases: cases_path.display().to_string(),
+        fixture: named.display().to_string(),
+        sha256,
+        now_source,
+        live,
+    };
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string(&eval_report_json(&head, &report))?
+        );
+    } else {
+        eval_print_report(&head, &report);
+    }
+    Ok(())
+}
+
+/// Чем прогон себя называет: это данные вызова, а не измерения, поэтому они
+/// живут рядом с печатью, а не внутри `EvalReport`.
+struct EvalHeader {
+    cases: String,
+    fixture: String,
+    /// `None` — sha256 не сверялся: прогон шёл по живой базе.
+    sha256: Option<String>,
+    now_source: &'static str,
+    live: bool,
+}
+
+/// Путь контракта — от корня репозитория, а не от текущего каталога: прогон из
+/// `crates/au` обязан взять тот же файл, что и прогон из корня, иначе «то же
+/// число завтра» держится на том, откуда его запустили. Корня нет (архив без
+/// `.git`) — путь остаётся относительным, и его разберёт файловая система.
+/// `.git` бывает и файлом (рабочее дерево `git worktree`), поэтому проверяется
+/// существование, а не «это каталог».
+fn eval_from_repo_root(relative: &str) -> PathBuf {
+    let mut dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(_) => return PathBuf::from(relative),
+    };
+    loop {
+        if dir.join(".git").exists() {
+            return dir.join(relative);
+        }
+        if !dir.pop() {
+            return PathBuf::from(relative);
+        }
+    }
+}
+
+/// Распакованная фикстура: временный файл, который убирает себя сам.
+///
+/// Своя обёртка, а не `tempfile`: ради одного файла новая зависимость крейта
+/// не стоит того. Имя несёт pid — два прогона рядом не должны затирать друг
+/// другу распакованную базу.
+struct UnpackedFixture(PathBuf);
+
+impl UnpackedFixture {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for UnpackedFixture {
+    fn drop(&mut self) {
+        // Ошибка уборки глотается: отчёт к этому моменту напечатан, и ронять
+        // код возврата из-за неудалённого файла значит объявить состоявшийся
+        // прогон несостоявшимся.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Путь с суффиксом `.zst` распаковывается во временный файл: sha256 и порядок
+/// выдачи считаются по содержимому базы, а не по байтам архива, и sqlite
+/// архива не открывает.
+fn eval_unpack_zst(archive: &std::path::Path) -> Result<UnpackedFixture> {
+    let stem = archive
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fixture.db");
+    let dest = std::env::temp_dir().join(format!("au-eval-{}-{stem}", std::process::id()));
+    let source = std::fs::File::open(archive)
+        .with_context(|| format!("не открывается архив фикстуры: {}", archive.display()))?;
+    let target = std::fs::File::create(&dest)
+        .with_context(|| format!("не создаётся временная фикстура: {}", dest.display()))?;
+    // Сторож заводится до распаковки: оборванная на середине копия — тоже сто
+    // мегабайт, и убрать её обязан тот же механизм.
+    let guard = UnpackedFixture(dest);
+    zstd::stream::copy_decode(std::io::BufReader::new(source), &target)
+        .with_context(|| format!("не распаковывается фикстура: {}", archive.display()))?;
+    drop(target);
+    Ok(guard)
+}
+
+/// Человеческая форма отчёта — `eval-cases.md` §5 и `contracts/cli.md` §2.
+/// Печатается построчно и грепабельно; список провалов и разбивку по авторам
+/// (FR-026) добавляет фаза F.
+fn eval_print_report(head: &EvalHeader, report: &eval::EvalReport) {
+    println!("{:<11}{}", "файл:", head.cases);
+    println!("{:<11}{}", "фикстура:", head.fixture);
+    match &head.sha256 {
+        Some(sha) => println!("{:<11}{}   совпал", "sha256:", eval_short_sha(sha)),
+        None => println!("{:<11}не сверялся   (живая база)", "sha256:"),
+    }
+    println!(
+        "{:<11}{}   ({})",
+        "as_of:",
+        report
+            .now
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        head.now_source
+    );
+    if head.live {
+        println!("{EVAL_INCOMPARABLE}");
+    }
+
+    println!();
+    let counts: Vec<String> = eval::CaseKind::ALL
+        .iter()
+        .map(|kind| format!("{} {}", kind.as_str(), report.tally(*kind).cases))
+        .collect();
+    println!("кейсов {}: {}", report.total, counts.join(", "));
+    eval_print_skips(report);
+    // Строка сверки — единственное место, где ошибка в знаменателе видна без
+    // пересчёта глазами: пропуски не входят ни в числитель, ни в знаменатель,
+    // и увидеть их можно только здесь.
+    println!(
+        "пройдено {}, провалено {}, пропущено {} — сумма {}",
+        report.passed, report.failed, report.skipped, report.total
+    );
+
+    println!();
+    for kind in eval::CaseKind::ALL {
+        let tally = report.tally(kind);
+        let name = kind.as_str();
+        if !tally.has_cases() {
+            println!("{name:<18} нет кейсов");
+        } else if tally.eligible() == 0 {
+            // Третье состояние: кейсы вида есть, но все непригодны на этой
+            // фикстуре. Ноль в знаменателе не печатается никогда.
+            println!("{name:<18} непригодно ({})", tally.skipped);
+        } else {
+            println!("{name:<18}{}", eval_share(tally.passed, tally.eligible()));
+        }
+    }
+
+    println!();
+    println!(
+        "{:<11}{} (два прогона подряд обязаны дать этот же digest)",
+        "digest:", report.digest
+    );
+    if head.live {
+        println!("{EVAL_INCOMPARABLE}");
+    }
+}
+
+/// Пропуски с причинами, сгруппированные по виду и причине в порядке файла.
+/// Без причин `SKIP` неотличим от «кейса не было», а это разные вещи: вырезанный
+/// обезличиванием узел — не регрессия ранжирования.
+fn eval_print_skips(report: &eval::EvalReport) {
+    let mut groups: Vec<(&str, &str, usize)> = Vec::new();
+    for outcome in &report.outcomes {
+        if outcome.verdict != eval::Verdict::Skip {
+            continue;
+        }
+        let kind = outcome.kind.as_str();
+        let reason = outcome.detail.as_deref().unwrap_or("причина не названа");
+        match groups
+            .iter_mut()
+            .find(|group| group.0 == kind && group.1 == reason)
+        {
+            Some(group) => group.2 += 1,
+            None => groups.push((kind, reason, 1)),
+        }
+    }
+    if groups.is_empty() {
+        println!("пропущено 0");
+        return;
+    }
+    for (kind, reason, count) in groups {
+        println!("пропущено {count} ({kind}): {reason}");
+    }
+}
+
+/// Доля вида: `19/29   (65,5 %)`. Процент печатает только человеческая форма —
+/// в `--json` уходят целые, потому что округление рядом с целыми это второй
+/// источник истины.
+fn eval_share(passed: usize, eligible: usize) -> String {
+    // Знаменатель нулём здесь не бывает: ноль отсекают состояния «нет кейсов»
+    // и «непригодно (N)» у вызывающего.
+    let percent = if passed == eligible {
+        "100 %".to_owned()
+    } else {
+        // Запятая, а не точка: отчёт читается по-русски.
+        format!("{:.1} %", passed as f64 * 100.0 / eligible as f64).replace('.', ",")
+    };
+    format!("{:>6}   ({percent})", format!("{passed}/{eligible}"))
+}
+
+/// Голова и хвост sha256: различить две фикстуры хватает шестнадцати знаков, а
+/// полные шестьдесят четыре в шапке мешают читать.
+fn eval_short_sha(sha: &str) -> String {
+    let sha = sha.trim();
+    let chars: Vec<char> = sha.chars().collect();
+    if chars.len() <= 17 {
+        return sha.to_owned();
+    }
+    let head: String = chars.iter().take(8).collect();
+    let tail: String = chars[chars.len() - 8..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// Машинная форма: один объект одной строкой, чтобы ворота фаз читали числа
+/// полем, а не регуляркой по прозе. Доля процентом не печатается — отдаются
+/// `passed` и `eligible`; `eligible = cases − skipped`; длительностей нет ни
+/// одной (`contracts/cli.md` §2). `failures[]` и `by_author` наполняет фаза F.
+fn eval_report_json(head: &EvalHeader, report: &eval::EvalReport) -> serde_json::Value {
+    let mut by_kind = serde_json::Map::new();
+    for kind in eval::CaseKind::ALL {
+        let tally = report.tally(kind);
+        by_kind.insert(
+            kind.as_str().to_owned(),
+            json!({
+                "cases": tally.cases,
+                "eligible": tally.eligible(),
+                "passed": tally.passed,
+                "failed": tally.failed,
+                "skipped": tally.skipped,
+            }),
+        );
+    }
+    json!({
+        "cases": head.cases,
+        "fixture": head.fixture,
+        // `null` на живой базе — это «не сверялся», а не «сошёлся»: подставить
+        // сюда `meta.fixture_sha256` значило бы назвать чужую сумму суммой той
+        // базы, по которой шёл прогон.
+        "fixture_sha256": head.sha256,
+        "as_of": report.now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "now_source": head.now_source,
+        "comparable": !head.live,
+        "total": report.total,
+        "passed": report.passed,
+        "failed": report.failed,
+        "skipped": report.skipped,
+        "by_kind": by_kind,
+        "digest": report.digest,
+    })
 }
 
 /// Записать след действия (ступень 1 «Бит-и-Дело»). `--hook` — режим

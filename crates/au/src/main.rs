@@ -649,6 +649,48 @@ enum Commands {
         #[arg(long, conflicts_with = "hook")]
         json: bool,
     },
+    /// Bounded, ranked payload for rebuilding working state after a context
+    /// wipe: anchor facet, the freshest session tail whose next_steps are
+    /// not empty (mcp preferred over cli), the project's facet list, up to
+    /// 8 open records under the anchor, and open critical-priority tasks.
+    /// See `aurelius_core::graph::pickup` for the ranking and the five
+    /// character ceilings.
+    Pickup {
+        /// Project to rebuild — required: an anchor facet makes no sense
+        /// without a scope to compute it in.
+        #[arg(short, long)]
+        project: String,
+        /// Print JSON instead of the human-readable line form.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Score search quality against a frozen fixture: the argument about
+    /// whether recall got better or worse acquires a number, and that number
+    /// repeats tomorrow. Reads only — the fixture is opened read-only, and a
+    /// run that needed to write is a failed run, not a failed case.
+    /// A failed case does not change the exit code; 14 means "no run, no
+    /// numbers". See `specs/010-waking-memory/contracts/cli.md` §2.
+    Eval {
+        /// Case file (JSONL, format in `contracts/eval-cases.md`); defaults to
+        /// `fixtures/eval/cases.jsonl` under the repository root.
+        cases: Option<String>,
+        /// Fixture dump to run against; defaults to `meta.fixture` of the case
+        /// file. A path ending in `.zst` is unpacked into a temporary file.
+        #[arg(long)]
+        db: Option<String>,
+        /// RFC3339 instant the node ages are measured from; defaults to
+        /// `meta.as_of`. The clock is a parameter, never the system time:
+        /// without a fixed instant two runs of one fixture print two numbers.
+        #[arg(long)]
+        now: Option<String>,
+        /// Run against the live database instead of a fixture. The report is
+        /// marked incomparable and its numbers never go into `research.md`.
+        #[arg(long)]
+        live: bool,
+        /// Machine-readable report: one JSON object on one line.
+        #[arg(long)]
+        json: bool,
+    },
     /// Switch or inspect which data/config directory au/aurelius use
     Home {
         #[command(subcommand)]
@@ -730,6 +772,22 @@ mod exit {
     /// Улика при этом СОХРАНЕНА узлом без ребра — код говорит «не привязано»,
     /// а не «не записано».
     pub const NO_ACTIVE_TASK: u8 = 12;
+    /// Рубеж перед графом (`add_node_full`, subject
+    /// `aurelius:write:secret-guard`): текст поля похож на само значение
+    /// секрета. Не ошибка вызова и не ошибка хранилища — вызов был правильным,
+    /// отказал ИМЕННО этот текст, и обходится это не повтором того же
+    /// вызова, а явным `--allow-secret`. Ничего не записано: в отличие от
+    /// `NO_ACTIVE_TASK`, здесь нет половинчатого узла — граф append-only, и
+    /// вычистить записанный секрет нечем.
+    pub const SECRET_LOOKALIKE: u8 = 13;
+    /// `au eval`: прогон не состоялся, и чисел нет — sha256 фикстуры не сошёлся
+    /// с `meta.fixture_sha256`, `meta.version` незнакома, либо проверке
+    /// потребовалась запись. Не ошибка вызова и не ошибка хранилища: вызов был
+    /// верным, база цела, испорчена именно сопоставимость. Отдельный код нужен
+    /// потому, что несравнимое число хуже отсутствующего — отсутствующее
+    /// заставляет прогнать заново, несравнимое молча ложится в `research.md`
+    /// рядом с числом, снятым на другой базе. Провал кейса кодом НЕ является.
+    pub const EVAL_NOT_COMPARABLE: u8 = 14;
 }
 
 /// Хранилищем считается всё, что пришло из слоя базы: `DbError` (открытие,
@@ -754,6 +812,22 @@ fn classify(err: &anyhow::Error) -> u8 {
         .any(|c| c.is::<aurelius_core::graph::NoActiveTask>())
     {
         return exit::NO_ACTIVE_TASK;
+    }
+    if err
+        .chain()
+        .any(|c| c.is::<aurelius_core::secret::SecretLookalikeRefused>())
+    {
+        return exit::SECRET_LOOKALIKE;
+    }
+    // До проверки на хранилище: `EvalRunFailed` — не `DbError` и не
+    // `rusqlite::Error`, поэтому без своей ветки он молча стал бы единицей,
+    // то есть «ошибкой вызова» — ровно тем, чем не является. Смотрим на тип,
+    // а не на текст сообщения: сообщение — это диагностика, а не контракт.
+    if err
+        .chain()
+        .any(|c| c.is::<aurelius_core::eval::EvalRunFailed>())
+    {
+        return exit::EVAL_NOT_COMPARABLE;
     }
     let storage = err
         .chain()
@@ -840,6 +914,14 @@ async fn run(cli: Cli) -> Result<()> {
             hook,
             json,
         } => commands::snapshot(project, hook, json).await,
+        Commands::Pickup { project, json } => commands::pickup(project, json).await,
+        Commands::Eval {
+            cases,
+            db,
+            now,
+            live,
+            json,
+        } => commands::eval(cases, db, now, live, json).await,
         Commands::Home { action } => commands::home(action).await,
         Commands::Identity { action } => commands::identity(action).await,
         Commands::Share { action } => commands::share(action).await,
