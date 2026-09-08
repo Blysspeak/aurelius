@@ -19,3 +19,13 @@ CLAUDE.md
 
 # Claude Code local settings (per-machine permissions, not shared)
 .claude/settings.local.json
+
+# ulika run state: artifacts and journal are per-machine evidence, not source
+.ulika/
+
+# Eval fixture: a copy of the owner's live memory graph. Anonymised by
+# fixtures/eval/scrub.sql, but 26 MB of personal working memory does not
+# belong in a public repository. The case file and the scrub script stay
+# tracked; research.md D-1 records the fixture's sha256 so a run can prove
+# it used the same file.
+fixtures/eval/*.db.zst

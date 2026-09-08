@@ -1,21 +1,12 @@
 use anyhow::Result;
 use aurelius_core::{
     graph::{self, ProblemSolved, SessionInput},
-    models::{MemoryKind, NodeType, Relation},
+    models::Relation,
     provenance::{self, Provenance},
 };
 use serde_json::json;
 
 use super::{node_recall, open_db, resolve_node, sync_push_if_enabled};
-
-/// Сколько записей знания отдаёт `memory_recall`. Ответ читает модель с
-/// ограниченным окном: двенадцать отранжированных записей она использует, сто
-/// — пролистывает.
-const RECALL_LIMIT: usize = 12;
-
-/// Хвост эпизодического. Двух хватает, чтобы ответить «чем занимались
-/// последний раз»; больше — это уже журнал, а за ним идут в `au journal`.
-const RECALL_TAIL_LIMIT: usize = 2;
 
 /// Строки массива параметра, пустой вектор при отсутствии или чужом типе.
 fn string_list(params: &serde_json::Value, key: &str) -> Vec<String> {
@@ -211,57 +202,16 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
     let depth = params.get("depth").and_then(|d| d.as_u64()).unwrap_or(2) as u32;
 
     let conn = open_db()?;
-    let traversal = graph::context_with_report_seeded(&conn, topic, depth, graph::RECALL_SEEDS)?;
-    let context_nodes = traversal.nodes;
+    // Обход, отсев, порядок и срезы — общий код ядра
+    // (`graph::recall_selection`). Он здесь не повторяется: `au eval` мерит
+    // боевой путь только пока путь один, а не копия в обработчике.
+    let selection = graph::recall_selection(&conn, topic, depth)?;
 
-    // Степень внутри найденного подграфа — мера того, насколько запись держит
-    // тему, а не насколько часто в её теле встретилось слово. BM25 по телу
-    // поднимал наверх дампы сессий: в каждом мёртвом пути `A:\workSpace\ulika\`
-    // имя проекта повторяется десятки раз, и частота терма отвечала за
-    // релевантность вместо связей.
-    let mut degree: std::collections::HashMap<uuid::Uuid, usize> = std::collections::HashMap::new();
-    for edge in &traversal.edges {
-        *degree.entry(edge.from_id).or_default() += 1;
-        *degree.entry(edge.to_id).or_default() += 1;
-    }
-
-    let mut knowledge = vec![];
-    let mut episodic_tail = vec![];
-
-    for node in &context_nodes {
-        // Карточки навыков приходят на SessionStart через `au skills --hook` и
-        // в выдаче recall были бы вторым экземпляром того же текста.
-        if matches!(node.node_type, NodeType::Skill) {
-            continue;
-        }
-        // Узел проекта — навигация, а не знание: у него нет ни claim, ни note,
-        // метка равна имени проекта. По степени он всегда первый (673 ребра у
-        // ulika), то есть занимал бы верхнюю строку ответа, ничего не сообщая.
-        if matches!(node.node_type, NodeType::Project) {
-            continue;
-        }
-        // Эпизодическое — снимок момента: сессия, срез перед компакцией. Оно
-        // отвечает на «что происходило», а спрашивают «что известно», поэтому
-        // уходит в хвост, а не смешивается со знанием.
-        if matches!(node.memory_kind, MemoryKind::Episodic) {
-            episodic_tail.push(node);
-        } else {
-            knowledge.push(node);
-        }
-    }
-
-    let rank = |a: &&aurelius_core::models::Node, b: &&aurelius_core::models::Node| {
-        let da = degree.get(&a.id).copied().unwrap_or(0);
-        let db = degree.get(&b.id).copied().unwrap_or(0);
-        db.cmp(&da).then(b.created_at.cmp(&a.created_at))
-    };
-    knowledge.sort_by(rank);
-    episodic_tail.sort_by(rank);
-
-    let shown: Vec<_> = knowledge.iter().take(RECALL_LIMIT).collect();
-    let tail: Vec<_> = episodic_tail.iter().take(RECALL_TAIL_LIMIT).collect();
-
-    for node in shown.iter().chain(tail.iter()) {
+    // Инкремент `access_count` — единственное, что осталось от сборки в
+    // обработчике, и переезжать ему некуда: фикстура прогона открывается
+    // только на чтение, и одна эта запись на общем пути роняла бы каждый
+    // кейс `recall_top5`.
+    for node in selection.knowledge.iter().chain(selection.recent.iter()) {
         // Best effort by design: an access counter must never fail a read.
         if let Err(e) = graph::touch_node(&conn, node.id) {
             tracing::warn!("could not record access for {}: {e}", node.id);
@@ -270,16 +220,24 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     Ok(json!({
         "topic": topic,
-        "knowledge": shown.iter().map(|n| node_recall(n, topic)).collect::<Vec<_>>(),
-        "recent": tail.iter().map(|n| node_recall(n, topic)).collect::<Vec<_>>(),
-        "shown": shown.len(),
-        "matched_knowledge": knowledge.len(),
-        "matched_recent": episodic_tail.len(),
-        "total_graph_nodes": context_nodes.len(),
+        "knowledge": selection
+            .knowledge
+            .iter()
+            .map(|n| node_recall(n, topic))
+            .collect::<Vec<_>>(),
+        "recent": selection
+            .recent
+            .iter()
+            .map(|n| node_recall(n, topic))
+            .collect::<Vec<_>>(),
+        "shown": selection.knowledge.len(),
+        "matched_knowledge": selection.matched_knowledge,
+        "matched_recent": selection.matched_recent,
+        "total_graph_nodes": selection.total_graph_nodes,
         "truncation": {
-            "truncated": traversal.truncated_at_depth.is_some(),
-            "hidden_nodes": traversal.hidden_nodes,
-            "truncated_at_depth": traversal.truncated_at_depth,
+            "truncated": selection.truncated_at_depth.is_some(),
+            "hidden_nodes": selection.hidden_nodes,
+            "truncated_at_depth": selection.truncated_at_depth,
         },
     }))
 }
@@ -287,7 +245,7 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aurelius_core::db;
+    use aurelius_core::{db, models::NodeType};
 
     /// The same trick as in `task.rs`: a real temp file, not `:memory:` —
     /// `db::open` hard-requires WAL, and `memory_session` hits the user's real

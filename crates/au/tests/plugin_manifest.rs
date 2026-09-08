@@ -99,7 +99,7 @@ fn install_sh_updates_installed_plugin() {
 }
 
 #[test]
-fn hooks_json_has_exactly_seven_au_commands() {
+fn hooks_json_declares_expected_au_commands() {
     let root = plugin_root();
     let plugin_json_path = root.join(".claude-plugin/plugin.json");
     let plugin = read_json(&plugin_json_path);
@@ -114,7 +114,10 @@ fn hooks_json_has_exactly_seven_au_commands() {
         .as_object()
         .expect("plugin/hooks.json: field `hooks` must be an object keyed by event name");
 
-    let mut command_count = 0usize;
+    // Named by first `args` element (the au subcommand) rather than merely
+    // counted: a bare count fails on every deliberate hook change and does
+    // not say which hook appeared or vanished.
+    let mut commands: Vec<&str> = Vec::new();
     for (event, matcher_groups) in events {
         let matcher_groups = matcher_groups.as_array().unwrap_or_else(|| {
             panic!("plugin/hooks.json: event `{event}` must be an array of matcher groups")
@@ -124,7 +127,6 @@ fn hooks_json_has_exactly_seven_au_commands() {
                 panic!("plugin/hooks.json: event `{event}` matcher group must have a `hooks` array")
             });
             for hook in hook_list {
-                command_count += 1;
                 assert_eq!(
                     hook["command"].as_str(),
                     Some("au"),
@@ -141,13 +143,22 @@ fn hooks_json_has_exactly_seven_au_commands() {
                     !args.is_empty(),
                     "plugin/hooks.json: event `{event}` hook field `args` must not be empty"
                 );
+                let subcommand = args.first().and_then(|a| a.as_str()).unwrap_or_else(|| {
+                    panic!(
+                        "plugin/hooks.json: event `{event}` hook `args[0]` must be a string subcommand"
+                    )
+                });
+                commands.push(subcommand);
             }
         }
     }
 
+    commands.sort_unstable();
+    let mut expected = ["db", "judge", "reindex", "skills", "touch", "trace"];
+    expected.sort_unstable();
     assert_eq!(
-        command_count, 7,
-        "plugin/hooks.json: total hook command count across all events must be exactly 7"
+        commands, expected,
+        "plugin/hooks.json: hook subcommands across all events must be exactly {expected:?} (six total), got {commands:?}"
     );
 }
 
