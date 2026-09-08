@@ -676,10 +676,13 @@ fn tally_up(outcomes: Vec<CaseOutcome>, now: DateTime<Utc>) -> EvalReport {
 /// одного кейса не должно зависеть от того, чем занят соседний.
 ///
 /// Отличие от нормативной сигнатуры `data-model.md` §4: параметра
-/// `w: &RankWeights` здесь нет — тип весов ранга заводит фаза B вместе с
-/// `rank.rs`, и до неё порядок выдачи задаёт `by_degree_then_recency`, у
-/// которой весов нет. Параметр добавляется в T018, вместе с тем, что его
-/// читает.
+/// `w: &RankWeights` здесь по-прежнему нет. T018 перевёл путь recall
+/// (`graph::recall_selection`) на `rank::score`, но там веса берутся
+/// `RankWeights::default()` на месте, а не приходят сюда параметром — эта
+/// строка `run()` до калибровки не дотянута и остаётся известным пробелом
+/// (см. отчёт агента волны T018): довести до нормативной формы значило бы
+/// протащить `w` ещё и через `judge`/`judge_recall_top5`, и через CLI-вызов
+/// в `au` (`commands.rs`), что уже вне зоны той правки.
 pub fn run(
     conn: &Connection,
     meta: &EvalMeta,
@@ -709,7 +712,7 @@ pub fn run(
 
     let mut outcomes = Vec::with_capacity(cases.len());
     for case in cases {
-        let (verdict, detail) = judge(conn, case)?;
+        let (verdict, detail) = judge(conn, case, now)?;
         outcomes.push(CaseOutcome {
             id: case.id.clone(),
             kind: case.kind(),
@@ -723,7 +726,11 @@ pub fn run(
 /// Вердикт одного кейса. Ошибка отсюда — сбой хранилища, а не провал кейса:
 /// «база не ответила» и «ответ не тот» — разные вещи, и код возврата у них
 /// разный.
-fn judge(conn: &Connection, case: &EvalCase) -> Result<(Verdict, Option<String>)> {
+fn judge(
+    conn: &Connection,
+    case: &EvalCase,
+    now: DateTime<Utc>,
+) -> Result<(Verdict, Option<String>)> {
     // Похожее на секрет вырезается из выдачи раньше ранжирования
     // (`graph::search`, `nodes.retain(|n| !secret::is_secret_ref(n))`), так
     // что ожидать такой узел в топ-5 бессмысленно, а хранить его текст в
@@ -742,7 +749,7 @@ fn judge(conn: &Connection, case: &EvalCase) -> Result<(Verdict, Option<String>)
         ));
     }
     match &case.body {
-        CaseBody::RecallTop5 { input, expect } => judge_recall_top5(conn, input, expect),
+        CaseBody::RecallTop5 { input, expect } => judge_recall_top5(conn, input, expect, now),
         CaseBody::Morphology { input, expect } => judge_morphology(conn, input, expect),
         // Сюда не дойти: неисполнимые виды роняют прогон в `run` до судейства.
         // Ветка существует затем, чтобы шестой вид, добавленный в enum, не
@@ -786,6 +793,7 @@ fn judge_recall_top5(
     conn: &Connection,
     input: &RecallInput,
     expect: &RecallExpect,
+    now: DateTime<Utc>,
 ) -> Result<(Verdict, Option<String>)> {
     if input.topic.trim().is_empty() {
         return Ok((
@@ -832,7 +840,7 @@ fn judge_recall_top5(
     }
 
     let depth = input.depth.unwrap_or(DEFAULT_RECALL_DEPTH);
-    let selection = graph::recall_selection(conn, &input.topic, depth)?;
+    let selection = graph::recall_selection(conn, &input.topic, depth, now)?;
     let shown: Vec<&Node> = selection
         .knowledge
         .iter()
