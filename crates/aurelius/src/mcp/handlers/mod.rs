@@ -392,6 +392,34 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Same escape hatch as the CLI's `au note --allow-secret`
+/// (`crates/au/src/commands.rs`, field `NoteArgs::allow_secret`): when
+/// `params["allow_secret"]` is `true`, stamps the bypass marker into `data`
+/// so `add_node_full`'s secret-lookalike guard
+/// (`aurelius_core::secret::BYPASS_MARKER_KEY`) lets the write through
+/// instead of refusing a legitimate record on a false positive. Absent or
+/// `false` — `data` comes back untouched, byte for byte what it was before
+/// this existed. The marker lands IN the written node, same as the CLI: a
+/// bypass nobody can find afterwards is the same as no guard at all.
+pub(crate) fn apply_secret_bypass(params: &serde_json::Value, data: &mut serde_json::Value) {
+    let allow = params
+        .get("allow_secret")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !allow {
+        return;
+    }
+    if data.is_null() {
+        *data = json!({});
+    }
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            aurelius_core::secret::BYPASS_MARKER_KEY.to_owned(),
+            serde_json::Value::Bool(true),
+        );
+    }
+}
+
 pub(crate) fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let now = chrono::Utc::now();
     match s.trim().to_lowercase().as_str() {
@@ -509,6 +537,43 @@ mod recall_window_tests {
         assert!(
             window.contains("улик"),
             "окно должно вести длинное слово, а не предлог: {window}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod secret_bypass_tests {
+    use super::apply_secret_bypass;
+    use serde_json::json;
+
+    #[test]
+    fn allow_secret_true_stamps_the_bypass_marker() {
+        let params = json!({ "allow_secret": true });
+        let mut data = json!({ "project": "proj" });
+        apply_secret_bypass(&params, &mut data);
+        assert_eq!(
+            data[aurelius_core::secret::BYPASS_MARKER_KEY],
+            json!(true),
+            "allow_secret: true must be accepted and stamp the marker: {data:?}"
+        );
+    }
+
+    /// Absent or explicit `false` — the default — must leave `data` untouched:
+    /// behaviour without the field stays bit-for-bit what it was before this
+    /// escape hatch existed.
+    #[test]
+    fn allow_secret_absent_or_false_leaves_data_untouched() {
+        let original = json!({ "project": "proj" });
+
+        let mut data = original.clone();
+        apply_secret_bypass(&json!({}), &mut data);
+        assert_eq!(data, original, "absent must not touch data: {data:?}");
+
+        let mut data = original.clone();
+        apply_secret_bypass(&json!({ "allow_secret": false }), &mut data);
+        assert_eq!(
+            data, original,
+            "explicit false must not touch data: {data:?}"
         );
     }
 }

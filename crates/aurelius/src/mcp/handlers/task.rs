@@ -6,7 +6,7 @@ use aurelius_core::{
 };
 use serde_json::json;
 
-use super::{node_compact, node_detail, open_db, resolve_task_node, truncate};
+use super::{apply_secret_bypass, node_compact, node_detail, open_db, resolve_task_node, truncate};
 
 pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
     let conn = open_db()?;
@@ -56,6 +56,7 @@ fn task_create_with_conn(
         "completed_at": null,
     });
     prov.write_into(&mut task_data);
+    apply_secret_bypass(params, &mut task_data);
 
     let label = format!("[{}] {}", project, title);
     let task = graph::add_node_full(
@@ -489,6 +490,7 @@ fn task_log_with_conn(
     // Create WorkLog node
     let mut log_data = json!({"task_id": task.id.to_string()});
     prov.write_into(&mut log_data);
+    apply_secret_bypass(params, &mut log_data);
     let log_node = aurelius_core::tasks::log_work(conn, &task, text, "mcp-task", log_data)?;
 
     let mut created_nodes = vec![node_compact(&log_node)];
@@ -504,6 +506,7 @@ fn task_log_with_conn(
             if let Some(dec_text) = decision.as_str() {
                 let mut dec_data = json!({"task_id": task.id.to_string()});
                 inherited.write_into(&mut dec_data);
+                apply_secret_bypass(params, &mut dec_data);
                 let dec_node = graph::add_node(
                     conn,
                     NodeType::Decision,
@@ -530,6 +533,7 @@ fn task_log_with_conn(
             if let (Some(prob), Some(sol)) = (prob_text, sol_text) {
                 let mut prob_data = json!({"task_id": task.id.to_string()});
                 inherited.write_into(&mut prob_data);
+                apply_secret_bypass(params, &mut prob_data);
                 let prob_node = graph::add_node(
                     conn,
                     NodeType::Problem,
@@ -540,6 +544,7 @@ fn task_log_with_conn(
                 )?;
                 let mut sol_data = json!({"task_id": task.id.to_string()});
                 inherited.write_into(&mut sol_data);
+                apply_secret_bypass(params, &mut sol_data);
                 let sol_node = graph::add_node(
                     conn,
                     NodeType::Solution,
@@ -1096,6 +1101,64 @@ mod tests {
         assert_eq!(
             prov.subject.as_deref(),
             Some("aurelius:proj-create-subject:task")
+        );
+    }
+
+    /// The MCP escape hatch for the secret-lookalike guard, mirrored from the
+    /// CLI's `au note --allow-secret`: default (field absent) behaves exactly
+    /// as before this existed — a description that looks like a leaked token
+    /// is refused, and nothing is created.
+    #[test]
+    fn task_create_without_allow_secret_still_refuses_a_lookalike_description() {
+        let (_tmp, conn) = setup();
+        let before = graph::get_all_nodes(&conn).expect("nodes before").len();
+
+        let err = task_create_with_conn(
+            &conn,
+            &json!({
+                "title": "задача без обхода",
+                "project": "proj-secret-default",
+                "description": "ran ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+            }),
+        )
+        .expect_err("похожий на токен текст обязан быть отказом по умолчанию");
+        assert!(
+            err.to_string().contains("отклонена"),
+            "ожидался отказ рубежа секретов: {err}"
+        );
+
+        let after = graph::get_all_nodes(&conn).expect("nodes after").len();
+        assert_eq!(before, after, "отказ обязан не создавать ни одного узла");
+    }
+
+    /// `allow_secret: true` is accepted and actually lets the write through —
+    /// the same lookalike description that `task_create_without_allow_secret_
+    /// still_refuses_a_lookalike_description` refuses above now succeeds, and
+    /// the bypass is stamped onto the node's data, not applied silently.
+    #[test]
+    fn task_create_with_allow_secret_true_bypasses_the_guard_and_marks_the_node() {
+        let (_tmp, conn) = setup();
+
+        let result = task_create_with_conn(
+            &conn,
+            &json!({
+                "title": "задача с обходом",
+                "project": "proj-secret-bypass",
+                "description": "ran ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+                "allow_secret": true,
+            }),
+        )
+        .expect("allow_secret: true обязано пропустить запись");
+
+        let id = result["id"].as_str().expect("id");
+        let node = graph::get_node(&conn, id)
+            .expect("get_node")
+            .expect("task exists");
+        assert_eq!(
+            node.data[aurelius_core::secret::BYPASS_MARKER_KEY],
+            json!(true),
+            "обход обязан быть виден в data узла, а не применяться молча: {:?}",
+            node.data
         );
     }
 
