@@ -5,10 +5,11 @@ use rusqlite::{params, Connection};
 use super::row_to_node;
 
 // T018 подключает `graph::rank` (`RankWeights`, data-model.md §1) к пути
-// посевов; до тех пор `search.rs` не имеет права зависеть от ещё не
-// подключённого модуля (эта волна — только T015/T016). Числа ниже дублируют
-// `RankWeights::df_veto_ratio` / `min_significant_terms` и будут унифицированы
-// вместе с остальными множителями ранга в T018.
+// посевов: нормировка bm25 теперь зовёт `rank::normalize_bm25` — приватная
+// копия этой формулы здесь удалена (замечено при приёмке 08.09.2026, две
+// копии одной формулы расходятся молча при первой же калибровке `au eval`).
+// Числа ниже по-прежнему дублируют `RankWeights::df_veto_ratio` /
+// `min_significant_terms`; их унификация в объём этой правки не входит.
 
 /// Результат поиска вместе с ответом на вопрос «почему не нашлось».
 ///
@@ -171,7 +172,7 @@ pub fn search_ranked(conn: &Connection, query: &str, limit: usize) -> Result<Sea
     // заменяет его, а не складывается с ним, T018), ни веса полей
     // (`rank_by_matched_terms`, снят с этого пути выше).
     let raw_ranks: Vec<f64> = fetched.iter().map(|(_, r)| *r).collect();
-    let normalized = normalize_bm25(&raw_ranks);
+    let normalized = super::rank::normalize_bm25(&raw_ranks);
     let mut scored: Vec<(Node, f64)> = fetched
         .into_iter()
         .zip(normalized)
@@ -186,41 +187,6 @@ pub fn search_ranked(conn: &Connection, query: &str, limit: usize) -> Result<Sea
         unmatched_terms: unmatched_terms(conn, &parsed.terms)?,
         terms: parsed.terms,
     })
-}
-
-/// `r = |rank| / (|rank| + median|rank|)` по текущей выдаче (FR-007a,
-/// `data-model.md` §1). Медианный кандидат по построению получает `r = 0.5`
-/// — то же нейтральное значение, что `RankWeights::r_traversed` назначает
-/// узлу, пришедшему в контекст обходом, а не посевом.
-///
-/// Дублирует будущую `rank::normalize_bm25` — см. комментарий у `use` в
-/// начале файла про зависимость от `graph::rank`.
-fn normalize_bm25(raw: &[f64]) -> Vec<f64> {
-    if raw.is_empty() {
-        return Vec::new();
-    }
-    let mut abs_sorted: Vec<f64> = raw.iter().map(|v| v.abs()).collect();
-    abs_sorted.sort_by(f64::total_cmp);
-    let mid = abs_sorted.len() / 2;
-    let median = if abs_sorted.len().is_multiple_of(2) {
-        (abs_sorted[mid - 1] + abs_sorted[mid]) / 2.0
-    } else {
-        abs_sorted[mid]
-    };
-    raw.iter()
-        .map(|v| {
-            let a = v.abs();
-            let denom = a + median;
-            // Все `rank` в выдаче совпали (медиана и элемент равны, обычно
-            // оба — 0): делить нечего, а не «есть на что делить, но вышел
-            // ноль» — нейтральный случай медианного элемента, а не провал.
-            if denom == 0.0 {
-                0.5
-            } else {
-                a / denom
-            }
-        })
-        .collect()
 }
 
 /// Вес совпадения по полям. Заголовок — то, что автор счёл сутью записи;
@@ -1137,27 +1103,6 @@ mod tests {
         );
 
         cleanup(&path, conn);
-    }
-
-    /// Медианный кандидат по построению нормировки получает `r = 0.5` — то
-    /// же нейтральное значение, что `RankWeights::r_traversed` назначает
-    /// узлу, пришедшему обходом (`data-model.md` §1).
-    #[test]
-    fn normalize_bm25_gives_the_median_candidate_exactly_half() {
-        let raw = vec![-1.0, -2.0, -3.0, -4.0, -5.0];
-        let normalized = normalize_bm25(&raw);
-        assert!(
-            (normalized[2] - 0.5).abs() < 1e-9,
-            "|raw[2]| = 3.0 — медиана по построению: {normalized:?}"
-        );
-        for r in &normalized {
-            assert!((0.0..1.0).contains(r), "r обязан лежать в [0,1): {r}");
-        }
-    }
-
-    #[test]
-    fn normalize_bm25_of_empty_input_is_empty() {
-        assert!(normalize_bm25(&[]).is_empty());
     }
 
     /// T016: сколько живых узлов нужно фильтром, помимо тех, что несут

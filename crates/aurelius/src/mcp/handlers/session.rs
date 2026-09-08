@@ -205,7 +205,7 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
     // Обход, отсев, порядок и срезы — общий код ядра
     // (`graph::recall_selection`). Он здесь не повторяется: `au eval` мерит
     // боевой путь только пока путь один, а не копия в обработчике.
-    let selection = graph::recall_selection(&conn, topic, depth)?;
+    let selection = graph::recall_selection(&conn, topic, depth, chrono::Utc::now())?;
 
     // Инкремент `access_count` — единственное, что осталось от сборки в
     // обработчике, и переезжать ему некуда: фикстура прогона открывается
