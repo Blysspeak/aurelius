@@ -10,10 +10,10 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/v1.11.1-stable-a6e3a1?style=flat-square" alt="v1.11.1">
+  <img src="https://img.shields.io/badge/v3.4.4-stable-a6e3a1?style=flat-square" alt="v3.4.4">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
-  <img src="https://img.shields.io/badge/MCP-32_tools-a6e3a1?style=flat-square" alt="MCP">
+  <img src="https://img.shields.io/badge/MCP-33_tools-a6e3a1?style=flat-square" alt="MCP">
 </p>
 
 <p align="center">
@@ -38,7 +38,7 @@ Every AI session starts from zero. You re-explain your projects, your past decis
 
 ## Quick Start
 
-Aurelius ships as a [Claude Code plugin](plugin/hooks.json): seven session hooks, skill cards and
+Aurelius ships as a [Claude Code plugin](plugin/hooks.json): six session hooks, skill cards and
 the `/pickup` command, installed with two `claude plugin` commands instead of hand-edited
 `settings.json`. The MCP server is registered separately, user-scope, by `install.sh` (`claude mcp
 add -s user aurelius au mcp`) — a plugin-bundled server would rename every tool to
@@ -96,7 +96,9 @@ only an entry pointing at the old wrapper script is stale — replace it with
 
 ```
 $ au --version
-au 1.11.1
+au 3.4.4
+$ aurelius --version        # the MCP binary answers too, instead of holding stdin open
+aurelius 3.4.4
 ```
 
 ---
@@ -110,11 +112,11 @@ Aurelius runs as an MCP server over stdio. `install.sh` registers it user-scope 
 
 | Tool | Description |
 |------|-------------|
-| `memory_status` | Session start — full project snapshot with active tasks and a `server` block (running MCP server version, `started_at`, and `restart_needed` when the binary on disk is newer than this running process — installing a new build over the old one doesn't kill an already-running MCP server). Optional `project` filter. |
+| `memory_status` | Session start — project snapshot with active tasks and a `server` block (running MCP server version, `started_at`, and `restart_needed` when the binary on disk is newer than this running process — installing a new build over the old one doesn't kill an already-running MCP server). Optional `project` filter. **Compact by default:** notes come back as word-boundary excerpts flagged `note_truncated`, task evidence is summarized to total/green/last_green, and a `truncation` block counts what was hidden past the per-section cap — so the first call of a session cannot blow the context on a large graph. `full=true` returns the legacy complete shape. |
 | `memory_session` | Session end — save decisions, problems/solutions, next steps. Links to tasks. Returns active tasks hint. SHA-256 dedup. Accepts the same provenance fields as `memory_add` (`confidence`, `evidence`, `subject`, `volatility`, `claim`, `measured_at`, `verify_with`); spawned decisions/problems/solutions inherit confidence/evidence but never subject/claim. |
-| `memory_recall` | Smart topic recall — FTS + BFS, grouped by type (incl. tasks), skips structural noise. |
+| `memory_recall` | Smart topic recall — FTS + BFS, grouped by type (incl. tasks), skips structural noise. Ordered by the rank score, not by node degree: a hub node no longer wins a topic just for having many edges. |
 | `memory_search` | Full-text search with `type`, `since`, and `limit` filters. `*` for recent. Words are OR-ed and ranked by how many of them matched, so one bad word form spoils the order rather than the result; `unmatched_terms` names the words that matched nothing, telling "no such knowledge" apart from "the query didn't work". |
-| `memory_context` | Raw BFS graph traversal from FTS seed nodes. |
+| `memory_context` | Raw BFS graph traversal from FTS seed nodes. Capped at 200 nodes and depth 3, and the cut is reported in a `truncation` block — an explicit `depth=2` through a hub node used to expand the answer into megabytes. The same cap applies to `memory_recall`. |
 | `memory_path` | Directed step ladder over `next_step`/`prerequisite` edges: shortest path between two nodes, or every node that transitively leads to one target. Same computation as `au path`. |
 | `memory_snapshot` | The seven-layer frozen slice as Markdown, under a hard budget. |
 | `memory_consolidate` | Rebuild a project's distillate — open next steps plus unsolved problems. Idempotent. |
@@ -213,7 +215,8 @@ the layer immediately below "In progress" in priority pays for it.
 ```bash
 au snapshot --project myapp          # Markdown, for humans and for context
 au snapshot --project myapp --json   # fixed shape, for programs
-au snapshot --hook                   # Claude Code SessionStart envelope
+au snapshot --hook                   # Claude Code SessionStart envelope — the flag stays,
+                                     # but the plugin no longer registers it (see Hooks)
 ```
 
 ### Machine-readable form
@@ -479,6 +482,15 @@ au export                          # export full graph as JSON
 au mcp                             # start MCP server
 au skills                          # print the skill index
 au snapshot -p myapp [--json]      # seven-layer slice: Markdown, or a fixed JSON shape
+au pickup -p myapp [--json]        # bounded ranked payload to rebuild working state after a context wipe
+au recall <uuid-or-subject>        # read one record back by its exact subject, not by search
+au recall --prefix xhub:refunds    # every live node whose subject starts with this facet
+au path <from> <to> [--json]       # step ladder over next_step/prerequisite edges; --before <id> for everything leading in
+au graph import graph.json         # bulk-import an external documentation graph (spec 008)
+au graph export --format mermaid   # the same graph back out
+au merge <source> <target>         # fold a near-duplicate node into the one that stays
+au home current                    # which data/config directory au and aurelius read (`use`, `reset`)
+au eval [cases.jsonl] [--json]     # score recall against a frozen fixture — the argument gets a number
 au trace -m "what just happened"   # append to the action journal (or --hook on PostToolUse)
 au judge                           # settle the session: reinforce, erode, fork or null
 au db check [PATH]                 # verify integrity (read-only); PATH verifies a snapshot
@@ -510,6 +522,15 @@ fixed by calling differently, the second by hand — retrying it is pointless.
 | `0` | done (`--help` and `--version` included) |
 | `1` | bad call — unknown `--type`, missing argument, node not found, malformed JSON on stdin |
 | `2` | storage unreachable — no database, damaged image, locked SQLite |
+| `10` | `au task claim`/`renew`/`release`/`give-up`: the pool is empty, or the lease expired and was reissued to someone else. A shift counts consecutive `10`s to know the queue is exhausted |
+| `11` | the same commands: the database is held by another writer. Distinct from `10` on purpose — otherwise the owner's own hand-run session reads as an empty queue and the shift exits reporting success |
+| `12` | `au task evidence`: nothing to attach the run to — the project has no active task. The evidence **is stored**, as a node without an edge; the code says "not attached", not "not written" |
+| `13` | the secret guard refused the text: a field reads like the secret's value itself. Nothing was written — the graph is append-only and there is no way to scrub a recorded secret. Bypass explicitly with `--allow-secret` |
+| `14` | `au eval`: no run, no numbers — the fixture's sha256 did not match `meta.fixture_sha256`, `meta.version` is unknown, or the run needed to write. A failing *case* is not this code: an incomparable number is worse than a missing one |
+
+Codes above `2` are neither: the call was right and the database is intact. Each names a state
+the caller has to branch on, and each exists because collapsing it into `1` made some script
+report success on a condition retrying cannot fix.
 
 The `--hook` variants (`au snapshot --hook`, `au trace --hook`, `au judge --hook`) are the
 deliberate exception: they never fail and stay silent on error. A broken hook is worse than
@@ -665,9 +686,15 @@ Session end    →  memory_session(summary, decisions, problems_solved, tasks)
 ```
 crates/
   aurelius-core/
-    src/graph/       — crud.rs, search.rs, traverse.rs, snapshot.rs (layers + distillate)
-    src/db.rs        — SQLite setup, migrations V1-V12
+    src/graph/       — crud.rs, search.rs, traverse.rs, snapshot.rs (layers + distillate),
+                       rank.rs (the score recall orders by), render.rs (one node → one prose line),
+                       lease.rs, path.rs, pickup.rs, import.rs, export.rs
+    src/db.rs        — SQLite setup, migrations V1-V14
     src/models.rs    — Node, Edge, NodeType, Relation, MemoryKind
+    src/provenance.rs — confidence/evidence/subject/volatility, parsed once for both doors
+    src/secret.rs    — the guard: refuses a field that reads like the secret's value
+    src/eval.rs      — recall scored against a frozen fixture, read-only
+    src/tasks.rs     — task lifecycle, leasing, ripeness
     src/indexer.rs   — Cargo.toml project indexer
     src/identity.rs  — local identity config (~/.config/aurelius/identity.toml)
     src/sync/        — push/pull types, upsert + last-writer-wins merge logic
@@ -701,14 +728,14 @@ deploy/
 
 - **SQLite + WAL** — concurrent reads, single writer, local-first. Every connection sets a busy timeout, verifies that WAL mode actually took effect, and checks the file header against the file size before use
 - **FTS5** — indexes label + note (not raw JSON), kept in sync via triggers
-- **12 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache, V6 sync attribution/tombstones, V7-V8 documents and skills, V9 the action journal (`act_trace`, `probes`, `pathways`, `labile_window`, `corrections`), V10 `codec`/`delta`/`node_version`, V11 obligations, V12 readable obligation objects. Applied atomically in a single `BEGIN IMMEDIATE` transaction
+- **14 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache, V6 sync attribution/tombstones, V7-V8 documents and skills, V9 the action journal (`act_trace`, `probes`, `pathways`, `labile_window`, `corrections`), V10 `codec`/`delta`/`node_version`, V11 obligations, V12 readable obligation objects, V13 the run that wrote a record, V14 the subject a fact asserts about. Applied atomically in a single `BEGIN IMMEDIATE` transaction
 - **Sync attribution** — `created_by`/`updated_by` stamped from the local identity config; deletes are soft (`deleted_at`) so they propagate as tombstones instead of resurrecting on the next sync
 - **Batch BFS** — `WHERE id IN (...)` per level, not N+1 per node
 - **Session dedup** — SHA-256 content hash on (project, summary)
 - **Edge dedup** — UNIQUE constraint on (from_id, to_id, relation)
 - **Task hub nodes** — tasks collect work logs, decisions, problems, solutions via `contains` edges
 - **Problem lifecycle** — unsolved = no Solution node with `solves` edge
-- **Relevance ranking** — FTS results boosted by access_count
+- **Relevance ranking** — recall orders by one score in `graph/rank.rs`: normalised bm25, provenance, freshness measured from `measured_at`, access count and node type. `memory_search` still ranks plainly, by how many query words matched
 - **Project hub nodes** — auto-created by `memory_session`, `task_create` and `memory_add(project=…)`, all children linked via `belongs_to`
 - **Project scoping** — membership is the label prefix `[project-name]` **or** an edge to the project node, in either direction and under any relation. Checking only the label made everything written via `memory_add` + `memory_relate` invisible to project queries
 - **Label convention** — child nodes prefixed `[project-name] description`, project nodes use plain names
@@ -732,18 +759,25 @@ hand-edited into `settings.json`. Every hook calls the `au` binary directly — 
 | Event | Matcher | `au` command | Timeout |
 |-------|---------|-----|---------|
 | SessionStart | `""` | `au skills --hook` | 10s |
-| SessionStart | `""` | `au snapshot --hook` | 10s |
 | SessionStart | `""` | `au db backup --hook` | 30s |
 | PostToolUse | `Edit\|Write` | `au touch --hook` | 5s |
 | PostToolUse | `Bash\|PowerShell\|Edit\|Write\|NotebookEdit` | `au trace --hook` | 5s |
 | Stop | `""` | `au reindex --hook` | 15s |
 | Stop | `""` | `au judge --hook` | 20s |
 
-`skills` injects the skill index, `snapshot` the seven-layer memory slice, `db backup` a throttled
-rolling database snapshot, `touch` increments access_count on edited files, `trace` appends to the
-action journal, `reindex` re-indexes the project and pushes sync-enabled projects, `judge` settles
-the session (reinforce/erode/fork/null). A failing hook is always swallowed: memory has no right
-to break the start — or the end — of a session.
+`skills` injects the skill index, `db backup` a throttled rolling database snapshot, `touch`
+increments access_count on edited files, `trace` appends to the action journal, `reindex`
+re-indexes the project and pushes sync-enabled projects, `judge` settles the session
+(reinforce/erode/fork/null). A failing hook is always swallowed: memory has no right to break
+the start — or the end — of a session.
+
+A seventh hook, `au snapshot --hook`, used to inject the memory slice at session start and was
+removed from the manifest: the slice surfaces the *freshest* nodes, which is not the same as the
+*needed* ones. The `--hook` flag itself stays on the CLI, so a hand-written `settings.json` can
+still call it. Spec
+[010 `waking-memory`](specs/010-waking-memory/) replaces it with a `UserPromptSubmit` hook that
+recalls against what was actually typed, rather than against the clock. Until that lands, pull
+memory in deliberately — `memory_status` at session start, `au pickup` after a context wipe.
 
 The bash wrappers in `contrib/claude-code/*.sh` and its own `install.sh` are **deprecated since
 3.4.0** — kept only for hand installs that never adopt the plugin, and removed in the next major
@@ -771,7 +805,15 @@ the Claude Code plugin, and is still installed by `install.sh` for the current r
 - [x] v1.9 — Documents to Markdown, converted locally (3 MCP tools + `au doc`)
 - [x] v1.10 — Seven-layer snapshot; Bit-i-Delo stages 1-4: action journal, ground-truth probes, surprise gate, outcome judge, clearing and obligations
 - [x] v1.11 — Project scoping by edge, not just by label prefix; `au snapshot --json`; `memory_add` warns on unattached nodes
-- [ ] Next — npm distribution, `au repair`, `au doctor`, context-ranked search, git log connector
+- [x] v1.12 — `au session`/`au relate` writing moved into core; records stamped with the run that wrote them; `au journal`
+- [x] v2.0 — Provenance: `confidence` + `evidence` required, volatility ageing, `subject` contradiction refusal
+- [x] v2.1 — Task leasing (`claim`/`renew`/`release`/`give-up`) and the autonomy fitness gate over the queue
+- [x] v3.0 — Closing a task became automatic: evidence attaches itself, `task_ripe` presents what is ready; doc graph import; secret coordinates
+- [x] v3.1 — Perplexity Search as a second `search_web` provider next to Brave, cache scoped per provider
+- [x] v3.2 — Provenance fields on every write handle; `memory_status` reports a stale server; task list stopped retelling the run journal
+- [x] v3.3 — Tasks addressable by an id prefix; the fitness gate reads volume stated as a number
+- [x] v3.4 — Claude Code plugin (`plugin/`), `--hook` mode inside `au` itself — no bash, no python3 — and an installer that updates instead of skipping
+- [ ] Next — spec [010 `waking-memory`](specs/010-waking-memory/): recall ranked and *measured* against a frozen fixture (`au eval`), and a `UserPromptSubmit` hook that brings memory in unasked, against what was typed rather than against the clock
 
 A release bumps `plugin/.claude-plugin/plugin.json` together with `Cargo.toml` — `crates/au/tests/plugin_manifest.rs`
 asserts the two versions are equal, so `cargo test` stays red until both are updated.
