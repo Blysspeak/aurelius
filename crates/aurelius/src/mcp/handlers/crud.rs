@@ -9,7 +9,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    edge_brief, node_detail, open_db, parse_node_type, parse_relation, parse_since, resolve_node,
+    apply_secret_bypass, edge_brief, node_detail, open_db, parse_node_type, parse_relation,
+    parse_since, resolve_node,
 };
 
 /// Бит-и-Дело, ступень 3: превратить recall в транзакцию. Отфильтровать
@@ -230,6 +231,11 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
     let prov = Provenance::parse(params)?;
     let mut data = data;
     prov.write_into(&mut data);
+
+    // Тот же обход, что и у `au note --allow-secret`: помечает `data`, а не
+    // тихо пропускает — рубеж `add_node_full` честно скажет, был ли он
+    // обойдён, любому, кто потом прочитает узел.
+    apply_secret_bypass(params, &mut data);
 
     // Разбор resolution — тоже до записи, по той же причине.
     let resolution = Resolution::parse_arg(params.get("resolution").and_then(|r| r.as_str()))?;
