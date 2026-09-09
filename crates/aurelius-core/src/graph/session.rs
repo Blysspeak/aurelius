@@ -110,6 +110,14 @@ pub struct SessionInput<'a> {
     /// problem/solution nodes the session spawns alongside it only get
     /// [`Provenance::inherited`] from it — without `subject` or `claim`.
     pub provenance: Provenance,
+    /// Ключ идемпотентности: ПОВОД записи, а не её текст. Дедупликация по
+    /// [`content_hash`] сравнивает `project + summary`, то есть ровно ту
+    /// строку, которую вызывающий пересобирает при каждом срабатывании:
+    /// сводка хука несёт накопительные счётчики («ходов 1» → «ходов 2»), и
+    /// `duplicate` не выставляется никогда. С ключом повторный вызов
+    /// переписывает свой узел — как `au note --key`, через
+    /// [`super::upsert_node_by_key`].
+    pub key: Option<&'a str>,
 }
 
 impl<'a> SessionInput<'a> {
@@ -126,6 +134,7 @@ impl<'a> SessionInput<'a> {
             source,
             agent_session: None,
             provenance: Provenance::default(),
+            key: None,
         }
     }
 }
@@ -175,13 +184,19 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
     }
 
     let hash = content_hash(project, summary);
-    if let Some(existing) = super::find_node_by_content_hash(conn, &hash)? {
-        return Ok(SessionWritten {
-            session: existing,
-            duplicate: true,
-            decisions: 0,
-            problems: 0,
-        });
+    // Ключ бьёт хеш: он опознаёт повод, а хеш — только дословно совпавший
+    // текст. Когда ключ передан, путь по `content_hash` пропускается целиком,
+    // иначе изменившаяся сводка сначала не нашлась бы по хешу, а потом всё
+    // равно ушла бы в upsert — лишний поиск на каждом вызове.
+    if input.key.is_none() {
+        if let Some(existing) = super::find_node_by_content_hash(conn, &hash)? {
+            return Ok(SessionWritten {
+                session: existing,
+                duplicate: true,
+                decisions: 0,
+                problems: 0,
+            });
+        }
     }
 
     let mut data = serde_json::Map::new();
@@ -196,16 +211,41 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
     input.provenance.write_into(&mut session_data);
 
     let label = format!("[{project}] {}", Utc::now().format("%Y-%m-%d %H:%M"));
-    let session = super::add_node_full(
-        conn,
-        NodeType::Session,
-        &label,
-        Some(summary),
-        input.source,
-        with_agent_session(session_data, input.agent_session),
-        MemoryKind::Episodic,
-        Some(&hash),
-    )?;
+    let session_data = with_agent_session(session_data, input.agent_session);
+    let (session, fresh) = match input.key {
+        Some(key) => {
+            // `upsert_node_by_key` кладёт ключ в `data`, поэтому ему нужен
+            // именно объект. `session_data` собран объектом двумя строками
+            // выше и остаётся им после `write_into`/`with_agent_session`.
+            let map = match session_data {
+                serde_json::Value::Object(map) => map,
+                other => anyhow::bail!("данные сессии перестали быть объектом: {other}"),
+            };
+            super::upsert_node_by_key(
+                conn,
+                key,
+                NodeType::Session,
+                &label,
+                Some(summary),
+                input.source,
+                map,
+                MemoryKind::Episodic,
+            )?
+        }
+        None => (
+            super::add_node_full(
+                conn,
+                NodeType::Session,
+                &label,
+                Some(summary),
+                input.source,
+                session_data,
+                MemoryKind::Episodic,
+                Some(&hash),
+            )?,
+            true,
+        ),
+    };
 
     let proj_node = match super::find_project_by_label(conn, project)? {
         Some(n) => n,
@@ -219,6 +259,20 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
         )?,
     };
     super::add_edge(conn, session.id, proj_node.id, Relation::BelongsTo, 1.0)?;
+
+    // Узел переписан по ключу: решения и проблемы уже висят на нём с прошлого
+    // срабатывания. Создать их второй раз — получить близнецов на каждое
+    // повторное срабатывание хука, то есть ровно тот мусор, ради которого ключ
+    // и заведён. Ребро к проекту выше идёт через `INSERT OR IGNORE`, поэтому
+    // повторный проход его не задваивает.
+    if !fresh {
+        return Ok(SessionWritten {
+            session,
+            duplicate: true,
+            decisions: 0,
+            problems: 0,
+        });
+    }
 
     // Task 2c8d25ce: nodes the session spawns alongside it inherit what backs
     // the record (confidence/evidence/measured_at/...), but not
@@ -384,6 +438,71 @@ mod tests {
         let sessions =
             super::super::get_nodes_by_type(&conn, &NodeType::Session).expect("sessions");
         assert_eq!(sessions.len(), 1, "близнец не должен появиться");
+    }
+
+    /// Случай, ради которого ключ и заведён: хук конца сессии срабатывает
+    /// несколько раз за один прогон, и каждый раз сводка ДРУГАЯ — в ней
+    /// накопительные счётчики. Дедупликация по `content_hash(project, summary)`
+    /// здесь не срабатывает никогда, и до ключа это давало по узлу на
+    /// срабатывание (измерено на проекте ulika: 41 пара сессий с разницей
+    /// меньше 10 минут).
+    #[test]
+    fn same_key_with_changed_summary_rewrites_one_session() {
+        let (_tmp, conn) = setup();
+
+        let first = record_session(
+            &conn,
+            &SessionInput {
+                key: Some("ulika:session:run-alpha"),
+                ..SessionInput::new("тестпроект", "ходов 1", "cli")
+            },
+        )
+        .expect("first");
+        let second = record_session(
+            &conn,
+            &SessionInput {
+                key: Some("ulika:session:run-alpha"),
+                ..SessionInput::new("тестпроект", "ходов 2", "cli")
+            },
+        )
+        .expect("second");
+
+        assert!(!first.duplicate);
+        assert!(
+            second.duplicate,
+            "тот же ключ при другой сводке обязан опознаться как повтор"
+        );
+        assert_eq!(first.session.id, second.session.id, "узел должен быть один");
+
+        let sessions =
+            super::super::get_nodes_by_type(&conn, &NodeType::Session).expect("sessions");
+        assert_eq!(sessions.len(), 1, "изменившийся текст не заводит близнеца");
+        assert_eq!(
+            sessions[0].note.as_deref(),
+            Some("ходов 2"),
+            "переписанный узел обязан нести последнюю сводку, а не первую"
+        );
+    }
+
+    /// Обратная сторона: разные поводы остаются разными записями, даже когда
+    /// текст совпал дословно. Иначе ключ схлопывал бы две честные сессии.
+    #[test]
+    fn different_keys_stay_apart() {
+        let (_tmp, conn) = setup();
+        for key in ["ulika:session:run-alpha", "ulika:session:run-beta"] {
+            record_session(
+                &conn,
+                &SessionInput {
+                    key: Some(key),
+                    ..SessionInput::new("тестпроект", "один и тот же итог", "cli")
+                },
+            )
+            .expect("record");
+        }
+
+        let sessions =
+            super::super::get_nodes_by_type(&conn, &NodeType::Session).expect("sessions");
+        assert_eq!(sessions.len(), 2, "разные поводы — разные узлы");
     }
 
     #[test]

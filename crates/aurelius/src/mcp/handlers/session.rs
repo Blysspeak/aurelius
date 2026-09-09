@@ -1,12 +1,12 @@
 use anyhow::Result;
 use aurelius_core::{
     graph::{self, ProblemSolved, SessionInput},
-    models::{NodeType, Relation},
+    models::Relation,
     provenance::{self, Provenance},
 };
 use serde_json::json;
 
-use super::{node_compact, open_db, resolve_node, sync_push_if_enabled};
+use super::{node_recall, open_db, resolve_node, sync_push_if_enabled};
 
 /// Строки массива параметра, пустой вектор при отсутствии или чужом типе.
 fn string_list(params: &serde_json::Value, key: &str) -> Vec<String> {
@@ -112,6 +112,10 @@ fn memory_session_with_conn(
 
     // Link session to tasks if specified
     let mut linked_tasks = vec![];
+    // Ссылка, которая никуда не привела, раньше просто пропускалась: `tasks`
+    // при этом оставался в `stored_fields`, то есть ответ утверждал, что поле
+    // принято. Теперь несопоставленные ссылки называются поимённо.
+    let mut unresolved_tasks: Vec<String> = vec![];
     if let Some(tasks) = params.get("tasks").and_then(|t| t.as_array()) {
         for task_ref in tasks {
             if let Some(task_id) = task_ref.as_str() {
@@ -122,6 +126,8 @@ fn memory_session_with_conn(
                         "label": task_node.label,
                         "status": task_node.data.get("status"),
                     }));
+                } else {
+                    unresolved_tasks.push(task_id.to_owned());
                 }
             }
         }
@@ -153,7 +159,18 @@ fn memory_session_with_conn(
     // Ровно та беда, ради которой это писалось: имена параметров теперь
     // проверены заслонкой, но правильно названный пустой список выглядел
     // переданным — и решения терялись при ответе "created": true.
-    let (stored_fields, dropped_fields) = super::super::params::field_report(params);
+    let (mut stored_fields, mut dropped_fields) = super::super::params::field_report(params);
+
+    // `field_report` смотрит на ЗАПРОС, а не на запись: он делит присланное на
+    // непустое и пустое. Непустой список задач, из которого не сопоставилась ни
+    // одна ссылка, попадал в `stored_fields` — поле числилось принятым, хотя не
+    // легло никуда. Пустой `dropped_fields` читается как «всё принято», и
+    // опереться на него было нельзя.
+    if !unresolved_tasks.is_empty() && linked_tasks.is_empty() {
+        stored_fields.retain(|f| f != "tasks");
+        dropped_fields.push("tasks".to_owned());
+        dropped_fields.sort();
+    }
 
     Ok(json!({
         "id": session.id.to_string(),
@@ -166,6 +183,7 @@ fn memory_session_with_conn(
         "stored_fields": stored_fields,
         "dropped_fields": dropped_fields,
         "linked_tasks": linked_tasks,
+        "unresolved_tasks": unresolved_tasks,
         "active_tasks_hint": active_tasks,
         "provenance": provenance_response,
     }))
@@ -176,67 +194,50 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
         .get("topic")
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'topic' parameter"))?;
-    let depth = params.get("depth").and_then(|d| d.as_u64()).unwrap_or(1) as u32;
+    // Глубина 2 по умолчанию, а не 1. Единица отвечала темой, до узла-хаба
+    // которой обход не доходил: измерено 07.09.2026 на теме «ulika» — 6 узлов
+    // при 672 связанных с проектом. Разрастание, из-за которого глубину когда-то
+    // опустили до единицы, теперь держит `MAX_TRAVERSAL_NODES`, а не заниженная
+    // глубина: потолок в 200 узлов стоит внутри самой прогулки.
+    let depth = params.get("depth").and_then(|d| d.as_u64()).unwrap_or(2) as u32;
 
     let conn = open_db()?;
-    // The traversal itself is capped (MAX_TRAVERSAL_NODES / depth clamp), so
-    // an explicit depth=2 can no longer expand a hub node into megabytes.
-    // The report travels back to the caller: a cut answer says it is cut.
-    let traversal = graph::context_with_report(&conn, topic, depth)?;
-    let context_nodes = traversal.nodes;
+    // Обход, отсев, порядок и срезы — общий код ядра
+    // (`graph::recall_selection`). Он здесь не повторяется: `au eval` мерит
+    // боевой путь только пока путь один, а не копия в обработчике.
+    let selection = graph::recall_selection(&conn, topic, depth, chrono::Utc::now())?;
 
-    let mut decisions = vec![];
-    let mut problems = vec![];
-    let mut solutions = vec![];
-    let mut sessions = vec![];
-    let mut concepts = vec![];
-    let mut tasks = vec![];
-    let mut skills = vec![];
-
-    for node in &context_nodes {
-        match &node.node_type {
-            NodeType::Decision => decisions.push(node_compact(node)),
-            NodeType::Problem => problems.push(node_compact(node)),
-            NodeType::Solution => solutions.push(node_compact(node)),
-            NodeType::Session => sessions.push(node_compact(node)),
-            NodeType::Task => tasks.push(node_compact(node)),
-            NodeType::Concept | NodeType::Project => concepts.push(node_compact(node)),
-            NodeType::Skill => skills.push(node_compact(node)),
-            _ => {}
-        }
-    }
-
-    for node in &context_nodes {
+    // Инкремент `access_count` — единственное, что осталось от сборки в
+    // обработчике, и переезжать ему некуда: фикстура прогона открывается
+    // только на чтение, и одна эта запись на общем пути роняла бы каждый
+    // кейс `recall_top5`.
+    for node in selection.knowledge.iter().chain(selection.recent.iter()) {
         // Best effort by design: an access counter must never fail a read.
         if let Err(e) = graph::touch_node(&conn, node.id) {
             tracing::warn!("could not record access for {}: {e}", node.id);
         }
     }
 
-    let knowledge_count = decisions.len()
-        + problems.len()
-        + solutions.len()
-        + sessions.len()
-        + concepts.len()
-        + tasks.len()
-        + skills.len();
-
     Ok(json!({
         "topic": topic,
-        "decisions": decisions,
-        "problems": problems,
-        "solutions": solutions,
-        "sessions": sessions,
-        "tasks": tasks,
-        "concepts": concepts,
-        "skills": skills,
-        "skills_hint": if skills.is_empty() { serde_json::Value::Null } else { json!("Relevant skill cards found — call skill_get <name> for full instructions.") },
-        "total_knowledge_nodes": knowledge_count,
-        "total_graph_nodes": context_nodes.len(),
+        "knowledge": selection
+            .knowledge
+            .iter()
+            .map(|n| node_recall(n, topic))
+            .collect::<Vec<_>>(),
+        "recent": selection
+            .recent
+            .iter()
+            .map(|n| node_recall(n, topic))
+            .collect::<Vec<_>>(),
+        "shown": selection.knowledge.len(),
+        "matched_knowledge": selection.matched_knowledge,
+        "matched_recent": selection.matched_recent,
+        "total_graph_nodes": selection.total_graph_nodes,
         "truncation": {
-            "truncated": traversal.truncated_at_depth.is_some(),
-            "hidden_nodes": traversal.hidden_nodes,
-            "truncated_at_depth": traversal.truncated_at_depth,
+            "truncated": selection.truncated_at_depth.is_some(),
+            "hidden_nodes": selection.hidden_nodes,
+            "truncated_at_depth": selection.truncated_at_depth,
         },
     }))
 }
@@ -244,7 +245,7 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aurelius_core::db;
+    use aurelius_core::{db, models::NodeType};
 
     /// The same trick as in `task.rs`: a real temp file, not `:memory:` —
     /// `db::open` hard-requires WAL, and `memory_session` hits the user's real
@@ -340,5 +341,84 @@ mod tests {
         )
         .expect_err("measured без evidence обязано быть отказом");
         assert!(format!("{err}").contains("inferred"), "{err}");
+    }
+
+    /// Пустой `dropped_fields` читается как «всё принято», и на нём строят
+    /// решения. Ссылка на задачу, которая никуда не привела, раньше молча
+    /// пропускалась, а `tasks` оставался среди принятых полей — ответ утверждал
+    /// то, чего не сделал.
+    #[test]
+    fn an_unresolvable_task_reference_is_named_not_swallowed() {
+        let (_tmp, conn) = setup();
+
+        let result = memory_session_with_conn(
+            &conn,
+            &json!({
+                "summary": "итог со ссылкой в никуда",
+                "project": "proj-session-tasks",
+                "tasks": ["нет-такой-задачи-12345"],
+            }),
+        )
+        .expect("memory_session");
+
+        let stored: Vec<&str> = result["stored_fields"]
+            .as_array()
+            .expect("stored_fields")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        let dropped: Vec<&str> = result["dropped_fields"]
+            .as_array()
+            .expect("dropped_fields")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            !stored.contains(&"tasks"),
+            "непривязанные задачи не должны числиться принятыми: {stored:?}"
+        );
+        assert!(
+            dropped.contains(&"tasks"),
+            "непринятое поле обязано быть названо: {dropped:?}"
+        );
+        assert_eq!(
+            result["unresolved_tasks"][0], "нет-такой-задачи-12345",
+            "ссылка называется поимённо, а не общим числом"
+        );
+    }
+
+    /// Обратная сторона: сопоставившаяся ссылка оставляет `tasks` принятым.
+    #[test]
+    fn a_resolvable_task_reference_keeps_the_field_stored() {
+        let (_tmp, conn) = setup();
+        let task = graph::add_node(
+            &conn,
+            NodeType::Task,
+            "[proj-session-tasks] живая задача",
+            None,
+            "test",
+            json!({ "status": "active" }),
+        )
+        .expect("task");
+
+        let result = memory_session_with_conn(
+            &conn,
+            &json!({
+                "summary": "итог с живой ссылкой",
+                "project": "proj-session-tasks",
+                "tasks": [task.id.to_string()],
+            }),
+        )
+        .expect("memory_session");
+
+        let dropped: Vec<&str> = result["dropped_fields"]
+            .as_array()
+            .expect("dropped_fields")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(!dropped.contains(&"tasks"), "{dropped:?}");
+        assert_eq!(result["linked_tasks"].as_array().map(Vec::len), Some(1));
     }
 }

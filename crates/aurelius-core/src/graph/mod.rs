@@ -3,6 +3,9 @@ mod export;
 mod import;
 mod lease;
 mod path;
+mod pickup;
+mod rank;
+mod render;
 mod search;
 mod session;
 mod snapshot;
@@ -13,6 +16,9 @@ pub use export::*;
 pub use import::*;
 pub use lease::*;
 pub use path::*;
+pub use pickup::*;
+pub use rank::*;
+pub use render::*;
 pub use search::*;
 pub use session::*;
 pub use snapshot::*;
@@ -22,13 +28,37 @@ use crate::models::{Edge, MemoryKind, Node, NodeType, Relation};
 use chrono::Utc;
 use uuid::Uuid;
 
+/// Улика прогона, которую не к чему привязать: в проекте нет активной задачи.
+///
+/// Своё значение, а не `USAGE`. Код `1` означает «вызвали неправильно», и
+/// вызывающий, получив его, чинит собственный вызов — тогда как чинить надо
+/// состояние проекта: завести или активировать задачу. Измерено 07.09.2026:
+/// на репозитории ulika мост улик отказывал ВСЕГДА (30 задач, все `done` или
+/// `backlog`, активной ни одной), и каждая зелёная улика падала на пол, потому
+/// что законная ситуация была неотличима от кривого вызова. Тот же принцип,
+/// по которому разведены [`LeaseError::NoTasksAvailable`] (10) и
+/// [`LeaseError::Busy`] (11).
+#[derive(Debug, thiserror::Error)]
+#[error("в проекте '{project}' нет активной задачи — улика сохранена без привязки: {run}")]
+pub struct NoActiveTask {
+    pub project: String,
+    pub run: uuid::Uuid,
+}
+
 /// Заводит узел прогона и связывает его с задачей ребром `verified_by`
 /// (спека 007, T013/T014, data-model.md «Ребро»). Улика внутри `data.evidence`
 /// задачи — для быстрого чтения без обхода графа; этот узел и ребро — для
 /// обратного пути: от прогона к задаче, которую он подтвердил.
+/// `task_id: None` — улика прогона, которой не к чему прицепиться: в проекте
+/// нет активной задачи. Узел всё равно пишется, и именно поэтому в него кладётся
+/// `project`: у сироты нет ребра `verified_by`, а значит нет и пути
+/// `run → task → belongs_to → project`, которым проект доставался раньше. Без
+/// поля такая улика не нашлась бы ни одной проектной выборкой.
 pub fn link_evidence_run(
     conn: &rusqlite::Connection,
-    task_id: Uuid,
+    task_id: Option<Uuid>,
+    project: Option<&str>,
+    subject: Option<&str>,
     command: &str,
     exit_code: i64,
     artifact: Option<&str>,
@@ -38,6 +68,14 @@ pub fn link_evidence_run(
         "command": command,
         "exit_code": exit_code,
         "artifact": artifact,
+        "project": project,
+        "subject": subject,
+        // Провенанс прогона не спрашивается у вызывающего, а выводится: раз
+        // улика существует, прогон состоялся, командой служит он сам. Просить
+        // хук передать `--confidence measured` значило бы просить его ввести
+        // то, что уже известно отсюда.
+        "confidence": "measured",
+        "evidence": command,
     });
     let run = crud::add_node(
         conn,
@@ -47,7 +85,9 @@ pub fn link_evidence_run(
         "au-task-evidence",
         data,
     )?;
-    crud::add_edge(conn, task_id, run.id, Relation::VerifiedBy, 1.0)?;
+    if let Some(task_id) = task_id {
+        crud::add_edge(conn, task_id, run.id, Relation::VerifiedBy, 1.0)?;
+    }
     Ok(run.id)
 }
 
@@ -94,6 +134,40 @@ pub fn list_secret_refs(
     let mut nodes = search::typed_in_project(conn, &NodeType::Config, project, 500)?;
     nodes.retain(crate::secret::is_secret_ref);
     Ok(nodes)
+}
+
+/// Степень каждого узла внутри уже найденного подграфа обхода: по скольким
+/// рёбрам из `edges` он виден. Мера того, насколько запись держит тему обхода,
+/// а не того, как часто слово встретилось в её теле (найдено 07.09.2026 на
+/// теме «ulika»: мёртвые windows-пути повторяли имя проекта десятками раз и
+/// выигрывали по частоте терма) — этим сигналом по-прежнему ранжирует
+/// `au pickup` (`graph::pickup`, `pickup.rs:335,370`), заявленно и намеренно
+/// (**C17**, `contracts/mcp.md` §4 п.16). `memory_recall` (MCP) с T018 ушёл
+/// на `rank::score` (`graph::recall_selection`, `traverse.rs`), где степени
+/// нет ни в множителях, ни в подсчёте — это разные пути с разным порядком,
+/// а не два потребителя одной формулы.
+pub fn subgraph_degree(edges: &[Edge]) -> std::collections::HashMap<Uuid, usize> {
+    let mut degree = std::collections::HashMap::new();
+    for edge in edges {
+        *degree.entry(edge.from_id).or_insert(0usize) += 1;
+        *degree.entry(edge.to_id).or_insert(0usize) += 1;
+    }
+    degree
+}
+
+/// Компаратор `au pickup`: выше степень в найденном подграфе первой, при
+/// равенстве — новее `created_at` первым. Узел вне карты степеней (не
+/// встретился в обходе) читается как степень 0, а не как ошибка. Единственные
+/// потребители — `pickup.rs:335,370`; `memory_recall` с T018 сортирует
+/// `rank::score` и этот компаратор не зовёт (**C17**).
+pub fn by_degree_then_recency(
+    degree: &std::collections::HashMap<Uuid, usize>,
+    a: &Node,
+    b: &Node,
+) -> std::cmp::Ordering {
+    let da = degree.get(&a.id).copied().unwrap_or(0);
+    let db = degree.get(&b.id).copied().unwrap_or(0);
+    db.cmp(&da).then(b.created_at.cmp(&a.created_at))
 }
 
 pub(crate) fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {

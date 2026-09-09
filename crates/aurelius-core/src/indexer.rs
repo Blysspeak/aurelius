@@ -125,6 +125,22 @@ fn get_or_create_project(
         return Ok(existing);
     }
 
+    // Путь сменился, а проект тот же. Ровно это случилось при переезде с
+    // Windows на Linux: хабы несут `\\?\A:\workSpace\xhub`, индексатор ищет
+    // `/home/blyss/workSpace/project/xhub`, не находит и заводит второй узел —
+    // с каждым прогоном `au reindex --hook`. Знание при этом делится между
+    // хабами: у xhub было 3337, 286 и 14 рёбер на трёх узлах одного проекта.
+    // Поиск по метке — второй заход, и найденному узлу присваивается текущий
+    // путь, чтобы следующий прогон нашёл его первым способом.
+    if let Some(existing) = graph::find_project_by_label(conn, name)? {
+        let mut data = existing.data.clone();
+        if let Some(map) = data.as_object_mut() {
+            map.insert("path".to_owned(), path_str.into());
+        }
+        graph::update_node(conn, existing.id, None, Some(data))?;
+        return Ok(existing);
+    }
+
     let node = graph::add_node(
         conn,
         NodeType::Project,
@@ -388,4 +404,79 @@ fn compute_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    struct TmpDb(std::path::PathBuf);
+
+    impl TmpDb {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("aurelius-indexer-test-{}.db", uuid::Uuid::new_v4())),
+            )
+        }
+    }
+
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(suffix);
+                let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+            }
+        }
+    }
+
+    /// Переезд между машинами: узел проекта несёт путь со старой машины, а
+    /// индексатор приходит с новым. Поиск по `data.path` промахивается, и до
+    /// заслонки по метке каждый прогон заводил второй хаб — знание проекта
+    /// делилось между узлами (у xhub было 3337, 286 и 14 рёбер).
+    #[test]
+    fn a_moved_project_is_found_by_label_and_adopts_the_new_path() {
+        let tmp = TmpDb::new();
+        let conn = db::open(&tmp.0).expect("open temp db");
+
+        let old = graph::add_node(
+            &conn,
+            NodeType::Project,
+            "переезжающий",
+            None,
+            "indexer",
+            serde_json::json!({ "path": r"\\?\A:\workSpace\переезжающий", "type": "rust" }),
+        )
+        .expect("старый узел");
+
+        let mut result = IndexResult {
+            project_name: "переезжающий".to_owned(),
+            crates_found: 0,
+            files_indexed: 0,
+            dependencies_found: 0,
+            nodes_created: 0,
+            nodes_updated: 0,
+            nodes_removed: 0,
+        };
+        let found = get_or_create_project(
+            &conn,
+            "переезжающий",
+            "/home/blyss/workSpace/переезжающий",
+            &mut result,
+        )
+        .expect("get_or_create_project");
+
+        assert_eq!(found.id, old.id, "должен найтись прежний узел, а не новый");
+        assert_eq!(result.nodes_created, 0, "второй хаб заводить нельзя");
+
+        let projects = graph::get_nodes_by_type(&conn, &NodeType::Project).expect("узлы проектов");
+        assert_eq!(projects.len(), 1, "узел проекта обязан остаться один");
+        assert_eq!(
+            projects[0].data.get("path").and_then(|p| p.as_str()),
+            Some("/home/blyss/workSpace/переезжающий"),
+            "найденному узлу присваивается текущий путь, иначе промах повторится"
+        );
+    }
 }

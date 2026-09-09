@@ -331,7 +331,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_recall",
-                "description": "Smart recall: get everything the knowledge graph knows about a topic. Combines FTS search with BFS traversal, returns only knowledge nodes (decisions, problems, solutions, sessions, concepts) grouped by type. Skips structural noise (files, deps). Use this instead of separate search+context calls.",
+                "description": "Smart recall: what the graph knows about a topic, ranked and cut to fit. FTS seeds a BFS walk, then records are ranked by how many edges they hold inside the found subgraph and by recency — not by how often the word occurs in their body. Returns `knowledge` (up to 12 lasting records: claim, or a window around the match when there is no claim, plus subject/confidence) and `recent` (at most 2 episodic records — sessions, pre-compaction snapshots). Node bodies are never returned: fetch one by id when you actually need it. Skill cards are excluded — they arrive at session start. Use this instead of separate search+context calls.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -341,8 +341,8 @@ pub fn tool_definitions() -> serde_json::Value {
                         },
                         "depth": {
                             "type": "integer",
-                            "description": "BFS traversal depth (default: 1, increase for broader recall)",
-                            "default": 1
+                            "description": "BFS traversal depth (default: 2 — depth 1 stops before the project hub node and answers with leaves). The walk is capped at 200 nodes regardless, and a cut answer says so in `truncation`.",
+                            "default": 2
                         }
                     },
                     "required": ["topic"]

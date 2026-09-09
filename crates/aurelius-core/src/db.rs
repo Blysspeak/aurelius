@@ -151,7 +151,23 @@ fn ensure_wal(conn: &Connection, path: &Path) -> Result<()> {
 }
 
 /// Read-only connection: no migration, no page ever written.
-fn open_readonly(path: &Path) -> Result<Connection> {
+///
+/// Public because two callers must read the graph without altering it, and
+/// [`open`] is unusable for both: it runs `ensure_wal` — `PRAGMA
+/// journal_mode=WAL`, which takes a brief exclusive lock — then pins `PRAGMA
+/// synchronous=FULL` and runs `migrate`. A reader that migrates is not a
+/// reader.
+///
+/// The two are the `au eval` run and the turn-start recognition hook. For eval
+/// the fixture is also the yardstick: a single write during a run changes the
+/// input of the next one — recall bumps `access_count` on every node it shows,
+/// and that counter is a ranking factor — so a run that needed to write is a
+/// failed run, not a failed case. The hook fires on every single turn and must
+/// never become a writer, let alone a migrator, of the database it consults.
+///
+/// `SQLITE_OPEN_READ_ONLY` is what enforces that: an attempted write fails on
+/// the connection instead of being caught by review.
+pub fn open_readonly(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     Ok(conn)
