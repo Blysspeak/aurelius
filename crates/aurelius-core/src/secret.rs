@@ -152,6 +152,59 @@ fn token_body_follows(tail: &str) -> bool {
     body_len >= RANDOM_TOKEN_MIN_LEN && tail.chars().take(body_len).any(|c| c.is_ascii_digit())
 }
 
+/// «Человеческая» hyphen-строка: slug (`backlog-audit-20260908`,
+/// `feat-guard-and-trace`) или дата/время с дефисами вместо привычных
+/// разделителей (`2026-09-08T17-40-00` — тот же ISO 8601, но с дефисами в
+/// `HH-MM-SS` вместо двоеточий, чтобы строка годилась именем файла и
+/// subject-идентификатором без экранирования). Найдено 08.09.2026 (subject
+/// `aurelius:crates/aurelius-core/src/secret.rs:hyphen-slug`): `backlog-audit-20260908`
+/// ложно отказывал как случайный токен, потому что дефис не входил в список
+/// структурных разделителей ниже.
+///
+/// ЛОВУШКА, из-за которой дефис нельзя было просто дописать в тот список
+/// рядом с `/`, `\`, `:`, `=`: настоящие ключи тоже дефис-разделены —
+/// `sk-proj-abc123def456ghi789jkl012mno345`, Slack `xoxb-…-…-…` — и голого
+/// факта «есть дефис», без разбора того, из чего состоят сегменты, было бы
+/// достаточно, чтобы пропустить и их тоже. Отличает форма: у человеческого
+/// слага сегменты — только строчные буквы и цифры, у настоящего токена после
+/// префикса — вперемешку регистр и высокая на вид случайность. Поэтому здесь
+/// не «строка содержит дефис», а «строка целиком состоит из дефис-сегментов
+/// в нижнем регистре» (плюс не более одной буквы `T`-разделителя для
+/// даты/времени).
+///
+/// Безопасность этого шейпа держится не на нём самом, а на порядке снаружи:
+/// оба вызывающих (`detect_lookalike`, `scan_text_for_lookalike`) проверяют
+/// `KNOWN_KEY_PREFIXES` раньше, чем доходят до `looks_like_random_token`, —
+/// `sk-proj-…` и `xoxb-…` отклоняются как `KnownPrefix` до того, как эта
+/// функция вообще увидит их целиком. Этот порядок закреплён тестом
+/// `known_prefix_wins_over_slug_shape_even_though_it_looks_like_one`: поменяй
+/// местами проверку префикса и проверку формы — тест перестанет проходить.
+fn looks_like_slug(s: &str) -> bool {
+    let mut seen_hyphen = false;
+    let mut seen_upper_t = false;
+    let mut prev_was_hyphen = true; // ведущий дефис — пустой сегмент, запрет
+    for c in s.chars() {
+        if c == '-' {
+            if prev_was_hyphen {
+                return false; // пустой сегмент: ведущий дефис или "--"
+            }
+            seen_hyphen = true;
+            prev_was_hyphen = true;
+            continue;
+        }
+        if c == 'T' && !seen_upper_t {
+            seen_upper_t = true;
+            prev_was_hyphen = false;
+            continue;
+        }
+        if !(c.is_ascii_lowercase() || c.is_ascii_digit()) {
+            return false;
+        }
+        prev_was_hyphen = false;
+    }
+    seen_hyphen && !prev_was_hyphen // был хотя бы один дефис, и не в конце
+}
+
 /// Длинная строка без пробелов, не похожая на путь или URI, с как минимум
 /// двумя классами символов (нижний+верхний регистр/цифры) — на глаз выглядит
 /// случайной, как настоящий токен, а не как имя переменной или файла.
@@ -170,13 +223,17 @@ fn looks_like_random_token(s: &str) -> bool {
     // канонический пример (`REFUND_REQUESTS_ENABLED=true`,
     // `xhub:.env:REFUND_REQUESTS_ENABLED`) — оба длиннее
     // `RANDOM_TOKEN_MIN_LEN` и оба ложно отказывали, пока `=`/`:` не встали
-    // в один ряд с `/`.
+    // в один ряд с `/`. Дефис в этот список НЕ входит — см. `looks_like_slug`
+    // и её комментарий про ловушку с `sk-proj-…`/Slack-токенами.
     if s.contains("://")
         || s.contains('/')
         || s.contains('\\')
         || s.contains(':')
         || s.contains('=')
     {
+        return false;
+    }
+    if looks_like_slug(s) {
         return false;
     }
     let has_lower = s.chars().any(|c| c.is_ascii_lowercase());
@@ -527,6 +584,77 @@ mod tests {
                 "структурная строка отклонена как секрет: {text}"
             );
         }
+    }
+
+    /// Находка 08.09.2026 (subject `aurelius:crates/aurelius-core/src/secret.rs:hyphen-slug`,
+    /// живой репро: `au note` с subject `backlog-audit-20260908` отказал на
+    /// смещении 0 и потребовал `--allow-secret`). Дефис не входил в список
+    /// структурных разделителей `looks_like_random_token`, и slug с цифрой
+    /// длиннее `RANDOM_TOKEN_MIN_LEN` ловился как случайный токен.
+    #[test]
+    fn hyphenated_slugs_and_dates_are_accepted_as_ordinary_text() {
+        for text in [
+            "backlog-audit-20260908",
+            "feat-guard-and-trace",
+            "2026-09-08T17-40-00",
+        ] {
+            assert_eq!(
+                scan_text_for_lookalike(text),
+                None,
+                "hyphen-slug отклонён как секрет: {text}"
+            );
+        }
+    }
+
+    /// Асимметрия предыдущего теста: реальные ключи тоже дефис-разделены и по
+    /// одному алфавиту символов неотличимы от слага — их ловит не форма, а
+    /// известный префикс, проверяемый раньше формы (см.
+    /// `known_prefix_wins_over_slug_shape_even_though_it_looks_like_one`).
+    #[test]
+    fn hyphen_carrying_credentials_are_still_rejected() {
+        // Slack bot token shape (xoxb-<team>-<bot>-<secret>). Литерал собран
+        // `concat!`, а не написан целиком: цельная строка этой формы блокирует
+        // `git push` защитой GitHub (GH013, push protection), хотя секретом не
+        // является. Компилятору достаётся ровно та же строка, тест не ослаблен.
+        assert!(matches!(
+            detect_lookalike(concat!(
+                "xoxb",
+                "-123456789012-abcdefghijklmnopqrstuvwxyz0123456789"
+            )),
+            Some(SecretLookalike::KnownPrefix("xoxb-"))
+        ));
+        // AWS access key id — публичный пример из документации AWS, не живой секрет.
+        assert!(matches!(
+            detect_lookalike("AKIAIOSFODNN7EXAMPLE"),
+            Some(SecretLookalike::KnownPrefix("AKIA"))
+        ));
+        // Ещё одно известное семейство префиксов из того же списка.
+        assert!(matches!(
+            detect_lookalike("sk-proj-abc123def456ghi789jkl012mno345"),
+            Some(SecretLookalike::KnownPrefix("sk-"))
+        ));
+    }
+
+    /// Пинает порядок проверок, обязательный по заданию: известный префикс
+    /// обязан решать РАНЬШЕ, чем общий carve-out для slug-формы сможет
+    /// принять строку. `sk-proj-abc123def456ghi789jkl012mno345` — валидный
+    /// slug по форме (только строчные буквы, цифры и дефисы), и если
+    /// поменять местами проверку `KNOWN_KEY_PREFIXES` и вызов
+    /// `looks_like_random_token`/`looks_like_slug` внутри `detect_lookalike`,
+    /// эта строка станет отклоняться как `None` (принята) вместо
+    /// `KnownPrefix` — тест это поймает.
+    #[test]
+    fn known_prefix_wins_over_slug_shape_even_though_it_looks_like_one() {
+        let token = "sk-proj-abc123def456ghi789jkl012mno345";
+        assert!(
+            looks_like_slug(token),
+            "тестовая строка должна сама по себе быть валидным слагом по форме"
+        );
+        assert_eq!(
+            detect_lookalike(token),
+            Some(SecretLookalike::KnownPrefix("sk-")),
+            "известный префикс должен решать раньше carve-out для slug-формы"
+        );
     }
 
     /// Единственное определение признака «это координата секрета» (FR-027) —

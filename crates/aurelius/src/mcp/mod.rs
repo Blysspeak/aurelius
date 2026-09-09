@@ -9,9 +9,10 @@ mod tools;
 pub use handlers::node_detail;
 
 use anyhow::Result;
+use aurelius_core::trace::{self, TraceInput, TraceKind};
 use protocol::{JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR, METHOD_NOT_FOUND};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub async fn serve() -> Result<()> {
     // Recorded before the request loop starts: `memory_status` compares this
@@ -129,41 +130,55 @@ async fn handle_tools_call(
 
     // Run handler in spawn_blocking since rusqlite isn't Send
     let tool_name = tool_name.to_owned();
-    let result = tokio::task::spawn_blocking(move || match tool_name.as_str() {
-        "memory_status" => handlers::memory_status(&arguments),
-        "memory_context" => handlers::memory_context(&arguments),
-        "memory_path" => handlers::memory_path(&arguments),
-        "memory_search" => handlers::memory_search(&arguments),
-        "memory_add" => handlers::memory_add(&arguments),
-        "memory_relate" => handlers::memory_relate(&arguments),
-        "memory_index" => handlers::memory_index(&arguments),
-        "memory_forget" => handlers::memory_forget(&arguments),
-        "memory_update" => handlers::memory_update(&arguments),
-        "memory_session" => handlers::memory_session(&arguments),
-        "memory_recall" => handlers::memory_recall(&arguments),
-        "memory_dump" => handlers::memory_dump(&arguments),
-        "memory_gc" => handlers::memory_gc(),
-        "memory_merge" => handlers::memory_merge(&arguments),
-        "memory_snapshot" => handlers::memory_snapshot(&arguments),
-        "memory_consolidate" => handlers::memory_consolidate(&arguments),
-        "task_create" => handlers::task_create(&arguments),
-        "task_update" => handlers::task_update(&arguments),
-        "task_list" => handlers::task_list(&arguments),
-        "task_log" => handlers::task_log(&arguments),
-        "task_view" => handlers::task_view(&arguments),
-        "task_stats" => handlers::task_stats(&arguments),
-        "task_ripe" => handlers::task_ripe(&arguments),
-        "secret_list" => handlers::secret_list(&arguments),
-        "search_web" => handlers::search_web(&arguments),
-        "search_recall" => handlers::search_recall(&arguments),
-        "doc_convert" => handlers::doc_convert(&arguments),
-        "doc_read" => handlers::doc_read(&arguments),
-        "doc_recall" => handlers::doc_recall(&arguments),
-        "skill_list" => handlers::skill_list(&arguments),
-        "skill_get" => handlers::skill_get(&arguments),
-        "skill_save" => handlers::skill_save(&arguments),
-        "skill_remove" => handlers::skill_remove(&arguments),
-        _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
+    let result = tokio::task::spawn_blocking(move || {
+        let outcome = match tool_name.as_str() {
+            "memory_status" => handlers::memory_status(&arguments),
+            "memory_context" => handlers::memory_context(&arguments),
+            "memory_path" => handlers::memory_path(&arguments),
+            "memory_search" => handlers::memory_search(&arguments),
+            "memory_add" => handlers::memory_add(&arguments),
+            "memory_relate" => handlers::memory_relate(&arguments),
+            "memory_index" => handlers::memory_index(&arguments),
+            "memory_forget" => handlers::memory_forget(&arguments),
+            "memory_update" => handlers::memory_update(&arguments),
+            "memory_session" => handlers::memory_session(&arguments),
+            "memory_recall" => handlers::memory_recall(&arguments),
+            "memory_dump" => handlers::memory_dump(&arguments),
+            "memory_gc" => handlers::memory_gc(),
+            "memory_merge" => handlers::memory_merge(&arguments),
+            "memory_snapshot" => handlers::memory_snapshot(&arguments),
+            "memory_consolidate" => handlers::memory_consolidate(&arguments),
+            "task_create" => handlers::task_create(&arguments),
+            "task_update" => handlers::task_update(&arguments),
+            "task_list" => handlers::task_list(&arguments),
+            "task_log" => handlers::task_log(&arguments),
+            "task_view" => handlers::task_view(&arguments),
+            "task_stats" => handlers::task_stats(&arguments),
+            "task_ripe" => handlers::task_ripe(&arguments),
+            "secret_list" => handlers::secret_list(&arguments),
+            "search_web" => handlers::search_web(&arguments),
+            "search_recall" => handlers::search_recall(&arguments),
+            "doc_convert" => handlers::doc_convert(&arguments),
+            "doc_read" => handlers::doc_read(&arguments),
+            "doc_recall" => handlers::doc_recall(&arguments),
+            "skill_list" => handlers::skill_list(&arguments),
+            "skill_get" => handlers::skill_get(&arguments),
+            "skill_save" => handlers::skill_save(&arguments),
+            "skill_remove" => handlers::skill_remove(&arguments),
+            _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
+        };
+
+        // Same `act_trace` table the CLI's `au trace --hook` writes to (see
+        // `au::commands::trace_cmd`), so the two sources land in one place.
+        // Swallowed on failure by design (doc comment on the fn below) —
+        // `outcome` below is untouched either way.
+        let session_id = arguments
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("mcp");
+        record_tool_call(session_id, &tool_name, outcome.is_ok());
+
+        outcome
     })
     .await;
 
@@ -194,6 +209,46 @@ async fn handle_tools_call(
             error!("spawn error: {e}");
             JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Internal error: {e}"))
         }
+    }
+}
+
+/// Records one row per dispatched MCP tool call in `act_trace` — the table
+/// `au trace --hook` (see `au::commands::trace_cmd`) already writes to for
+/// Bash/PowerShell/Edit/Write/NotebookEdit. Without this, the trace table
+/// only knows about shell commands and file edits, never which of the
+/// server's own tools an agent actually called.
+///
+/// `kind` is `tool_call` and `payload` is the bare tool name — the same
+/// shape `trace_cmd`'s hook branch uses for any tool it doesn't special-case
+/// (its `_ => (TraceKind::ToolCall, tool.to_owned(), None)` arm). `exit_code`
+/// carries the outcome as 0/1, the exact convention `differ::attribute`
+/// already reads for `tool_call` rows (`Some(0) | None` => ok, `Some(_)` =>
+/// fail), so MCP-originated rows score identically to CLI-originated ones
+/// with no changes needed on the reading side.
+///
+/// Must never be observable to the caller: called only from inside the
+/// `spawn_blocking` that already ran the handler, after `outcome` is
+/// decided, and it never mutates `outcome` — a failed write is logged and
+/// dropped, not surfaced as a tool error.
+fn record_tool_call(session_id: &str, tool_name: &str, success: bool) {
+    let write = || -> Result<()> {
+        let conn = handlers::open_db()?;
+        trace::ingest(
+            &conn,
+            &TraceInput {
+                session_id,
+                kind: TraceKind::ToolCall,
+                payload: tool_name,
+                exit_code: Some(i64::from(!success)),
+                state_hash_pre: None,
+                state_hash_post: None,
+            },
+        )?;
+        Ok(())
+    };
+
+    if let Err(e) = write() {
+        warn!("mcp trace write failed: {e}");
     }
 }
 

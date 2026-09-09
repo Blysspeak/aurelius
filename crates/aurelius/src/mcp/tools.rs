@@ -176,6 +176,11 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "string",
                             "enum": ["supersede", "refine", "coexist"],
                             "description": "How this relates to the existing fact about the same 'subject'. supersede: the old one is no longer true (creates a supersedes edge). refine: the old one stays true, this makes it more precise. coexist: both hold — say so deliberately."
+                        },
+                        "allow_secret": {
+                            "type": "boolean",
+                            "description": "Bypass the secret-lookalike guard that otherwise refuses a write whose label/note/claim/evidence/subject looks like a token or key. Use only when the match is a false positive on a legitimate record — the bypass is stamped onto the written node's data, same as `au note --allow-secret`, not applied silently.",
+                            "default": false
                         }
                     },
                     "required": ["label", "confidence"]
@@ -508,6 +513,11 @@ pub fn tool_definitions() -> serde_json::Value {
                         "subject": {
                             "type": "string",
                             "description": "Identity of what is being asserted, e.g. 'xhub:.env:REFUND_REQUESTS_ENABLED'. Two facts sharing a subject cannot both be true, so a second one is refused until you say how to resolve it — see 'resolution'."
+                        },
+                        "allow_secret": {
+                            "type": "boolean",
+                            "description": "Bypass the secret-lookalike guard that otherwise refuses a write whose title/description/claim/evidence/subject looks like a token or key. Use only when the match is a false positive on a legitimate record — the bypass is stamped onto the written node's data, same as `au note --allow-secret`, not applied silently.",
+                            "default": false
                         }
                     },
                     "required": ["title"]
@@ -683,6 +693,11 @@ pub fn tool_definitions() -> serde_json::Value {
                         "subject": {
                             "type": "string",
                             "description": "Identity of what is being asserted, e.g. 'xhub:.env:REFUND_REQUESTS_ENABLED'. Two facts sharing a subject cannot both be true, so a second one is refused until you say how to resolve it — see 'resolution'."
+                        },
+                        "allow_secret": {
+                            "type": "boolean",
+                            "description": "Bypass the secret-lookalike guard that otherwise refuses a write whose text/claim/evidence/subject looks like a token or key — applies to the WorkLog node and any decisions/problems/solutions this call spawns. Use only when the match is a false positive on a legitimate record — the bypass is stamped onto each written node's data, same as `au note --allow-secret`, not applied silently.",
+                            "default": false
                         }
                     },
                     "required": ["task", "text"]
