@@ -34,6 +34,7 @@ dirs-next = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
+zstd = { workspace = true }
 axum = { workspace = true }
 open = { workspace = true }
 rust-embed = { workspace = true }

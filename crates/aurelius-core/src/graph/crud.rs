@@ -1,5 +1,6 @@
 use crate::identity;
 use crate::models::{Edge, MemoryKind, Node, NodeType, Relation};
+use crate::provenance::Provenance;
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::{params, Connection};
@@ -38,6 +39,34 @@ pub fn add_node_full(
     memory_kind: MemoryKind,
     content_hash: Option<&str>,
 ) -> Result<Node> {
+    // Единственный рубеж перед графом, subject `aurelius:write:secret-guard`
+    // (измерено 07.09.2026: `au note` с ghp_-токеном в тексте ложилось кодом
+    // 0, а граф append-only — вычистить нечем, `memory_forget` уносит узел
+    // вместе со знанием). Судятся `label`, `note` и четыре именованных
+    // провенанс-поля `data` (`claim`/`evidence`/`subject`/`verify_with`, см.
+    // `secret::scan_provenance_for_lookalike`) — то же измерение 07.09.2026
+    // нашло, что `au note "тело" --claim "<токен>"` проходило кодом 0, а
+    // карточка `agent-checkpoint` отдельно велит класть дословную команду
+    // именно в `--evidence`. `data` ЦЕЛИКОМ по-прежнему не сканируется: там
+    // же лежат машинные поля вроде идемпотентного `key`, где сорокасимвольное
+    // значение base64-алфавита легитимно, и слепая проверка отказала бы на
+    // верном вводе (рубеж стоит здесь для ВСЕХ вызывающих, включая индексатор
+    // и слияние синка, а не только для ручных). Обход читается уже из
+    // готового `data`, а не из отдельного параметра: добавить параметр
+    // значило бы чинить сигнатуру и все вызовы вне зоны правки этой задачи.
+    let bypassed = data
+        .get(crate::secret::BYPASS_MARKER_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !bypassed {
+        let hit = crate::secret::scan_text_for_lookalike(label)
+            .or_else(|| note.and_then(crate::secret::scan_text_for_lookalike))
+            .or_else(|| crate::secret::scan_provenance_for_lookalike(&data));
+        if let Some((kind, offset)) = hit {
+            return Err(crate::secret::SecretLookalikeRefused { kind, offset }.into());
+        }
+    }
+
     let now = Utc::now();
     let author = identity::current().map(|i| i.as_author());
     let node = Node {
@@ -510,6 +539,82 @@ pub fn find_nodes_by_data_field(
     Ok(nodes)
 }
 
+/// Одна семья фасета: все живые узлы с одним и тем же `subject`, сведённые в
+/// count плюс самый свежий член. `au recall --prefix` группирует по точному
+/// значению `subject`, а не отдаёт голый список узлов — иначе повторяющийся
+/// subject (пример из задачи: `xhub:bank131:refunds`, несколько записей за
+/// август) шумел бы в выдаче копиями вместо одной строки с count.
+#[derive(Debug)]
+pub struct SubjectFamily {
+    pub subject: String,
+    pub count: usize,
+    pub newest: Node,
+}
+
+/// Живые узлы, чей `subject` начинается с `prefix`, сгруппированные в семьи.
+///
+/// Диапазонная форма условия — измерено на живой базе (15419 строк, 2568 с
+/// subject, 2238 различных): `LIKE 'prefix%'` и `GLOB 'prefix*'` обе НЕ
+/// используют партиальный индекс `idx_nodes_subject`
+/// (`ON nodes(json_extract(data,'$.subject')) WHERE json_extract(data,'$.subject')
+/// IS NOT NULL`) и уходят в скан, а форма `>= prefix AND < prefix ||
+/// char(1114111)` — используют: `EXPLAIN QUERY PLAN` подтверждает
+/// `SEARCH nodes USING INDEX idx_nodes_subject`. `char(1114111)` — верхняя
+/// граница Unicode (U+10FFFF); она делает верхнюю границу диапазона правильной
+/// для любого префикса без ручного инкремента байтов.
+///
+/// `deleted_at IS NULL` в том же WHERE всё равно ставится: без него мёртвые
+/// узлы просочились бы в выдачу. Измерено, что из-за этого условия
+/// планировщик (нет статистики ANALYZE) переключается на
+/// `idx_nodes_deleted_at`, посчитав равенство более избирательным — это не
+/// так (живых узлов почти все 15419), но скан такого масштаба стоит
+/// миллисекунды. `INDEXED BY` не ставится: это стало бы жёсткой ошибкой,
+/// если индекс когда-нибудь переименуют.
+///
+/// Порядок строк из SQL — по subject, внутри subject свежие первыми; это даёт
+/// готовую границу группы и готового «самого свежего» без второго запроса на
+/// семью. Порядок результата — по свежести самого нового члена семьи, тоже
+/// новый первым: это контракт команды, а не порядок группировки в SQL.
+pub fn find_subject_families_by_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> Result<Vec<SubjectFamily>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, node_type, label, note, source, data, created_at, updated_at,
+                memory_kind, last_accessed_at, access_count, content_hash,
+                created_by, updated_by, deleted_at, sync_seq
+         FROM nodes
+         WHERE json_extract(data, '$.subject') >= ?1
+           AND json_extract(data, '$.subject') < ?1 || char(1114111)
+           AND deleted_at IS NULL
+         ORDER BY json_extract(data, '$.subject') ASC, created_at DESC",
+    )?;
+    let nodes = stmt
+        .query_map(params![prefix], row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut families: Vec<SubjectFamily> = Vec::new();
+    for node in nodes {
+        // Гарантировано WHERE выше (сравнение с NULL ложно), но
+        // `Provenance::from_data` читается снисходительно и без паники —
+        // узел без подписи молча пропускается, а не рушит всю выдачу.
+        let Some(subject) = Provenance::from_data(&node.data).subject else {
+            continue;
+        };
+        match families.last_mut() {
+            Some(family) if family.subject == subject => family.count += 1,
+            _ => families.push(SubjectFamily {
+                subject,
+                count: 1,
+                newest: node,
+            }),
+        }
+    }
+
+    families.sort_by_key(|f| std::cmp::Reverse(f.newest.created_at));
+    Ok(families)
+}
+
 pub fn get_all_nodes(conn: &Connection) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
@@ -844,6 +949,78 @@ mod tests {
         assert!(
             message.contains(shared_id_a) && message.contains(shared_id_b),
             "сообщение должно называть оба id-кандидата: {message}"
+        );
+    }
+
+    fn add_with_subject(conn: &Connection, subject: &str, claim: &str) -> Node {
+        add_node(
+            conn,
+            NodeType::Concept,
+            subject,
+            None,
+            "test",
+            serde_json::json!({ "subject": subject, "claim": claim }),
+        )
+        .expect("add node with subject")
+    }
+
+    /// Три семьи под одним префиксом, count и «самый свежий» — на уровне SQL,
+    /// до интеграционного теста CLI на `au recall --prefix`.
+    #[test]
+    fn find_subject_families_groups_counts_and_orders_by_newest_member() {
+        let (_tmp, conn) = setup();
+
+        add_with_subject(&conn, "xhub:bank131:refunds", "первая запись августа");
+        let newest_refunds = add_with_subject(&conn, "xhub:bank131:refunds", "вторая, свежее");
+        add_with_subject(
+            &conn,
+            "xhub:antifraud:research:data-layer",
+            "заметка по антифроду",
+        );
+        // Другой фасет — не должен попасть в выдачу по префику "xhub:bank131".
+        add_with_subject(&conn, "xhub:antifraud:other", "постороннее");
+
+        let families =
+            find_subject_families_by_prefix(&conn, "xhub:bank131").expect("lookup must not error");
+
+        assert_eq!(families.len(), 1, "один subject под этим префиксом");
+        assert_eq!(families[0].subject, "xhub:bank131:refunds");
+        assert_eq!(families[0].count, 2, "count считает узлы, а не заявления");
+        assert_eq!(
+            families[0].newest.id, newest_refunds.id,
+            "самый свежий член семьи — второй вставленный узел"
+        );
+    }
+
+    /// Порядок результата — по свежести самого нового члена КАЖДОЙ семьи,
+    /// а не по алфавиту subject (в котором их выдаёт группировка SQL).
+    #[test]
+    fn find_subject_families_orders_families_newest_first() {
+        let (_tmp, conn) = setup();
+
+        add_with_subject(&conn, "xhub:aaa:older", "давняя заметка");
+        let newer = add_with_subject(&conn, "xhub:zzz:newer", "свежая заметка");
+
+        let families =
+            find_subject_families_by_prefix(&conn, "xhub:").expect("lookup must not error");
+
+        assert_eq!(families.len(), 2);
+        assert_eq!(
+            families[0].newest.id, newer.id,
+            "свежая семья обязана идти первой, хотя её subject алфавитно позже"
+        );
+    }
+
+    #[test]
+    fn find_subject_families_returns_empty_for_unmatched_prefix() {
+        let (_tmp, conn) = setup();
+        add_with_subject(&conn, "xhub:bank131:refunds", "не тот префикс");
+
+        let families =
+            find_subject_families_by_prefix(&conn, "xhub:refunds").expect("lookup must not error");
+        assert!(
+            families.is_empty(),
+            "нет subject, начинающегося с xhub:refunds"
         );
     }
 }
