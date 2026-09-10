@@ -758,6 +758,125 @@ pub fn tool_definitions() -> serde_json::Value {
                 }
             },
             {
+                "name": "reminder_add",
+                "description": "Set a reminder — for the owner, for this AI session, or for both. Exactly one of due_in (a delay, e.g. '2h') or due_at (a moment) is required; both or neither is refused with a message naming which. A reminder addressed to 'ai' or 'both' is delivered into a Claude Code session at the end of a turn or when the owner next types — the session-side hook only gets to look at the reminders table at those two points, so it arrives at the next touch, not at the exact wall-clock second. A reminder that must arrive at that exact moment regardless of whether a session happens to be open belongs to owner 'me' or 'both': only the out-of-session channel (the always-on daemon) is independent of a turn in progress. Optionally attaches to a task by UUID or label, resolved the same way task_update resolves 'id', and inherits that task's project unless 'project' is given explicitly. 'repeat' re-arms the reminder after each delivery using the same delay grammar as due_in.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "What to remind about"
+                        },
+                        "due_in": {
+                            "type": "string",
+                            "description": "Delay from now: a bare number of minutes, or a number with suffix m/h/d/w (e.g. '2h', '30', '1w'). Exactly one of due_in/due_at is required."
+                        },
+                        "due_at": {
+                            "type": "string",
+                            "description": "An absolute moment: RFC 3339, 'YYYY-MM-DD HH:MM', 'YYYY-MM-DD' (09:00 local), or 'HH:MM' (today if still ahead, otherwise tomorrow). Exactly one of due_in/due_at is required."
+                        },
+                        "owner": {
+                            "type": "string",
+                            "enum": ["me", "ai", "both"],
+                            "description": "Who this reminder is for, and therefore which channel may deliver it. 'ai': session-only, arrives on the next turn boundary. 'me': out-of-session channel only (the daemon). 'both': either. Default: both.",
+                            "default": "both"
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "UUID or label of a task to attach this reminder to, resolved the same way task tools resolve an id-or-label. The reminder inherits this task's project unless 'project' is also given."
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Project name. Inherited from 'task' when one is given and this is omitted."
+                        },
+                        "repeat": {
+                            "type": "string",
+                            "description": "Delay to re-arm the reminder after each delivery, same grammar as due_in (e.g. '1d' for a daily reminder). Omit for a one-shot reminder."
+                        }
+                    },
+                    "required": ["text"]
+                }
+            },
+            {
+                "name": "reminder_list",
+                "description": "List reminders, oldest due first. By default only non-terminal ones (pending, delivered) — pass include_terminal=true or a specific state to also see done/cancelled ones. Delivered is not an outcome: it means shown to someone and not yet resolved, so it still counts as open unless include_terminal or state says otherwise.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": "Filter by project name"
+                        },
+                        "state": {
+                            "type": "string",
+                            "enum": ["pending", "delivered", "done", "cancelled"],
+                            "description": "Filter to exactly this state. Overrides include_terminal."
+                        },
+                        "include_terminal": {
+                            "type": "boolean",
+                            "description": "Include done/cancelled reminders (default: false — only pending/delivered)",
+                            "default": false
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max results (default: 50)",
+                            "default": 50
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "reminder_show",
+                "description": "One reminder by full id or unique prefix (4+ hex characters), together with its full journal — every creation, delivery, postponement and re-arm recorded against it, oldest first. The journal is the point of this tool: snooze_count and original_due_at on the reminder itself say how many times and from when it was first set, but only the journal says exactly when each move happened.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Full reminder id, or a unique prefix of at least 4 characters"
+                        }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "reminder_done",
+                "description": "Mark a reminder done — the outcome meaning it was acted on, distinct from cancelled (won't be acted on) and from delivered (shown to someone but not yet resolved either way). Refuses on a reminder already done or cancelled rather than rewriting that history.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Full reminder id, or a unique prefix of at least 4 characters"
+                        }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "reminder_snooze",
+                "description": "Postpone a reminder to a new moment. Exactly one of in (a delay) or at (a moment) is required, same grammar as reminder_add's due_in/due_at; both or neither is refused with a message naming which. Increments the reminder's snooze_count and appends a journal entry recording the old and new moment, while original_due_at stays untouched — a postponement is meant to be remembered, not overwritten. Works on a pending or delivered reminder; refuses on one already done or cancelled.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Full reminder id, or a unique prefix of at least 4 characters"
+                        },
+                        "in": {
+                            "type": "string",
+                            "description": "Delay from now, same grammar as due_in (e.g. '2h'). Exactly one of in/at is required."
+                        },
+                        "at": {
+                            "type": "string",
+                            "description": "An absolute moment, same grammar as due_at. Exactly one of in/at is required."
+                        }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
                 "name": "secret_list",
                 "description": "List where each project's secrets live — name, purpose, and location (env var / file path / password manager reference) — never the value itself. Aurelius refuses to store secret values (`au secret add` rejects anything that looks like one); this only reads coordinates already recorded that way. Coordinates are intentionally excluded from memory_snapshot and every other automatic dump, so this is the only MCP path to them. Adding or removing a coordinate stays CLI-only (`au secret add`/`rm`) — recording one is a deliberate human act, and an MCP write path risks a model writing the actual secret value into 'location' by mistake, caught only heuristically.",
                 "inputSchema": {

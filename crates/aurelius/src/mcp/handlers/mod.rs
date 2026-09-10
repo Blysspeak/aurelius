@@ -1,6 +1,7 @@
 mod crud;
 mod doc;
 mod path;
+mod reminder;
 mod search;
 mod secret;
 mod session;
@@ -12,6 +13,7 @@ mod task;
 pub use crud::*;
 pub use doc::*;
 pub use path::*;
+pub use reminder::*;
 pub use search::*;
 pub use secret::*;
 pub use session::*;

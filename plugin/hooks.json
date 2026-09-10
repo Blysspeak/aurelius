@@ -1,10 +1,15 @@
 {
-  "description": "aurelius: skill index at session start, database backup, file-touch and action trace after tool use, reindex and judge on stop. Every command is the au binary from PATH.",
+  "description": "aurelius: skill index at session start, database backup, file-touch and action trace after tool use, reindex, judge and reminder delivery on stop, reminder delivery on prompt submit too. Every command is the au binary from PATH. Reminders are wired to BOTH Stop and UserPromptSubmit on purpose, not by oversight: Stop delivers at the end of a turn, UserPromptSubmit delivers the moment the owner types, and whichever fires first wins reminders::mark_delivered's conditional UPDATE — the other one finds the row already taken and says nothing, so registering both costs nothing and halves the wait for a reminder that matured mid-turn.",
   "hooks": {
     "SessionStart": [
       { "matcher": "", "hooks": [
         { "type": "command", "command": "au", "args": ["skills", "--hook"], "timeout": 10 },
         { "type": "command", "command": "au", "args": ["db", "backup", "--hook"], "timeout": 30 }
+      ] }
+    ],
+    "UserPromptSubmit": [
+      { "matcher": "", "hooks": [
+        { "type": "command", "command": "au", "args": ["remind", "--hook"], "timeout": 5 }
       ] }
     ],
     "PostToolUse": [
@@ -18,7 +23,8 @@
     "Stop": [
       { "matcher": "", "hooks": [
         { "type": "command", "command": "au", "args": ["reindex", "--hook"], "timeout": 15 },
-        { "type": "command", "command": "au", "args": ["judge", "--hook"], "timeout": 20 }
+        { "type": "command", "command": "au", "args": ["judge", "--hook"], "timeout": 20 },
+        { "type": "command", "command": "au", "args": ["remind", "--hook"], "timeout": 5 }
       ] }
     ]
   }

@@ -31,6 +31,20 @@ pub enum TaskAction {
         /// Description
         #[arg(short, long)]
         description: Option<String>,
+        /// When the task is expected to be finished — a different question
+        /// from whether it is ripe for closing (`tasks::is_ripe` looks only
+        /// at edits vs. evidence, never at the clock). Accepts everything
+        /// `reminders::parse_moment` does: RFC 3339, `YYYY-MM-DD[ HH:MM]`, or
+        /// a bare `HH:MM` for the next occurrence of that time. Also creates
+        /// a reminder attached to this task, owned by `both`, so the
+        /// deadline surfaces in `au remind` without a second command to
+        /// remember it in.
+        #[arg(long)]
+        due: Option<String>,
+        /// Place the attached reminder this much before `--due` instead of
+        /// exactly on it — same delay grammar as `au remind add --in`
+        #[arg(long, requires = "due")]
+        remind_before: Option<String>,
     },
     /// List tasks
     List {
@@ -65,6 +79,17 @@ pub enum TaskAction {
         /// Acceptance criterion to append (can be specified multiple times)
         #[arg(short = 'c', long = "criteria")]
         criteria: Vec<String>,
+        /// New due moment — same grammar as `au task new --due`. Moving it
+        /// moves the task's existing attached reminder through
+        /// `reminders::snooze` rather than deleting and recreating it, so
+        /// the journal records the move (a task without one yet gets one
+        /// created, same as `au task new --due` would)
+        #[arg(long)]
+        due: Option<String>,
+        /// Place the moved reminder this much before the new `--due` instead
+        /// of exactly on it
+        #[arg(long, requires = "due")]
+        remind_before: Option<String>,
         /// Print one line of JSON instead of human-readable text
         #[arg(long)]
         json: bool,
@@ -287,6 +312,92 @@ pub enum TaskAction {
         project: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// A reminder is a moment set on purpose, not a side effect of anything
+/// else — the daemon of wave 2 owns the clock, every subcommand here is a
+/// consumer that reads or moves a row, never a timer of its own.
+#[derive(Subcommand)]
+pub enum RemindAction {
+    /// Set a reminder. Exactly one of `--at` (an absolute moment) or `--in`
+    /// (a delay from now) is required — giving both, or neither, is a call
+    /// error rather than a silent pick of one
+    Add {
+        /// What to be reminded of
+        text: String,
+        /// Absolute moment — RFC 3339, `YYYY-MM-DD[ HH:MM]`, or a bare
+        /// `HH:MM` for the next occurrence of that time
+        #[arg(long)]
+        at: Option<String>,
+        /// Delay from now: a bare number of minutes, or a number suffixed
+        /// `m`/`h`/`d`/`w`
+        #[arg(long = "in")]
+        in_: Option<String>,
+        /// Attach to a task (UUID or label) — inherits the task's project
+        /// instead of `--project`
+        #[arg(long)]
+        task: Option<String>,
+        /// Project this reminder belongs to, when it is not attached to a task
+        #[arg(long)]
+        project: Option<String>,
+        /// Re-arm on delivery instead of settling into `delivered` for good
+        /// — same delay grammar as `--in`
+        #[arg(long)]
+        repeat: Option<String>,
+        /// Who may be shown this: `me` (out-of-session channel only), `ai`
+        /// (a session-side consumer only), or `both`
+        #[arg(long = "for", default_value = "both")]
+        for_: String,
+        /// Print one line of JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// List reminders — pending and delivered by default, the same view the
+    /// bare `au remind` prints
+    List {
+        /// Filter by project
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by state: pending, delivered, done, cancelled
+        #[arg(long)]
+        state: Option<String>,
+        /// Include done and cancelled reminders too
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one reminder and its full journal — every postponement is a
+    /// line, so a reminder pushed five times still shows all five
+    Show {
+        /// Reminder UUID or unique prefix (4+ characters)
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mark a reminder done — an outcome, distinct from cancelling it
+    Done {
+        /// Reminder UUID or unique prefix
+        id: String,
+    },
+    /// Cancel a reminder — the other outcome; not a done one wearing a
+    /// different name
+    Cancel {
+        /// Reminder UUID or unique prefix
+        id: String,
+    },
+    /// Push a reminder's due moment out. Same exactly-one rule as `add`
+    /// between `--in` and `--at`. The move is recorded, not overwritten
+    /// silently — `au remind show` afterwards names how many times and from
+    /// when
+    Snooze {
+        /// Reminder UUID or unique prefix
+        id: String,
+        #[arg(long = "in")]
+        in_: Option<String>,
+        #[arg(long)]
+        at: Option<String>,
     },
 }
 
@@ -578,6 +689,49 @@ enum Commands {
         #[command(subcommand)]
         action: TaskAction,
     },
+    /// A moment set on purpose, with an explicit state and an auditable
+    /// trail of every postponement (spec: `aurelius:reminders:clock-owner`).
+    /// The clock belongs to the wave-2 daemon and its systemd unit alone —
+    /// this command, like `--hook`, only reads or moves a row, never ticks
+    /// one. Bare `au remind` with no subcommand and no `--hook` lists the
+    /// open reminders
+    Remind {
+        #[command(subcommand)]
+        action: Option<RemindAction>,
+        /// Session-side consumer, wired to the Stop hook: prints reminders
+        /// addressed to the AI and marks each one delivered through the
+        /// conditional UPDATE in `reminders::mark_delivered`, so a crash
+        /// between print and stamp cannot double-deliver it. Never fails —
+        /// a broken reminder must not break the turn
+        #[arg(long)]
+        hook: bool,
+    },
+    /// Единственный владелец часов напоминаний во всей системе
+    /// (`aurelius:reminders:clock-owner`, решение владельца 2026-09-10):
+    /// MCP-сервер поднимается заново на каждую сессию Claude Code, и таймер
+    /// внутри него размножился бы по числу сессий, а не остался одним —
+    /// поэтому часы живут ровно здесь, одним процессом с файловым замком, а
+    /// не в MCP и не в сессии. Каждый такт забирает у `reminders::overdue_undelivered`
+    /// напоминания для `Owner::Me`/`Owner::Both`, перезревшие на `--grace` —
+    /// `Owner::Ai` принадлежит сессии, и демон их никогда не трогает
+    Daemon {
+        /// Пауза между тактами, секунд
+        #[arg(long, default_value = "60")]
+        interval: u64,
+        /// Окно ожидания после наступления срока, прежде чем считать
+        /// напоминание пропущенным живой сессией и включать внесессионный
+        /// канал — та же грамматика задержки, что у `au remind add --in`
+        #[arg(long, default_value = "15m")]
+        grace: String,
+        /// Один такт вместо цикла: выход сразу после него — так демон
+        /// тестируется без сна, и так systemd-таймер может заменить
+        /// долгоживущую службу
+        #[arg(long)]
+        once: bool,
+        /// Печатать такт как одну строку JSON, а не человекочитаемый вывод
+        #[arg(long)]
+        json: bool,
+    },
     /// Координаты секретов проекта — место хранения, не значение (спека 007, US4)
     Secret {
         #[command(subcommand)]
@@ -788,6 +942,12 @@ mod exit {
     /// заставляет прогнать заново, несравнимое молча ложится в `research.md`
     /// рядом с числом, снятым на другой базе. Провал кейса кодом НЕ является.
     pub const EVAL_NOT_COMPARABLE: u8 = 14;
+    /// `au daemon`: файловый замок уже держит ЖИВОЙ процесс — не «упал», а
+    /// реально работает. Отдельный код нужен затем, чтобы супервизор
+    /// (systemd `Restart=on-failure`) отличал «второй экземпляр отказался
+    /// стартовать корректно» от настоящего сбоя и не пытался лечить его
+    /// перезапуском — второй демон рядом с живым первым ничего не чинит.
+    pub const DAEMON_ALREADY_RUNNING: u8 = 15;
 }
 
 /// Хранилищем считается всё, что пришло из слоя базы: `DbError` (открытие,
@@ -818,6 +978,15 @@ fn classify(err: &anyhow::Error) -> u8 {
         .any(|c| c.is::<aurelius_core::secret::SecretLookalikeRefused>())
     {
         return exit::SECRET_LOOKALIKE;
+    }
+    // `au daemon`: другой экземпляр уже держит замок и жив — не ошибка
+    // хранилища и не ошибка вызова, а отдельный код именно затем, чтобы
+    // отличаться от обоих (см. `exit::DAEMON_ALREADY_RUNNING`).
+    if err
+        .chain()
+        .any(|c| c.is::<commands::DaemonAlreadyRunning>())
+    {
+        return exit::DAEMON_ALREADY_RUNNING;
     }
     // До проверки на хранилище: `EvalRunFailed` — не `DbError` и не
     // `rusqlite::Error`, поэтому без своей ветки он молча стал бы единицей,
@@ -889,6 +1058,13 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Touch { path, hook } => commands::touch_cmd(path, hook).await,
         Commands::Export => commands::export().await,
         Commands::Task { action } => commands::task(action).await,
+        Commands::Remind { action, hook } => commands::remind(action, hook).await,
+        Commands::Daemon {
+            interval,
+            grace,
+            once,
+            json,
+        } => commands::daemon(interval, &grace, once, json).await,
         Commands::Secret { action } => commands::secret(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,
