@@ -50,7 +50,10 @@ fn cwd_of(payload: &Value) -> Option<PathBuf> {
 
 /// One line on stderr, gated behind `AURELIUS_HOOK_DEBUG=1` so a hook that
 /// fires on every tool call doesn't spam a session nobody is debugging.
-fn debug(cmd: &str, reason: &str) {
+/// `pub(crate)`, not private: `commands::daemon`'s tick reuses this exact
+/// gate for its own silent-failure paths (no external channel configured,
+/// the channel command failed) instead of growing a second debug switch.
+pub(crate) fn debug(cmd: &str, reason: &str) {
     if std::env::var("AURELIUS_HOOK_DEBUG").as_deref() == Ok("1") {
         eprintln!("au {cmd} --hook: {reason}");
     }
@@ -200,7 +203,7 @@ pub async fn remind_hook() {
             Ok(true) => {
                 let overdue = commands::humanize_duration(now - r.due_at);
                 let mut line = format!(
-                    "{} {} — overdue {overdue}",
+                    "{} {} — просрочено на {overdue}",
                     commands::short_id(&r.id),
                     r.text
                 );

@@ -154,11 +154,17 @@ fn hooks_json_declares_expected_au_commands() {
     }
 
     commands.sort_unstable();
-    let mut expected = ["db", "judge", "reindex", "skills", "touch", "trace"];
+    // `remind` appears twice, not once: it is wired to both Stop and
+    // UserPromptSubmit (`aurelius:reminders` wave 2) on purpose, so whichever
+    // fires first wins `reminders::mark_delivered`'s conditional UPDATE and
+    // the owner waits at most until the next prompt, not until end of turn.
+    let mut expected = [
+        "db", "judge", "reindex", "remind", "remind", "skills", "touch", "trace",
+    ];
     expected.sort_unstable();
     assert_eq!(
         commands, expected,
-        "plugin/hooks.json: hook subcommands across all events must be exactly {expected:?} (six total), got {commands:?}"
+        "plugin/hooks.json: hook subcommands across all events must be exactly {expected:?} (eight total), got {commands:?}"
     );
 }
 
