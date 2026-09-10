@@ -10,6 +10,11 @@
 //! silently. Claude Code shows a hook's stderr to the user only on a
 //! non-zero exit, so the only way to see a reason is `AURELIUS_HOOK_DEBUG=1`,
 //! which prints one line to stderr per failure.
+//!
+//! [`remind_hook`] follows the same silent-failure rule but is not one of
+//! the three: it has no bash predecessor, and it is the session-side
+//! consumer of `aurelius_core::reminders` — the clock stays the wave-2
+//! daemon's alone, this only reads and stamps a row.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -133,6 +138,92 @@ pub async fn reindex_hook() {
             }
         }
         Err(e) => debug("reindex", &format!("share push: {e:#}")),
+    }
+}
+
+/// `hook_event_name` from a Claude Code hook payload — `remind_hook`'s only
+/// branch point between plain stdout and the `{"systemMessage": …}` shape.
+fn hook_event_name(payload: &Value) -> &str {
+    payload
+        .get("hook_event_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// `au remind --hook` — the session-side consumer. Takes at most three
+/// reminders addressed to the AI (`reminders::due(.., Some(Owner::Ai), 3)`:
+/// a reminder addressed to the human alone must never be spent on a session
+/// that cannot act on it), stamps each with `mark_delivered(via = "session")`
+/// BEFORE printing it, and silently drops any that call returns `false`
+/// for — another consumer already took it. Stamping after printing would
+/// double-deliver on a crash between the two; the conditional `UPDATE`
+/// inside `mark_delivered` is the only arbiter this design allows.
+///
+/// Nothing due means nothing printed and exit 0 — a hook that talks every
+/// turn stops being read. Every failure path goes through [`debug`] and
+/// returns quietly: a broken reminder must never break the owner's turn.
+pub async fn remind_hook() {
+    let Some(payload) = read_payload() else {
+        debug("remind", "no JSON payload on stdin");
+        return;
+    };
+    let event = hook_event_name(&payload).to_owned();
+
+    let conn = match aurelius_core::db::open(&aurelius_core::db::db_path()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            debug("remind", &format!("{e}"));
+            return;
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let candidates = match aurelius_core::reminders::due(
+        &conn,
+        now,
+        Some(aurelius_core::reminders::Owner::Ai),
+        3,
+    ) {
+        Ok(items) => items,
+        Err(e) => {
+            debug("remind", &format!("{e:#}"));
+            return;
+        }
+    };
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for r in &candidates {
+        match aurelius_core::reminders::mark_delivered(&conn, &r.id, "session", now) {
+            Ok(true) => {
+                let overdue = commands::humanize_duration(now - r.due_at);
+                let mut line = format!(
+                    "{} {} — overdue {overdue}",
+                    commands::short_id(&r.id),
+                    r.text
+                );
+                if let Some(marker) = commands::postponement_marker(r) {
+                    line.push_str(&format!(" ({marker})"));
+                }
+                lines.push(line);
+            }
+            // Another consumer (or the daemon) already took it — say
+            // nothing about it, not even on stderr: this is the expected
+            // outcome of the race, not a failure.
+            Ok(false) => {}
+            Err(e) => debug("remind", &format!("mark_delivered: {e:#}")),
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+
+    let text = format!("[aurelius] {}", lines.join("\n"));
+    match event.as_str() {
+        "UserPromptSubmit" => println!("{text}"),
+        _ => println!("{}", serde_json::json!({"systemMessage": text})),
     }
 }
 

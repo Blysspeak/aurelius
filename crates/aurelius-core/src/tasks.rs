@@ -7,7 +7,13 @@
 //! [`TaskFields::from_data`] обязана прочитать такой узел без ошибки и отдать
 //! пустые поля (T005). Обратная запись — [`TaskFields::merge_into`] — обязана
 //! не терять посторонние ключи чужих модулей (T006): она стартует с исходной
-//! карты `data` и только перезаписывает свои шесть ключей.
+//! карты `data` и только перезаписывает свои семь ключей.
+//!
+//! Седьмой ключ, `due_at` (модуль `reminders`, спека напоминаний), — это
+//! КОГДА задачу ожидают завершённой, и это другой вопрос, чем «созрела ли
+//! она для закрытия» ([`is_ripe`]): срок можно пропустить, не сделав ни
+//! одной правки и не имея ни одной улики, а `is_ripe` вообще не смотрит на
+//! часы — только на то, что правка старше зелёного прогона.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -62,10 +68,16 @@ pub struct TaskFields {
     pub last_edit_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declined_ripe_at: Option<DateTime<Utc>>,
+    /// Когда задачу ожидают завершённой — не то же самое, что «созрела для
+    /// закрытия» (см. заголовок модуля). Заводится `au task new --due`/
+    /// `au task update --due` и держит напоминание в актуальном виде через
+    /// `reminders::snooze`, а не пересозданием строки.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<DateTime<Utc>>,
 }
 
 impl TaskFields {
-    /// Читает шесть полей из `Node.data`, игнорируя все остальные ключи,
+    /// Читает семь полей из `Node.data`, игнорируя все остальные ключи,
     /// которые там лежат (`status`, `priority`, `lease`, `attempts`, ...).
     /// Узел без единого нового ключа даёт `TaskFields::default()` — не
     /// ошибку (T005).
@@ -85,10 +97,11 @@ impl TaskFields {
             evidence: readable_evidence(data),
             last_edit_at: field(data, "last_edit_at"),
             declined_ripe_at: field(data, "declined_ripe_at"),
+            due_at: field(data, "due_at"),
         }
     }
 
-    /// Сливает свои шесть полей обратно в `data`, не трогая ничего постороннее
+    /// Сливает свои семь полей обратно в `data`, не трогая ничего постороннее
     /// (T006). Работает всегда от исходной карты: значение, отсутствующее в
     /// `self` (сериализация пропускает `None`/пустой `Vec` через
     /// `skip_serializing_if`), просто не упоминается в патче и остаётся в
@@ -839,6 +852,31 @@ mod tests {
         assert_eq!(merged["priority"], "critical");
         assert_eq!(merged["custom_key_from_another_module"]["nested"], true);
         assert_eq!(merged["last_edit_at"], "2026-08-30T09:00:00Z");
+    }
+
+    /// Седьмое поле: узел без `due_at` читается пустым (как и остальные
+    /// шесть), а запись срока переживает `merge_into` вместе с чужими
+    /// ключами — round-trip, не молчаливая потеря.
+    #[test]
+    fn due_at_reads_none_on_legacy_node_and_round_trips_through_merge_into() {
+        let legacy = json!({"status": "backlog", "priority": "medium"});
+        assert_eq!(TaskFields::from_data(&legacy).due_at, None);
+
+        let data = json!({
+            "status": "active",
+            "custom_key_from_another_module": {"nested": true},
+        });
+        let mut fields = TaskFields::from_data(&data);
+        fields.due_at = Some("2026-09-15T09:00:00Z".parse().expect("rfc3339"));
+
+        let merged = fields.merge_into(&data);
+
+        assert_eq!(merged["due_at"], "2026-09-15T09:00:00Z");
+        assert_eq!(merged["custom_key_from_another_module"]["nested"], true);
+        assert_eq!(
+            TaskFields::from_data(&merged).due_at,
+            Some("2026-09-15T09:00:00Z".parse().expect("rfc3339"))
+        );
     }
 
     fn evidence(command: &str, exit_code: i64, at: &str) -> EvidenceEntry {
