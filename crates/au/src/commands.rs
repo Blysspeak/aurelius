@@ -2468,44 +2468,91 @@ pub(crate) fn short_id(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-/// A duration as one short token (`45m`, `2h`, `3d`, `1w`) — the display
-/// counterpart of `reminders::parse_delay`'s grammar, always given a
-/// non-negative magnitude by the caller.
+/// A duration as one short token (`45 мин`, `2 ч`, `3 дн`, `1 нед`) — the
+/// display counterpart of `reminders::parse_delay`'s grammar, always given a
+/// non-negative magnitude by the caller. The owner reads this, so the unit
+/// is Russian even though `parse_delay`'s own input grammar (`--in 2h`)
+/// stays Latin — a CLI flag's syntax and a sentence shown to a human are two
+/// different registers, and only the second one is in scope here.
 pub(crate) fn humanize_duration(d: chrono::Duration) -> String {
     let secs = d.num_seconds().max(0);
     if secs < 60 {
-        return format!("{secs}s");
+        return format!("{secs} с");
     }
     let mins = secs / 60;
     if mins < 60 {
-        return format!("{mins}m");
+        return format!("{mins} мин");
     }
     let hours = mins / 60;
     if hours < 24 {
-        return format!("{hours}h");
+        return format!("{hours} ч");
     }
     let days = hours / 24;
     if days < 7 {
-        return format!("{days}d");
+        return format!("{days} дн");
     }
-    format!("{}w", days / 7)
+    format!("{} нед", days / 7)
+}
+
+/// Русское согласование числительного со словом «раз»: 1 → «раз», 2–4
+/// (кроме 12–14) → «раза», всё остальное → «раз». Отдельная функция, а не
+/// подстрока внутри `postponement_marker`, потому что это единственное
+/// склонение во всём модуле, и именно оно ломало грамматику волны 1
+/// («moved 1 times» не склонялось никак, по-английски тоже).
+fn times_ru(n: i64) -> &'static str {
+    let hundred = n.rem_euclid(100);
+    if (11..=14).contains(&hundred) {
+        return "раз";
+    }
+    match hundred % 10 {
+        1 => "раз",
+        2..=4 => "раза",
+        _ => "раз",
+    }
 }
 
 /// The one rendering of "this reminder was postponed", shared by the CLI
 /// line, `au remind show`, and the Stop-hook block — a postponement counted
 /// two different ways in two places is exactly the kind of drift this
-/// feature exists to make visible instead of committing.
+/// feature exists to make visible instead of committing. This is the whole
+/// visible payoff of the journal (`aurelius:reminders` order, 2026-09-10),
+/// read daily, so the count declines correctly instead of reading
+/// "перенесено 1 раза".
 pub(crate) fn postponement_marker(r: &reminders::Reminder) -> Option<String> {
     if r.snooze_count == 0 {
         return None;
     }
     Some(format!(
-        "moved {} times, originally {}",
+        "перенесено {} {}, изначально {}",
         r.snooze_count,
+        times_ru(r.snooze_count),
         r.original_due_at
             .with_timezone(&chrono::Local)
             .format("%Y-%m-%d %H:%M")
     ))
+}
+
+/// Русская подпись состояния для человеческого вывода. `State::as_str` и
+/// `Serialize` остаются машинным контрактом БД и `--json` — их трогать
+/// нельзя, эта подпись существует только для строк, которые читает
+/// владелец, не парсер.
+fn state_label_ru(state: reminders::State) -> &'static str {
+    match state {
+        reminders::State::Pending => "ожидает",
+        reminders::State::Delivered => "доставлено",
+        reminders::State::Done => "выполнено",
+        reminders::State::Cancelled => "отменено",
+    }
+}
+
+/// Русская подпись адресата — `Owner::as_str`/`Serialize` остаются
+/// машинными (`me`/`ai`/`both`) ровно по той же причине, что и у `State`.
+fn owner_label_ru(owner: reminders::Owner) -> &'static str {
+    match owner {
+        reminders::Owner::Me => "мне",
+        reminders::Owner::Ai => "ИИ",
+        reminders::Owner::Both => "обоим",
+    }
 }
 
 /// One line per reminder for `au remind list`/`show`: short id, due moment
@@ -2522,13 +2569,13 @@ fn format_reminder_line(conn: &rusqlite::Connection, r: &reminders::Reminder) ->
         .with_timezone(&chrono::Local)
         .format("%Y-%m-%d %H:%M");
     let relative = if r.due_at <= now {
-        format!("overdue by {}", humanize_duration(now - r.due_at))
+        format!("просрочено на {}", humanize_duration(now - r.due_at))
     } else {
-        format!("in {}", humanize_duration(r.due_at - now))
+        format!("через {}", humanize_duration(r.due_at - now))
     };
     let mut line = format!("{}  {due_local} ({relative})", short_id(&r.id));
     if r.state != reminders::State::Pending {
-        line.push_str(&format!(" [{}]", r.state.as_str()));
+        line.push_str(&format!(" [{}]", state_label_ru(r.state)));
     }
     line.push_str(&format!(" — {}", r.text));
 
@@ -2538,7 +2585,7 @@ fn format_reminder_line(conn: &rusqlite::Connection, r: &reminders::Reminder) ->
     }
     if let Some(task_id) = &r.task_id {
         if let Ok(Some(node)) = graph::get_node(conn, task_id) {
-            trailer.push(format!("task: {}", node.label));
+            trailer.push(format!("задача: {}", node.label));
         }
     }
     if !trailer.is_empty() {
@@ -2548,17 +2595,73 @@ fn format_reminder_line(conn: &rusqlite::Connection, r: &reminders::Reminder) ->
     line
 }
 
+/// Момент, разобранный из детали журнала (`snooze`/`mark_delivered` пишут
+/// его через `to_rfc3339()` — полный RFC 3339 с наносекундами), в местном
+/// времени и том же формате, что и вся остальная строка. Без этого журнал
+/// показывал бы один и тот же момент дважды в двух форматах на соседних
+/// строках: местное время у самой записи, и сырой RFC 3339 с наносекундами
+/// на строке детали под ней.
+fn reformat_rfc3339_local(raw: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+        Err(_) => raw.to_owned(),
+    }
+}
+
+/// Русская подпись вида события журнала.
+fn event_kind_label_ru(kind: reminders::EventKind) -> &'static str {
+    match kind {
+        reminders::EventKind::Created => "заведено",
+        reminders::EventKind::Delivered => "доставлено",
+        reminders::EventKind::Snoozed => "перенесено",
+        reminders::EventKind::Rearmed => "перевзведено",
+        reminders::EventKind::Done => "выполнено",
+        reminders::EventKind::Cancelled => "отменено",
+    }
+}
+
+/// Деталь одной записи журнала по-русски, с моментами, пересчитанными в
+/// местное время. Формат детали задаёт сам писатель события в
+/// `reminders.rs` — `Snoozed` пишет `"<rfc3339> -> <rfc3339>"`, `Rearmed` —
+/// `"next <rfc3339>"`, `Delivered` — голый `via` без момента внутри; разбор
+/// здесь идёт по виду события, а не угадыванием по содержимому строки.
+fn event_detail_ru(kind: reminders::EventKind, detail: Option<&str>) -> String {
+    let Some(detail) = detail else {
+        return "—".to_owned();
+    };
+    match kind {
+        reminders::EventKind::Snoozed => match detail.split_once(" -> ") {
+            Some((before, after)) => format!(
+                "{} → {}",
+                reformat_rfc3339_local(before),
+                reformat_rfc3339_local(after)
+            ),
+            None => detail.to_owned(),
+        },
+        reminders::EventKind::Rearmed => match detail.strip_prefix("next ") {
+            Some(rest) => format!("далее {}", reformat_rfc3339_local(rest)),
+            None => detail.to_owned(),
+        },
+        reminders::EventKind::Delivered => format!("канал: {detail}"),
+        _ => detail.to_owned(),
+    }
+}
+
 /// One reminder by full id or unique prefix. `reminders`'s public surface
 /// deliberately covers only what the daemon and this CLI need to mutate a
 /// row; "one reminder by id" for `show`/`done`/`cancel`/`snooze` is a scan
 /// over `list`, not a query the design asked for as its own function.
 fn fetch_reminder(conn: &rusqlite::Connection, prefix: &str) -> Result<reminders::Reminder> {
-    let id = reminders::resolve_id(conn, prefix)?
-        .ok_or_else(|| anyhow::anyhow!("reminder not found or ambiguous prefix: {prefix}"))?;
+    let id = reminders::resolve_id(conn, prefix)?.ok_or_else(|| {
+        anyhow::anyhow!("напоминание не найдено или префикс неоднозначен: {prefix}")
+    })?;
     reminders::list(conn, None, None, true, usize::MAX)?
         .into_iter()
         .find(|r| r.id == id)
-        .ok_or_else(|| anyhow::anyhow!("reminder vanished: {id}"))
+        .ok_or_else(|| anyhow::anyhow!("напоминание пропало: {id}"))
 }
 
 /// `--at`/`--in` (and `snooze`'s identical pair) resolved to one moment.
@@ -2571,12 +2674,12 @@ fn one_moment(
 ) -> Result<chrono::DateTime<chrono::Utc>> {
     match (at, in_) {
         (Some(at), None) => reminders::parse_moment(at, now)
-            .ok_or_else(|| anyhow::anyhow!("--at: could not parse moment '{at}'")),
+            .ok_or_else(|| anyhow::anyhow!("--at: не удалось разобрать момент '{at}'")),
         (None, Some(delay)) => Ok(now
             + reminders::parse_delay(delay)
-                .ok_or_else(|| anyhow::anyhow!("--in: could not parse delay '{delay}'"))?),
-        (Some(_), Some(_)) => anyhow::bail!("pass exactly one of --at or --in, not both"),
-        (None, None) => anyhow::bail!("pass exactly one of --at or --in"),
+                .ok_or_else(|| anyhow::anyhow!("--in: не удалось разобрать задержку '{delay}'"))?),
+        (Some(_), Some(_)) => anyhow::bail!("укажи ровно один из --at или --in, не оба сразу"),
+        (None, None) => anyhow::bail!("укажи ровно один из --at или --in"),
     }
 }
 
@@ -2640,7 +2743,7 @@ fn remind_add(
     as_json: bool,
 ) -> Result<()> {
     let owner = reminders::Owner::parse(for_)
-        .ok_or_else(|| anyhow::anyhow!("--for: unknown addressee '{for_}' (me | ai | both)"))?;
+        .ok_or_else(|| anyhow::anyhow!("--for: неизвестный адресат '{for_}' (me | ai | both)"))?;
     let due_at = one_moment(chrono::Utc::now(), at, in_)?;
 
     // `--task` is resolved through the same id-or-label lookup `au task log`
@@ -2672,7 +2775,7 @@ fn remind_add(
     if as_json {
         println!("{}", serde_json::to_string(&reminder)?);
     } else {
-        println!("✓ reminder set: {}", short_id(&reminder.id));
+        println!("✓ напоминание поставлено: {}", short_id(&reminder.id));
         println!("  {}", format_reminder_line(conn, &reminder));
     }
     Ok(())
@@ -2689,7 +2792,7 @@ fn remind_list(
         .map(|s| {
             reminders::State::parse(s).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "--state: unknown state '{s}' (pending | delivered | done | cancelled)"
+                    "--state: неизвестное состояние '{s}' (pending | delivered | done | cancelled)"
                 )
             })
         })
@@ -2701,10 +2804,10 @@ fn remind_list(
         return Ok(());
     }
     if items.is_empty() {
-        println!("No open reminders.");
+        println!("Открытых напоминаний нет.");
         return Ok(());
     }
-    println!("{} reminder(s):", items.len());
+    println!("Напоминаний: {}", items.len());
     for r in &items {
         println!("  {}", format_reminder_line(conn, r));
     }
@@ -2722,22 +2825,22 @@ fn remind_show(conn: &rusqlite::Connection, id: &str, as_json: bool) -> Result<(
     }
 
     println!("{}", format_reminder_line(conn, &reminder));
-    println!("  owner: {}", reminder.owner.as_str());
+    println!("  адресат: {}", owner_label_ru(reminder.owner));
     println!(
-        "  created: {}",
+        "  заведено: {}",
         reminder
             .created_at
             .with_timezone(&chrono::Local)
             .format("%Y-%m-%d %H:%M")
     );
     if !history.is_empty() {
-        println!("  journal:");
+        println!("  журнал:");
         for e in &history {
             println!(
                 "    {} {} {}",
                 e.at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"),
-                e.kind.as_str(),
-                e.detail.as_deref().unwrap_or("-")
+                event_kind_label_ru(e.kind),
+                event_detail_ru(e.kind, e.detail.as_deref())
             );
         }
     }
@@ -2746,13 +2849,13 @@ fn remind_show(conn: &rusqlite::Connection, id: &str, as_json: bool) -> Result<(
 
 fn remind_done(conn: &rusqlite::Connection, id: &str) -> Result<()> {
     let full_id = reminders::resolve_id(conn, id)?
-        .ok_or_else(|| anyhow::anyhow!("reminder not found or ambiguous prefix: {id}"))?;
+        .ok_or_else(|| anyhow::anyhow!("напоминание не найдено или префикс неоднозначен: {id}"))?;
     if reminders::done(conn, &full_id, chrono::Utc::now())? {
-        println!("✓ done: {}", short_id(&full_id));
+        println!("✓ выполнено: {}", short_id(&full_id));
         Ok(())
     } else {
         anyhow::bail!(
-            "reminder is already done or cancelled: {}",
+            "напоминание уже выполнено или отменено: {}",
             short_id(&full_id)
         );
     }
@@ -2760,13 +2863,13 @@ fn remind_done(conn: &rusqlite::Connection, id: &str) -> Result<()> {
 
 fn remind_cancel(conn: &rusqlite::Connection, id: &str) -> Result<()> {
     let full_id = reminders::resolve_id(conn, id)?
-        .ok_or_else(|| anyhow::anyhow!("reminder not found or ambiguous prefix: {id}"))?;
+        .ok_or_else(|| anyhow::anyhow!("напоминание не найдено или префикс неоднозначен: {id}"))?;
     if reminders::cancel(conn, &full_id, chrono::Utc::now())? {
-        println!("✓ cancelled: {}", short_id(&full_id));
+        println!("✓ отменено: {}", short_id(&full_id));
         Ok(())
     } else {
         anyhow::bail!(
-            "reminder is already done or cancelled: {}",
+            "напоминание уже выполнено или отменено: {}",
             short_id(&full_id)
         );
     }
@@ -2781,20 +2884,223 @@ fn remind_snooze(
     let now = chrono::Utc::now();
     let until = one_moment(now, at, in_)?;
     let full_id = reminders::resolve_id(conn, id)?
-        .ok_or_else(|| anyhow::anyhow!("reminder not found or ambiguous prefix: {id}"))?;
+        .ok_or_else(|| anyhow::anyhow!("напоминание не найдено или префикс неоднозначен: {id}"))?;
     if reminders::snooze(conn, &full_id, until, now)? {
         println!(
-            "✓ snoozed: {} → {}",
+            "✓ перенесено: {} → {}",
             short_id(&full_id),
             until.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
         );
         Ok(())
     } else {
         anyhow::bail!(
-            "reminder cannot be snoozed (already done or cancelled): {}",
+            "напоминание нельзя перенести (уже выполнено или отменено): {}",
             short_id(&full_id)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// au daemon
+// ---------------------------------------------------------------------------
+
+/// Другой процесс уже держит файловый замок демона и жив — это не «упал», а
+/// действительно работает. Отдельный тип ошибки, а не голая строка через
+/// `anyhow::bail!`, потому что `main::classify` обязан различать этот случай
+/// СВОИМ кодом возврата (`exit::DAEMON_ALREADY_RUNNING`) по типу, а не по
+/// тексту сообщения — тот же приём, что у `LeaseError`/`NoActiveTask` в
+/// aurelius-core. Живёт здесь, а не там: замок — забота CLI-бинаря, не
+/// библиотеки.
+#[derive(Debug)]
+pub struct DaemonAlreadyRunning(pub u32);
+
+impl std::fmt::Display for DaemonAlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "демон уже запущен: держит замок процесс {}", self.0)
+    }
+}
+
+impl std::error::Error for DaemonAlreadyRunning {}
+
+/// Файл замка — рядом с базой, тем же способом, каким `db_path()` выбирает
+/// каталог (`AURELIUS_HOME` либо системный data dir), а не отдельным жёстко
+/// зашитым путём где-то ещё.
+fn daemon_lock_path(db: &std::path::Path) -> PathBuf {
+    db.parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("aurelius-remind.lock")
+}
+
+/// PID живого держателя замка: файл существует, его содержимое разбирается
+/// в число, и по этому числу существует `/proc/<pid>`. Замок с
+/// неразбираемым содержимым и замок на процесс, которого больше нет, — НЕ
+/// живой держатель: это ровно тот «мёртвый замок», который следующий запуск
+/// обязан перехватить, а не считать фатальным (владелец мог упасть от
+/// `SIGKILL`, не успев его снять).
+fn daemon_lock_holder(path: &std::path::Path) -> Option<u32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let pid: u32 = text.trim().parse().ok()?;
+    PathBuf::from(format!("/proc/{pid}"))
+        .exists()
+        .then_some(pid)
+}
+
+/// Держатель замка на диске. `Drop` снимает файл при штатном завершении —
+/// единственный путь снять его: процесс, убитый `SIGKILL`, файл оставит, и
+/// это как раз мёртвый замок для следующего запуска, а не повод чинить его
+/// руками.
+#[derive(Debug)]
+struct DaemonLock(PathBuf);
+
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Занять замок: живой держатель — отказ (`DaemonAlreadyRunning`), мёртвый
+/// или отсутствующий файл — перехват, не фатальная ошибка. Одиночность
+/// демона держится на этом файле, а не на процедуре запуска — второй `au
+/// daemon`, запущенный поверх работающего юнита, обязан отказаться сам, а
+/// не полагаться, что его никто не запустит.
+fn acquire_daemon_lock(path: &std::path::Path) -> Result<DaemonLock> {
+    if let Some(pid) = daemon_lock_holder(path) {
+        return Err(DaemonAlreadyRunning(pid).into());
+    }
+    std::fs::write(path, std::process::id().to_string())
+        .with_context(|| format!("не удалось записать замок демона {}", path.display()))?;
+    Ok(DaemonLock(path.to_path_buf()))
+}
+
+/// `notify-send` где-нибудь в `PATH` — проверка без запуска процесса ради
+/// самой проверки.
+fn notify_send_on_path() -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join("notify-send").is_file()))
+        .unwrap_or(false)
+}
+
+/// Внешний канал: `AURELIUS_NOTIFY_CMD`, прогнанный через `sh -c` с текстом
+/// напоминания в переменной окружения `AURELIUS_REMINDER_TEXT` — НЕ
+/// подставленным в саму строку команды. Подстановка сломалась бы на первом
+/// же апострофе русского предложения, и это к тому же форма
+/// shell-инъекции. Без переменной — `notify-send`, если он есть в `PATH`,
+/// двумя простыми аргументами и вовсе без шелла. Ни того ни другого нет —
+/// `false` через уже существующий отладочный путь `hooks::debug`, и
+/// напоминание остаётся недоставленным до следующего такта, а не
+/// помечается через силу.
+fn notify_external(text: &str) -> bool {
+    if let Ok(cmd) = std::env::var("AURELIUS_NOTIFY_CMD") {
+        return match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("AURELIUS_REMINDER_TEXT", text)
+            .status()
+        {
+            Ok(status) => status.success(),
+            Err(e) => {
+                hooks::debug("daemon", &format!("AURELIUS_NOTIFY_CMD не запустился: {e}"));
+                false
+            }
+        };
+    }
+    if notify_send_on_path() {
+        return match std::process::Command::new("notify-send")
+            .arg("aurelius")
+            .arg(text)
+            .status()
+        {
+            Ok(status) => status.success(),
+            Err(e) => {
+                hooks::debug("daemon", &format!("notify-send не запустился: {e}"));
+                false
+            }
+        };
+    }
+    hooks::debug(
+        "daemon",
+        "внешнего канала нет: AURELIUS_NOTIFY_CMD не задан, notify-send не найден в PATH",
+    );
+    false
+}
+
+/// Один такт: берёт у `reminders::overdue_undelivered` напоминания для
+/// `Owner::Me` (в выборку попадает и `Owner::Both` — так уже устроен
+/// `select_pending` внутри `reminders.rs`, `Owner::Ai` туда не входит),
+/// доставляет каждое через внешний канал и штампует `mark_delivered` ТОЛЬКО
+/// после того, как канал подтвердил успех (exit 0). Порядок нарочно обратный
+/// `hooks::remind_hook`: тот печатает в stdout, который провалиться не
+/// может, и потому штампует раньше печати; здесь канал — внешняя команда,
+/// которая может отказать, а для напоминания дубль при повторной попытке
+/// дешевле, чем тихая потеря.
+fn daemon_tick(
+    conn: &rusqlite::Connection,
+    now: chrono::DateTime<chrono::Utc>,
+    grace: chrono::Duration,
+    limit: usize,
+) -> Result<usize> {
+    let overdue =
+        reminders::overdue_undelivered(conn, now, grace, Some(reminders::Owner::Me), limit)?;
+    let mut delivered = 0usize;
+    for r in &overdue {
+        let mut text = r.text.clone();
+        if let Some(marker) = postponement_marker(r) {
+            text.push_str(&format!(" ({marker})"));
+        }
+        if notify_external(&text) && reminders::mark_delivered(conn, &r.id, "daemon", now)? {
+            delivered += 1;
+        }
+    }
+    Ok(delivered)
+}
+
+fn print_daemon_tick(delivered: usize, as_json: bool) {
+    if as_json {
+        println!("{}", json!({"delivered": delivered}));
+    } else {
+        println!("✓ такт демона: доставлено {delivered}");
+    }
+}
+
+/// `au daemon` — единственный процесс во всей системе, которому разрешено
+/// спать и просыпаться по будильнику (доккомментарий `Commands::Daemon` в
+/// `main.rs`, решение `aurelius:reminders:clock-owner`): MCP-сервер
+/// поднимается заново на каждую сессию Claude Code, и таймер внутри него
+/// размножился бы по числу сессий, а не остался одним. Замок на диске
+/// (`acquire_daemon_lock`) не даёт запустить второй экземпляр даже по
+/// ошибке.
+pub async fn daemon(interval_secs: u64, grace_spec: &str, once: bool, as_json: bool) -> Result<()> {
+    let grace = reminders::parse_delay(grace_spec)
+        .ok_or_else(|| anyhow::anyhow!("--grace: не удалось разобрать задержку '{grace_spec}'"))?;
+
+    let db = db_path();
+    let conn = db::open(&db)?;
+    let lock_path = daemon_lock_path(&db);
+    let _lock = acquire_daemon_lock(&lock_path)?;
+
+    if once {
+        let delivered = daemon_tick(&conn, chrono::Utc::now(), grace, 50)?;
+        print_daemon_tick(delivered, as_json);
+        return Ok(());
+    }
+
+    // SIGTERM — единственный сигнал, о котором просит порядок: дождаться,
+    // пока текущий такт закончится, и выйти чисто. Выход через `return`
+    // роняет `_lock` (`Drop`), снимая файл замка — второй нитке кода для
+    // этого не нужно.
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("подписка на SIGTERM")?;
+    loop {
+        let delivered = daemon_tick(&conn, chrono::Utc::now(), grace, 50)?;
+        print_daemon_tick(delivered, as_json);
+        tokio::select! {
+            () = tokio::time::sleep(interval) => {}
+            _ = sigterm.recv() => break,
+        }
+    }
+    Ok(())
 }
 
 /// Координаты секретов (спека 007, US4, T040): `au secret add / list / rm`.
@@ -4695,6 +5001,157 @@ mod tests {
         assert!(
             fields.activated_at.is_some(),
             "первая активация обязана выставить activated_at"
+        );
+    }
+
+    /// Наш собственный PID гарантированно жив прямо сейчас — простейший
+    /// живой держатель без запуска второго процесса.
+    #[test]
+    fn acquire_daemon_lock_refuses_while_the_holder_is_alive() {
+        let path = std::env::temp_dir().join(format!(
+            "aurelius-daemon-lock-test-alive-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, std::process::id().to_string()).expect("write lock");
+
+        let err = acquire_daemon_lock(&path).expect_err("must refuse while the holder lives");
+        assert!(
+            err.downcast_ref::<DaemonAlreadyRunning>().is_some(),
+            "refusal must be typed DaemonAlreadyRunning, not a generic error: {err:#}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Мёртвый держатель — реально умерший процесс (`true`, дождались его
+    /// через `wait()`), а не выдуманный номер: следующий запуск обязан
+    /// перехватить такой замок, а не отказать.
+    #[test]
+    fn acquire_daemon_lock_takes_over_a_stale_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "aurelius-daemon-lock-test-stale-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived process");
+        let dead_pid = child.id();
+        child.wait().expect("reap child");
+        std::fs::write(&path, dead_pid.to_string()).expect("write stale lock");
+
+        let lock = acquire_daemon_lock(&path).expect("must take over a stale lock");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read lock"),
+            std::process::id().to_string(),
+            "the lock file must now name THIS process"
+        );
+
+        drop(lock);
+        assert!(!path.exists(), "clean drop must remove the lock file");
+    }
+
+    /// Сериализует тесты, которые трогают `AURELIUS_NOTIFY_CMD`: переменная
+    /// окружения — состояние всего процесса, а тесты одного бинаря
+    /// выполняются в параллельных потоках. Сегодня её трогает только один
+    /// тест, но замок дешевле, чем гонка, которую отладить потом.
+    static NOTIFY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Один такт: доставляет просроченное `Owner::Me` через
+    /// `AURELIUS_NOTIFY_CMD`, оставляет нетронутыми `Owner::Ai` (не канал
+    /// демона — принадлежит сессии) и ещё не наступившее `Owner::Me` (не
+    /// просрочено). Канал проверяется по тому, что он реально получил —
+    /// файл, в который команда сама записала `$AURELIUS_REMINDER_TEXT`, — а
+    /// не по факту вызова мока.
+    #[test]
+    fn daemon_tick_delivers_only_the_overdue_owner_me_reminder_through_the_external_channel() {
+        let _guard = NOTIFY_ENV_LOCK.lock().expect("notify env lock poisoned");
+        let (_tmp, conn) = setup();
+        let now = chrono::Utc::now();
+
+        let overdue_me = reminders::add(
+            &conn,
+            reminders::NewReminder {
+                text: "полить цветы".to_owned(),
+                due_at: now - chrono::Duration::hours(1),
+                owner: reminders::Owner::Me,
+                task_id: None,
+                project: None,
+                repeat_spec: None,
+            },
+        )
+        .expect("add overdue me");
+        let overdue_ai = reminders::add(
+            &conn,
+            reminders::NewReminder {
+                text: "не для демона".to_owned(),
+                due_at: now - chrono::Duration::hours(1),
+                owner: reminders::Owner::Ai,
+                task_id: None,
+                project: None,
+                repeat_spec: None,
+            },
+        )
+        .expect("add overdue ai");
+        let not_due_me = reminders::add(
+            &conn,
+            reminders::NewReminder {
+                text: "ещё рано".to_owned(),
+                due_at: now + chrono::Duration::hours(1),
+                owner: reminders::Owner::Me,
+                task_id: None,
+                project: None,
+                repeat_spec: None,
+            },
+        )
+        .expect("add not due me");
+
+        let out_file = std::env::temp_dir().join(format!(
+            "aurelius-daemon-notify-test-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        let cmd = format!(
+            "printf '%s' \"$AURELIUS_REMINDER_TEXT\" > '{}'",
+            out_file.display()
+        );
+        // SAFETY: сериализовано NOTIFY_ENV_LOCK — других читателей/писателей
+        // этой переменной среды среди тестов этого бинаря нет.
+        unsafe {
+            std::env::set_var("AURELIUS_NOTIFY_CMD", &cmd);
+        }
+        let delivered = daemon_tick(&conn, now, chrono::Duration::minutes(0), 10);
+        unsafe {
+            std::env::remove_var("AURELIUS_NOTIFY_CMD");
+        }
+        let delivered = delivered.expect("tick");
+
+        assert_eq!(delivered, 1, "exactly the one overdue Owner::Me row");
+
+        let written = std::fs::read_to_string(&out_file).expect("read notify output");
+        assert_eq!(
+            written, "полить цветы",
+            "channel must receive the reminder text verbatim, via the env var, not a command string"
+        );
+        let _ = std::fs::remove_file(&out_file);
+
+        let me = fetch_reminder(&conn, &overdue_me.id).expect("fetch overdue me");
+        assert_eq!(
+            me.state,
+            reminders::State::Delivered,
+            "delivered through the channel"
+        );
+
+        let ai = fetch_reminder(&conn, &overdue_ai.id).expect("fetch overdue ai");
+        assert_eq!(
+            ai.state,
+            reminders::State::Pending,
+            "Owner::Ai belongs to the session, the daemon must never spend it"
+        );
+
+        let not_due = fetch_reminder(&conn, &not_due_me.id).expect("fetch not due me");
+        assert_eq!(
+            not_due.state,
+            reminders::State::Pending,
+            "not overdue yet — must be left alone"
         );
     }
 }

@@ -706,6 +706,32 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
+    /// Единственный владелец часов напоминаний во всей системе
+    /// (`aurelius:reminders:clock-owner`, решение владельца 2026-09-10):
+    /// MCP-сервер поднимается заново на каждую сессию Claude Code, и таймер
+    /// внутри него размножился бы по числу сессий, а не остался одним —
+    /// поэтому часы живут ровно здесь, одним процессом с файловым замком, а
+    /// не в MCP и не в сессии. Каждый такт забирает у `reminders::overdue_undelivered`
+    /// напоминания для `Owner::Me`/`Owner::Both`, перезревшие на `--grace` —
+    /// `Owner::Ai` принадлежит сессии, и демон их никогда не трогает
+    Daemon {
+        /// Пауза между тактами, секунд
+        #[arg(long, default_value = "60")]
+        interval: u64,
+        /// Окно ожидания после наступления срока, прежде чем считать
+        /// напоминание пропущенным живой сессией и включать внесессионный
+        /// канал — та же грамматика задержки, что у `au remind add --in`
+        #[arg(long, default_value = "15m")]
+        grace: String,
+        /// Один такт вместо цикла: выход сразу после него — так демон
+        /// тестируется без сна, и так systemd-таймер может заменить
+        /// долгоживущую службу
+        #[arg(long)]
+        once: bool,
+        /// Печатать такт как одну строку JSON, а не человекочитаемый вывод
+        #[arg(long)]
+        json: bool,
+    },
     /// Координаты секретов проекта — место хранения, не значение (спека 007, US4)
     Secret {
         #[command(subcommand)]
@@ -916,6 +942,12 @@ mod exit {
     /// заставляет прогнать заново, несравнимое молча ложится в `research.md`
     /// рядом с числом, снятым на другой базе. Провал кейса кодом НЕ является.
     pub const EVAL_NOT_COMPARABLE: u8 = 14;
+    /// `au daemon`: файловый замок уже держит ЖИВОЙ процесс — не «упал», а
+    /// реально работает. Отдельный код нужен затем, чтобы супервизор
+    /// (systemd `Restart=on-failure`) отличал «второй экземпляр отказался
+    /// стартовать корректно» от настоящего сбоя и не пытался лечить его
+    /// перезапуском — второй демон рядом с живым первым ничего не чинит.
+    pub const DAEMON_ALREADY_RUNNING: u8 = 15;
 }
 
 /// Хранилищем считается всё, что пришло из слоя базы: `DbError` (открытие,
@@ -946,6 +978,15 @@ fn classify(err: &anyhow::Error) -> u8 {
         .any(|c| c.is::<aurelius_core::secret::SecretLookalikeRefused>())
     {
         return exit::SECRET_LOOKALIKE;
+    }
+    // `au daemon`: другой экземпляр уже держит замок и жив — не ошибка
+    // хранилища и не ошибка вызова, а отдельный код именно затем, чтобы
+    // отличаться от обоих (см. `exit::DAEMON_ALREADY_RUNNING`).
+    if err
+        .chain()
+        .any(|c| c.is::<commands::DaemonAlreadyRunning>())
+    {
+        return exit::DAEMON_ALREADY_RUNNING;
     }
     // До проверки на хранилище: `EvalRunFailed` — не `DbError` и не
     // `rusqlite::Error`, поэтому без своей ветки он молча стал бы единицей,
@@ -1018,6 +1059,12 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Export => commands::export().await,
         Commands::Task { action } => commands::task(action).await,
         Commands::Remind { action, hook } => commands::remind(action, hook).await,
+        Commands::Daemon {
+            interval,
+            grace,
+            once,
+            json,
+        } => commands::daemon(interval, &grace, once, json).await,
         Commands::Secret { action } => commands::secret(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,

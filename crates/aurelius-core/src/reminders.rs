@@ -442,12 +442,22 @@ fn next_occurrence(from: DateTime<Utc>, delay: Duration, now: DateTime<Utc>) -> 
 /// вызов напоминание; `Delivered`-событие с `via` в деталях пишется только
 /// тогда. Повторяющееся напоминание не остаётся в `Delivered` — оно тут же
 /// перевзводится в `Pending` со сдвинутым `due_at` и записью `Rearmed`.
+///
+/// `WHERE` проверяет `state = 'pending' AND due_at <= now` вместе, атомарно
+/// одним условным `UPDATE` — не отдельным чтением, а потом отдельной
+/// записью. Без `due_at` в этом же условии два потребителя гонки на
+/// ПОВТОРЯЮЩЕМСЯ напоминании расходятся не по правде, а по времени опроса:
+/// потребитель A побеждает и тем же вызовом перевзводит строку в `Pending` с
+/// `due_at` в будущем; потребитель B, вычитавший ту же строку ДО перевзвода
+/// A, увидит `state = 'pending'` и без проверки срока тоже выиграет —
+/// сегодня такого второго потребителя нет, но демон второй волны становится
+/// им (`aurelius:reminders:mark-delivered-race`).
 pub fn mark_delivered(conn: &Connection, id: &str, via: &str, now: DateTime<Utc>) -> Result<bool> {
     let changed = conn.execute(
         "UPDATE reminders
             SET state = 'delivered', delivered_at = ?1, delivered_via = ?2,
                 delivered_count = delivered_count + 1
-          WHERE id = ?3 AND state = 'pending'",
+          WHERE id = ?3 AND state = 'pending' AND due_at <= ?1",
         params![now.timestamp(), via, id],
     )?;
     if changed == 0 {
@@ -756,6 +766,63 @@ mod tests {
         assert!(
             !second,
             "second caller must lose — the row already left Pending"
+        );
+    }
+
+    /// Регрессия на гонку двух потребителей одного ПОВТОРЯЮЩЕГОСЯ
+    /// напоминания (`aurelius:reminders:mark-delivered-race`): пока
+    /// `WHERE` проверял только `state`, потребитель B — вычитавший строку
+    /// ДО того, как потребитель A перевзвёл её в будущее тем же вызовом —
+    /// тоже проходил условие, потому что `state` к тому моменту снова было
+    /// `pending`. Один живой потребитель этого не видел никогда; демон
+    /// второй волны становится вторым, и без `due_at` в том же `WHERE` эта
+    /// гонка стреляет по построению, а не по случайности.
+    #[test]
+    fn mark_delivered_two_consumer_race_on_a_repeating_reminder_is_won_once() {
+        let conn = test_conn();
+        let now = Utc::now();
+        let mut r = new_reminder("standup", now - Duration::minutes(1), Owner::Both);
+        r.repeat_spec = Some("1h".to_owned());
+        let r = add(&conn, r).expect("add");
+
+        // Consumer A takes it and, inside the SAME call, re-arms it
+        // strictly into the future.
+        let a = mark_delivered(&conn, &r.id, "consumer-a", now).expect("consumer a");
+        assert!(a, "consumer A must win the still-due row");
+
+        // Consumer B holds the row as it read it before A ran — same `now`,
+        // the shape of a daemon tick racing the session hook. Its `UPDATE`
+        // must fail on `due_at`, not slip through on `state` alone: A's
+        // re-arm already put the row back into `Pending`, but for the NEXT
+        // occurrence, not the one B saw.
+        let b = mark_delivered(&conn, &r.id, "consumer-b", now).expect("consumer b");
+        assert!(
+            !b,
+            "consumer B must lose — the row is pending for a future occurrence, not the one B saw"
+        );
+
+        let got = get(&conn, &r.id).expect("get").expect("row exists");
+        assert_eq!(
+            got.delivered_count, 1,
+            "exactly one delivery must be counted, not two"
+        );
+
+        let history = events(&conn, &r.id).expect("events");
+        let delivered_events = history
+            .iter()
+            .filter(|e| e.kind == EventKind::Delivered)
+            .count();
+        assert_eq!(
+            delivered_events, 1,
+            "exactly one Delivered journal entry, not one per consumer"
+        );
+        let rearmed_events = history
+            .iter()
+            .filter(|e| e.kind == EventKind::Rearmed)
+            .count();
+        assert_eq!(
+            rearmed_events, 1,
+            "exactly one Rearmed journal entry, from consumer A's win alone"
         );
     }
 

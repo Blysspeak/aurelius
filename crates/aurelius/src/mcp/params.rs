@@ -285,4 +285,30 @@ mod tests {
         assert_eq!(stored, ["next_steps", "summary"]);
         assert_eq!(dropped, ["decisions", "key_files"]);
     }
+
+    /// `reminder_add` has no field the plain required-list can express for
+    /// "exactly one of due_in/due_at" — that half of validation lives in the
+    /// handler itself (see `handlers::reminder`). What this schema-derived
+    /// layer DOES owe it: the one plain-required field, and an unknown-owner
+    /// value refused the same way a misspelled node type is.
+    #[test]
+    fn reminder_add_required_field_and_enum_are_schema_derived() {
+        let err = validate("reminder_add", &json!({})).expect_err("text обязателен");
+        assert!(format!("{err}").contains("text"), "{err}");
+
+        let err = validate(
+            "reminder_add",
+            &json!({ "text": "x", "due_in": "1h", "owner": "somebody" }),
+        )
+        .expect_err("неизвестный owner");
+        assert!(format!("{err}").contains("both"), "{err}");
+    }
+
+    #[test]
+    fn reminder_show_and_done_require_id() {
+        for tool in ["reminder_show", "reminder_done", "reminder_snooze"] {
+            let err = validate(tool, &json!({})).expect_err("id обязателен");
+            assert!(format!("{err}").contains("id"), "{tool}: {err}");
+        }
+    }
 }

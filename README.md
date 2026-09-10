@@ -13,12 +13,12 @@
   <img src="https://img.shields.io/badge/v3.4.4-stable-a6e3a1?style=flat-square" alt="v3.4.4">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
-  <img src="https://img.shields.io/badge/MCP-33_tools-a6e3a1?style=flat-square" alt="MCP">
+  <img src="https://img.shields.io/badge/MCP-38_tools-a6e3a1?style=flat-square" alt="MCP">
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#mcp-tools-32">MCP Tools</a> ·
+  <a href="#mcp-tools-38">MCP Tools</a> ·
   <a href="#memory-snapshot">Snapshot</a> ·
   <a href="#task-management">Tasks</a> ·
   <a href="#project-sync">Sync</a> ·
@@ -103,7 +103,7 @@ aurelius 3.4.4
 
 ---
 
-## MCP Tools (33)
+## MCP Tools (38)
 
 Aurelius runs as an MCP server over stdio. `install.sh` registers it user-scope with
 `claude mcp add -s user aurelius au mcp`, and the same command adds it by hand.
@@ -140,6 +140,20 @@ Aurelius runs as an MCP server over stdio. `install.sh` registers it user-scope 
 | `task_view` | Full task branch — timeline of work logs, decisions, problems, solutions, subtasks. |
 | `task_stats` | Task analytics — counts by status/priority, completion rate, avg/median duration, blocked count, oldest active. |
 | `task_ripe` | Tasks ready to close — active, with a passing evidence run newer than the last edit, plus the basis (which run, when, files touched). Same computation as `au task ripe`; closing itself is still `task_update`. |
+
+### Reminders
+
+A reminder is a moment set on purpose, with an explicit `state` (`pending` → `delivered` → `done`/`cancelled`, where `delivered` is not an outcome — a promise shown to someone and not yet resolved either way) and an auditable trail of every postponement. It has an addressee (`owner`: `me` / `ai` / `both`) that decides which channel may deliver it. **No timer lives in the MCP server or in these tools** — every one of them is a single request/response read or write over the same `reminders`/`reminder_events` tables `au remind` uses; the clock belongs to one always-on daemon (see [Reminder Commands](#reminder-commands)) precisely because the MCP server itself is respawned once per Claude Code session, and a scheduler living inside it would multiply by the number of open sessions.
+
+| Tool | Description |
+|------|-------------|
+| `reminder_add` | Set a reminder — exactly one of `due_in` (a delay) or `due_at` (a moment) is required. `owner: ai`/`both` is delivered into a session at the end of a turn or when the owner next types (the next touch, not the exact second); `owner: me`/`both` is the only kind an out-of-session channel can act on. Optional `task` attaches it (inherits the task's project), `repeat` re-arms it after each delivery. |
+| `reminder_list` | List reminders, oldest due first. Non-terminal (`pending`/`delivered`) by default; `state` or `include_terminal=true` reaches `done`/`cancelled` too. |
+| `reminder_show` | One reminder by id or unique prefix, together with its full journal — every creation, delivery, postponement and re-arm, oldest first. `snooze_count`/`original_due_at` say how many times and from when; the journal says exactly when each move happened. |
+| `reminder_done` | Mark a reminder done — distinct from `cancelled` and from `delivered` (shown, not yet resolved). Refuses on one already done or cancelled rather than rewriting that history. |
+| `reminder_snooze` | Postpone a reminder — exactly one of `in` (a delay) or `at` (a moment) is required. Recorded as a journal entry, not a silent overwrite; `original_due_at` never moves. |
+
+There is no `reminder_cancel` on this surface — cancelling is CLI-only (`au remind cancel`), the same asymmetry `task_ripe --decline` has with MCP `task_update`.
 
 ### Skills
 
@@ -584,6 +598,7 @@ au share disable <project>         # stop syncing (local data kept)
 
 ```bash
 au task new "Title" -p myapp --priority high -c "Tests pass"
+au task new "Title" -p myapp --due 2026-09-20 --remind-before 1d   # --due also creates an attached reminder (owner both)
 au task list --project myapp --status active,blocked
 au task show <id>                  # full details with work log branch and three timestamps
 au task log <id> "Did X, Y, Z"    # record work (does not activate; see `au task activate`)
@@ -593,10 +608,63 @@ au task done <id> --commit <sha> --pr <url>   # override/add to the detected res
 au task done <id> --unconfirmed    # force "closed without confirmation"
 au task block <id> "waiting on API keys"
 au task activate <id>              # resume blocked task, demotes any other active task
+au task update <id> --due 2026-09-25   # moves the due date; the attached reminder moves with it via snooze,
+                                        # recorded in its journal instead of being silently overwritten
 
 # called by the ulika verify hook, not by hand:
 au task evidence --project myapp --command "npm test" --exit 0 --artifact run.log
 ```
+
+### Reminder Commands
+
+A reminder is a moment set on purpose — see [Reminders](#reminders) under MCP Tools for the
+state machine (`pending` → `delivered` → `done`/`cancelled`) and the journal. `au remind` and the
+MCP `reminder_*` tools only ever read or move a row; the clock itself belongs to `au daemon`, a
+single always-on process installed as a systemd **user** unit
+(`contrib/systemd/aurelius-remind.service`):
+
+```bash
+mkdir -p ~/.config/systemd/user && cp contrib/systemd/aurelius-remind.service ~/.config/systemd/user/
+systemctl --user enable --now aurelius-remind.service
+```
+
+Each tick reads `reminders::overdue_undelivered` for `owner: me`/`both` that outlived `--grace`
+past their due moment (default `15m`) — `owner: ai` belongs to a session and the daemon never
+touches it — and hands each one to `$AURELIUS_NOTIFY_CMD` (run through `sh -c`, reminder text
+passed as the `AURELIUS_REMINDER_TEXT` environment variable, never interpolated into the command
+string itself) or, absent that, to `notify-send` if it's on `PATH`; a reminder is stamped
+delivered only once that channel exits 0, so a failed notification is retried on the next tick
+instead of being marked and lost. `--interval` (default `60s`) sets the pause between ticks,
+`--once` runs a single tick and exits (how the daemon is tested without sleeping, and how a
+systemd timer could stand in for the long-lived service). A file lock next to the database, not
+the unit being started once, is what keeps the daemon a singleton: a second `au daemon` — a stray
+manual start over an already-enabled unit, a double `enable` after copying the file twice — finds
+a live PID in the lock, refuses with its own exit code, and leaves the database untouched.
+
+```bash
+au remind add "check the deploy" --in 2h --for ai          # --for: me | ai | both (default both)
+au remind add "call the client" --at "2030-01-01 09:00" --for me
+au remind add "standup" --in 30m --task <task-id-or-label> --repeat 1d  # attaches to a task, inherits
+                                                                         # its project, re-arms daily
+au remind list [--project myapp] [--state pending] [--all]   # --all also shows done/cancelled
+au remind show <id>                # the reminder plus its full journal — every postponement, oldest first
+au remind done <id>
+au remind cancel <id>
+au remind snooze <id> --in 1h      # or --at <moment> — exactly one, same rule as `add`
+au remind --hook                   # session-side consumer, wired to Stop/UserPromptSubmit (see Hooks below):
+                                    # reminders addressed to ai/both, marked delivered BEFORE printing so a
+                                    # crash between the two can't double-deliver one. UserPromptSubmit prints
+                                    # plain text to stdout; Stop (or anything else) prints {"systemMessage": …}.
+                                    # Silent, exit 0, when nothing is due — a hook that talks every turn stops
+                                    # being read.
+```
+
+A reminder addressed to `ai`/`both` therefore arrives at the next turn boundary, not at the exact
+wall-clock second — the session-side hook only gets to look at the table when the session is
+already talking. A reminder that must land at an exact moment regardless of whether a session
+happens to be open needs `owner me`/`both`: only the daemon's out-of-session channel is independent
+of a turn in progress, which is also why the MCP server and `au remind` are deliberately not allowed
+to run a timer of their own (see [Reminders](#reminders)).
 
 ### Secrets
 
@@ -689,12 +757,13 @@ crates/
     src/graph/       — crud.rs, search.rs, traverse.rs, snapshot.rs (layers + distillate),
                        rank.rs (the score recall orders by), render.rs (one node → one prose line),
                        lease.rs, path.rs, pickup.rs, import.rs, export.rs
-    src/db.rs        — SQLite setup, migrations V1-V14
+    src/db.rs        — SQLite setup, migrations V1-V15
     src/models.rs    — Node, Edge, NodeType, Relation, MemoryKind
     src/provenance.rs — confidence/evidence/subject/volatility, parsed once for both doors
     src/secret.rs    — the guard: refuses a field that reads like the secret's value
     src/eval.rs      — recall scored against a frozen fixture, read-only
     src/tasks.rs     — task lifecycle, leasing, ripeness
+    src/reminders.rs — reminders/reminder_events: state, owner, journal of postponements
     src/indexer.rs   — Cargo.toml project indexer
     src/identity.rs  — local identity config (~/.config/aurelius/identity.toml)
     src/sync/        — push/pull types, upsert + last-writer-wins merge logic
@@ -708,7 +777,7 @@ crates/
   aurelius-sync-server/ — self-hosted sync server (POST/GET /sync/push,pull,grants)
   aurelius/
     src/mcp/
-      handlers/      — status.rs, session.rs, crud.rs, search.rs, task.rs
+      handlers/      — status.rs, session.rs, crud.rs, search.rs, task.rs, reminder.rs
       tools.rs       — MCP tool definitions (JSON schemas)
       mod.rs         — JSON-RPC 2.0 server
     src/search/
@@ -728,7 +797,7 @@ deploy/
 
 - **SQLite + WAL** — concurrent reads, single writer, local-first. Every connection sets a busy timeout, verifies that WAL mode actually took effect, and checks the file header against the file size before use
 - **FTS5** — indexes label + note (not raw JSON), kept in sync via triggers
-- **14 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache, V6 sync attribution/tombstones, V7-V8 documents and skills, V9 the action journal (`act_trace`, `probes`, `pathways`, `labile_window`, `corrections`), V10 `codec`/`delta`/`node_version`, V11 obligations, V12 readable obligation objects, V13 the run that wrote a record, V14 the subject a fact asserts about. Applied atomically in a single `BEGIN IMMEDIATE` transaction
+- **15 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache, V6 sync attribution/tombstones, V7-V8 documents and skills, V9 the action journal (`act_trace`, `probes`, `pathways`, `labile_window`, `corrections`), V10 `codec`/`delta`/`node_version`, V11 obligations, V12 readable obligation objects, V13 the run that wrote a record, V14 the subject a fact asserts about, V15 `reminders`/`reminder_events`. Applied atomically in a single `BEGIN IMMEDIATE` transaction
 - **Sync attribution** — `created_by`/`updated_by` stamped from the local identity config; deletes are soft (`deleted_at`) so they propagate as tombstones instead of resurrecting on the next sync
 - **Batch BFS** — `WHERE id IN (...)` per level, not N+1 per node
 - **Session dedup** — SHA-256 content hash on (project, summary)
@@ -760,16 +829,22 @@ hand-edited into `settings.json`. Every hook calls the `au` binary directly — 
 |-------|---------|-----|---------|
 | SessionStart | `""` | `au skills --hook` | 10s |
 | SessionStart | `""` | `au db backup --hook` | 30s |
+| UserPromptSubmit | `""` | `au remind --hook` | 5s |
 | PostToolUse | `Edit\|Write` | `au touch --hook` | 5s |
 | PostToolUse | `Bash\|PowerShell\|Edit\|Write\|NotebookEdit` | `au trace --hook` | 5s |
 | Stop | `""` | `au reindex --hook` | 15s |
 | Stop | `""` | `au judge --hook` | 20s |
+| Stop | `""` | `au remind --hook` | 5s |
 
 `skills` injects the skill index, `db backup` a throttled rolling database snapshot, `touch`
 increments access_count on edited files, `trace` appends to the action journal, `reindex`
 re-indexes the project and pushes sync-enabled projects, `judge` settles the session
 (reinforce/erode/fork/null). A failing hook is always swallowed: memory has no right to break
-the start — or the end — of a session.
+the start — or the end — of a session. `remind` is wired to **both** `UserPromptSubmit` and
+`Stop` on purpose, not by oversight: `Stop` delivers at the end of a turn, `UserPromptSubmit`
+the moment the owner next types, and whichever fires first wins the conditional `UPDATE` inside
+`reminders::mark_delivered` — the other finds the row already taken and says nothing. Registering
+both costs nothing extra and halves the wait for a reminder that matures mid-turn.
 
 A seventh hook, `au snapshot --hook`, used to inject the memory slice at session start and was
 removed from the manifest: the slice surfaces the *freshest* nodes, which is not the same as the
@@ -778,6 +853,12 @@ still call it. Spec
 [010 `waking-memory`](specs/010-waking-memory/) replaces it with a `UserPromptSubmit` hook that
 recalls against what was actually typed, rather than against the clock. Until that lands, pull
 memory in deliberately — `memory_status` at session start, `au pickup` after a context wipe.
+
+`au remind --hook` prints reminders addressed to `ai`/`both` as plain stdout on `UserPromptSubmit`
+and as `{"systemMessage": …}` on `Stop` — see [Reminder Commands](#reminder-commands) for the full
+behavior and why no timer is involved anywhere in the delivery path. Same escape hatch as the
+removed seventh hook above: `--hook` stays a plain CLI flag, so a hand-written `settings.json` can
+still call it without the plugin.
 
 The bash wrappers in `contrib/claude-code/*.sh` and its own `install.sh` are **deprecated since
 3.4.0** — kept only for hand installs that never adopt the plugin, and removed in the next major
