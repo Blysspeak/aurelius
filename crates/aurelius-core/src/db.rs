@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 14;
+pub const SCHEMA_VERSION: i32 = 15;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -578,6 +578,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 14)?;
     }
 
+    if current < 15 {
+        migrate_v15(&tx)?;
+        set_schema_version(&tx, 15)?;
+    }
+
     tx.commit()?;
     Ok(())
 }
@@ -596,6 +601,61 @@ fn migrate_v14(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_nodes_subject
             ON nodes(json_extract(data, '$.subject'))
             WHERE json_extract(data, '$.subject') IS NOT NULL;
+        ",
+    )?;
+    Ok(())
+}
+
+/// V15 — напоминанию не хватало собственной таблицы: срок был либо мыслью в
+/// голове, либо необязательным полем задачи, но ни то, ни другое никогда
+/// никому не напоминало.
+///
+/// Напоминание — это ЯВНО поставленный момент со своим состоянием и
+/// аудируемым журналом переносов, а не производная от чего-то ещё:
+/// `pending` вооружено и ждёт, `delivered` показано, но исход ещё не
+/// наступил, а `done`/`cancelled` — два РАЗНЫХ исхода, и не сливать их в
+/// один nullable timestamp — половина смысла этой таблицы.
+///
+/// `original_due_at` и `snooze_count` рядом с `due_at` и `reminder_events`
+/// не избыточны: `original_due_at` держит момент, на который напоминание
+/// было поставлено ПЕРВЫЙ раз, поэтому строка, перенесённая пять раз, всё
+/// равно показывает, что обещала вначале; `snooze_count` — это дешёвое
+/// чтение той же правды для одной строки списка, а `reminder_events` —
+/// полный журнал для того, кто захочет посмотреть, откуда и когда именно.
+/// Точно так же `state` и три временны́х метки исхода не дублируют друг
+/// друга: `state` — то, по чему фильтрует запрос, метки — когда это
+/// случилось.
+fn migrate_v15(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS reminders (
+            id              TEXT PRIMARY KEY,
+            task_id         TEXT,
+            project         TEXT,
+            text            TEXT NOT NULL,
+            owner           TEXT NOT NULL DEFAULT 'both',
+            state           TEXT NOT NULL DEFAULT 'pending',
+            due_at          INTEGER NOT NULL,
+            original_due_at INTEGER NOT NULL,
+            repeat_spec     TEXT,
+            created_at      INTEGER NOT NULL,
+            delivered_at    INTEGER,
+            delivered_via   TEXT,
+            delivered_count INTEGER NOT NULL DEFAULT 0,
+            snooze_count    INTEGER NOT NULL DEFAULT 0,
+            done_at         INTEGER,
+            cancelled_at    INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_reminders_state_due ON reminders(state, due_at);
+        CREATE INDEX IF NOT EXISTS idx_reminders_task ON reminders(task_id);
+        CREATE TABLE IF NOT EXISTS reminder_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            reminder_id TEXT NOT NULL,
+            at          INTEGER NOT NULL,
+            kind        TEXT NOT NULL,
+            detail      TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_reminder_events_rem ON reminder_events(reminder_id, at);
         ",
     )?;
     Ok(())

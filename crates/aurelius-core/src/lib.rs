@@ -19,6 +19,7 @@ pub mod models;
 pub mod obligations;
 pub mod probes;
 pub mod provenance;
+pub mod reminders;
 pub mod secret;
 pub mod sync;
 pub mod tasks;

@@ -3,14 +3,14 @@ use aurelius_core::{
     db, eval, graph, identity, indexer,
     models::{MemoryKind, NodeType, Relation},
     provenance::{self, Provenance, Resolution},
-    tasks as task_fields,
+    reminders, tasks as task_fields,
 };
 use serde_json::json;
 use std::path::PathBuf;
 
 use crate::{
-    hooks, DbAction, DocAction, GraphAction, HomeAction, IdentityAction, SecretAction, ShareAction,
-    TaskAction,
+    hooks, DbAction, DocAction, GraphAction, HomeAction, IdentityAction, RemindAction,
+    SecretAction, ShareAction, TaskAction,
 };
 
 use aurelius_core::db::db_path;
@@ -1405,6 +1405,15 @@ fn activate_task(
     Ok(evicted)
 }
 
+/// What `au task update --due` did to the task's attached reminder — moved
+/// an existing one through `reminders::snooze` (its journal now shows the
+/// move), or created the first one for a task that never had a due date.
+struct DueReminderSummary {
+    id: String,
+    due_at: chrono::DateTime<chrono::Utc>,
+    moved: bool,
+}
+
 /// What `au task update` actually changed, for the two printers below.
 struct TaskUpdate {
     id: uuid::Uuid,
@@ -1416,6 +1425,14 @@ struct TaskUpdate {
     /// The acceptance criteria AFTER the append — the appended ones are not
     /// distinguishable from the ones `au task new` wrote.
     criteria: Vec<serde_json::Value>,
+    due_reminder: Option<DueReminderSummary>,
+}
+
+/// The bare title portion of a composite task label (`"[project] title"` →
+/// `"title"`) — a reminder's text should read like a task's title, not like
+/// the project-qualified label `find_task` matches on.
+fn bare_title(label: &str) -> &str {
+    label.split_once(']').map_or(label, |(_, rest)| rest.trim())
 }
 
 /// The criteria already on the task, in whatever shape the node happens to
@@ -1449,6 +1466,7 @@ fn existing_criteria(data: &serde_json::Value) -> Vec<serde_json::Value> {
 /// node, edit the fields, hand the blob to `graph::update_node`. Nothing is
 /// removed on the way, so the work log, the evidence, the resolution and all
 /// three timestamps survive a retitle untouched.
+#[allow(clippy::too_many_arguments)]
 fn update_task(
     conn: &rusqlite::Connection,
     id: &str,
@@ -1456,6 +1474,8 @@ fn update_task(
     title: Option<String>,
     description: Option<String>,
     added_criteria: &[String],
+    due: Option<&str>,
+    remind_before: Option<&str>,
 ) -> Result<TaskUpdate> {
     let task = find_task(conn, id)?;
     let mut data = task.data.clone();
@@ -1478,8 +1498,32 @@ fn update_task(
         changed.push("criteria");
     }
 
+    // Parsed before the first write, same reasoning as `note()`'s
+    // provenance check: a bad `--due`/`--remind-before` must not leave a
+    // half-applied edit behind.
+    let due_at = due
+        .map(|spec| {
+            reminders::parse_moment(spec, chrono::Utc::now())
+                .ok_or_else(|| anyhow::anyhow!("--due: could not parse moment '{spec}'"))
+        })
+        .transpose()?;
+    let remind_delay = remind_before
+        .map(|spec| {
+            reminders::parse_delay(spec)
+                .ok_or_else(|| anyhow::anyhow!("--remind-before: could not parse delay '{spec}'"))
+        })
+        .transpose()?;
+    if let Some(due_at) = due_at {
+        let mut fields = task_fields::TaskFields::from_data(&data);
+        fields.due_at = Some(due_at);
+        data = fields.merge_into(&data);
+        changed.push("due");
+    }
+
     // `update_node` writes `note` only when it is `Some`, so passing the
-    // description through leaves it alone when the flag was not given.
+    // description through leaves it alone when the flag was not given. This
+    // is the ONE write of `data` (due date included) — see the lost-update
+    // note at the call site for why a second write here would be a bug.
     graph::update_node(conn, task.id, description.as_deref(), Some(data.clone()))?;
 
     let label = match &title {
@@ -1498,6 +1542,56 @@ fn update_task(
         None => task.label.clone(),
     };
 
+    // Moving the due date moves the task's existing attached reminder
+    // through `snooze` — the journal then records the move — rather than
+    // deleting and recreating the row. A task that never had one yet gets
+    // one created, same as `au task new --due` would.
+    let due_reminder = match due_at {
+        Some(due_at) => {
+            let reminder_due = match remind_delay {
+                Some(delay) => due_at - delay,
+                None => due_at,
+            };
+            let title_text = title
+                .clone()
+                .unwrap_or_else(|| bare_title(&task.label).to_owned());
+            let project = data
+                .get("project")
+                .and_then(|p| p.as_str())
+                .map(str::to_owned);
+            let attached = reminders::for_task(conn, &task.id.to_string(), false)?;
+            Some(match attached.into_iter().next() {
+                Some(existing) => {
+                    reminders::snooze(conn, &existing.id, reminder_due, chrono::Utc::now())?;
+                    DueReminderSummary {
+                        id: existing.id,
+                        due_at: reminder_due,
+                        moved: true,
+                    }
+                }
+                None => {
+                    let created = reminders::add(
+                        conn,
+                        reminders::NewReminder {
+                            text: format!("due: {title_text}"),
+                            due_at: reminder_due,
+                            owner: reminders::Owner::Both,
+                            task_id: Some(task.id.to_string()),
+                            project,
+                            repeat_spec: None,
+                        },
+                    )?;
+                    DueReminderSummary {
+                        id: created.id,
+                        due_at: created.due_at,
+                        moved: false,
+                    }
+                }
+            })
+        }
+        None => None,
+    };
+
     Ok(TaskUpdate {
         id: task.id,
         label,
@@ -1508,6 +1602,7 @@ fn update_task(
             .to_owned(),
         changed,
         criteria: existing_criteria(&data),
+        due_reminder,
     })
 }
 
@@ -1521,10 +1616,32 @@ pub async fn task(action: TaskAction) -> Result<()> {
             priority,
             criteria,
             description,
+            due,
+            remind_before,
         } => {
             let project = project.as_deref().unwrap_or("unknown");
             let label = format!("[{}] {}", project, title);
-            let task_data = json!({
+
+            // Parsed before the first write, same as `note()`'s provenance
+            // check: a bad `--due`/`--remind-before` must not leave a
+            // half-created task behind.
+            let due_at = due
+                .as_deref()
+                .map(|spec| {
+                    reminders::parse_moment(spec, chrono::Utc::now())
+                        .ok_or_else(|| anyhow::anyhow!("--due: could not parse moment '{spec}'"))
+                })
+                .transpose()?;
+            let remind_delay = remind_before
+                .as_deref()
+                .map(|spec| {
+                    reminders::parse_delay(spec).ok_or_else(|| {
+                        anyhow::anyhow!("--remind-before: could not parse delay '{spec}'")
+                    })
+                })
+                .transpose()?;
+
+            let mut task_data = json!({
                 "status": "backlog",
                 "priority": priority,
                 "acceptance_criteria": criteria,
@@ -1532,6 +1649,13 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 "started_at": null,
                 "completed_at": null,
             });
+            if let Some(due_at) = due_at {
+                let fields = task_fields::TaskFields {
+                    due_at: Some(due_at),
+                    ..Default::default()
+                };
+                task_data = fields.merge_into(&task_data);
+            }
 
             let task = graph::add_node_full(
                 &conn,
@@ -1558,6 +1682,30 @@ pub async fn task(action: TaskAction) -> Result<()> {
             };
             graph::add_edge(&conn, task.id, proj_node.id, Relation::BelongsTo, 1.0)?;
 
+            // `--due` is the whole point of the feature, so it also creates
+            // the reminder attached to this task — not a second command to
+            // remember (spec, step 6).
+            let due_reminder = match due_at {
+                Some(due_at) => {
+                    let reminder_due = match remind_delay {
+                        Some(delay) => due_at - delay,
+                        None => due_at,
+                    };
+                    Some(reminders::add(
+                        &conn,
+                        reminders::NewReminder {
+                            text: format!("due: {title}"),
+                            due_at: reminder_due,
+                            owner: reminders::Owner::Both,
+                            task_id: Some(task.id.to_string()),
+                            project: Some(project.to_owned()),
+                            repeat_spec: None,
+                        },
+                    )?)
+                }
+                None => None,
+            };
+
             println!("✓ Task created: [{}]", task.id);
             println!("  {} ({})", label, priority);
             if !criteria.is_empty() {
@@ -1565,6 +1713,15 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 for c in &criteria {
                     println!("    ☐ {c}");
                 }
+            }
+            if let Some(r) = &due_reminder {
+                println!(
+                    "  due: {} (reminder {})",
+                    r.due_at
+                        .with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M"),
+                    short_id(&r.id)
+                );
             }
         }
 
@@ -1648,15 +1805,21 @@ pub async fn task(action: TaskAction) -> Result<()> {
             title,
             description,
             criteria,
+            due,
+            remind_before,
             json: as_json,
         } => {
             // A call with no mutating flag is refused before the database is
             // touched, and the refusal names the flags: a silent no-op reads
             // as "the edit went through" to both a human and a script.
-            if priority.is_none() && title.is_none() && description.is_none() && criteria.is_empty()
+            if priority.is_none()
+                && title.is_none()
+                && description.is_none()
+                && criteria.is_empty()
+                && due.is_none()
             {
                 anyhow::bail!(
-                    "nothing to update: pass at least one of --priority, --title, --description, -c/--criteria"
+                    "nothing to update: pass at least one of --priority, --title, --description, -c/--criteria, --due"
                 );
             }
 
@@ -1672,7 +1835,16 @@ pub async fn task(action: TaskAction) -> Result<()> {
             // transaction of its own, can still overwrite us with a blob it
             // read first. Fixing that means changing `log`, not `update`.
             conn.execute_batch("BEGIN IMMEDIATE")?;
-            let updated = update_task(&conn, &id, priority, title, description, &criteria);
+            let updated = update_task(
+                &conn,
+                &id,
+                priority,
+                title,
+                description,
+                &criteria,
+                due.as_deref(),
+                remind_before.as_deref(),
+            );
             if updated.is_ok() {
                 conn.execute_batch("COMMIT")?;
             } else {
@@ -1689,6 +1861,11 @@ pub async fn task(action: TaskAction) -> Result<()> {
                     "changed": updated.changed,
                     "acceptance_criteria": updated.criteria,
                     "updated": true,
+                    "due_reminder": updated.due_reminder.as_ref().map(|r| json!({
+                        "id": r.id,
+                        "due_at": r.due_at.to_rfc3339(),
+                        "moved": r.moved,
+                    })),
                 });
                 println!("{}", serde_json::to_string(&out)?);
             } else {
@@ -1701,6 +1878,16 @@ pub async fn task(action: TaskAction) -> Result<()> {
                             println!("    ☐ {text}");
                         }
                     }
+                }
+                if let Some(r) = &updated.due_reminder {
+                    let verb = if r.moved { "moved" } else { "created" };
+                    println!(
+                        "  due reminder {verb}: {} (reminder {})",
+                        r.due_at
+                            .with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M"),
+                        short_id(&r.id)
+                    );
                 }
             }
         }
@@ -1732,6 +1919,7 @@ pub async fn task(action: TaskAction) -> Result<()> {
             println!("  Заведена: {}", task.created_at.to_rfc3339());
             println!("  Взята:    {}", fmt_time(fields.activated_at));
             println!("  Закрыта:  {}", fmt_time(fields.closed_at));
+            println!("  Срок:     {}", fmt_time(fields.due_at));
             if task_fields::is_ripe(&fields, st) {
                 println!("  🟢 Созрела к закрытию — есть зелёная улика свежее правки");
             }
@@ -2268,6 +2456,345 @@ pub async fn task(action: TaskAction) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// au remind
+// ---------------------------------------------------------------------------
+
+/// First 8 characters of a reminder id — enough for `resolve_id` to accept
+/// back, short enough for one line.
+pub(crate) fn short_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+/// A duration as one short token (`45m`, `2h`, `3d`, `1w`) — the display
+/// counterpart of `reminders::parse_delay`'s grammar, always given a
+/// non-negative magnitude by the caller.
+pub(crate) fn humanize_duration(d: chrono::Duration) -> String {
+    let secs = d.num_seconds().max(0);
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    if days < 7 {
+        return format!("{days}d");
+    }
+    format!("{}w", days / 7)
+}
+
+/// The one rendering of "this reminder was postponed", shared by the CLI
+/// line, `au remind show`, and the Stop-hook block — a postponement counted
+/// two different ways in two places is exactly the kind of drift this
+/// feature exists to make visible instead of committing.
+pub(crate) fn postponement_marker(r: &reminders::Reminder) -> Option<String> {
+    if r.snooze_count == 0 {
+        return None;
+    }
+    Some(format!(
+        "moved {} times, originally {}",
+        r.snooze_count,
+        r.original_due_at
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+    ))
+}
+
+/// One line per reminder for `au remind list`/`show`: short id, due moment
+/// in local time, a relative marker, the state when it is not `Pending`,
+/// the text, the task label when attached, and the postponement marker.
+/// Order matters: the task label is pushed last precisely so it is the
+/// first thing dropped if this line is ever squeezed for width — the
+/// postponement marker is the visible answer to the owner's ask and must
+/// survive a trim that the task label does not.
+fn format_reminder_line(conn: &rusqlite::Connection, r: &reminders::Reminder) -> String {
+    let now = chrono::Utc::now();
+    let due_local = r
+        .due_at
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M");
+    let relative = if r.due_at <= now {
+        format!("overdue by {}", humanize_duration(now - r.due_at))
+    } else {
+        format!("in {}", humanize_duration(r.due_at - now))
+    };
+    let mut line = format!("{}  {due_local} ({relative})", short_id(&r.id));
+    if r.state != reminders::State::Pending {
+        line.push_str(&format!(" [{}]", r.state.as_str()));
+    }
+    line.push_str(&format!(" — {}", r.text));
+
+    let mut trailer: Vec<String> = Vec::new();
+    if let Some(marker) = postponement_marker(r) {
+        trailer.push(marker);
+    }
+    if let Some(task_id) = &r.task_id {
+        if let Ok(Some(node)) = graph::get_node(conn, task_id) {
+            trailer.push(format!("task: {}", node.label));
+        }
+    }
+    if !trailer.is_empty() {
+        line.push_str(" · ");
+        line.push_str(&trailer.join(" · "));
+    }
+    line
+}
+
+/// One reminder by full id or unique prefix. `reminders`'s public surface
+/// deliberately covers only what the daemon and this CLI need to mutate a
+/// row; "one reminder by id" for `show`/`done`/`cancel`/`snooze` is a scan
+/// over `list`, not a query the design asked for as its own function.
+fn fetch_reminder(conn: &rusqlite::Connection, prefix: &str) -> Result<reminders::Reminder> {
+    let id = reminders::resolve_id(conn, prefix)?
+        .ok_or_else(|| anyhow::anyhow!("reminder not found or ambiguous prefix: {prefix}"))?;
+    reminders::list(conn, None, None, true, usize::MAX)?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| anyhow::anyhow!("reminder vanished: {id}"))
+}
+
+/// `--at`/`--in` (and `snooze`'s identical pair) resolved to one moment.
+/// Both or neither is a call error, not a silent pick of one — the same
+/// shape `au path`'s `from`/`to`/`before` check uses.
+fn one_moment(
+    now: chrono::DateTime<chrono::Utc>,
+    at: Option<&str>,
+    in_: Option<&str>,
+) -> Result<chrono::DateTime<chrono::Utc>> {
+    match (at, in_) {
+        (Some(at), None) => reminders::parse_moment(at, now)
+            .ok_or_else(|| anyhow::anyhow!("--at: could not parse moment '{at}'")),
+        (None, Some(delay)) => Ok(now
+            + reminders::parse_delay(delay)
+                .ok_or_else(|| anyhow::anyhow!("--in: could not parse delay '{delay}'"))?),
+        (Some(_), Some(_)) => anyhow::bail!("pass exactly one of --at or --in, not both"),
+        (None, None) => anyhow::bail!("pass exactly one of --at or --in"),
+    }
+}
+
+/// Dispatch for `au remind [ACTION] [--hook]`. `--hook` is the session-side
+/// consumer wired to the Stop/UserPromptSubmit hooks (`hooks::remind_hook`);
+/// bare `au remind` with neither a subcommand nor `--hook` lists the open
+/// reminders — the same view `List` prints with every filter at its default.
+pub async fn remind(action: Option<RemindAction>, hook: bool) -> Result<()> {
+    if hook {
+        hooks::remind_hook().await;
+        return Ok(());
+    }
+    let conn = open_and_ensure(&db_path())?;
+    match action {
+        Some(RemindAction::Add {
+            text,
+            at,
+            in_,
+            task,
+            project,
+            repeat,
+            for_,
+            json: as_json,
+        }) => remind_add(
+            &conn,
+            text,
+            at.as_deref(),
+            in_.as_deref(),
+            task,
+            project,
+            repeat,
+            &for_,
+            as_json,
+        ),
+        Some(RemindAction::List {
+            project,
+            state,
+            all,
+            json: as_json,
+        }) => remind_list(&conn, project.as_deref(), state.as_deref(), all, as_json),
+        Some(RemindAction::Show { id, json: as_json }) => remind_show(&conn, &id, as_json),
+        Some(RemindAction::Done { id }) => remind_done(&conn, &id),
+        Some(RemindAction::Cancel { id }) => remind_cancel(&conn, &id),
+        Some(RemindAction::Snooze { id, in_, at }) => {
+            remind_snooze(&conn, &id, in_.as_deref(), at.as_deref())
+        }
+        None => remind_list(&conn, None, None, false, false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remind_add(
+    conn: &rusqlite::Connection,
+    text: String,
+    at: Option<&str>,
+    in_: Option<&str>,
+    task: Option<String>,
+    project: Option<String>,
+    repeat: Option<String>,
+    for_: &str,
+    as_json: bool,
+) -> Result<()> {
+    let owner = reminders::Owner::parse(for_)
+        .ok_or_else(|| anyhow::anyhow!("--for: unknown addressee '{for_}' (me | ai | both)"))?;
+    let due_at = one_moment(chrono::Utc::now(), at, in_)?;
+
+    // `--task` is resolved through the same id-or-label lookup `au task log`
+    // uses (`find_task`); an unresolvable value fails here with a clear
+    // message rather than storing a dangling reference. Attached to a task,
+    // the reminder inherits ITS project instead of re-deriving one.
+    let (task_id, resolved_project) = match task.as_deref() {
+        Some(t) => {
+            let node = find_task(conn, t)?;
+            let inherited = project.clone().or_else(|| project_of_task(&node));
+            (Some(node.id.to_string()), inherited)
+        }
+        // Same derivation `au snapshot` uses when --project is absent.
+        None => (None, project.clone().or_else(current_dir_name)),
+    };
+
+    let reminder = reminders::add(
+        conn,
+        reminders::NewReminder {
+            text,
+            due_at,
+            owner,
+            task_id,
+            project: resolved_project,
+            repeat_spec: repeat,
+        },
+    )?;
+
+    if as_json {
+        println!("{}", serde_json::to_string(&reminder)?);
+    } else {
+        println!("✓ reminder set: {}", short_id(&reminder.id));
+        println!("  {}", format_reminder_line(conn, &reminder));
+    }
+    Ok(())
+}
+
+fn remind_list(
+    conn: &rusqlite::Connection,
+    project: Option<&str>,
+    state: Option<&str>,
+    all: bool,
+    as_json: bool,
+) -> Result<()> {
+    let state_filter = state
+        .map(|s| {
+            reminders::State::parse(s).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--state: unknown state '{s}' (pending | delivered | done | cancelled)"
+                )
+            })
+        })
+        .transpose()?;
+    let items = reminders::list(conn, project, state_filter, all, 50)?;
+
+    if as_json {
+        println!("{}", serde_json::to_string(&items)?);
+        return Ok(());
+    }
+    if items.is_empty() {
+        println!("No open reminders.");
+        return Ok(());
+    }
+    println!("{} reminder(s):", items.len());
+    for r in &items {
+        println!("  {}", format_reminder_line(conn, r));
+    }
+    Ok(())
+}
+
+fn remind_show(conn: &rusqlite::Connection, id: &str, as_json: bool) -> Result<()> {
+    let reminder = fetch_reminder(conn, id)?;
+    let history = reminders::events(conn, &reminder.id)?;
+
+    if as_json {
+        let out = json!({"reminder": reminder, "events": history});
+        println!("{}", serde_json::to_string(&out)?);
+        return Ok(());
+    }
+
+    println!("{}", format_reminder_line(conn, &reminder));
+    println!("  owner: {}", reminder.owner.as_str());
+    println!(
+        "  created: {}",
+        reminder
+            .created_at
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M")
+    );
+    if !history.is_empty() {
+        println!("  journal:");
+        for e in &history {
+            println!(
+                "    {} {} {}",
+                e.at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M"),
+                e.kind.as_str(),
+                e.detail.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn remind_done(conn: &rusqlite::Connection, id: &str) -> Result<()> {
+    let full_id = reminders::resolve_id(conn, id)?
+        .ok_or_else(|| anyhow::anyhow!("reminder not found or ambiguous prefix: {id}"))?;
+    if reminders::done(conn, &full_id, chrono::Utc::now())? {
+        println!("✓ done: {}", short_id(&full_id));
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "reminder is already done or cancelled: {}",
+            short_id(&full_id)
+        );
+    }
+}
+
+fn remind_cancel(conn: &rusqlite::Connection, id: &str) -> Result<()> {
+    let full_id = reminders::resolve_id(conn, id)?
+        .ok_or_else(|| anyhow::anyhow!("reminder not found or ambiguous prefix: {id}"))?;
+    if reminders::cancel(conn, &full_id, chrono::Utc::now())? {
+        println!("✓ cancelled: {}", short_id(&full_id));
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "reminder is already done or cancelled: {}",
+            short_id(&full_id)
+        );
+    }
+}
+
+fn remind_snooze(
+    conn: &rusqlite::Connection,
+    id: &str,
+    in_: Option<&str>,
+    at: Option<&str>,
+) -> Result<()> {
+    let now = chrono::Utc::now();
+    let until = one_moment(now, at, in_)?;
+    let full_id = reminders::resolve_id(conn, id)?
+        .ok_or_else(|| anyhow::anyhow!("reminder not found or ambiguous prefix: {id}"))?;
+    if reminders::snooze(conn, &full_id, until, now)? {
+        println!(
+            "✓ snoozed: {} → {}",
+            short_id(&full_id),
+            until.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+        );
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "reminder cannot be snoozed (already done or cancelled): {}",
+            short_id(&full_id)
+        );
+    }
 }
 
 /// Координаты секретов (спека 007, US4, T040): `au secret add / list / rm`.
