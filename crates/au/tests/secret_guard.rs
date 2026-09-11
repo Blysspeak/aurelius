@@ -98,6 +98,18 @@ fn only_node_data(home: &TmpHome) -> serde_json::Value {
     serde_json::from_str(&raw).expect("data — валидный JSON")
 }
 
+/// Текст `note` единственного живого узла — сверяется, что полная заметка
+/// легла без потерь независимо от того, как обрезалась метка (`label`).
+fn only_node_note(home: &TmpHome) -> String {
+    let conn = aurelius_core::db::open(&home.0.join("aurelius.db")).expect("открыть базу");
+    conn.query_row(
+        "SELECT note FROM nodes WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    )
+    .expect("прочитать note единственного узла")
+}
+
 /// Акцептанс 1: `au note` с валидной по форме строкой GitHub-токена в тексте
 /// отказывает своим кодом, и узел не создаётся — а не код 0 и тихая запись,
 /// как было измерено 07.09.2026 (subject `aurelius:write:secret-guard`).
@@ -392,5 +404,415 @@ fn machine_value_living_in_data_is_not_rejected() {
         only_node_data(&home)["key"],
         serde_json::Value::String(machine_value.to_owned()),
         "машинное значение обязано дойти до data без изменений"
+    );
+}
+
+// Дефект 3 (найдено 11.09.2026, измерено на установленном бинаре с
+// изолированным AURELIUS_HOME): git-хэш, UUID в скобках и квалифицированный
+// идентификатор кода ложно отказывали в свободном тексте `au note`.
+
+/// Репро 3а: git-хэш (SHA-1, 40 hex) в тексте заметки — не секрет, обязан
+/// пройти без `--allow-secret`.
+#[test]
+fn note_with_git_sha1_hash_is_accepted() {
+    for text in [
+        "commit 7b86a7d98517479bbcd10998e74b292d763159dd fixed it",
+        "see ff202359c32a6819358a9e9636b2284b98387c5f for the diff",
+    ] {
+        let home = TmpHome::dir("git-hash");
+        let (code, out, err) = run(&home, &["note", text]);
+        assert_eq!(
+            code, 0,
+            "git-хэш не должен отказывать: {text}: stdout={out} stderr={err}"
+        );
+        assert_eq!(
+            node_count(&home),
+            1,
+            "принятая запись обязана лечь узлом: {text}"
+        );
+    }
+}
+
+/// Репро 3б: UUID, приклеенный к скобкам без пробела, — та же форма, что уже
+/// проходит голой, но обёртка ломает распознавание.
+#[test]
+fn note_with_parenthesized_uuid_is_accepted() {
+    let home = TmpHome::dir("uuid-paren");
+    let text = "session id (449adf4b-26f9-4273-9e18-e16e638185f3) attached";
+
+    let (code, out, err) = run(&home, &["note", text]);
+    assert_eq!(
+        code, 0,
+        "UUID в скобках не должен отказывать: stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+}
+
+/// Репро 3в: квалифицированный идентификатор кода (`Тип.метод`, опционально
+/// с `()`), измерено как `SocketBusClient.request`.
+#[test]
+fn note_with_qualified_code_identifier_is_accepted() {
+    for text in [
+        "SocketBusClient.request failed with exit13",
+        "SocketBusClient.request() failed with exit13",
+    ] {
+        let home = TmpHome::dir("qualified-id");
+        let (code, out, err) = run(&home, &["note", text]);
+        assert_eq!(
+            code, 0,
+            "идентификатор не должен отказывать: {text}: stdout={out} stderr={err}"
+        );
+        assert_eq!(
+            node_count(&home),
+            1,
+            "принятая запись обязана лечь узлом: {text}"
+        );
+    }
+}
+
+/// Асимметрия: обёрточная пунктуация сама по себе поблажки не даёт — обычный
+/// случайный токен под скобками отказывает так же, как без них. Фикстура
+/// собрана `concat!` из двух частей, а не как цельный литерал.
+#[test]
+fn note_with_wrapped_generic_random_token_is_still_refused() {
+    const GENERIC_RANDOM_TOKEN: &str = concat!("aZ9bQ7mK2xR5vN8p", "L1wT4Q9zK3");
+    let home = TmpHome::dir("wrapped-random");
+    let text = format!("leaked: ({GENERIC_RANDOM_TOKEN}) rotate it");
+
+    let (code, out, err) = run(&home, &["note", &text]);
+    assert_eq!(
+        code, SECRET_LOOKALIKE,
+        "случайный токен в скобках обязан отказать: stdout={out} stderr={err}"
+    );
+    assert_eq!(
+        node_count(&home),
+        0,
+        "отказанная запись не должна была создать узел"
+    );
+}
+
+/// Асимметрия: обёрнутый известный префикс по-прежнему ловится — поиск
+/// префикса подстрокой по всему тексту обёрткой не задет.
+#[test]
+fn note_with_wrapped_known_prefix_is_still_refused() {
+    let home = TmpHome::dir("wrapped-prefix");
+    let text = format!("token ({GH_TOKEN}) leaked");
+
+    let (code, out, err) = run(&home, &["note", &text]);
+    assert_eq!(
+        code, SECRET_LOOKALIKE,
+        "известный префикс в скобках обязан отказать: stdout={out} stderr={err}"
+    );
+    assert_eq!(
+        node_count(&home),
+        0,
+        "отказанная запись не должна была создать узел"
+    );
+}
+
+// Приёмка 2 (11.09.2026, родитель): бэктики, пунктуация конца предложения на
+// уже распознанных формах, и простой вызов `callee(arg)` всё ещё ложно
+// отказывали в позиционном тексте и в провенанс-полях.
+
+/// Репро: git-хэш, обёрнутый в бэктики (markdown-стиль code span).
+#[test]
+fn note_with_backtick_wrapped_hash_is_accepted() {
+    let home = TmpHome::dir("backtick-hash");
+    let text = "see `7b86a7d98517479bbcd10998e74b292d763159dd` for the diff";
+
+    let (code, out, err) = run(&home, &["note", text]);
+    assert_eq!(
+        code, 0,
+        "хэш в бэктиках не должен отказывать: stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+}
+
+/// Репро: обычная пунктуация конца предложения на уже распознанных формах —
+/// запятая после идентификатора, точка после UUID в скобках и после хэша.
+#[test]
+fn note_with_sentence_punctuation_after_safe_shapes_is_accepted() {
+    for text in [
+        "SocketBusClient.request, and it failed",
+        "session id (449adf4b-26f9-4273-9e18-e16e638185f3).",
+        "commit 7b86a7d98517479bbcd10998e74b292d763159dd.",
+    ] {
+        let home = TmpHome::dir("sentence-punct");
+        let (code, out, err) = run(&home, &["note", text]);
+        assert_eq!(
+            code, 0,
+            "форма с пунктуацией не должна отказывать: {text}: stdout={out} stderr={err}"
+        );
+        assert_eq!(
+            node_count(&home),
+            1,
+            "принятая запись обязана лечь узлом: {text}"
+        );
+    }
+}
+
+/// Репро: `callee(arg)` — простой вызов, живая формулировка из отказанного
+/// провенанс-поля (`createMapper(claude)`, 20 символов).
+#[test]
+fn note_with_simple_call_is_accepted() {
+    let home = TmpHome::dir("simple-call");
+    let text = "failed inside createMapper(claude) during init";
+
+    let (code, out, err) = run(&home, &["note", text]);
+    assert_eq!(
+        code, 0,
+        "простой вызов не должен отказывать: stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+}
+
+/// Асимметрия: длинный/случайный callee или аргумент — уже не «простой
+/// вызов», обязан отказать.
+#[test]
+fn note_with_simple_call_carrying_a_long_random_part_is_still_refused() {
+    const GENERIC_RANDOM_TOKEN: &str = concat!("aZ9bQ7mK2xR5vN8p", "L1wT4Q9zK3");
+    let home = TmpHome::dir("simple-call-random");
+    let text = format!("failed inside createMapper({GENERIC_RANDOM_TOKEN}) during init");
+
+    let (code, out, err) = run(&home, &["note", &text]);
+    assert_eq!(
+        code, SECRET_LOOKALIKE,
+        "вызов со случайным аргументом обязан отказать: stdout={out} stderr={err}"
+    );
+    assert_eq!(
+        node_count(&home),
+        0,
+        "отказанная запись не должна была создать узел"
+    );
+}
+
+/// Репро в провенанс-поле, не только в теле заметки: бэктик-хэш в
+/// `--claim` обязан пройти так же, как в позиционном тексте.
+#[test]
+fn claim_with_backtick_wrapped_hash_is_accepted() {
+    let home = TmpHome::dir("claim-backtick-hash");
+    let claim = "see `7b86a7d98517479bbcd10998e74b292d763159dd` for the diff";
+
+    let (code, out, err) = run(&home, &["note", BENIGN_BODY, "--claim", claim]);
+    assert_eq!(
+        code, 0,
+        "хэш в бэктиках в --claim не должен отказывать: stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+}
+
+/// Репро в провенанс-поле: простой вызов `callee(arg)` в `--evidence`
+/// обязан пройти так же, как в позиционном тексте.
+#[test]
+fn evidence_with_simple_call_is_accepted() {
+    let home = TmpHome::dir("evidence-simple-call");
+    let evidence = "failed inside createMapper(claude) during init";
+
+    let (code, out, err) = run(&home, &["note", BENIGN_BODY, "--evidence", evidence]);
+    assert_eq!(
+        code, 0,
+        "простой вызов в --evidence не должен отказывать: stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+}
+
+// Дефект 4 (найдено 11.09.2026, subject
+// `aurelius:write:secret-guard:label-truncation`): рубеж судит `label`
+// независимо от `note` (`add_node_full`), а авто-метка резала текст слепо —
+// `text.chars().take(60)`. Безопасная форма (git-хэш, UUID), пересечённая
+// границей в 60 символов, превращалась в НЕузнаваемый обрубок, и рубеж
+// отказывал по метке даже там, где полный текст был чист. Измерено: текст
+// "word ".repeat(6) + 40-hex git-хэш + " fixed" отказывал кодом 13 — фикс
+// режет метку по границе слова, а не по счётчику символов
+// (`aurelius_core::graph::label_preview`).
+
+const GIT_SHA1_HASH: &str = "7b86a7d98517479bbcd10998e74b292d763159dd";
+
+/// Репро 4а: хэш, пересекающий старую границу метки в 60 символов на разных
+/// смещениях (30/35/40 символов филлера перед хэшем — все три ложно
+/// отказывали при старой слепой резке ровно потому, что обрубок хэша длиной
+/// 20-30 символов был не короче `RANDOM_TOKEN_MIN_LEN`). Полный текст заметки
+/// обязан остаться нетронутым, а маркер обхода — отсутствовать: фикс не
+/// пропускает секреты мимо рубежа, он лишь чинит метку.
+#[test]
+fn note_with_hash_crossing_the_old_label_boundary_is_accepted() {
+    for filler_words in [6usize, 7, 8] {
+        let home = TmpHome::dir("hash-boundary");
+        let text = format!("{}{GIT_SHA1_HASH} fixed", "word ".repeat(filler_words));
+
+        let (code, out, err) = run(&home, &["note", &text]);
+        assert_eq!(
+            code, 0,
+            "хэш, пересекающий старую границу метки, не должен отказывать \
+             ({filler_words} слов филлера): stdout={out} stderr={err}"
+        );
+        assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+        assert_eq!(
+            only_node_note(&home),
+            text,
+            "полный текст заметки обязан остаться нетронутым"
+        );
+        assert_eq!(
+            only_node_data(&home).get("secret_guard_bypassed"),
+            None,
+            "рубеж обязан быть пройден честно, а не в обход"
+        );
+    }
+}
+
+/// Репро 4б: UUID в скобках, пересекающий старую границу метки — тот же
+/// обрубок-без-закрывающей-скобки, что и у хэша, только с формой
+/// `looks_like_uuid`, которую ломает уже сама незакрытая скобка.
+#[test]
+fn note_with_wrapped_uuid_crossing_the_old_label_boundary_is_accepted() {
+    let home = TmpHome::dir("uuid-boundary");
+    let text = format!(
+        "{}(449adf4b-26f9-4273-9e18-e16e638185f3) attached",
+        "word ".repeat(9)
+    );
+
+    let (code, out, err) = run(&home, &["note", &text]);
+    assert_eq!(
+        code, 0,
+        "UUID в скобках, пересекающий старую границу метки, не должен отказывать: \
+         stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+    assert_eq!(
+        only_node_note(&home),
+        text,
+        "полный текст заметки обязан остаться нетронутым"
+    );
+}
+
+/// Репро 4в: «голый» (не обёрнутый) SHA-256 — сам длиннее бюджета метки
+/// (64 > 60) — посреди предложения длиннее 60 символов. Собран из
+/// печатного hex-алфавита повтором, а не как хэш реального коммита.
+#[test]
+fn note_with_standalone_sha256_longer_than_the_label_budget_is_accepted() {
+    let sha256 = "0123456789abcdef".repeat(4);
+    assert_eq!(sha256.len(), 64, "предпосылка теста: ровно длина SHA-256");
+    let home = TmpHome::dir("sha256-standalone");
+    let text = format!("investigating regression: {sha256} across the board");
+
+    let (code, out, err) = run(&home, &["note", &text]);
+    assert_eq!(
+        code, 0,
+        "голый SHA-256 длиннее бюджета метки не должен отказывать: \
+         stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+    assert_eq!(
+        only_node_note(&home),
+        text,
+        "полный текст заметки обязан остаться нетронутым"
+    );
+}
+
+/// Репро 4г: та же граница, но филлер — кириллица (многобайтовые символы в
+/// UTF-8, один символ на `char`). Резка обязана считать `char`, а не байт, и
+/// по-прежнему не разрубать хэш.
+#[test]
+fn note_with_cyrillic_filler_crossing_the_old_label_boundary_is_accepted() {
+    let home = TmpHome::dir("cyrillic-boundary");
+    let text = format!("{}{GIT_SHA1_HASH} готово", "слово ".repeat(7));
+
+    let (code, out, err) = run(&home, &["note", &text]);
+    assert_eq!(
+        code, 0,
+        "кириллический филлер вокруг старой границы метки не должен отказывать: \
+         stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+    assert_eq!(
+        only_node_note(&home),
+        text,
+        "полный текст заметки обязан остаться нетронутым, включая кириллицу"
+    );
+}
+
+/// Асимметрия дефекта 4: чинится ДЕРИВАЦИЯ метки, а не рубеж. Настоящий
+/// токен, лежащий в тексте ПОСЛЕ той точки, где новая (куда более короткая,
+/// режущая по словам) метка уже оборвалась, обязан по-прежнему отказать —
+/// потому что рубеж сканирует `note` целиком независимо от того, что попало
+/// в `label`. Если бы это перестало работать, укорачивание метки само стало
+/// бы дырой, через которую секрет проходит незамеченным.
+#[test]
+fn note_with_real_token_after_the_new_shorter_label_still_refused() {
+    let home = TmpHome::dir("token-after-shorter-label");
+    let text = format!("{}{GH_TOKEN}", "word ".repeat(15));
+
+    let (code, out, err) = run(&home, &["note", &text]);
+    assert_eq!(
+        code, SECRET_LOOKALIKE,
+        "токен после укороченной метки обязан отказать так же, как и раньше: \
+         stdout={out} stderr={err}"
+    );
+    assert_eq!(
+        node_count(&home),
+        0,
+        "отказанная запись не должна была создать узел"
+    );
+}
+
+/// Репро 4д (найдено родителем 11.09.2026, приёмка ранее принятого фикса):
+/// текст заметки — ЦЕЛИКОМ голый 64-hex, ни единого слова вокруг, ни единого
+/// пробела. Первое (и единственное) слово само длиннее бюджета метки — тот
+/// самый крайний случай, где предыдущая версия резала слово посимвольно
+/// (`take(58)`) и получала 58-символьный обрубок, который уже не совпадает с
+/// `HEX_HASH_LENS` (40/64) и ловится как случайный токен. Измерено родителем
+/// на `'a1'.repeat(32)` (64 hex-валидных символа) — отказ на смещении 0.
+/// Метка теперь не режет слово вовсе, отдаёт нейтральное многоточие.
+#[test]
+fn note_with_bare_64_hex_text_and_nothing_else_is_accepted() {
+    let sha256 = "0123456789abcdef".repeat(4);
+    assert_eq!(sha256.len(), 64, "предпосылка теста: ровно длина SHA-256");
+    let home = TmpHome::dir("bare-64hex");
+
+    let (code, out, err) = run(&home, &["note", &sha256]);
+    assert_eq!(
+        code, 0,
+        "голый 64-hex без единого слова вокруг не должен отказывать: \
+         stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+    assert_eq!(
+        only_node_note(&home),
+        sha256,
+        "полный текст заметки обязан остаться нетронутым"
+    );
+    assert_eq!(
+        only_node_data(&home).get("secret_guard_bypassed"),
+        None,
+        "рубеж обязан быть пройден честно, а не в обход"
+    );
+}
+
+/// Асимметрия репро 4д: когда единственное «слово» текста — НАСТОЯЩИЙ похожий
+/// на секрет токен (известный префикс `sk-` + длинный алфанумерик-хвост с
+/// цифрой), длиннее бюджета метки, рубеж обязан отказать так же, как и до
+/// фикса. Метка для такого текста становится голым многоточием и сама по
+/// себе безобидна — отказ здесь может дать только скан `note` целиком, не
+/// зависящий от того, что попало в `label`. Если бы этот тест прошёл кодом 0,
+/// укорачивание метки само стало бы дырой для обхода рубежа.
+#[test]
+fn note_with_bare_long_secret_shaped_word_and_nothing_else_is_still_refused() {
+    let secret_shaped = format!("sk-{}", "a1".repeat(35));
+    assert!(
+        secret_shaped.chars().count() > 60,
+        "предпосылка теста: единственное слово длиннее бюджета метки"
+    );
+    let home = TmpHome::dir("bare-long-secret-word");
+
+    let (code, out, err) = run(&home, &["note", &secret_shaped]);
+    assert_eq!(
+        code, SECRET_LOOKALIKE,
+        "голый секретоподобный токен без единого слова вокруг обязан отказать: \
+         stdout={out} stderr={err}"
+    );
+    assert_eq!(
+        node_count(&home),
+        0,
+        "отказанная запись не должна была создать узел"
     );
 }

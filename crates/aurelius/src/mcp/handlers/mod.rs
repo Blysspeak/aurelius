@@ -385,13 +385,13 @@ pub(crate) fn parse_relation(s: &str) -> anyhow::Result<Relation> {
     })
 }
 
+/// Label preview for generated decision/problem/solution labels
+/// (`task.rs`'s five call sites). Delegates to `graph::label_preview`
+/// (`crates/aurelius-core/src/graph/session.rs`) — see its doc comment for
+/// why a blind `chars().take(max)` here false-positives the secret guard on
+/// labels that chop through a safe-shaped token (git hash, UUID, ...).
 pub(crate) fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_owned()
-    } else {
-        let truncated: String = s.chars().take(max).collect();
-        format!("{truncated}...")
-    }
+    graph::label_preview(s, max)
 }
 
 /// Same escape hatch as the CLI's `au note --allow-secret`
