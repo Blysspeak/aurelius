@@ -159,13 +159,54 @@ fn content_hash(project: &str, summary: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_owned()
-    } else {
-        let head: String = s.chars().take(max).collect();
-        format!("{head}...")
+/// Unicode-safe label preview: cuts on word boundaries, never through a
+/// token. `add_node_full`'s secret guard (`crate::secret::scan_text_for_lookalike`)
+/// scans `label` and `note` independently — a preview that slices a token in
+/// half (as plain `chars().take(n)` used to, here and in three other places)
+/// can turn a safe shape (git hash, UUID, ...) into an unrecognized fragment
+/// that trips the guard on the label alone, even though the full note is
+/// clean. Found 11.09.2026 (subject `aurelius:write:secret-guard:label-truncation`):
+/// six filler words plus a 40-hex git hash, cut blindly at char 60, left a
+/// hex fragment 20-30 chars long — long enough to read as a random token.
+///
+/// `pub`, not private: the same rule is needed by `au note`
+/// (`crates/au/src/commands.rs`), `tasks::log_work`, and the MCP handlers'
+/// generated decision/problem/solution labels — see `graph::clip`'s doc
+/// comment for why the near-identical whitespace-collapsing helper there
+/// isn't reused: it falls back to slicing a first word that alone exceeds
+/// the budget, which is exactly this bug.
+///
+/// When not even the first word alone fits, it is dropped whole, not sliced:
+/// a same-length hex string is exactly as safe-shaped as a 58-char fragment
+/// of it is not — cutting `'a1'.repeat(32)` (64 hex-valid chars, a safe hash
+/// shape) down to 58 chars turned it into an unrecognized, guard-tripping
+/// fragment (measured 11.09.2026, offset 0). A bare, neutral ellipsis is the
+/// only preview that is both bounded and never a fragment of the value. The
+/// value itself is not lost: the full text stays in `note`, which the guard
+/// scans in full regardless of what the label looks like.
+#[must_use]
+pub fn label_preview(text: &str, budget: usize) -> String {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let joined = words.join(" ");
+    if joined.chars().count() <= budget {
+        return joined;
     }
+    let room = budget.saturating_sub(2); // trailing " …" marker
+    let mut out = String::new();
+    for word in &words {
+        let sep = usize::from(!out.is_empty());
+        if out.chars().count() + sep + word.chars().count() > room {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    if out.is_empty() {
+        return "…".chars().take(budget).collect();
+    }
+    format!("{out} …")
 }
 
 /// Записать сессию: узел `Session` (эпизодический — снимок момента, он обязан
@@ -291,7 +332,7 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
         let node = super::add_node(
             conn,
             NodeType::Decision,
-            &format!("[{project}] {}", truncate(text, 60)),
+            &format!("[{project}] {}", label_preview(text, 60)),
             Some(text),
             input.source,
             with_agent_session(node_data, input.agent_session),
@@ -312,7 +353,7 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
         let prob = super::add_node(
             conn,
             NodeType::Problem,
-            &format!("[{project}] {}", truncate(problem, 60)),
+            &format!("[{project}] {}", label_preview(problem, 60)),
             Some(problem),
             input.source,
             with_agent_session(prob_data, input.agent_session),
@@ -322,7 +363,7 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
         let sol = super::add_node(
             conn,
             NodeType::Solution,
-            &format!("[{project}] {}", truncate(solution, 60)),
+            &format!("[{project}] {}", label_preview(solution, 60)),
             Some(solution),
             input.source,
             with_agent_session(sol_data, input.agent_session),
@@ -624,5 +665,86 @@ mod tests {
             with_agent_session(serde_json::json!({}), Some(" run-alpha ")),
             serde_json::json!({ AGENT_SESSION_KEY: "run-alpha" })
         );
+    }
+
+    /// Short input passes through unchanged — no ellipsis, no reformatting.
+    #[test]
+    fn label_preview_leaves_short_text_unchanged() {
+        assert_eq!(label_preview("короткая заметка", 60), "короткая заметка");
+    }
+
+    /// The bug this exists to fix: `chars().take(60)` used to slice straight
+    /// through a token. The new cut must land on a word boundary before the
+    /// token, leaving it out whole rather than truncated in half.
+    #[test]
+    fn label_preview_never_splits_a_token_crossing_the_budget() {
+        let hash = "7b86a7d98517479bbcd10998e74b292d763159dd";
+        let text = format!("{}{hash} fixed", "word ".repeat(7));
+
+        let preview = label_preview(&text, 60);
+
+        assert!(
+            !preview.contains(&hash[..20]),
+            "preview must not contain a fragment of the hash: {preview:?}"
+        );
+        assert!(
+            preview.chars().count() <= 62,
+            "preview must stay close to budget: {preview:?} ({} chars)",
+            preview.chars().count()
+        );
+    }
+
+    /// A single word that alone exceeds the budget still has to give — an
+    /// unbounded label defeats the point of a preview. It is dropped whole,
+    /// never sliced: a same-length fragment of a safe-shaped token (hex hash,
+    /// UUID, ...) is not itself safe-shaped, which is exactly how a 64-char
+    /// hex string cut to 58 chars used to trip the guard on the label alone.
+    #[test]
+    fn label_preview_never_slices_a_first_word_that_alone_exceeds_the_budget() {
+        let one_long_word = "a".repeat(80);
+        let preview = label_preview(&one_long_word, 60);
+        assert_eq!(
+            preview, "…",
+            "no fragment of the word may appear, only a neutral ellipsis"
+        );
+    }
+
+    /// Budget edge cases: the preview must never exceed `budget`, including
+    /// at the degenerate ends — empty for a budget of 0, a bare ellipsis for
+    /// a budget of 1.
+    #[test]
+    fn label_preview_respects_a_degenerate_budget() {
+        let long_text = "a".repeat(80);
+        assert_eq!(label_preview(&long_text, 0), "");
+        assert_eq!(label_preview(&long_text, 1), "…");
+    }
+
+    /// Multi-byte text must be cut by `char`, not by byte — a boundary that
+    /// split a Cyrillic codepoint in half would produce invalid UTF-8 and
+    /// panic before this line runs.
+    #[test]
+    fn label_preview_counts_chars_not_bytes_for_cyrillic_text() {
+        let text = "слово ".repeat(15);
+        let preview = label_preview(&text, 60);
+        assert!(preview.chars().count() <= 62);
+    }
+
+    /// Session-spawned decision/problem/solution labels go through the same
+    /// helper as `au note` — a decision whose text carries a hash crossing
+    /// the old 60-char boundary must not make `record_session` fail.
+    #[test]
+    fn decision_label_does_not_split_a_hash_crossing_the_boundary() {
+        let (_tmp, conn) = setup();
+        let hash = "7b86a7d98517479bbcd10998e74b292d763159dd";
+        let text = format!("{}{hash} fixed", "word ".repeat(7));
+        let decisions = [text.clone()];
+        let input = SessionInput {
+            decisions: &decisions,
+            ..SessionInput::new("тестпроект", "хэш на границе метки решения", "cli")
+        };
+
+        let written = record_session(&conn, &input)
+            .expect("record_session must accept a decision whose hash crosses the label boundary");
+        assert_eq!(written.decisions, 1);
     }
 }

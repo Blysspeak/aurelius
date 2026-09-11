@@ -703,12 +703,6 @@ UPDATE nodes SET
 WHERE id = ?4 AND deleted_at IS NULL AND node_type = '\"task\"'
 ";
 
-/// First `max` characters of `text`, cut on a character boundary so a
-/// multi-byte character never gets split in half.
-fn truncate_label(text: &str, max: usize) -> String {
-    text.chars().take(max).collect()
-}
-
 /// Builds the work-log node for a task and wires it into the graph — the one
 /// place both `au task log` (CLI) and MCP `task_log` build a work-log node,
 /// so the two stop keeping their own copies of the same label/note/source/
@@ -732,7 +726,7 @@ pub fn log_work(
         .get("project")
         .and_then(|p| p.as_str())
         .unwrap_or("unknown");
-    let label = format!("[{project}] {}", truncate_label(text, 60));
+    let label = format!("[{project}] {}", crate::graph::label_preview(text, 60));
 
     let log_node = crate::graph::add_node_full(
         conn,
@@ -1640,5 +1634,44 @@ mod tests {
         .expect("task --contains--> worklog edge must exist");
         assert_eq!(edge.from_id, task_id);
         assert_eq!(edge.to_id, log_node.id);
+    }
+
+    /// The work-log label used to slice through a token at
+    /// `text.chars().take(60)` (`truncate_label`, replaced by
+    /// `crate::graph::label_preview`), turning a git-hash fragment into
+    /// something `secret::scan_text_for_lookalike` reads as a random token —
+    /// `add_node_full` scans `label` and `note` independently, so the label
+    /// alone tripped the guard even though the full note was safe. Regression
+    /// for `aurelius:write:secret-guard:label-truncation`.
+    #[test]
+    fn log_work_label_does_not_split_a_hash_crossing_the_boundary() {
+        let (_tmp, conn) = setup();
+        let task_id = seed_task(
+            &conn,
+            "задача с длинным логом",
+            json!({"status": "active", "priority": "medium", "project": "proj-log-work-hash"}),
+        );
+        let task = crate::graph::get_node(&conn, &task_id.to_string())
+            .expect("get_node")
+            .expect("task exists");
+
+        let text = format!(
+            "{}7b86a7d98517479bbcd10998e74b292d763159dd fixed",
+            "word ".repeat(7)
+        );
+        let log_node = log_work(
+            &conn,
+            &task,
+            &text,
+            "test",
+            json!({"task_id": task_id.to_string()}),
+        )
+        .expect("log_work must accept a note whose hash crosses the old 60-char label boundary");
+
+        assert_eq!(
+            log_node.note.as_deref(),
+            Some(text.as_str()),
+            "full note text must survive intact"
+        );
     }
 }

@@ -341,12 +341,135 @@ pub fn scan_text_for_lookalike(text: &str) -> Option<(SecretLookalike, usize)> {
     None
 }
 
+/// Стандартные длины hex-хэша: SHA-1 (git) и SHA-256 (`sha256sum`, git v2).
+/// Форма неотличима от опакового hex-ключа той же длины — поблажка только
+/// здесь, для свободного текста ([`check_candidate`]); `detect_lookalike`
+/// (координата секрета) её не получает.
+const HEX_HASH_LENS: &[usize] = &[40, 64];
+
+fn is_lower_hex(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, 'a'..='f')
+}
+
+fn looks_like_hex_hash(s: &str) -> bool {
+    HEX_HASH_LENS.contains(&s.chars().count()) && s.chars().all(is_lower_hex)
+}
+
+/// Канонический UUID: 5 групп hex через дефис, длины 8-4-4-4-12.
+fn looks_like_uuid(s: &str) -> bool {
+    const GROUP_LENS: [usize; 5] = [8, 4, 4, 4, 12];
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip(GROUP_LENS)
+            .all(|(g, len)| g.chars().count() == len && g.chars().all(is_lower_hex))
+}
+
+/// Сегмент квалифицированного идентификатора (`Тип` или `метод`): обычный
+/// идентификатор кода и строго короче `RANDOM_TOKEN_MIN_LEN` — тот же порог,
+/// что у случайного токена, чтобы длинный base64-сегмент (например, часть
+/// JWT `header.payload.signature`), сам по себе похожий на секрет, не прошёл
+/// под видом «имени».
+fn is_identifier_segment(seg: &str) -> bool {
+    if seg.is_empty() || seg.chars().count() >= RANDOM_TOKEN_MIN_LEN {
+        return false;
+    }
+    let mut chars = seg.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `Тип.метод` или `Тип.метод()` — читаемый код-идентификатор, не значение.
+fn looks_like_qualified_identifier(s: &str) -> bool {
+    let core = s.strip_suffix("()").unwrap_or(s);
+    let segments: Vec<&str> = core.split('.').collect();
+    segments.len() >= 2 && segments.iter().all(|seg| is_identifier_segment(seg))
+}
+
+/// `callee(arg, arg, ...)` — простой вызов, не произвольное выражение:
+/// ровно одна пара скобок, callee и каждый аргумент — идентификатор той же
+/// формы и длины, что сегмент [`looks_like_qualified_identifier`]. Найдено
+/// 11.09.2026 (репро: `createMapper(claude)`, 20 символов, отказал в
+/// провенанс-поле).
+fn looks_like_simple_call(s: &str) -> bool {
+    let Some(open) = s.find('(') else {
+        return false;
+    };
+    if !s.ends_with(')') {
+        return false;
+    }
+    let callee = &s[..open];
+    let args = &s[open + 1..s.len() - 1];
+    is_identifier_segment(callee)
+        && (args.is_empty() || args.split(',').all(|arg| is_identifier_segment(arg.trim())))
+}
+
+/// Пунктуация конца предложения, которую свободный текст цепляет к токену
+/// без пробела (`hash.`, `identifier,`) — снимается только для проверки
+/// формы; `looks_like_aws_secret_key` и `looks_like_random_token` в
+/// [`check_candidate`] по-прежнему видят слово целиком, с этой пунктуацией.
+const SENTENCE_PUNCTUATION: &[char] = &[',', '.', ';', '!', '?'];
+
+/// Снять обёрточную пунктуацию (`(x)`, `[x]`, `{x}`, кавычки, `` `x` ``) и
+/// пунктуацию конца предложения — в любом порядке, вложенно (`` "(`x`)." ``),
+/// пока строка меняется. Форму значения под обёрткой это не меняет.
+fn strip_wrapping_punctuation(word: &str) -> &str {
+    const PAIRS: &[(char, char)] = &[
+        ('(', ')'),
+        ('[', ']'),
+        ('{', '}'),
+        ('"', '"'),
+        ('\'', '\''),
+        ('`', '`'),
+    ];
+    let mut core = word;
+    loop {
+        if let Some(trimmed) = core.strip_suffix(SENTENCE_PUNCTUATION) {
+            core = trimmed;
+            continue;
+        }
+        let mut stripped = false;
+        for &(open, close) in PAIRS {
+            if let Some(inner) = core.strip_prefix(open).and_then(|s| s.strip_suffix(close)) {
+                core = inner;
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    core
+}
+
+/// Узкий список безопасных технических форм для свободного текста (найдено
+/// 11.09.2026: git-хэш, UUID, квалифицированный идентификатор и простой
+/// вызов ложно ловились `looks_like_random_token` — 2 класса символов на
+/// строке длиннее `RANDOM_TOKEN_MIN_LEN` не отличают их от самого секрета той
+/// же формы). Не бланкетный обход: обычный случайный токен под той же
+/// обёрткой ни в одну из этих форм не попадёт и продолжит отказывать через
+/// `looks_like_random_token` в [`check_candidate`] ниже.
+fn looks_like_safe_technical_shape(word: &str) -> bool {
+    let core = strip_wrapping_punctuation(word);
+    looks_like_hex_hash(core)
+        || looks_like_uuid(core)
+        || looks_like_qualified_identifier(core)
+        || looks_like_simple_call(core)
+}
+
 /// Кандидат — фрагмент текста между пробелами, проверяемый теми же формами,
 /// что и координата секрета целиком: длина и состав решают, префикс — нет
-/// (он уже отловлен раньше, подстрокой по всему тексту).
+/// (он уже отловлен раньше, подстрокой по всему тексту). Известные безопасные
+/// формы ([`looks_like_safe_technical_shape`]) проверяются до
+/// `looks_like_random_token` — только здесь, не в `detect_lookalike`.
 fn check_candidate(word: &str) -> Option<SecretLookalike> {
     if looks_like_aws_secret_key(word) {
         return Some(SecretLookalike::AwsSecretKeyShape);
+    }
+    if looks_like_safe_technical_shape(word) {
+        return None;
     }
     if looks_like_random_token(word) {
         return Some(SecretLookalike::RandomToken);
@@ -655,6 +778,171 @@ mod tests {
             Some(SecretLookalike::KnownPrefix("sk-")),
             "известный префикс должен решать раньше carve-out для slug-формы"
         );
+    }
+
+    /// Дефект 3 (найдено 11.09.2026, subject
+    /// `aurelius:crates/aurelius-core/src/secret.rs:free-text-safe-shapes`,
+    /// измерено против установленного бинаря с изолированным AURELIUS_HOME):
+    /// git-хэш (SHA-1, 40 hex) ложно отказывал в свободном тексте.
+    #[test]
+    fn git_sha1_hash_in_free_text_is_accepted() {
+        for text in [
+            "commit 7b86a7d98517479bbcd10998e74b292d763159dd fixed it",
+            "see ff202359c32a6819358a9e9636b2284b98387c5f for the diff",
+        ] {
+            assert_eq!(
+                scan_text_for_lookalike(text),
+                None,
+                "git-хэш отклонён как секрет: {text}"
+            );
+        }
+    }
+
+    /// Та же находка: голый UUID уже проходил как slug (строчный hex +
+    /// дефисы), но обёрточные скобки ломают именно эту форму раньше, чем до
+    /// неё доходит проверка.
+    #[test]
+    fn parenthesized_uuid_in_free_text_is_accepted() {
+        assert_eq!(
+            scan_text_for_lookalike("session id (449adf4b-26f9-4273-9e18-e16e638185f3) attached"),
+            None,
+            "UUID в скобках отклонён как секрет"
+        );
+    }
+
+    /// Та же находка: `Тип.метод`/`Тип.метод()` — верхний регистр имени типа
+    /// и нижний имени метода дают ровно два класса символов, тот же признак,
+    /// что у случайного токена.
+    #[test]
+    fn qualified_code_identifier_in_free_text_is_accepted() {
+        for text in [
+            "SocketBusClient.request failed with exit13",
+            "SocketBusClient.request() failed with exit13",
+        ] {
+            assert_eq!(
+                scan_text_for_lookalike(text),
+                None,
+                "квалифицированный идентификатор отклонён как секрет: {text}"
+            );
+        }
+    }
+
+    /// Асимметрия: обёрточная пунктуация сама по себе поблажки не даёт —
+    /// обычный случайный токен под скобками отказывает так же, как без них.
+    #[test]
+    fn wrapped_generic_random_token_is_still_rejected() {
+        assert!(matches!(
+            scan_text_for_lookalike("leaked: (aZ9bQ7mK2xR5vN8pL1wT4) rotate it"),
+            Some((SecretLookalike::RandomToken, _))
+        ));
+    }
+
+    /// Асимметрия: обёрнутый известный префикс по-прежнему ловится —
+    /// подстрочный поиск префикса по всему тексту обёрткой не задет.
+    #[test]
+    fn wrapped_known_prefix_token_is_still_rejected() {
+        assert!(matches!(
+            scan_text_for_lookalike("token (ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789) leaked"),
+            Some((SecretLookalike::KnownPrefix("ghp_"), _))
+        ));
+    }
+
+    /// Асимметрия: `detect_lookalike` (координата секрета, `--where`)
+    /// поблажки для хэш-формы не получает — форма хэша неотличима от
+    /// опакового ключа такой же формы, а цена ошибки здесь выше, чем в
+    /// свободном тексте (см. doc-комментарий `HEX_HASH_LENS`).
+    #[test]
+    fn detect_lookalike_does_not_exempt_hash_shaped_coordinates() {
+        assert_eq!(
+            detect_lookalike("7b86a7d98517479bbcd10998e74b292d763159dd"),
+            Some(SecretLookalike::RandomToken)
+        );
+    }
+
+    /// Сегмент, сам по себе достаточно длинный, чтобы выглядеть отдельным
+    /// токеном (как base64-часть JWT: `header.payload.signature`), не
+    /// проходит под видом идентификатора — граница, которая отделяет
+    /// `Тип.метод` от `xxx.yyy.zzz` ([`is_identifier_segment`]). Части
+    /// собраны `concat!`, чтобы в исходнике не лежал цельный
+    /// credential-похожий литерал.
+    #[test]
+    fn long_dot_joined_segments_are_not_mistaken_for_a_qualified_identifier() {
+        let header = concat!("eyJhbGciOiJIUzI1", "NiIsInR5cCI6IkpXVCJ9");
+        let payload = concat!("eyJzdWIiOiIxMjM0", "NTY3ODkwIn0");
+        let signature = concat!("dozjgNryP4J3jVmN", "Hl0w5N_XgL0n3I9PlFUP0THsR8U");
+        let jwt_shaped = format!("{header}.{payload}.{signature}");
+        assert!(matches!(
+            scan_text_for_lookalike(&jwt_shaped),
+            Some((SecretLookalike::RandomToken, _))
+        ));
+    }
+
+    /// Приёмка 2 (11.09.2026, родитель): хэш в бэктиках не проходил, пока
+    /// `strip_wrapping_punctuation` снимала только одну пару и не знала
+    /// бектики.
+    #[test]
+    fn backtick_wrapped_hash_in_free_text_is_accepted() {
+        assert_eq!(
+            scan_text_for_lookalike("see `7b86a7d98517479bbcd10998e74b292d763159dd` for the diff"),
+            None,
+            "хэш в бэктиках отклонён как секрет"
+        );
+    }
+
+    /// Приёмка 2: обычная пунктуация конца предложения, приклеенная к уже
+    /// распознаваемой безопасной форме, не должна была её ломать.
+    #[test]
+    fn sentence_punctuation_after_safe_shapes_is_accepted() {
+        for text in [
+            "SocketBusClient.request, and it failed",
+            "session id (449adf4b-26f9-4273-9e18-e16e638185f3).",
+            "commit 7b86a7d98517479bbcd10998e74b292d763159dd.",
+        ] {
+            assert_eq!(
+                scan_text_for_lookalike(text),
+                None,
+                "форма с пунктуацией отклонена как секрет: {text}"
+            );
+        }
+    }
+
+    /// Приёмка 2: `callee(arg)` — простой вызов, не значение (живой репро:
+    /// `createMapper(claude)`, 20 символов, отказал в провенанс-поле).
+    #[test]
+    fn simple_call_with_identifier_argument_is_accepted() {
+        assert_eq!(
+            scan_text_for_lookalike("failed inside createMapper(claude) during init"),
+            None,
+            "простой вызов отклонён как секрет"
+        );
+    }
+
+    /// Асимметрия: callee или аргумент, сам по себе длинный/случайный, — уже
+    /// не «простой вызов», а секрет со скобками; обязан отказать так же, как
+    /// без скобок.
+    #[test]
+    fn simple_call_with_long_or_random_parts_is_still_rejected() {
+        assert!(matches!(
+            scan_text_for_lookalike("failed inside aZ9bQ7mK2xR5vN8pL1wT4(claude) during init"),
+            Some((SecretLookalike::RandomToken, _))
+        ));
+        assert!(matches!(
+            scan_text_for_lookalike(
+                "failed inside createMapper(aZ9bQ7mK2xR5vN8pL1wT4) during init"
+            ),
+            Some((SecretLookalike::RandomToken, _))
+        ));
+    }
+
+    /// Асимметрия: вложенная обёртка (скобки + бэктики) и приклеенная
+    /// пунктуация конца предложения на обычном случайном токене поблажки
+    /// по-прежнему не дают.
+    #[test]
+    fn nested_wrapper_and_sentence_punctuation_do_not_exempt_a_random_token() {
+        assert!(matches!(
+            scan_text_for_lookalike("leaked: (`aZ9bQ7mK2xR5vN8pL1wT4`). rotate it"),
+            Some((SecretLookalike::RandomToken, _))
+        ));
     }
 
     /// Единственное определение признака «это координата секрета» (FR-027) —

@@ -224,10 +224,9 @@ pub async fn note(args: NoteArgs) -> Result<()> {
 
     let text = read_note_text(args.text, args.stdin, prov.claim.as_deref())?;
     let conn = open_and_ensure(&db_path())?;
-    let label = args.label.unwrap_or_else(|| {
-        let t = text.chars().take(60).collect::<String>();
-        t.trim_end().to_owned()
-    });
+    let label = args
+        .label
+        .unwrap_or_else(|| graph::label_preview(&text, 60));
 
     let agent_session = resolve_agent_session(args.session.as_deref());
     let mut data = serde_json::Map::new();
