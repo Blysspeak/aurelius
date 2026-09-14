@@ -2142,6 +2142,9 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 if let Some(commit) = &resolution.commit {
                     println!("    коммит: {commit}");
                 }
+                if let Some(branch) = &resolution.branch {
+                    println!("    ветка: {branch}");
+                }
                 if let Some(pr) = &resolution.pull_request {
                     println!("    PR: {pr}");
                 }
@@ -2281,6 +2284,8 @@ pub async fn task(action: TaskAction) -> Result<()> {
             // `fields.activated_at` передаётся как есть, без подмены
             // `created_at` (resolution-window finding): задача, не взятая в
             // работу, не имеет окна работы вовсе.
+            // `commit` мувится вызовом ниже — флаг «назван ли явно» нужен до.
+            let commit_given = commit.is_some();
             let resolution = task_fields::build_resolution(
                 &conn,
                 fields.activated_at,
@@ -2289,6 +2294,26 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 pull_request,
                 unconfirmed,
             );
+            // Автоподстановка коммита обязана быть видимой: сессия на чужой
+            // ветке молча записала бы неуловимо чужой SHA. Не тот случай,
+            // когда автодетект не сработал (`resolution.commit == None`) —
+            // там честнее существующее предупреждение о неподтверждённом
+            // закрытии. stderr, а не stdout: это не результат команды, а
+            // примечание к нему.
+            if !commit_given {
+                if let Some(sha) = &resolution.commit {
+                    let branch_note = resolution
+                        .branch
+                        .as_ref()
+                        .map(|b| format!(" (ветка {b})"))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "коммит определён автоматически: {sha}{branch_note} — если это не тот, закрой заново с --commit <sha>",
+                        sha = sha,
+                        branch_note = branch_note
+                    );
+                }
+            }
             let confirmed = resolution.confirmed;
             fields.closed_at = Some(chrono::Utc::now());
             fields.resolution = Some(resolution);

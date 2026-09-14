@@ -72,6 +72,28 @@ fn run_in(home: &TmpHome, cwd: &std::path::Path, args: &[&str]) -> (i32, String)
     )
 }
 
+/// То же, что `run_in`, но и stderr возвращается: нужно там, где команда
+/// обязана что-то СКАЗАТЬ в stderr (`au task done` без `--commit`), не
+/// смешивая это с результатом в stdout.
+fn run_in_full(
+    home: &TmpHome,
+    cwd: &std::path::Path,
+    args: &[&str],
+) -> (i32, String, String) {
+    let out = au(home, args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("запустить au");
+    (
+        out.status.code().expect("процесс завершился сам"),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 /// Запустить со stdin — нужно `au trace --hook`, который читает JSON хука
 /// оттуда.
 fn run_with_stdin_in(
@@ -585,4 +607,136 @@ fn secret_add_list_rm_round_trip() {
         refs_after.as_array().expect("массив").is_empty(),
         "после удаления координат не обязано остаться: {list_out_after}"
     );
+}
+/// Временный НАСТОЯЩИЙ git-репозиторий под автоподстановку коммита: init,
+/// минимальный cargo-проект (Cargo.toml обязателен — `ensure_indexed`
+/// пропускает каталог без него, проект не индексируется, `project_root`
+/// не находит путь и автодетект молчит), первый коммит и перевод HEAD на
+/// ветку `feat/cli-probe`. Возвращает каталог и SHA первого коммита.
+///
+/// Имя каталога — короткий слаг БЕЗ «task» и без uuid: имя проекта ложится
+/// в метку задачи `[<проект>] …`, которую рубеж на запись судит как один
+/// кандидат до пробела — длинное имя (uuid сам по себе 36 символов) с
+/// цифрами отклоняется как «случайный токен», а `sk-` прячется внутри
+/// обычного слова «ta*sk-*…». Найдено 14.09.2026 на этом же тесте.
+fn temp_git_repo(tag: &str) -> (std::path::PathBuf, String) {
+    let repo = std::env::temp_dir().join(format!("au-probe-repo-{tag}"));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    let run_git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .expect("запустить git")
+    };
+    assert!(run_git(&["init", "-q"]).status.success());
+    assert!(run_git(&["config", "user.email", "test@example.com"])
+        .status
+        .success());
+    assert!(run_git(&["config", "user.name", "test"]).status.success());
+    std::fs::create_dir_all(repo.join("src")).expect("mkdir src");
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"auto-probe\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("write Cargo.toml");
+    std::fs::write(repo.join("src/lib.rs"), "").expect("write lib.rs");
+    assert!(run_git(&["add", "."]).status.success());
+    assert!(run_git(&["commit", "-q", "-m", "init"]).status.success());
+    let expected_sha =
+        String::from_utf8_lossy(&run_git(&["rev-parse", "--short", "HEAD"]).stdout)
+            .trim()
+            .to_owned();
+    assert!(run_git(&["checkout", "-q", "-b", "feat/cli-probe"])
+        .status
+        .success());
+    (repo, expected_sha)
+}
+
+/// Сессия сидит на чужой ветке — `au task done` без `--commit` молча записал
+/// бы неуловимо чужой коммит. Автоподстановка остаётся (FR-004..006), но
+/// обязана стать видимой: одна строка в stderr с SHA и веткой, а в записи —
+/// имя ветки рядом с автоподставленным коммитом (`au task show` его
+/// показывает).
+#[test]
+fn task_done_without_commit_prints_notice_and_stores_branch() {
+    let home = TmpHome::dir("done-notice");
+    let (repo, expected_sha) = temp_git_repo("notice");
+    let project = repo.file_name().and_then(|n| n.to_str()).expect("имя каталога");
+
+    let (code, out, err) =
+        run_in_full(&home, &repo, &["task", "new", "probe auto detection", "--project", project]);
+    assert_eq!(code, 0, "создание задачи: stdout={out} stderr={err}");
+    let id = created_task_id(&out);
+
+    let (code, out, err) = run_in_full(&home, &repo, &["task", "activate", &id]);
+    assert_eq!(code, 0, "активация: stdout={out} stderr={err}");
+
+    let (code, out, err) = run_in_full(&home, &repo, &["task", "done", &id]);
+    assert_eq!(code, 0, "закрытие задачи: stdout={out} stderr={err}");
+    assert!(
+        err.contains("определён автоматически"),
+        "автоподстановка обязана быть названа в stderr: {err}"
+    );
+    assert!(
+        err.contains(&expected_sha),
+        "в примечании обязан быть сам SHA {expected_sha}: {err}"
+    );
+    assert!(
+        err.contains("feat/cli-probe"),
+        "в примечании обязана быть ветка HEAD: {err}"
+    );
+
+    let (code, show_out, err) = run_in_full(&home, &repo, &["task", "show", &id]);
+    assert_eq!(code, 0, "показ задачи: stdout={show_out} stderr={err}");
+    assert!(
+        show_out.contains(&format!("    коммит: {expected_sha}")),
+        "автоподставленный коммит обязан быть в записи:\n{show_out}"
+    );
+    assert!(
+        show_out.contains("    ветка: feat/cli-probe"),
+        "ветка автоподстановки обязана быть в записи и в show:\n{show_out}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Явно названный коммит — не автоподстановка: ни примечания в stderr, ни
+/// ветки в записи (человек назвал сам, позиция HEAD ни при чём). Семантика
+/// закрепляется тестом намеренно, это не случайность.
+#[test]
+fn task_done_with_explicit_commit_prints_no_notice() {
+    let home = TmpHome::dir("done-explicit");
+    let (repo, _expected_sha) = temp_git_repo("explicit");
+    let project = repo.file_name().and_then(|n| n.to_str()).expect("имя каталога");
+
+    let (code, out, err) =
+        run_in_full(&home, &repo, &["task", "new", "probe auto detection", "--project", project]);
+    assert_eq!(code, 0, "создание задачи: stdout={out} stderr={err}");
+    let id = created_task_id(&out);
+
+    let (code, out, err) = run_in_full(&home, &repo, &["task", "activate", &id]);
+    assert_eq!(code, 0, "активация: stdout={out} stderr={err}");
+
+    let (code, out, err) = run_in_full(&home, &repo, &["task", "done", &id, "--commit", "deadbee"]);
+    assert_eq!(code, 0, "закрытие задачи: stdout={out} stderr={err}");
+    assert!(
+        !err.contains("определён автоматически"),
+        "при явном коммите примечания об автоподстановке быть не должно: {err}"
+    );
+
+    let (code, show_out, err) = run_in_full(&home, &repo, &["task", "show", &id]);
+    assert_eq!(code, 0, "показ задачи: stdout={show_out} stderr={err}");
+    assert!(
+        show_out.contains("    коммит: deadbee"),
+        "явный коммит обязан лечь в запись как есть:\n{show_out}"
+    );
+    assert!(
+        !show_out.contains("    ветка:"),
+        "явному коммиту ветка не положена:\n{show_out}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
 }
