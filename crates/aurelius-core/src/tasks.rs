@@ -28,6 +28,13 @@ use std::path::{Path, PathBuf};
 pub struct Resolution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Ветка, на которой стоял HEAD, когда коммит был определён
+    /// автоматически. Пишется только рядом с автоподставленным коммитом:
+    /// названному явно ветка не нужна, а в старых записях её никогда не
+    /// было (serde-дефолт оставляет их читаемыми). Отсоединённый HEAD
+    /// (`git checkout --detach`) даёт `None` — ветку назвать не кому.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -191,6 +198,33 @@ pub fn current_commit_sha(dir: Option<&Path>) -> Option<String> {
     }
 }
 
+/// Ветка, в которой лежит коммит автоподстановки — та же механика, что у
+/// [`current_commit_sha`] (`git rev-parse --abbrev-ref HEAD`): `dir` —
+/// каталог репозитория (`git -C <dir>`), `None` — текущий каталог процесса.
+/// `None` в результате — не отказ, а «ветку назвать не вышло»: не
+/// git-репозиторий, пустой вывод или отсоединённый HEAD (вывод ровно
+/// `HEAD`) — имя ветки в последнем случае не существует, а коммит
+/// [`current_commit_sha`] всё равно вернёт.
+///
+/// Общая точка для CLI и MCP — как и у [`current_commit_sha`].
+pub fn current_branch(dir: Option<&Path>) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    if let Some(dir) = dir {
+        cmd.arg("-C").arg(dir);
+    }
+    cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]);
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if branch.is_empty() || branch == "HEAD" {
+        None
+    } else {
+        Some(branch)
+    }
+}
+
 /// Собирает способ решения из следов работы (T021a, FR-004…006): коммит — из
 /// состояния репозитория, если не назван явно; файлы — из правок,
 /// привязанных хуком `au trace --hook` с момента взятия задачи в работу.
@@ -227,6 +261,13 @@ pub fn current_commit_sha(dir: Option<&Path>) -> Option<String> {
 /// caller passed in explicitly is kept), and is `confirmed` only when the
 /// caller gave an explicit commit or pull request.
 ///
+/// Рядом с автоподставленным коммитом пишется и ветка, на которой стоял
+/// HEAD (`current_branch` из того же каталога): сессия, сидящая на чужой
+/// ветке, иначе автоподставляет неуловимо чужой коммит. Явно названному
+/// коммиту ветка не нужна — его назвал человек, а не позиция HEAD, — в
+/// раннем выходе (задача не была в работе) коммит не автоподставляется
+/// вовсе, поэтому и там `branch: None`.
+///
 /// Общая точка для CLI (`au task done`) и MCP (`task_update`, статус `done`).
 pub fn build_resolution(
     conn: &rusqlite::Connection,
@@ -240,6 +281,7 @@ pub fn build_resolution(
         let confirmed = !unconfirmed && (commit.is_some() || pull_request.is_some());
         return Resolution {
             commit,
+            branch: None,
             pull_request,
             files: Vec::new(),
             confirmed,
@@ -247,18 +289,28 @@ pub fn build_resolution(
     };
 
     let root = project.and_then(|p| project_root(conn, p));
+    let auto_commit = commit.is_none();
     let commit = commit.or_else(|| match project {
         Some(_) => root
             .as_deref()
             .and_then(|dir| current_commit_sha(Some(dir))),
         None => current_commit_sha(None),
     });
+    let branch = if auto_commit && commit.is_some() {
+        match project {
+            Some(_) => root.as_deref().and_then(|dir| current_branch(Some(dir))),
+            None => current_branch(None),
+        }
+    } else {
+        None
+    };
     let files = crate::trace::files_edited_since(conn, since.timestamp(), root.as_deref())
         .unwrap_or_default();
     let confirmed =
         !unconfirmed && (commit.is_some() || pull_request.is_some() || !files.is_empty());
     Resolution {
         commit,
+        branch,
         pull_request,
         files,
         confirmed,
@@ -1337,6 +1389,146 @@ mod tests {
         assert_ne!(resolution.commit, current_commit_sha(None));
 
         std::fs::remove_dir_all(&repo_b).ok();
+    }
+
+    /// Ветка пишется ТОЛЬКО рядом с автоподставленным коммитом (и именно та,
+    /// на которой стоял HEAD в момент автоподстановки): сессия на чужой
+    /// ветке автоподставляет неуловимо чужой коммит, и без имени ветки
+    /// заметить это нечем. Репозиторий B — как в тесте выше, но после
+    /// первого коммита HEAD переводится на новую ветку.
+    #[test]
+    fn build_resolution_records_branch_with_auto_detected_commit() {
+        let (_tmp, conn) = setup();
+
+        let repo =
+            std::env::temp_dir().join(format!("aurelius-tasks-branch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("запустить git")
+        };
+        assert!(run_git(&["init", "-q"]).status.success());
+        assert!(run_git(&["config", "user.email", "test@example.com"])
+            .status
+            .success());
+        assert!(run_git(&["config", "user.name", "test"]).status.success());
+        std::fs::write(repo.join("README.md"), "b").expect("write file");
+        assert!(run_git(&["add", "."]).status.success());
+        assert!(run_git(&["commit", "-q", "-m", "init"]).status.success());
+        let expected_sha =
+            String::from_utf8_lossy(&run_git(&["rev-parse", "--short", "HEAD"]).stdout)
+                .trim()
+                .to_owned();
+        assert!(run_git(&["checkout", "-q", "-b", "feat/auto-probe"])
+            .status
+            .success());
+
+        seed_project_with_path(&conn, "proj-branch", &repo.to_string_lossy());
+        let since = "2020-01-01T00:00:00Z".parse().expect("rfc3339");
+
+        let resolution = build_resolution(&conn, Some(since), Some("proj-branch"), None, None, false);
+
+        assert_eq!(resolution.branch.as_deref(), Some("feat/auto-probe"));
+        assert_eq!(resolution.commit.as_deref(), Some(expected_sha.as_str()));
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Обратная сторона: коммит, названный человеком, ветки не получает —
+    /// его назвали явно, а не прочитали с позиции HEAD, так что связка
+    /// «коммит такой-то, потому что HEAD стоял на такой-то ветке» к нему
+    /// не относится.
+    #[test]
+    fn build_resolution_keeps_explicit_commit_branchless() {
+        let (_tmp, conn) = setup();
+
+        let repo = std::env::temp_dir()
+            .join(format!("aurelius-tasks-explicit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("запустить git")
+        };
+        assert!(run_git(&["init", "-q"]).status.success());
+        assert!(run_git(&["config", "user.email", "test@example.com"])
+            .status
+            .success());
+        assert!(run_git(&["config", "user.name", "test"]).status.success());
+        std::fs::write(repo.join("README.md"), "b").expect("write file");
+        assert!(run_git(&["add", "."]).status.success());
+        assert!(run_git(&["commit", "-q", "-m", "init"]).status.success());
+        assert!(run_git(&["checkout", "-q", "-b", "feat/elsewhere"])
+            .status
+            .success());
+
+        seed_project_with_path(&conn, "proj-explicit", &repo.to_string_lossy());
+        let since = "2020-01-01T00:00:00Z".parse().expect("rfc3339");
+
+        let resolution = build_resolution(
+            &conn,
+            Some(since),
+            Some("proj-explicit"),
+            Some("abc1234".to_owned()),
+            None,
+            false,
+        );
+
+        assert_eq!(resolution.commit.as_deref(), Some("abc1234"));
+        assert_eq!(resolution.branch, None);
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Отсоединённый HEAD: ветки нет, а коммит есть. `current_branch`
+    /// обязана отличать «вывод ровно HEAD» от настоящего имени ветки —
+    /// иначе в запись уехала бы псевдоветка `HEAD`.
+    #[test]
+    fn current_branch_is_none_when_head_is_detached() {
+        let repo =
+            std::env::temp_dir().join(format!("aurelius-tasks-detached-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("запустить git")
+        };
+        assert!(run_git(&["init", "-q"]).status.success());
+        assert!(run_git(&["config", "user.email", "test@example.com"])
+            .status
+            .success());
+        assert!(run_git(&["config", "user.name", "test"]).status.success());
+        std::fs::write(repo.join("README.md"), "b").expect("write file");
+        assert!(run_git(&["add", "."]).status.success());
+        assert!(run_git(&["commit", "-q", "-m", "init"]).status.success());
+        assert!(run_git(&["checkout", "-q", "--detach"]).status.success());
+
+        assert_eq!(current_branch(Some(&repo)), None);
+        assert_ne!(current_commit_sha(Some(&repo)), None);
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Старые записи (до поля `branch`) обязаны читаться: serde-дефолт
+    /// превращает отсутствие ключа в `None`, а не в ошибку разбора.
+    #[test]
+    fn resolution_json_without_branch_field_still_reads() {
+        let resolution: Resolution =
+            serde_json::from_str(r#"{"commit":"abc1234","confirmed":true}"#).expect("прочитать");
+
+        assert_eq!(resolution.commit.as_deref(), Some("abc1234"));
+        assert_eq!(resolution.branch, None);
+        assert!(resolution.confirmed);
     }
 
     // -- build_resolution: resolution-window finding, measured 2026-09-05 --
