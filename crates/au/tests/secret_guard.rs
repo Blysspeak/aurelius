@@ -816,3 +816,141 @@ fn note_with_bare_long_secret_shaped_word_and_nothing_else_is_still_refused() {
         "отказанная запись не должна была создать узел"
     );
 }
+
+// Заказ 14.09.2026 (subject
+// `aurelius:crates/aurelius-core/src/secret.rs:camelcase-identifier`): живой
+// отказ пришёл на голое camelCase-имя в поле `evidence` двух заметок про
+// dsh-russian-lang. Обе заметки легли только через `--allow-secret` и несут
+// `secret_guard_bypassed` в `data`; обе отказали на одном и том же имени, на
+// смещении 55 и 384 байт. Ниже — пара «принять/отказать» для этой формы и
+// точная полезная нагрузка заказа целиком.
+
+/// Дословное значение `evidence` второй отказавшей заметки (создана
+/// 2026-09-14T01:13:31Z): та самая строка, что дала код 13 на смещении 55.
+/// Имя функции вписано целиком — оно и было единственным виновником.
+const CAMEL_EVIDENCE: &str = "python3 scan of lib/client.js: the single call site of translateTurnContent sits inside the onClick of slot entry dsh-russian-lang-translate-action; the two fetch calls are the only network calls in the bundle";
+
+/// Репро: та же строка в `--evidence` обязана лечь узлом без обхода. Если этот
+/// тест красный, рубеж снова считает имя функции случайным токеном и заказ не
+/// закрыт.
+#[test]
+fn evidence_with_camel_case_code_identifier_is_accepted() {
+    let home = TmpHome::dir("camel-evidence");
+    let (code, out, err) = run(&home, &["note", BENIGN_BODY, "--evidence", CAMEL_EVIDENCE]);
+    assert_eq!(
+        code, 0,
+        "camelCase-имя в --evidence не должно отказывать: stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+    assert_eq!(
+        only_node_data(&home)["evidence"],
+        serde_json::Value::String(CAMEL_EVIDENCE.to_owned()),
+        "evidence обязан дойти до data без изменений"
+    );
+    assert_eq!(
+        only_node_data(&home).get("secret_guard_bypassed"),
+        None,
+        "рубеж обязан быть пройден честно, а не в обход"
+    );
+}
+
+/// Та же форма в позиционном тексте — скан `note` не должен расходиться со
+/// сканом `data`.
+#[test]
+fn positional_text_with_camel_case_code_identifier_is_accepted() {
+    for text in [
+        "the single call site of translateTurnContent sits inside the onClick",
+        "field actualReceiveAmountUsdt is written before the callback",
+        "resolveCardCommission is called before the write",
+    ] {
+        let home = TmpHome::dir("camel-text");
+        let (code, out, err) = run(&home, &["note", text]);
+        assert_eq!(
+            code, 0,
+            "camelCase-имя не должно отказывать: {text}: stdout={out} stderr={err}"
+        );
+        assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+    }
+}
+
+/// Асимметрия: поблажка дана рисунку регистра, а не «строке из букв». Строка
+/// той же длины, где строчные идут по одной между заглавными, — по-прежнему
+/// случайный токен. Литерал собран `concat!`, чтобы цельный
+/// credential-подобный текст не лежал в исходнике.
+#[test]
+fn note_with_random_mixed_case_word_is_still_refused() {
+    const RANDOM_WORD: &str = concat!("aZbQmKxRvNpLwTs", "HdGfQr");
+    let home = TmpHome::dir("random-mixed-case");
+    let text = format!("leaked: {RANDOM_WORD} rotate it");
+
+    let (code, out, err) = run(&home, &["note", &text]);
+    assert_eq!(
+        code, SECRET_LOOKALIKE,
+        "случайная строка обязана отказать: stdout={out} stderr={err}"
+    );
+    assert_eq!(
+        node_count(&home),
+        0,
+        "отказанная запись не должна была создать узел"
+    );
+}
+
+// Точная полезная нагрузка заказа (отчёт от 14.09.2026): заметка о
+// локализации интерфейса DSH, её `claim`, `subject` и `evidence`. Хранится
+// целиком, потому что приёмка требует прогнать через настоящий путь именно её,
+// а не отдельные слова: `note` — 1865 байт, смещение 926 в ней попадает на
+// обычное слово из кириллицы, и рубеж обязан принять все поля без обхода.
+const ORDER_PAYLOAD_NOTE: &str = r#"ASKED: локализовать интерфейс DSH на русский. WHY: владелец видел китайские подписи в доке композера и в настройках. FOUND: китайский льют сторонние client-плагины профиля web, ядро уже английское; штатный locale.register позволяет дополнить чужой namespace словарём ru, а плагинй без локализации (api-balance) переводится только правкой код — форк с русским словарём. NEXT: два решения владельца — публиковать ли форк и предлагать ли локализацию в апстрим 02Muller25/dsh-api-balance.
+
+Грабли: pnpm 11 держит суточный карантин на свежие версии (обход через минимальный возраст релиза не делали, 0.2.16 подтянется сам). Живой watcher профиля следит только за файлом патча профиля и патчем в домашнем каталоге DSH — изменения package.json (список бандлов, источник зависимости) видны только на старте, поэтому смена источника api-balance и новый пакет потребовали рестарта systemd-юнита dsh-web.service. Типографику пакета выключили: поле liveInput по умолчанию включено и мастер-ключом не гейтится, она правила бы текст прямо в поле ввода. Сеть в пакете живёт только под кнопкой перевода ответа ассистента."#;
+const ORDER_PAYLOAD_CLAIM: &str = r#"Русский для CSH делается без правки яднр: языковой пакет дополняет чужие namespace словарём ru, а плагин без локализации форкается и получает locale.register"#;
+const ORDER_PAYLOAD_SUBJECT: &str = r#"deepseek-harness:web-gui:localization-ru"#;
+const ORDER_PAYLOAD_EVIDENCE: &str = r#"git -C workSpace/project/dsh-api-balance log --oneline; npm-version обоих установленных пакетов; grep -c по CJK в установленном клиентском бандле api-balance даёт 0"#;
+
+/// Приёмка заказа: все четыре поля обязаны лечь одним узлом, код 0, без
+/// маркера обхода.
+#[test]
+fn order_payload_is_accepted_end_to_end() {
+    let home = TmpHome::dir("order-payload");
+    let (code, out, err) = run(
+        &home,
+        &[
+            "note",
+            ORDER_PAYLOAD_NOTE,
+            "--claim",
+            ORDER_PAYLOAD_CLAIM,
+            "--subject",
+            ORDER_PAYLOAD_SUBJECT,
+            "--evidence",
+            ORDER_PAYLOAD_EVIDENCE,
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "полезная нагрузка заказа обязана пройти: stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+    assert_eq!(
+        only_node_note(&home),
+        ORDER_PAYLOAD_NOTE,
+        "заметка обязана дойти до узла без потерь"
+    );
+    let data = only_node_data(&home);
+    assert_eq!(
+        data["claim"],
+        serde_json::Value::String(ORDER_PAYLOAD_CLAIM.to_owned())
+    );
+    assert_eq!(
+        data["subject"],
+        serde_json::Value::String(ORDER_PAYLOAD_SUBJECT.to_owned())
+    );
+    assert_eq!(
+        data["evidence"],
+        serde_json::Value::String(ORDER_PAYLOAD_EVIDENCE.to_owned())
+    );
+    assert_eq!(
+        data.get("secret_guard_bypassed"),
+        None,
+        "рубеж обязан быть пройден честно, а не в обход"
+    );
+}
