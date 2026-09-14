@@ -405,6 +405,50 @@ fn looks_like_simple_call(s: &str) -> bool {
         && (args.is_empty() || args.split(',').all(|arg| is_identifier_segment(arg.trim())))
 }
 
+/// Слово кода в camelCase (`calculateCartSummary`, `latestMonthlyReportRows`,
+/// `computeFontDimensions`) — читаемое имя функции, поля или метода, а не
+/// значение. Найдено 14.09.2026 (subject
+/// `aurelius:crates/aurelius-core/src/secret.rs:camelcase-identifier`):
+/// голый идентификатор функции в поле `evidence` двух рабочих заметок
+/// отказал как `RandomToken` на смещении 55 и 384 байт, и обе заметки легли
+/// только через `--allow-secret`. До этой правки свободный текст знал четыре
+/// безопасные формы (хэш, UUID, `Тип.метод`, простой вызов), но голого имени
+/// без точки и скобок среди них не было — а `looks_like_random_token` его
+/// ловил: два класса символов и длина больше порога.
+///
+/// Решает форму не длина, а рисунок регистра — тот же приём, что у
+/// [`looks_like_slug`] с его сегментами. У camelCase-имени каждый отрезок
+/// строчных букв между заглавными (и начальный тоже) длиннее одного символа:
+/// слова, а не буквы. У случайной base64-строки той же длины
+/// (`aZ9bQ7mK2xR5vN8pL1wT4`) строчные идут по одной между заглавными и
+/// цифрами, и она остаётся отклонённой; цифра, разделитель или ведущая
+/// заглавная снимают поблажку так же.
+fn looks_like_code_identifier(s: &str) -> bool {
+    if s.chars().count() < RANDOM_TOKEN_MIN_LEN {
+        return false;
+    }
+    if !s.chars().all(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut has_upper = false;
+    let mut lower_run = 0usize;
+    for c in s.chars() {
+        if c.is_ascii_uppercase() {
+            // Отрезок строчных перед заглавной: ровно одна буква — это уже
+            // не начало слова, а разброс регистра случайной строки. Ноль —
+            // ведущая заглавная (`AntigravityModels`), тоже не camelCase.
+            if lower_run <= 1 {
+                return false;
+            }
+            has_upper = true;
+            lower_run = 0;
+        } else {
+            lower_run += 1;
+        }
+    }
+    has_upper && lower_run > 1
+}
+
 /// Пунктуация конца предложения, которую свободный текст цепляет к токену
 /// без пробела (`hash.`, `identifier,`) — снимается только для проверки
 /// формы; `looks_like_aws_secret_key` и `looks_like_random_token` в
@@ -448,15 +492,17 @@ fn strip_wrapping_punctuation(word: &str) -> &str {
 /// 11.09.2026: git-хэш, UUID, квалифицированный идентификатор и простой
 /// вызов ложно ловились `looks_like_random_token` — 2 класса символов на
 /// строке длиннее `RANDOM_TOKEN_MIN_LEN` не отличают их от самого секрета той
-/// же формы). Не бланкетный обход: обычный случайный токен под той же
-/// обёрткой ни в одну из этих форм не попадёт и продолжит отказывать через
-/// `looks_like_random_token` в [`check_candidate`] ниже.
+/// же формы; 14.09.2026 сюда же легло голое camelCase-имя
+/// [`looks_like_code_identifier`]. Не бланкетный обход: обычный случайный
+/// токен под той же обёрткой ни в одну из этих форм не попадёт и продолжит
+/// отказывать через `looks_like_random_token` в [`check_candidate`] ниже.
 fn looks_like_safe_technical_shape(word: &str) -> bool {
     let core = strip_wrapping_punctuation(word);
     looks_like_hex_hash(core)
         || looks_like_uuid(core)
         || looks_like_qualified_identifier(core)
         || looks_like_simple_call(core)
+        || looks_like_code_identifier(core)
 }
 
 /// Кандидат — фрагмент текста между пробелами, проверяемый теми же формами,
@@ -943,6 +989,83 @@ mod tests {
             scan_text_for_lookalike("leaked: (`aZ9bQ7mK2xR5vN8pL1wT4`). rotate it"),
             Some((SecretLookalike::RandomToken, _))
         ));
+    }
+
+    /// Найдено 14.09.2026 (subject
+    /// `aurelius:crates/aurelius-core/src/secret.rs:camelcase-identifier`):
+    /// голое camelCase-имя длиннее порога ловилось как случайный токен.
+    /// Первые две строки — обезличенные подстроки той же формы из двух
+    /// заметок, отказавших на смещении 55 и 384 байт.
+    #[test]
+    fn camel_case_code_identifier_in_free_text_is_accepted() {
+        for text in [
+            "the single call site of calculateCartSummary sits inside the onClick",
+            "the two render calls are the only layout calls in the widget",
+            "field latestMonthlyReportRows is written before the callback",
+            "computeFontDimensions is called before the write",
+            "globalShortcutReleased and globalShortcutRepeated fired",
+        ] {
+            assert_eq!(
+                scan_text_for_lookalike(text),
+                None,
+                "camelCase-имя отклонено как секрет: {text}"
+            );
+        }
+        // Само имя — тоже кандидат, а не только фраза вокруг него.
+        assert_eq!(scan_text_for_lookalike("calculateCartSummary"), None);
+    }
+
+    /// Асимметрия: поблажка даётся рисунку регистра, а не «длинной строке из
+    /// букв». Строка той же длины без camelCase-отрезков (строчные идут по
+    /// одной между заглавными) остаётся случайным токеном, цифра снимает
+    /// поблажку так же. Дефисный слаг в этот список не входит: он принимается
+    /// раньше и по своему признаку ([`looks_like_slug`]).
+    #[test]
+    fn mixed_case_word_without_camel_runs_is_still_rejected() {
+        for text in [
+            "leaked: aZbQmKxRvNpLwTsHdGfQr rotate it",
+            "leaked: aZ9bQ7mK2xR5vN8pL1wT4 rotate it",
+            "leaked: AntigravityModelsClaudeOpus rotate it",
+        ] {
+            assert!(
+                matches!(
+                    scan_text_for_lookalike(text),
+                    Some((SecretLookalike::RandomToken, _))
+                ),
+                "случайная строка принята как безопасная форма: {text}"
+            );
+        }
+    }
+
+    /// Асимметрия, как у хэш-формы: `detect_lookalike` (координата секрета,
+    /// `--where`) поблажки для camelCase-имени не получает — там цена ошибки
+    /// выше, а форма имени неотличима от опакового ключа той же длины.
+    #[test]
+    fn detect_lookalike_does_not_exempt_code_identifier_shaped_coordinates() {
+        assert_eq!(
+            detect_lookalike("calculateCartSummary"),
+            Some(SecretLookalike::RandomToken)
+        );
+    }
+
+    /// Заказ 14.09.2026: полезная нагрузка из отчёта обязана проходить рубеж
+    /// целиком, а не только её отдельные слова. Строки ниже — длинные токены
+    /// обезличенной нагрузки из `scripts/repro-secret-guard.sh` и её
+    /// провенанс-полей: та же форма, что у токенов отказавшей заметки.
+    #[test]
+    fn localization_note_long_tokens_are_accepted() {
+        for text in [
+            "модуль взят из форка 04Harbor17/web-img-gallery.",
+            "раз в час страницы пересобирает systemd-юнит pix-web.service.",
+            "subject backyard-gallery:web-gui:thumbnailing-ru",
+            "evidence git -C workSpace/project/web-img-gallery log --oneline",
+        ] {
+            assert_eq!(
+                scan_text_for_lookalike(text),
+                None,
+                "токен заметки отклонён как секрет: {text}"
+            );
+        }
     }
 
     /// Единственное определение признака «это координата секрета» (FR-027) —

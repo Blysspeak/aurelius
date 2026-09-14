@@ -816,3 +816,141 @@ fn note_with_bare_long_secret_shaped_word_and_nothing_else_is_still_refused() {
         "отказанная запись не должна была создать узел"
     );
 }
+
+// Заказ 14.09.2026 (subject
+// `aurelius:crates/aurelius-core/src/secret.rs:camelcase-identifier`): живой
+// отказ пришёл на голое camelCase-имя в поле `evidence` двух рабочих
+// заметок. Обе заметки легли только через `--allow-secret` и несут
+// `secret_guard_bypassed` в `data`; обе отказали на одном и том же имени, на
+// смещении 55 и 384 байт. Ниже — пара «принять/отказать» для этой формы и
+// полезная нагрузка заказа целиком, обезличенная с сохранением формы.
+
+/// Значение `evidence` второй отказавшей заметки в обезличенном виде той же
+/// формы: имя функции стоит на том же смещении 55, где заметка получила
+/// код 13, и остаётся единственным кандидатом на отказ.
+const CAMEL_EVIDENCE: &str = "python3 scan of src/widget.js: the single call site of calculateCartSummary sits inside the onClick of menu entry web-invoice-cart-calculate-action; the two render calls are the only layout calls in the widget";
+
+/// Репро: та же строка в `--evidence` обязана лечь узлом без обхода. Если этот
+/// тест красный, рубеж снова считает имя функции случайным токеном и заказ не
+/// закрыт.
+#[test]
+fn evidence_with_camel_case_code_identifier_is_accepted() {
+    let home = TmpHome::dir("camel-evidence");
+    let (code, out, err) = run(&home, &["note", BENIGN_BODY, "--evidence", CAMEL_EVIDENCE]);
+    assert_eq!(
+        code, 0,
+        "camelCase-имя в --evidence не должно отказывать: stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+    assert_eq!(
+        only_node_data(&home)["evidence"],
+        serde_json::Value::String(CAMEL_EVIDENCE.to_owned()),
+        "evidence обязан дойти до data без изменений"
+    );
+    assert_eq!(
+        only_node_data(&home).get("secret_guard_bypassed"),
+        None,
+        "рубеж обязан быть пройден честно, а не в обход"
+    );
+}
+
+/// Та же форма в позиционном тексте — скан `note` не должен расходиться со
+/// сканом `data`.
+#[test]
+fn positional_text_with_camel_case_code_identifier_is_accepted() {
+    for text in [
+        "the single call site of calculateCartSummary sits inside the onClick",
+        "field latestMonthlyReportRows is written before the callback",
+        "computeFontDimensions is called before the write",
+    ] {
+        let home = TmpHome::dir("camel-text");
+        let (code, out, err) = run(&home, &["note", text]);
+        assert_eq!(
+            code, 0,
+            "camelCase-имя не должно отказывать: {text}: stdout={out} stderr={err}"
+        );
+        assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+    }
+}
+
+/// Асимметрия: поблажка дана рисунку регистра, а не «строке из букв». Строка
+/// той же длины, где строчные идут по одной между заглавными, — по-прежнему
+/// случайный токен. Литерал собран `concat!`, чтобы цельный
+/// credential-подобный текст не лежал в исходнике.
+#[test]
+fn note_with_random_mixed_case_word_is_still_refused() {
+    const RANDOM_WORD: &str = concat!("aZbQmKxRvNpLwTs", "HdGfQr");
+    let home = TmpHome::dir("random-mixed-case");
+    let text = format!("leaked: {RANDOM_WORD} rotate it");
+
+    let (code, out, err) = run(&home, &["note", &text]);
+    assert_eq!(
+        code, SECRET_LOOKALIKE,
+        "случайная строка обязана отказать: stdout={out} stderr={err}"
+    );
+    assert_eq!(
+        node_count(&home),
+        0,
+        "отказанная запись не должна была создать узел"
+    );
+}
+
+// Полезная нагрузка заказа (отчёт от 14.09.2026) в обезличенном виде той же
+// формы: заметка, её `claim`, `subject` и `evidence`. Хранится
+// целиком, потому что приёмка требует прогнать через настоящий путь именно её,
+// а не отдельные слова: `note` — 1865 байт, смещение 926 в ней попадает на
+// обычное слово из кириллицы, и рубеж обязан принять все поля без обхода.
+const ORDER_PAYLOAD_NOTE: &str = r#"ASKED: выяснить, почему ночные снимки теплицы попадают в семейный альбом без подписи. WHY: по подписи с датой и влажностью сверяют рост рассады, серия без неё бесполезна. FOUND: подпись ставит сборщик кадров, а миниатюры режет отдельный модуль превью, который о подписи не знает; хук theme.override в шаблоне альбома срабатывает раньше модуля, и при каждом пересчёте миниатюра собирается из чистого кадра. Модуль превью взят из форка 04Harbor17/web-img-gallery. NEXT: неделю гонять ночные серии на форке с исправленным порядком хуков и считать кадры без подписи.
+
+Стенд: камера над грядками снимает раз в десять минут. Сборщик сам кладёт файлы в каталог альбома, а pix-web.service раз в час пересобирает страницы. Модуль превью версии 1.4.2, тема закрепляет 1.4.0 через link 2.1.0, так что обновлять приходится в двух местах. Поле lazyThumb в config.toml включено по умолчанию и откладывает пересчёт до первого просмотра, поэтому пропажа подписи видна только утром. Отвергнуто: править шаблон ядра, ставить подпись вторым проходом по готовым миниатюрам, выключить превью целиком."#;
+const ORDER_PAYLOAD_CLAIM: &str = r#"Подпись на миниатюрах альбома теряется не в ядре: хук theme.override срабатывает раньше модуля превью, и миниатюра собирается из чистого кадра до наложения подписи"#;
+const ORDER_PAYLOAD_SUBJECT: &str = r#"backyard-gallery:web-gui:thumbnailing-ru"#;
+const ORDER_PAYLOAD_EVIDENCE: &str = r#"git -C workSpace/project/web-img-gallery log --oneline; yarn-version обоих пакетов темы; grep -c по EXIF в собранном бандле превью img-gallery даёт 0"#;
+
+/// Приёмка заказа: все четыре поля обязаны лечь одним узлом, код 0, без
+/// маркера обхода.
+#[test]
+fn order_payload_is_accepted_end_to_end() {
+    let home = TmpHome::dir("order-payload");
+    let (code, out, err) = run(
+        &home,
+        &[
+            "note",
+            ORDER_PAYLOAD_NOTE,
+            "--claim",
+            ORDER_PAYLOAD_CLAIM,
+            "--subject",
+            ORDER_PAYLOAD_SUBJECT,
+            "--evidence",
+            ORDER_PAYLOAD_EVIDENCE,
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "полезная нагрузка заказа обязана пройти: stdout={out} stderr={err}"
+    );
+    assert_eq!(node_count(&home), 1, "принятая запись обязана лечь узлом");
+    assert_eq!(
+        only_node_note(&home),
+        ORDER_PAYLOAD_NOTE,
+        "заметка обязана дойти до узла без потерь"
+    );
+    let data = only_node_data(&home);
+    assert_eq!(
+        data["claim"],
+        serde_json::Value::String(ORDER_PAYLOAD_CLAIM.to_owned())
+    );
+    assert_eq!(
+        data["subject"],
+        serde_json::Value::String(ORDER_PAYLOAD_SUBJECT.to_owned())
+    );
+    assert_eq!(
+        data["evidence"],
+        serde_json::Value::String(ORDER_PAYLOAD_EVIDENCE.to_owned())
+    );
+    assert_eq!(
+        data.get("secret_guard_bypassed"),
+        None,
+        "рубеж обязан быть пройден честно, а не в обход"
+    );
+}
