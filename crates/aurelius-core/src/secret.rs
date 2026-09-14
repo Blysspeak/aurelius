@@ -146,6 +146,33 @@ fn token_body_follows(tail: &str) -> bool {
     body_len >= RANDOM_TOKEN_MIN_LEN && tail.chars().take(body_len).any(|c| c.is_ascii_digit())
 }
 
+/// Префиксы, обязанные стоять на границе слова; `sk-` — единственный элемент
+/// `KNOWN_KEY_PREFIXES`, начало которого живёт внутри обычных английских слов
+/// (`task-hygiene`, `mask-image`, `risk-free`): приклеенный к слову он
+/// совпадает подстрокой даже с длинным похожим на токен хвостом —
+/// `task-hygiene-wf_77b967a8-bb2`, найдено 13.09.2026, subject
+/// `aurelius:write:secret-guard:false-positives` — и побеждается только
+/// границей слова; остальные префиксы (`ghp_`, `AKIA`, `xoxb-`) внутри
+/// обычных слов не встречаются, и требование границы для них лишь ослабило
+/// бы рубеж: настоящий токен, приклеенный без разделителя, обязан отказать
+/// точно так же, как отдельный, — см. тесты
+/// `known_prefix_with_token_shaped_body_is_still_rejected` и
+/// `token_glued_between_prefix_and_suffix_without_word_boundary_is_still_refused`.
+fn prefix_requires_word_boundary(prefix: &str) -> bool {
+    prefix == "sk-"
+}
+
+/// Граница слова перед байтовой позицией `idx`: начало текста, либо
+/// предыдущий символ — не буква, не цифра и не подчёркивание (пробел,
+/// кавычка, знак равенства, двоеточие, скобка, иная пунктуация); алфавит
+/// юникодный: кириллица перед токеном — тоже внутри слова, не граница.
+fn is_at_word_boundary(text: &str, idx: usize) -> bool {
+    match text[..idx].chars().next_back() {
+        None => true,
+        Some(prev) => !(prev.is_alphanumeric() || prev == '_'),
+    }
+}
+
 /// «Человеческая» hyphen-строка: slug (`backlog-audit-20260908`,
 /// `feat-guard-and-trace`) или дата/время с дефисами вместо привычных
 /// разделителей (`2026-09-08T17-40-00` — тот же ISO 8601, но с дефисами в
@@ -283,13 +310,19 @@ pub fn detect_lookalike(location: &str) -> Option<SecretLookalike> {
 /// поправкой — см. [`token_body_follows`]: голой подстроки без неё было
 /// достаточно, чтобы поймать приклейку, но она же била по обычным словам
 /// (найдено 07.09.2026, subject `aurelius:write:secret-guard:false-positives`:
-/// `sk-` совпадал внутри `mask-image`, `task-list`, `risk-free`).
+/// `sk-` совпадал внутри `mask-image`, `task-list`, `risk-free`). Для `sk-`
+/// совпадение обязано вдобавок стоять на границе слова (найдено 13.09.2026,
+/// тот же subject: `sk-` внутри `task-hygiene-wf_77b967a8-bb2` с хвостом
+/// длиннее порога) — см. [`prefix_requires_word_boundary`].
 pub fn scan_text_for_lookalike(text: &str) -> Option<(SecretLookalike, usize)> {
     if let Some(idx) = text.find("-----BEGIN") {
         return Some((SecretLookalike::PemHeader, idx));
     }
     for prefix in KNOWN_KEY_PREFIXES {
         for (idx, _) in text.match_indices(prefix) {
+            if prefix_requires_word_boundary(prefix) && !is_at_word_boundary(text, idx) {
+                continue;
+            }
             if token_body_follows(&text[idx + prefix.len()..]) {
                 return Some((SecretLookalike::KnownPrefix(prefix), idx));
             }
@@ -346,6 +379,27 @@ fn looks_like_uuid(s: &str) -> bool {
             .iter()
             .zip(GROUP_LENS)
             .all(|(g, len)| g.chars().count() == len && g.chars().all(is_lower_hex))
+}
+
+/// Диапазон git-коммитов: два hex-sha по 7–40 символов (минимальная
+/// аббревиатура git … полная длина SHA-1), соединённые двумя точками
+/// (`08cf458e..3ffb349e`). Найдено 14.09.2026, subject
+/// `aurelius:write:secret-guard:false-positives`: короткая форма из двух
+/// заглушек проходила лишь потому, что целиком короче
+/// `RANDOM_TOKEN_MIN_LEN`, а две полные hex-стороны ловились как случайный
+/// токен — точка не входит в структурные разделители
+/// `looks_like_random_token`. Рубеж это не ослабляет: 40-hex-строка и так
+/// принимается отдельно через `HEX_HASH_LENS`, диапазон — та же форма
+/// дважды, соединённая `..`, и ничего, кроме hex и двух точек, в себе не
+/// несёт.
+fn looks_like_git_range(s: &str) -> bool {
+    let Some((left, right)) = s.split_once("..") else {
+        return false;
+    };
+    let sha = |part: &str| {
+        (7..=40).contains(&part.chars().count()) && part.chars().all(is_lower_hex)
+    };
+    sha(left) && sha(right)
 }
 
 /// Сегмент квалифицированного идентификатора (`Тип` или `метод`): обычный
@@ -474,17 +528,30 @@ fn strip_wrapping_punctuation(word: &str) -> &str {
 /// 11.09.2026: git-хэш, UUID, квалифицированный идентификатор и простой
 /// вызов ложно ловились `looks_like_random_token` — 2 класса символов на
 /// строке длиннее `RANDOM_TOKEN_MIN_LEN` не отличают их от самого секрета той
-/// же формы; 14.09.2026 сюда же легло голое camelCase-имя
-/// [`looks_like_code_identifier`]. Не бланкетный обход: обычный случайный
-/// токен под той же обёрткой ни в одну из этих форм не попадёт и продолжит
-/// отказывать через `looks_like_random_token` в [`check_candidate`] ниже.
+/// же формы; 13–14.09.2026 сюда же легли диапазон git-коммитов и слаг под
+/// обёрточной пунктуацией (subject `aurelius:write:secret-guard:false-positives`),
+/// 14.09.2026 — голое camelCase-имя [`looks_like_code_identifier`].
+/// Не бланкетный обход: обычный случайный токен под той же
+/// обёрткой ни в одну из этих форм не попадёт и продолжит отказывать через
+/// `looks_like_random_token` в [`check_candidate`] ниже.
+///
+/// Слаг здесь проверяется по ядру после [`strip_wrapping_punctuation`], а не
+/// по сырой строке, как внутри `looks_like_random_token`: запятая конца
+/// предложения, приклеенная к слагу длиннее порога без пробела
+/// (`claude-opus-4-6-thinking,`, найдено 14.09.2026, репро 5в того же
+/// subject), ломала распознавание слага в сыром виде — а голый слаг той же
+/// формы проходил. Смешанно-регистровый случайный токен слагом не является и
+/// обёрткой не спасается (асимметрия
+/// `wrapped_generic_random_token_is_still_rejected`).
 fn looks_like_safe_technical_shape(word: &str) -> bool {
     let core = strip_wrapping_punctuation(word);
     looks_like_hex_hash(core)
         || looks_like_uuid(core)
+        || looks_like_git_range(core)
         || looks_like_qualified_identifier(core)
         || looks_like_simple_call(core)
         || looks_like_code_identifier(core)
+        || looks_like_slug(core)
 }
 
 /// Кандидат — фрагмент текста между пробелами, проверяемый теми же формами,
@@ -1365,5 +1432,116 @@ mod tests {
             }
         }
         assert_eq!(mask_secrets("url: password=x"), "url: password=***");
+    }
+
+    // Дефект 5 (найдено 13-14.09.2026, subject
+    // `aurelius:write:secret-guard:false-positives`): установленный бинарь
+    // отказал четырём живым заметкам — ниже технические формы текста,
+    // обязанные проходить без `--allow-secret`; фикстуры — дословные
+    // подстроки отказанных заметок.
+
+    /// Репро 5а: имя workflow — `sk-` внутри слова `xhub-task-hygiene`.
+    #[test]
+    fn task_hygiene_workflow_name_is_accepted() {
+        assert_eq!(
+            scan_text_for_lookalike(
+                "Task hygiene workflow wf_77b967a8-bb2 (xhub-task-hygiene) stopped"
+            ),
+            None,
+            "имя workflow со sk- внутри слова отклонено как секрет"
+        );
+    }
+
+    /// Репро 5б: путь к скрипту workflow с UUID и хвостом
+    /// `task-hygiene-wf_77b967a8-bb2.js` — хвост после `sk-` длиннее
+    /// `RANDOM_TOKEN_MIN_LEN` и с цифрами, так что одного `token_body_follows`
+    /// уже недостаточно; спасает только требование границы слова для `sk-`,
+    /// см. `prefix_requires_word_boundary`.
+    #[test]
+    fn workflow_script_path_with_uuid_is_accepted() {
+        assert_eq!(
+            scan_text_for_lookalike(
+                "Resume: Workflow scriptPath ~/.claude/projects/-home-blyss-workSpace-project-xhub/2d4dafc2-3502-4bf9-a07c-eb8d05a7dc8d/workflows/scripts/xhub-task-hygiene-wf_77b967a8-bb2.js"
+            ),
+            None,
+            "путь к скрипту workflow отклонён как секрет"
+        );
+    }
+
+    /// Репро 5в (14.09.2026): два дословных варианта одной заметки, второй
+    /// обрезан на `claude-sonnet-4-6`; список идентификаторов моделей — слаги
+    /// из слов и номеров версий, не ключи.
+    #[test]
+    fn model_slug_lists_are_accepted() {
+        for text in [
+            "agy 2026-09-14: Antigravity models claude-sonnet-4-6, claude-opus-4-6-thinking, gpt-oss-120b-medium answer headless",
+            "au note \"agy 2026-09-14: Antigravity models claude-sonnet-4-6",
+        ] {
+            assert_eq!(
+                scan_text_for_lookalike(text),
+                None,
+                "список моделей отклонён как секрет: {text}"
+            );
+        }
+    }
+
+    /// Репро 5г: диапазон git-коммитов в скобках с запятой на хвосте; вторая
+    /// строка — та же форма из двух полных 40-hex sha: короткая проходит
+    /// лишь потому, что целиком короче `RANDOM_TOKEN_MIN_LEN`, — поблажка
+    /// не должна зависеть от длины заглушек.
+    #[test]
+    fn git_commit_ranges_are_accepted() {
+        for text in [
+            "029 wave 6 closed 13.09: T081 T082 T083 T087 T089 committed in feat/provider-tariff-core (08cf458e..3ffb349e), tree clean",
+            "range 7b86a7d98517479bbcd10998e74b292d763159dd..ff202359c32a6819358a9e9636b2284b98387c5f closed",
+        ] {
+            assert_eq!(
+                scan_text_for_lookalike(text),
+                None,
+                "диапазон git-коммитов отклонён как секрет: {text}"
+            );
+        }
+    }
+
+    /// Асимметрия дефекта 5 — матрица «обязан отказать» из той же задачи:
+    /// настоящий `sk-proj`-токен (отдельным словом и сразу после знака
+    /// равенства), GitHub-токен, пара AWS access key id + secret access key и
+    /// случайная 40-символьная base62-строка без разделителей; последняя —
+    /// ровно форма AWS secret access key (40 символов base64-алфавита с
+    /// обоими регистрами и цифрой) и отказывает именно по ней: не слаг и не
+    /// hex.
+    #[test]
+    fn real_secret_shapes_are_still_refused() {
+        assert!(matches!(
+            scan_text_for_lookalike("token sk-proj-abc123def456ghi789jkl012mno345"),
+            Some((SecretLookalike::KnownPrefix("sk-"), _))
+        ));
+        assert!(matches!(
+            scan_text_for_lookalike("OPENAI_API_KEY=sk-proj-abc123def456ghi789jkl012mno345"),
+            Some((SecretLookalike::KnownPrefix("sk-"), _))
+        ));
+        assert!(matches!(
+            scan_text_for_lookalike("token: ghp_16C7e42F292c6912E7710c838347Ae178B4a"),
+            Some((SecretLookalike::KnownPrefix("ghp_"), _))
+        ));
+        // AWS access key id без достаточно длинного хвоста после префикса
+        // ловится формой (20 символов, верхний регистр + цифра), секрет —
+        // собственной 40-символьной формой со слэшем в теле.
+        assert!(matches!(
+            scan_text_for_lookalike("AKIAIOSFODNN7EXAMPLE"),
+            Some((SecretLookalike::RandomToken, _))
+        ));
+        assert!(matches!(
+            scan_text_for_lookalike("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            Some((SecretLookalike::AwsSecretKeyShape, _))
+        ));
+        // Случайный base62 без разделителей: не слаг, не hex, не путь.
+        assert!(matches!(
+            scan_text_for_lookalike(concat!(
+                "leaked aZ9bQ7mK2xR5vN8pL1wT",
+                "4Q9zK3mN6bV8cX5dF2gH"
+            )),
+            Some((SecretLookalike::AwsSecretKeyShape, _))
+        ));
     }
 }
