@@ -13,6 +13,9 @@ pub const SCHEMA_VERSION: i32 = 18;
 /// surfaces instead of hanging an editor hook.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Size of the WAL file header. A `-wal` no longer than this holds no frames.
+const WAL_HEADER_BYTES: u64 = 32;
+
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
     #[error(
@@ -20,7 +23,9 @@ pub enum DbError {
          hint: `au db check --full` for the full report, `au db backup` to snapshot what is \
          still readable.\n  \
          never copy or restore aurelius.db with cp/mv/rsync while `au` or an MCP server is \
-         running — use `au db backup`"
+         running — use `au db backup`. A process still holding the old file keeps writing \
+         to it, and on a clean exit SQLite deletes `aurelius.db-wal`/`-shm` by name — the \
+         new file's. Stop every `au` process (MCP servers, `au daemon`) before a swap"
     )]
     Corrupt { path: String, detail: String },
 
@@ -233,11 +238,23 @@ struct Geometry {
 /// matters most. Reading the bytes needs no connection, takes no lock, and
 /// cannot fail on a healthy database.
 ///
-/// `page_size * page_count` is the LOGICAL size seen through the WAL, so while
-/// a `-wal` is live it can legitimately exceed the main file. The reverse — a
-/// file larger than its own header describes — never happens legitimately, and
-/// is the fingerprint of a file-level copy over a live WAL database (the
-/// 2026-07-27 incident file: 7 294 976 bytes against 181 pages x 4096).
+/// While the `-wal` holds frames, the header in the main file is not the
+/// current one: the newest page 1 may live in the WAL, so the main file can
+/// legitimately be shorter OR longer than its header says. Longer is what a
+/// PASSIVE checkpoint leaves behind when a reader holds an older snapshot: it
+/// copies every page whose newest frame predates that snapshot — extending the
+/// file — but skips page 1 if a later transaction rewrote it, and truncates only
+/// after backfilling everything. SQLite itself rejects only a header larger than
+/// the file. Judging that state as damage locked every `au` call out on
+/// 2026-09-13 and 2026-09-15 (nBackfill 981 of mxFrame 1001, page 1 newest in
+/// frame 991, file 26 pages past a header one checkpoint behind), and the
+/// lock-out sustained itself: no connection could write the transaction whose
+/// checkpoint heals the header.
+///
+/// So the size comparison runs only against a WAL with no frames. A file longer
+/// than its header with nothing left to checkpoint is the fingerprint of an
+/// in-place overwrite by a shorter image (the 2026-07-27 incident file:
+/// 7 294 976 bytes against 181 pages x 4096).
 fn geometry(path: &Path) -> Geometry {
     let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let wal_bytes = std::fs::metadata(sidecar(path, "-wal"))
@@ -289,17 +306,19 @@ fn geometry(path: &Path) -> Geometry {
     // (24) equals the version-valid-for marker (92). Otherwise SQLite derives
     // the size from the file itself and the comparison below would be noise.
     let header_size_authoritative = be32(24) == be32(92);
+    let wal_has_frames = wal_bytes > WAL_HEADER_BYTES;
 
     let logical = u64::try_from(page_size.saturating_mul(page_count)).unwrap_or(0);
-    if header_size_authoritative && logical > 0 {
+    if header_size_authoritative && logical > 0 && !wal_has_frames {
         if file_bytes > logical {
             problems.push(format!(
                 "file is {file_bytes} bytes but the header describes only {page_count} pages of \
                  {page_size} ({logical} bytes) — {} bytes lie past the end of the declared \
-                 database; this is the signature of a file-level copy over a live WAL database",
+                 database with no -wal frames to account for them; this is the signature of \
+                 the file being overwritten in place by a shorter image",
                 file_bytes - logical
             ));
-        } else if file_bytes < logical && wal_bytes == 0 {
+        } else if file_bytes < logical {
             problems.push(format!(
                 "file is {file_bytes} bytes, the header describes {logical} bytes and there is \
                  no -wal to account for the difference — the file is truncated"
@@ -329,14 +348,35 @@ fn geometry(path: &Path) -> Geometry {
 /// Run per open rather than once per process on purpose: the file can be
 /// swapped in the middle of a long-lived process's life, which is exactly what
 /// happened on 2026-07-27.
+///
+/// The header is evidence, SQLite is the verdict. A geometry finding alone
+/// refuses nothing: the engine is asked (read-only, per-table `quick_check`)
+/// and only a finding it confirms becomes a refusal. A refusal locks out every
+/// CLI call, hook and MCP request at once, and on 2026-09-15 that lock-out is
+/// what drove a session to swap the live file with `mv`/`cp` — the one action
+/// that really can damage it. The scan runs only on this rare path, never on a
+/// clean open.
 fn verify(path: &Path) -> Result<()> {
     let geometry = geometry(path);
     if geometry.problems.is_empty() {
         return Ok(());
     }
+    let detail = geometry.problems.join("\n  ");
+    let confirmed = match open_readonly(path) {
+        Ok(conn) => table_findings(&conn, false),
+        Err(e) => vec![e.to_string()],
+    };
+    if confirmed.is_empty() {
+        eprintln!(
+            "aurelius: warning: {}\n  {detail}\n  SQLite reads the database as intact \
+             (quick_check ok), continuing — run `au db check --full`",
+            path.display()
+        );
+        return Ok(());
+    }
     Err(DbError::Corrupt {
         path: path.display().to_string(),
-        detail: geometry.problems.join("\n  "),
+        detail: format!("{detail}\n  SQLite confirms: {}", confirmed.join("; ")),
     })
 }
 
@@ -355,6 +395,43 @@ fn checkable_tables(conn: &Connection) -> Result<Vec<String>> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(names)
+}
+
+/// SQLite's own page-level verdict, one ordinary table at a time — empty means
+/// the engine found nothing.
+///
+/// Per table rather than whole-database: the whole-database form also validates
+/// FTS5 inverted indexes, which needs write access, so on a read-only connection
+/// it reports "attempt to write a readonly database" for every healthy database.
+/// Checking ordinary tables individually covers the same b-tree integrity
+/// without that false positive.
+fn table_findings(conn: &Connection, full: bool) -> Vec<String> {
+    let verb = if full {
+        "integrity_check"
+    } else {
+        "quick_check"
+    };
+    let tables = match checkable_tables(conn) {
+        Ok(tables) => tables,
+        Err(e) => return vec![format!("cannot enumerate tables: {e}")],
+    };
+    let mut findings = Vec::new();
+    for table in tables {
+        let sql = format!("PRAGMA {verb}('{}')", table.replace('\'', "''"));
+        match conn.query_row(&sql, [], |row| row.get::<_, String>(0)) {
+            Ok(report) if report.eq_ignore_ascii_case("ok") => {}
+            Ok(report) => findings.push(format!("{table}: {report}")),
+            // The engine bails out mid-scan on a badly damaged file. That is a
+            // finding to report, not a reason to crash.
+            Err(e) => findings.push(format!("{table}: {e}")),
+        }
+        // Quick mode answers "is it damaged", not "how much" — stop at the
+        // first table with a finding. `--full` reports everything.
+        if !full && !findings.is_empty() {
+            break;
+        }
+    }
+    findings
 }
 
 /// Read-only integrity report. Never migrates, never writes a database page, and
@@ -393,36 +470,7 @@ pub fn check(path: &Path, full: bool) -> Result<CheckReport> {
         }
     };
 
-    // Per table rather than whole-database: the whole-database form also
-    // validates FTS5 inverted indexes, which needs write access, so on a
-    // read-only connection it reports "attempt to write a readonly database"
-    // for every healthy database. Checking ordinary tables individually covers
-    // the same page-level b-tree integrity without that false positive.
-    let verb = if full {
-        "integrity_check"
-    } else {
-        "quick_check"
-    };
-    match checkable_tables(&conn) {
-        Ok(tables) => {
-            for table in tables {
-                let sql = format!("PRAGMA {verb}('{}')", table.replace('\'', "''"));
-                match conn.query_row(&sql, [], |row| row.get::<_, String>(0)) {
-                    Ok(report) if report.eq_ignore_ascii_case("ok") => {}
-                    Ok(report) => problems.push(format!("{table}: {report}")),
-                    // The engine bails out mid-scan on a badly damaged file.
-                    // That is a finding to report, not a reason to crash.
-                    Err(e) => problems.push(format!("{table}: {e}")),
-                }
-                // Quick mode answers "is it damaged", not "how much" — stop at
-                // the first table with a finding. `--full` reports everything.
-                if !full && !problems.is_empty() {
-                    break;
-                }
-            }
-        }
-        Err(e) => problems.push(format!("cannot enumerate tables: {e}")),
-    }
+    problems.extend(table_findings(&conn, full));
 
     Ok(CheckReport {
         ok: problems.is_empty(),
@@ -1602,6 +1650,10 @@ mod tests {
             message.contains("au db backup"),
             "the corruption error must tell the user what to do next, got: {message}"
         );
+        assert!(
+            message.contains("SQLite confirms"),
+            "the refusal must come from the health gate with SQLite's verdict, got: {message}"
+        );
         assert_eq!(
             digest(tmp.path()),
             before,
@@ -1615,6 +1667,116 @@ mod tests {
             "check must name the file-larger-than-header signature: {:?}",
             report.problems
         );
+    }
+
+    fn header_u32(path: &Path, offset: u64) -> u32 {
+        let mut f = std::fs::File::open(path).expect("open for header");
+        f.seek(SeekFrom::Start(offset)).expect("seek header");
+        let mut bytes = [0u8; 4];
+        f.read_exact(&mut bytes).expect("read header");
+        u32::from_be_bytes(bytes)
+    }
+
+    /// The 2026-09-13 / 2026-09-15 lock-out, produced by SQLite's own
+    /// machinery: a PASSIVE checkpoint held back by a reader copies the pages
+    /// that grew the file but not the newer page 1, so the file outgrows its
+    /// authoritative-looking header while the newest header sits in the WAL.
+    /// Healthy — must open, and `au db check` must agree.
+    #[test]
+    fn partial_checkpoint_longer_than_header_is_healthy() {
+        let tmp = TmpDb::new("partial-ckpt");
+        let writer = open(tmp.path()).expect("initial open");
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE bulk (b BLOB);
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("setup");
+        // Transaction 1 grows the file: overflow pages at the end, and page 1
+        // records the new page count.
+        writer
+            .execute("INSERT INTO bulk VALUES (zeroblob(262144))", [])
+            .expect("grow");
+        // A reader pins the snapshot that ends with transaction 1.
+        let reader = open_readonly(tmp.path()).expect("reader");
+        reader.execute_batch("BEGIN").expect("begin read");
+        let rows: i64 = reader
+            .query_row("SELECT count(*) FROM bulk", [], |row| row.get(0))
+            .expect("pin snapshot");
+        assert_eq!(rows, 1);
+        // Transaction 2 rewrites page 1 past the reader's snapshot, then the
+        // checkpoint can backfill only up to that snapshot.
+        writer
+            .execute_batch("CREATE TABLE later (x); PRAGMA wal_checkpoint(PASSIVE);")
+            .expect("touch page 1 and checkpoint");
+
+        let g = geometry(tmp.path());
+        let declared =
+            u64::from(header_u32(tmp.path(), 28)) * u64::try_from(g.page_size).expect("page size");
+        assert_eq!(
+            header_u32(tmp.path(), 24),
+            header_u32(tmp.path(), 92),
+            "precondition: the header page count must look authoritative"
+        );
+        assert!(
+            g.file_bytes > declared && g.wal_bytes > WAL_HEADER_BYTES,
+            "precondition: file must outgrow its header with a live WAL, got {} bytes vs {declared}, wal {}",
+            g.file_bytes,
+            g.wal_bytes
+        );
+        assert!(
+            g.problems.is_empty(),
+            "a partially checkpointed database is not damage: {:?}",
+            g.problems
+        );
+
+        let conn = open(tmp.path()).expect("a partially checkpointed database must open");
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM bulk", [], |row| row.get(0))
+            .expect("read through the WAL");
+        assert_eq!(rows, 1);
+        let report = check(tmp.path(), false).expect("check runs");
+        assert!(report.ok, "check must agree: {:?}", report.problems);
+        drop(reader);
+    }
+
+    /// A tail past the header with no WAL to explain it is still reported, but
+    /// SQLite ignores bytes past the declared end, so the open degrades to a
+    /// warning instead of locking every caller out.
+    #[test]
+    fn tail_without_wal_opens_when_sqlite_reads_it_intact() {
+        let tmp = TmpDb::new("tail");
+        {
+            let conn = open(tmp.path()).expect("initial open");
+            insert_node(&conn, "n1", "alpha");
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("checkpoint");
+        }
+        {
+            let page = usize::try_from(geometry(tmp.path()).page_size).expect("page size");
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(tmp.path())
+                .expect("open file");
+            f.write_all(&vec![0u8; 8 * page]).expect("append tail");
+            f.sync_all().expect("sync");
+        }
+        assert!(
+            geometry(tmp.path())
+                .problems
+                .iter()
+                .any(|p| p.contains("past the end")),
+            "precondition: geometry must flag the tail"
+        );
+
+        let conn = open(tmp.path()).expect("SQLite reads it intact, so open must not refuse");
+        let found: i64 = conn
+            .query_row("SELECT count(*) FROM nodes WHERE id = 'n1'", [], |row| {
+                row.get(0)
+            })
+            .expect("read");
+        assert_eq!(found, 1);
     }
 
     /// Contention must wait, not fail. Has a timing component by nature.
