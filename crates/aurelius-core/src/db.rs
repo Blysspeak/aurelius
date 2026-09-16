@@ -4,8 +4,9 @@ use rusqlite::{
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Highest schema version this binary understands.
-pub const SCHEMA_VERSION: i32 = 15;
+// SCHEMA_VERSION must be incremented whenever the database schema changes.
+// The migration chain in `migrate()` updates older instances on connection.
+pub const SCHEMA_VERSION: i32 = 18;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -93,7 +94,26 @@ pub fn mark_write(conn: &Connection) {
     );
 }
 
+type SqliteExtensionEntryPoint = unsafe extern "C" fn(
+    db: *mut rusqlite::ffi::sqlite3,
+    pz_err_msg: *mut *const std::os::raw::c_char,
+    p_thunk: *const rusqlite::ffi::sqlite3_api_routines,
+) -> std::os::raw::c_int;
+
+pub fn init_sqlite_extensions() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            SqliteExtensionEntryPoint,
+        >(
+            sqlite_vec::sqlite3_vec_init as *const ()
+        )));
+    });
+}
+
 pub fn open(path: &Path) -> Result<Connection> {
+    init_sqlite_extensions();
     // Health gate first: never let a connection — let alone the migration
     // chain — touch an image whose own header disagrees with the file.
     verify(path)?;
@@ -168,6 +188,7 @@ fn ensure_wal(conn: &Connection, path: &Path) -> Result<()> {
 /// `SQLITE_OPEN_READ_ONLY` is what enforces that: an attempted write fails on
 /// the connection instead of being caught by review.
 pub fn open_readonly(path: &Path) -> Result<Connection> {
+    init_sqlite_extensions();
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     Ok(conn)
@@ -583,7 +604,78 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 15)?;
     }
 
+    if current < 16 {
+        migrate_v16(&tx)?;
+        set_schema_version(&tx, 16)?;
+    }
+
+    if current < 17 {
+        migrate_v17(&tx)?;
+        set_schema_version(&tx, 17)?;
+    }
+
+    if current < 18 {
+        migrate_v18(&tx)?;
+        set_schema_version(&tx, 18)?;
+    }
+
     tx.commit()?;
+    Ok(())
+}
+
+/// V18 — очередь эмбеддинга (спека `011-dense-retrieval`, фаза D,
+/// `data-model.md` §1a). До этой версии `au db reindex-embeddings` сама
+/// грузила bge-m3 и считала вектора на месте — вторая копия весов рядом с
+/// демоном, который уже держит свою. Теперь демон (`au daemon`) — единственный
+/// держатель модели во всей системе: запись узла (`add_node_full`,
+/// `crates/aurelius-core/src/graph/crud.rs`) и разовая доиндексация
+/// (`db_reindex_embeddings_cli`, `crates/au/src/commands.rs`) только кладут
+/// сюда `node_id` — дёшево, без модели и без вычислений; демон разбирает
+/// очередь на каждом такте уже загруженной моделью.
+///
+/// `node_id` — сам PRIMARY KEY, не отдельный автоинкремент: повторная
+/// постановка того же узла (например, правка до того, как демон успел его
+/// разобрать) обязана лечь на ту же строку через `INSERT OR REPLACE`, а не
+/// завести дубль. `attempts` растёт на ошибке инференса, не на успехе;
+/// строка покидает очередь только ПОСЛЕ успешной записи вектора в
+/// `node_embeddings`, обе операции — одной транзакцией: падение демона
+/// посреди пачки не теряет и не задваивает уже обработанные узлы, а
+/// необработанные остаются в очереди и подхватываются следующим тактом.
+///
+/// `ON DELETE CASCADE`: `PRAGMA foreign_keys=ON` (`db::open`) делает эту
+/// ссылку настоящей, а не декоративной — `memory_gc` (`crates/aurelius/src/
+/// mcp/handlers/crud.rs`) жёстко удаляет узлы-дубли по `content_hash`
+/// напрямую через `DELETE FROM nodes`, и без каскада такое удаление узла, у
+/// которого демон ещё не успел разобрать очередь, падало бы нарушением
+/// внешнего ключа вместо того, чтобы просто унести за собой уже бессмысленную
+/// строку очереди.
+fn migrate_v18(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE embedding_queue (
+            node_id    TEXT PRIMARY KEY REFERENCES nodes(id) ON DELETE CASCADE,
+            queued_at  TEXT NOT NULL,
+            attempts   INTEGER NOT NULL DEFAULT 0
+        );",
+    )?;
+    Ok(())
+}
+
+/// V17 — переразметка узлов прогона со старой формы `NodeType::Custom("run")`
+/// на новый вариант перечисления `NodeType::Run` (граф `aurelius-core`, живая
+/// база держала ~2992 таких строк на 16.09.2026). В одной транзакции с
+/// подъёмом версии схемы — иначе есть окно, где версия уже говорит «17», а
+/// строки ещё в старой форме.
+///
+/// Сравнение через `json_extract`, а не через точное совпадение строки:
+/// `node_type` — это сериализованный JSON (`{"custom":"run"}` для старой
+/// формы), и `$.custom` не находится в скалярных значениях вроде `"project"`
+/// — им путь `json_extract` вернёт `NULL`, они не тронуты.
+fn migrate_v17(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE nodes SET node_type = '\"run\"'
+          WHERE json_valid(node_type) AND json_extract(node_type, '$.custom') = 'run'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -625,6 +717,16 @@ fn migrate_v14(conn: &Connection) -> Result<()> {
 /// Точно так же `state` и три временны́х метки исхода не дублируют друг
 /// друга: `state` — то, по чему фильтрует запрос, метки — когда это
 /// случилось.
+fn migrate_v16(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE node_embeddings USING vec0(
+            rowid INTEGER PRIMARY KEY,
+            embedding INT8[1024]
+        );",
+    )?;
+    Ok(())
+}
+
 fn migrate_v15(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "

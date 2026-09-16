@@ -127,9 +127,14 @@ impl Default for RankWeights {
 /// падает в `unreachable!`: тип, которого нет в списке FR-007b, получает
 /// нейтральный `t_other`, а не вес соседа по алфавиту.
 ///
-/// Ветка `Custom(s) if s == "run"` обязательна: узлы прогонов заводятся
-/// именно так (`graph/mod.rs:53`, `link_evidence_run`), и без неё `run` из
-/// FR-007b получил бы нейтральный вес вместо машинного.
+/// `NodeType::Run` and the legacy `Custom(s) if s == "run"` both carry the
+/// machine weight and both stay: `link_evidence_run` (`graph/mod.rs:57`)
+/// writes `Run` now, but a row synced in from a peer still on the old build
+/// can arrive stamped `Custom("run")` long after this crate stopped writing
+/// that form, and a "delete the old branch later" plan never actually
+/// happens. Drop either arm and those rows fall through to `_` — no
+/// compile error, no test failure, just a quiet drop from the machine weight
+/// to the neutral one.
 pub fn type_weight(w: &RankWeights, t: &NodeType) -> f64 {
     match t {
         NodeType::Decision => w.t_decision,
@@ -138,7 +143,7 @@ pub fn type_weight(w: &RankWeights, t: &NodeType) -> f64 {
         NodeType::Problem => w.t_problem,
         NodeType::Task => w.t_task,
         NodeType::File => w.t_file,
-        NodeType::Session | NodeType::WorkLog => w.t_machine,
+        NodeType::Session | NodeType::WorkLog | NodeType::Run => w.t_machine,
         NodeType::Custom(s) if s == "run" => w.t_machine,
         _ => w.t_other,
     }
@@ -195,6 +200,56 @@ pub fn score(w: &RankWeights, node: &Node, r: f64, now: DateTime<Utc>) -> f64 {
     let access = access_multiplier(w, node.access_count);
     let t = type_weight(w, &node.node_type);
     r * p * fresh * access * t
+}
+
+/// Reciprocal Rank Fusion — слияние FTS5 top-50 и dense KNN top-50 в один
+/// посев (спека 011, `data-model.md` §2). Константа из той же спеки.
+pub const RRF_K: f64 = 60.0;
+
+/// RRF-скор одного узла: сумма `1 / (k + ранг)` по спискам, где узел
+/// нашёлся. Складываются РАНГИ (позиция с единицы), а не сырые релевантности
+/// FTS5 и dense — поэтому нормализация между движками не нужна вовсе.
+/// `None` — узел не входит в этот список, и вклад по нему просто ноль, а не
+/// штраф за последнее место: движок, нашедший узел единственным, не наказан
+/// вторым, который его не увидел.
+#[must_use]
+pub fn rrf_score(fts_rank: Option<usize>, dense_rank: Option<usize>) -> f64 {
+    let term = |rank: Option<usize>| rank.map_or(0.0, |r| 1.0 / (RRF_K + r as f64));
+    term(fts_rank) + term(dense_rank)
+}
+
+/// Мин-макс нормировка: растягивает сырые значения на весь `[0, 1]` —
+/// худшее из списка получает `0`, лучшее `1`, — независимо от того, насколько
+/// узок исходный разброс.
+///
+/// Не [`normalize_bm25`]: та нормирует относительно медианы, что подходит
+/// bm25 (разброс на порядки между хорошим и плохим совпадением), но топит
+/// RRF-скор посевов (`search::hybrid_seeds`) в одну точку у `0.5`. Причина —
+/// в самой константе `RRF_K = 60`: она на порядок больше диапазона рангов
+/// топ-12 (`1..=12`), поэтому `1/(k+1)` и `1/(k+12)` отличаются всего на
+/// ~18%, и медианное отношение `a/(a+median)` на такой узкой кучке чисел
+/// возвращает почти одно и то же значение всем. Тот самый провал,
+/// перечисленный в задаче спеки 011 третьим: «normalisation that flattened
+/// the fused score» — измерено на живой базе 16.09.2026: `normalize_bm25` на
+/// RRF-скоре давало `r` в полосе 0,49…0,51 для всех двенадцати посевов
+/// (неотличимо от `RankWeights::r_traversed = 0.5`), из девяти кросс-язычных
+/// кейсов проходил один; `normalize_minmax` вместо неё — то же измерение,
+/// подробности в отчёте агента волны 011.
+///
+/// Единственное значение в списке — весь список получает `0.5`: RRF-скор
+/// внутри списка есть, а различать нечего, и середина шкалы этого не выдаёт
+/// ни за высокий сигнал, ни за низкий.
+#[must_use]
+pub fn normalize_minmax(raw: &[f64]) -> Vec<f64> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let min = raw.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = raw.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = max - min;
+    raw.iter()
+        .map(|v| if span == 0.0 { 0.5 } else { (v - min) / span })
+        .collect()
 }
 
 /// Нормированный bm25 внутри одной выдачи: `r = |rank| / (|rank| +
@@ -456,5 +511,71 @@ mod tests {
     #[test]
     fn normalize_bm25_empty_input_gives_empty_output() {
         assert!(normalize_bm25(&[]).is_empty());
+    }
+
+    // --- normalize_minmax: спред на весь [0, 1] даже на узком RRF-диапазоне -
+    #[test]
+    fn normalize_minmax_stretches_a_narrow_range_to_the_full_scale() {
+        // Ровно то узкое соотношение, которое RRF(k=60) даёт рангам 1..12:
+        // ~18% разброса между лучшим и худшим значением.
+        let raw: Vec<f64> = (1..=12)
+            .map(|rank: i32| 1.0 / (60.0 + rank as f64))
+            .collect();
+        let normalized = normalize_minmax(&raw);
+        assert!(
+            (normalized[0] - 1.0).abs() < 1e-9,
+            "лучший (ранг 1) обязан получить 1: {normalized:?}"
+        );
+        assert!(
+            normalized[11].abs() < 1e-9,
+            "худший (ранг 12) обязан получить 0: {normalized:?}"
+        );
+        // Медианная нормировка на этом же входе даёт полосу 0,49…0,51
+        // (измерено на живой базе 16.09.2026) — не тест на конкретное число
+        // `normalize_bm25`, а контраст: мин-макс обязана давать заметно
+        // больший спред на том же узком входе.
+        let spread = normalized[0] - normalized[11];
+        assert!(
+            spread > 0.9,
+            "мин-макс обязана растягивать на весь диапазон: {spread}"
+        );
+    }
+
+    #[test]
+    fn normalize_minmax_single_distinct_value_gives_the_midpoint() {
+        assert_eq!(normalize_minmax(&[0.5, 0.5, 0.5]), vec![0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn normalize_minmax_empty_input_gives_empty_output() {
+        assert!(normalize_minmax(&[]).is_empty());
+    }
+
+    // --- RRF: слияние по рангам, не по релевантности ------------------------
+    #[test]
+    fn rrf_score_sums_both_lists_when_present_in_both() {
+        // Первое место в обоих списках — наибольший возможный скор.
+        let both_first = rrf_score(Some(1), Some(1));
+        let one_only = rrf_score(Some(1), None);
+        assert!((both_first - 2.0 / (RRF_K + 1.0)).abs() < 1e-9);
+        assert!(
+            both_first > one_only,
+            "узел, найденный обоими движками, обязан обгонять найденный одним"
+        );
+    }
+
+    #[test]
+    fn rrf_score_never_penalizes_absence_from_the_other_list() {
+        // Найден только dense-движком на первом месте — тот же вклад, что и
+        // у чисто FTS-найденного на первом месте: складываются ранги, а не
+        // штрафуется отсутствие во втором списке.
+        let fts_only = rrf_score(Some(1), None);
+        let dense_only = rrf_score(None, Some(1));
+        assert!((fts_only - dense_only).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rrf_score_is_zero_when_absent_from_both() {
+        assert_eq!(rrf_score(None, None), 0.0);
     }
 }

@@ -113,6 +113,19 @@ pub fn add_node_full(
     // what keeps the marker honest for memory written over MCP, which no hook
     // and no CLI wrapper can observe.
     crate::db::mark_write(conn);
+    // Queue the new node for embedding instead of computing one here: the
+    // daemon is the only process allowed to hold bge-m3 in memory (spec
+    // `011-dense-retrieval`, phase D), and this call site runs from
+    // short-lived processes (`au note` is a fresh process per invocation,
+    // and a hook fires one per file edit) where loading ~2.2 GB of weights
+    // per write would turn a sub-10ms insert into seconds. `INSERT OR
+    // REPLACE` on the `node_id` primary key: this row is always freshly
+    // created here, so there is nothing to preserve, but the same statement
+    // is what keeps a node re-queued elsewhere from ever duplicating.
+    conn.execute(
+        "INSERT OR REPLACE INTO embedding_queue (node_id, queued_at, attempts) VALUES (?1, ?2, 0)",
+        params![node.id.to_string(), now.to_rfc3339()],
+    )?;
     Ok(node)
 }
 
@@ -121,7 +134,22 @@ pub fn add_node_full(
 /// вместо того, чтобы завести близнеца — так хук, сработавший дважды за один
 /// повод (авто- и ручная компакция), оставляет одну запись, а не две.
 ///
+/// `expected_type` — граница между машинным и человеческим вызывающим.
+/// `find_node_by_data_field` ищет совпадение только по значению ключа, без
+/// фильтра по типу или источнику, поэтому найденный узел может оказаться
+/// записью совсем другого автора. `Some(t)` — вызывающий знает свой тип как
+/// константу (`link_evidence_run`, `record_session`) и не ждёт здесь ничего,
+/// кроме него: узел другого типа — не близнец, а чужая запись, и это ошибка,
+/// называющая оба типа, без переписи. `None` — вызывающий сам назвал тип
+/// явным флагом (`au note --type`) и подмена для него легитимна; тогда
+/// разница просто обязана быть видна вызывающему — отсюда третий элемент
+/// возврата.
+///
 /// Второй элемент — `true`, если узел создан, `false`, если обновлён.
+/// Третий — узел, каким он был ДО перезаписи (`None` при создании): его берёт
+/// уже прочитанный `existing`, а не повторный запрос после `UPDATE` — между
+/// чтением и записью есть гонка, и раздача читателю честного «было» до того,
+/// как поле исчезнет под записью, часть того же исправления, что и сам гард.
 /// `data` принимается объектом, а не любым `Value`: ключ должен быть куда
 /// положить, иначе следующий вызов не нашёл бы запись и молча создал вторую.
 #[allow(clippy::too_many_arguments)]
@@ -129,12 +157,13 @@ pub fn upsert_node_by_key(
     conn: &Connection,
     key: &str,
     node_type: NodeType,
+    expected_type: Option<NodeType>,
     label: &str,
     note: Option<&str>,
     source: &str,
     mut data: serde_json::Map<String, serde_json::Value>,
     memory_kind: MemoryKind,
-) -> Result<(Node, bool)> {
+) -> Result<(Node, bool, Option<Node>)> {
     data.insert("key".to_owned(), serde_json::Value::String(key.to_owned()));
     let data = serde_json::Value::Object(data);
 
@@ -149,11 +178,28 @@ pub fn upsert_node_by_key(
             memory_kind,
             None,
         )?;
-        return Ok((node, true));
+        return Ok((node, true, None));
     };
+
+    if let Some(expected) = &expected_type {
+        let found_kind = format!("{:?}", existing.node_type).to_lowercase();
+        let expected_kind = format!("{:?}", expected).to_lowercase();
+        if found_kind != expected_kind {
+            anyhow::bail!(
+                "ключ '{key}' уже занят узлом {} типа {found_kind}, а не {expected_kind} — \
+                 отказ вместо молчаливой подмены чужой записи",
+                existing.id,
+            );
+        }
+    }
 
     let now = Utc::now();
     let author = identity::current().map(|i| i.as_author());
+    // ВНИМАНИЕ: тот же UPDATE переписывает и `source` — совпадение типов не
+    // защищает от смены источника. Человек, переписавший ключ машинного узла
+    // тем же типом, молча меняет `source` с машинного на `"manual"`, а
+    // источник — то поле, по которому потом меряют состав графа. Отдельный
+    // дефект, вне этой задачи.
     conn.execute(
         "UPDATE nodes SET node_type = ?1, label = ?2, note = ?3, source = ?4, data = ?5,
                 memory_kind = ?6, updated_at = ?7, updated_by = ?8
@@ -172,7 +218,7 @@ pub fn upsert_node_by_key(
     )?;
     let updated = get_node(conn, &existing.id.to_string())?
         .ok_or_else(|| anyhow::anyhow!("узел {} исчез между поиском и обновлением", existing.id))?;
-    Ok((updated, false))
+    Ok((updated, false, Some(existing)))
 }
 
 pub fn add_edge(
@@ -783,10 +829,11 @@ mod tests {
         let (_tmp, conn) = setup();
         let key = "precompact:session-42";
 
-        let (first, created) = upsert_node_by_key(
+        let (first, created, replaced) = upsert_node_by_key(
             &conn,
             key,
             NodeType::Session,
+            Some(NodeType::Session),
             "снимок перед компакцией",
             Some("первый заход"),
             "hook",
@@ -795,11 +842,13 @@ mod tests {
         )
         .expect("first upsert");
         assert!(created, "первый вызов создаёт узел");
+        assert!(replaced.is_none(), "создание не заменяет ничего");
 
-        let (second, created) = upsert_node_by_key(
+        let (second, created, replaced) = upsert_node_by_key(
             &conn,
             key,
             NodeType::Session,
+            Some(NodeType::Session),
             "снимок перед компакцией",
             Some("второй заход"),
             "hook",
@@ -809,6 +858,11 @@ mod tests {
         .expect("second upsert");
         assert!(!created, "второй вызов обновляет, а не создаёт");
         assert_eq!(first.id, second.id, "id должен остаться тем же");
+        assert_eq!(
+            replaced.map(|n| n.id),
+            Some(first.id),
+            "вызывающий обязан увидеть узел, каким он был до перезаписи"
+        );
         assert_eq!(second.note.as_deref(), Some("второй заход"));
         assert_eq!(second.memory_kind, MemoryKind::Episodic);
         assert_eq!(
@@ -833,10 +887,11 @@ mod tests {
     #[test]
     fn upsert_by_key_keeps_distinct_keys_apart() {
         let (_tmp, conn) = setup();
-        let (a, _) = upsert_node_by_key(
+        let (a, ..) = upsert_node_by_key(
             &conn,
             "snapshot:a",
             NodeType::Session,
+            Some(NodeType::Session),
             "a",
             None,
             "hook",
@@ -844,10 +899,11 @@ mod tests {
             MemoryKind::Episodic,
         )
         .expect("upsert a");
-        let (b, created) = upsert_node_by_key(
+        let (b, created, _) = upsert_node_by_key(
             &conn,
             "snapshot:b",
             NodeType::Session,
+            Some(NodeType::Session),
             "b",
             None,
             "hook",
@@ -857,6 +913,96 @@ mod tests {
         .expect("upsert b");
         assert!(created);
         assert_ne!(a.id, b.id);
+    }
+
+    /// Ядро дефекта: одноимённый ключ, заведённый под чужим типом, не должен
+    /// молча превращаться в узел вызывающего. `Some(expected)` обязан
+    /// отказать, назвав оба типа, и не трогать найденную запись.
+    #[test]
+    fn upsert_by_key_refuses_type_mismatch_when_expected() {
+        let (_tmp, conn) = setup();
+        let key = "run:xhub:refunds";
+
+        let (note, ..) = upsert_node_by_key(
+            &conn,
+            key,
+            NodeType::Decision,
+            None,
+            "заметка под чужим ключом",
+            Some("текст"),
+            "manual",
+            serde_json::Map::new(),
+            MemoryKind::Semantic,
+        )
+        .expect("human note");
+
+        let err = upsert_node_by_key(
+            &conn,
+            key,
+            NodeType::Run,
+            Some(NodeType::Run),
+            "прогон",
+            None,
+            "au-task-evidence",
+            serde_json::Map::new(),
+            MemoryKind::Semantic,
+        )
+        .expect_err("тип не совпал — обязан отказать, а не переписать чужой узел");
+        let message = err.to_string();
+        assert!(
+            message.contains("decision") && message.contains("run"),
+            "сообщение обязано назвать оба типа: {message}"
+        );
+
+        let untouched = get_node(&conn, &note.id.to_string())
+            .expect("lookup")
+            .expect("узел обязан остаться на месте");
+        assert_eq!(
+            untouched.note.as_deref(),
+            Some("текст"),
+            "отказ не должен трогать найденную запись"
+        );
+    }
+
+    /// Человеческая граница: без ожидания подмена типа разрешена, а старый
+    /// узел возвращается вызывающему целиком — печатать предупреждение не из
+    /// чего, если это `None`.
+    #[test]
+    fn upsert_by_key_allows_type_change_when_no_expectation() {
+        let (_tmp, conn) = setup();
+        let key = "note:same-key";
+
+        let (first, ..) = upsert_node_by_key(
+            &conn,
+            key,
+            NodeType::Decision,
+            None,
+            "первая заметка",
+            None,
+            "manual",
+            serde_json::Map::new(),
+            MemoryKind::Semantic,
+        )
+        .expect("first");
+
+        let (second, created, replaced) = upsert_node_by_key(
+            &conn,
+            key,
+            NodeType::Concept,
+            None,
+            "вторая заметка, другой тип",
+            None,
+            "manual",
+            serde_json::Map::new(),
+            MemoryKind::Semantic,
+        )
+        .expect("second");
+
+        assert!(!created);
+        assert_eq!(first.id, second.id);
+        let replaced = replaced.expect("должен вернуться узел, каким он был");
+        assert!(matches!(replaced.node_type, NodeType::Decision));
+        assert!(matches!(second.node_type, NodeType::Concept));
     }
 
     #[test]
@@ -932,6 +1078,13 @@ mod tests {
 
         let shared_id_a = "deadbeef-0000-4000-8000-000000000001";
         let shared_id_b = "deadbeef-0000-4000-8000-000000000002";
+        // `add_node` queues both nodes for embedding, and `embedding_queue.node_id`
+        // is `FOREIGN KEY ... REFERENCES nodes(id)` (db.rs, migrate_v18): rewriting
+        // a node's id out from under a still-queued row would violate that
+        // constraint. Irrelevant to what this test checks (prefix ambiguity, not
+        // the queue), so the queue rows are cleared first rather than rewritten.
+        conn.execute("DELETE FROM embedding_queue", [])
+            .expect("clear embedding queue before id rewrite");
         conn.execute(
             "UPDATE nodes SET id = ?1 WHERE id = ?2",
             params![shared_id_a, a.id.to_string()],

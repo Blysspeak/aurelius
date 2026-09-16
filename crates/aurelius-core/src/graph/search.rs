@@ -772,6 +772,216 @@ pub fn get_tasks_filtered(
     Ok(nodes)
 }
 
+/// Сколько ждать ответа от демона на embed-сокете, прежде чем сдаться и
+/// уйти на чистый FTS5 (спека 011, `data-model.md` §6). Живой сокет отвечает
+/// на порядок быстрее — это запас на инференс под нагрузкой, не ожидаемая
+/// норма; мёртвый сокет не имеет права держать вызывающего дольше, чем занял
+/// бы ответ без него вовсе.
+const EMBED_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Просит у демона вектор запроса и превращает любой отказ в понятную
+/// причину — никогда в ошибку, которую вызывающий обязан разбирать.
+///
+/// Общая точка пяти входных точек (спека 011, волна «hybrid everywhere»):
+/// MCP `memory_search`/`memory_recall`/`memory_context` и CLI `au search`
+/// (обе формы вывода)/`au context` — просят вектор ровно здесь, а не каждый
+/// у себя. Лесенка отказа (нет сокета, отказано в соединении, таймаут, демон
+/// ответил `{"error": ...}`) одна и та же у всех пяти; пять её копий
+/// разошлись бы молча при первой же правке таймаута или текста причины.
+///
+/// `home` — каталог, где лежит сокет (`db_path().parent()`), тот же, что
+/// держит и саму базу.
+///
+/// Возвращает `(Some(vector), None)` на успехе и `(None, Some(reason))` на
+/// любом отказе — никогда `Err`: деградация к FTS5-only обязана быть явной,
+/// а не остановить вызывающего (spec.md, ограничение №2). `reason` уже готов
+/// к показу — и человеку, и в поле JSON-ответа.
+pub async fn query_vector_for_search(
+    home: &std::path::Path,
+    query: &str,
+) -> (Option<Vec<f32>>, Option<String>) {
+    let socket = crate::embed_socket::socket_path(home);
+    match crate::embed_socket::request_vector(&socket, query, EMBED_SOCKET_TIMEOUT).await {
+        Ok(vector) => (Some(vector), None),
+        Err(reason) => (
+            None,
+            Some(format!(
+                "векторная половина недоступна, отвечаю по полнотекстовому — {reason}"
+            )),
+        ),
+    }
+}
+
+/// Сколько записей берёт каждая из двух сторон гибридного поиска до слияния
+/// (спека 011, «Архитектура пайплайна»: FTS5 top-50 AND dense KNN top-50).
+pub const FUSION_POOL: usize = 50;
+
+/// Ближайшие соседи вектора запроса в `node_embeddings` (миграция v15→v16,
+/// `db.rs`), ближайший первым. Пустой список — не ошибка, ни когда таблицы
+/// нет вовсе (фикстура на старой схеме), ни когда она есть, но пуста (векторы
+/// ещё не досчитаны `db reindex-embeddings`): деградация к FTS-only обязана
+/// быть тихой (спека 011, «Graceful degradation без векторов»).
+///
+/// # Errors
+/// Ошибка исполнения запроса к `node_embeddings` или к `nodes` — не считая
+/// самого отсутствия таблицы, которое ловится раньше и молча даёт `Ok(vec![])`.
+pub fn dense_search(conn: &Connection, query_vector: &[f32], limit: usize) -> Result<Vec<Node>> {
+    if !node_embeddings_available(conn)? {
+        return Ok(Vec::new());
+    }
+    let bytes = f32_le_bytes(query_vector);
+    let mut stmt = conn.prepare(
+        "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
+                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash,
+                n.created_by, n.updated_by, n.deleted_at, n.sync_seq
+         FROM (
+             SELECT rowid, distance FROM node_embeddings
+              WHERE embedding MATCH vec_quantize_int8(?1, 'unit') AND k = ?2
+              ORDER BY distance
+         ) ve
+         JOIN nodes n ON n.rowid = ve.rowid
+         WHERE n.deleted_at IS NULL
+         ORDER BY ve.distance",
+    )?;
+    let mut nodes = stmt
+        .query_map(params![bytes, limit as i64], row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    // Находка 11 (FR-027) — тот же фильтр, что у обоих FTS-путей: координата
+    // секрета не должна утечь через смысловое сходство точно так же, как не
+    // утекает через совпадение слов.
+    nodes.retain(|n| !crate::secret::is_secret_ref(n));
+    Ok(nodes)
+}
+
+/// Таблица векторов существует и не пуста.
+///
+/// Отдельная проверка `sqlite_master` до самого KNN-запроса, а не перехват
+/// «no such table» из результата `prepare`: перехват ошибки по тексту или коду
+/// не отличил бы «таблицы нет» от кривого SQL в этом же запросе, а плодить
+/// для этого собственный код ошибки — цена, которую отсутствие таблицы на
+/// старой фикстуре не стоит.
+fn node_embeddings_available(conn: &Connection) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_embeddings')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(false);
+    }
+    let count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM node_embeddings", [], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// `f32` в little-endian байты — формат, который `vec_quantize_int8` ждёт на
+/// входе того же вида, каким его пишет `INSERT` на стороне записи
+/// (`commands.rs::db_reindex_embeddings_cli`, `bytemuck::cast_slice`).
+/// `aurelius-core` не тянет `bytemuck` ради одного места — стандартной
+/// `to_le_bytes` на четыре байта достаточно.
+fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
+/// Слияние FTS5 и векторного поиска в посев обхода (спека 011,
+/// `data-model.md` §2, `spec.md` «Архитектура пайплайна»): top-50 с каждой
+/// стороны → RRF (`rank::rrf_score`, k=60) → верхние `limit`.
+///
+/// RRF складывает вклад по РАНГУ в каждом из двух списков, не по самой
+/// релевантности — оба списка совместимы уже по построению, нормализация
+/// между FTS5 и dense не нужна. Когда `dense_search` отдаёт пустой список
+/// (таблицы нет или она пуста), RRF вырождается в `1 / (k + rank_fts)` —
+/// строго убывающую функцию от ранга FTS, поэтому сортировка по RRF даёт
+/// РОВНО тот же порядок, что и чистый bm25-порядок `search_ranked`: слияние
+/// не меняет ни состав, ни порядок посева там, где векторов нет (та же
+/// гарантия деградации, что и в `dense_search`, но уже для слияния целиком).
+///
+/// Возвращает узлы вместе с их нормированным RRF-скором — мин-макс
+/// (`rank::normalize_minmax`, НЕ `rank::normalize_bm25`: медианная нормировка
+/// той топит узкий разброс RRF-скора в одну точку у `0.5`, см. её
+/// доккомментарий) по всему пулу кандидатов, растянутый в `[r_traversed, 1]`,
+/// а не в `[0, 1]`: попадание в слияние хотя бы одним из двух движков — сигнал
+/// сильнее, чем «узел дошёл только обходом графа», и не имеет права стоить
+/// МЕНЬШЕ той же фиксированной константы. Это и есть `r`, который
+/// `graph::traverse` подставляет в `rank::score` для посевных узлов вместо
+/// фиксированного `RankWeights::r_traversed`.
+///
+/// # Errors
+/// Ошибка `search_ranked` или `dense_search`.
+pub fn hybrid_seeds(
+    conn: &Connection,
+    query: &str,
+    query_vector: &[f32],
+    limit: usize,
+) -> Result<(Vec<Node>, std::collections::HashMap<uuid::Uuid, f64>)> {
+    let fts_nodes = search_ranked(conn, query, FUSION_POOL)?.nodes;
+    let dense_nodes = dense_search(conn, query_vector, FUSION_POOL)?;
+
+    let mut by_id: std::collections::HashMap<uuid::Uuid, Node> = std::collections::HashMap::new();
+    let mut fts_rank: std::collections::HashMap<uuid::Uuid, usize> =
+        std::collections::HashMap::new();
+    for (i, node) in fts_nodes.into_iter().enumerate() {
+        fts_rank.insert(node.id, i + 1);
+        by_id.insert(node.id, node);
+    }
+    let mut dense_rank: std::collections::HashMap<uuid::Uuid, usize> =
+        std::collections::HashMap::new();
+    for (i, node) in dense_nodes.into_iter().enumerate() {
+        dense_rank.insert(node.id, i + 1);
+        by_id.entry(node.id).or_insert(node);
+    }
+
+    let pool: Vec<(uuid::Uuid, f64)> = by_id
+        .keys()
+        .map(|id| {
+            let score =
+                super::rank::rrf_score(fts_rank.get(id).copied(), dense_rank.get(id).copied());
+            (*id, score)
+        })
+        .collect();
+    // Мин-макс на весь пул (до сотни кандидатов: объединение двух top-50), а
+    // не только на верхнюю дюжину после отсечения: нормировка на одном лишь
+    // топ-12 меряет узел против одиннадцати лучших конкурентов, а не против
+    // всего круга, что нашли оба движка.
+    let raw: Vec<f64> = pool.iter().map(|(_, score)| *score).collect();
+    let normalized = super::rank::normalize_minmax(&raw);
+
+    // Растянуто в [r_traversed, 1], не в [0, 1]: посев — это узел, который
+    // нашёл хотя бы один из двух движков, и это факт СИЛЬНЕЕ, чем «узел
+    // пришёл только обходом графа» — попадание в слияние не имеет права
+    // стоить МЕНЬШЕ фиксированного `r_traversed`, которым и так награждён
+    // любой сосед по графу без единого совпадения ни в одном из движков.
+    // Худший из пула получает ровно `r_traversed` (нейтрально, как и раньше),
+    // лучший — максимум шкалы; линейно между ними — единственный рычаг,
+    // который эта правка вообще трогает.
+    let r_floor = super::rank::RankWeights::default().r_traversed;
+    let mut scored: Vec<(uuid::Uuid, f64)> = pool
+        .into_iter()
+        .zip(normalized)
+        .map(|((id, _), norm)| (id, r_floor + (1.0 - r_floor) * norm))
+        .collect();
+    // Тай-брейк по id: `HashMap` не гарантирует порядок обхода, а RRF-скор
+    // двух узлов может совпасть (например, один нашёлся только первым в FTS,
+    // другой — только первым в dense: у обоих 1/(k+1)). Без явного тай-брейка
+    // порядок между такими узлами был бы недетерминирован между прогонами.
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scored.truncate(limit);
+
+    let mut nodes = Vec::with_capacity(scored.len());
+    let mut r = std::collections::HashMap::with_capacity(scored.len());
+    for (id, norm) in scored {
+        if let Some(node) = by_id.remove(&id) {
+            r.insert(id, norm);
+            nodes.push(node);
+        }
+    }
+    Ok((nodes, r))
+}
+
 pub fn get_recent_nodes(conn: &Connection, limit: usize) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(
         "SELECT id, node_type, label, note, source, data, created_at, updated_at,
@@ -1369,6 +1579,69 @@ mod tests {
                 .contains("Если ты про проект Guard — укажи project."),
             "хвост про совпавший проект обязан быть дословным именем метки: {}",
             refusal.advice
+        );
+
+        cleanup(&path, conn);
+    }
+
+    /// `db::open` уже накатывает миграцию v15→v16 (`node_embeddings` через
+    /// `vec0`), но ни строки в неё этот тест не пишет — тот же пустой случай,
+    /// что и таблица, которой вовсе нет на старой фикстуре (спека 011,
+    /// «Graceful degradation без векторов»).
+    #[test]
+    fn dense_search_on_empty_table_yields_empty_not_error() {
+        let (path, conn) = temp_db();
+        let query = vec![0.1f32; 1024];
+        let found = dense_search(&conn, &query, 10).expect("деградация — не ошибка");
+        assert!(found.is_empty());
+        cleanup(&path, conn);
+    }
+
+    /// Слияние без вектора запроса вырождается в чистый FTS-порядок: RRF при
+    /// пустом dense-списке — строго убывающая функция от ранга FTS, поэтому
+    /// состав и порядок посева совпадают с `search_ranked` побайтово. Это и
+    /// есть доказательство, на котором держится сохранение эталонного
+    /// digest `au eval` на замороженной фикстуре без таблицы векторов.
+    #[test]
+    fn hybrid_seeds_degrades_to_plain_fts_order_when_dense_is_empty() {
+        let (path, conn) = temp_db();
+        for (label, note) in [
+            ("отправка алерта в телеграм", "и то и другое слово тут есть"),
+            ("телеграм-бот", "только одно слово из запроса"),
+            ("совсем про другое", "ни одного слова запроса"),
+        ] {
+            super::super::add_node(
+                &conn,
+                NodeType::Concept,
+                label,
+                Some(note),
+                "test",
+                serde_json::json!({}),
+            )
+            .expect("add node");
+        }
+
+        let plain = search_ranked(&conn, "телеграм алерта", 5)
+            .expect("поиск")
+            .nodes;
+        let query = vec![0.1f32; 1024];
+        let (fused, r) =
+            hybrid_seeds(&conn, "телеграм алерта", &query, 5).expect("слияние без dense");
+
+        assert_eq!(
+            fused.iter().map(|n| n.id).collect::<Vec<_>>(),
+            plain.iter().map(|n| n.id).collect::<Vec<_>>(),
+            "без dense-выдачи слияние обязано дать тот же порядок, что и чистый FTS"
+        );
+        assert_eq!(r.len(), fused.len());
+        // Мин-макс, не медианная нормировка: лучший из посева получает
+        // ровно 1, не асимптотическое приближение к нему.
+        for v in r.values() {
+            assert!(*v >= 0.0 && *v <= 1.0, "r ∈ [0, 1]: {v}");
+        }
+        assert!(
+            r.values().any(|v| (*v - 1.0).abs() < 1e-9),
+            "лучший узел посева обязан получить максимум шкалы"
         );
 
         cleanup(&path, conn);

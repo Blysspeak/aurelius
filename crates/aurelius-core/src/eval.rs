@@ -150,6 +150,7 @@ impl EvalCase {
     pub fn kind(&self) -> CaseKind {
         match self.body {
             CaseBody::RecallTop5 { .. } => CaseKind::RecallTop5,
+            CaseBody::CrosslingualTop5 { .. } => CaseKind::CrosslingualTop5,
             CaseBody::Morphology { .. } => CaseKind::Morphology,
             CaseBody::Refusal { .. } => CaseKind::Refusal,
             CaseBody::SnapshotContains { .. } => CaseKind::SnapshotContains,
@@ -177,6 +178,15 @@ impl EvalCase {
 pub enum CaseBody {
     /// Нужный узел входит в топ-5 recall по теме (SC-002, SC-002a, FR-007…009).
     RecallTop5 {
+        input: RecallInput,
+        expect: RecallExpect,
+    },
+    /// Русский запрос находит англоязычную заметку по смыслу в топ-5
+    /// (spec 011). Судейство то же, что у `recall_top5` — разница между
+    /// видами в том, что они утверждают о мире, а не в том, как считается
+    /// вердикт, поэтому у варианта те же `input`/`expect` и общая функция
+    /// [`judge_recall_top5`].
+    CrosslingualTop5 {
         input: RecallInput,
         expect: RecallExpect,
     },
@@ -341,11 +351,12 @@ pub enum TopMode {
     All,
 }
 
-/// Пять видов проверки — других нет. Значение вне этих пяти читается serde как
-/// неразобранная строка, то есть сломанный файл.
+/// Шесть видов проверки — других нет. Значение вне этих шести читается serde
+/// как неразобранная строка, то есть сломанный файл.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseKind {
     RecallTop5,
+    CrosslingualTop5,
     Morphology,
     Refusal,
     SnapshotContains,
@@ -356,8 +367,9 @@ impl CaseKind {
     /// Порядок этого массива — порядок строк отчёта и ключей `by_kind` в
     /// `--json`. Он задан здесь, а не на печати, чтобы у двух форм отчёта не
     /// разошёлся порядок видов.
-    pub const ALL: [CaseKind; 5] = [
+    pub const ALL: [CaseKind; 6] = [
         CaseKind::RecallTop5,
+        CaseKind::CrosslingualTop5,
         CaseKind::Morphology,
         CaseKind::Refusal,
         CaseKind::SnapshotContains,
@@ -369,6 +381,7 @@ impl CaseKind {
     pub fn as_str(self) -> &'static str {
         match self {
             CaseKind::RecallTop5 => "recall_top5",
+            CaseKind::CrosslingualTop5 => "crosslingual_top5",
             CaseKind::Morphology => "morphology",
             CaseKind::Refusal => "refusal",
             CaseKind::SnapshotContains => "snapshot_contains",
@@ -381,10 +394,11 @@ impl CaseKind {
     fn index(self) -> usize {
         match self {
             CaseKind::RecallTop5 => 0,
-            CaseKind::Morphology => 1,
-            CaseKind::Refusal => 2,
-            CaseKind::SnapshotContains => 3,
-            CaseKind::RecognizeFeed => 4,
+            CaseKind::CrosslingualTop5 => 1,
+            CaseKind::Morphology => 2,
+            CaseKind::Refusal => 3,
+            CaseKind::SnapshotContains => 4,
+            CaseKind::RecognizeFeed => 5,
         }
     }
 }
@@ -392,7 +406,11 @@ impl CaseKind {
 /// Виды, которые исполняет этот бинарник. Остальные три ждут своих фаз
 /// (C — снимок, D и G — подача, F — отказ) и до тех пор роняют прогон, а не
 /// пополняют долю.
-const EXECUTABLE_KINDS: &[CaseKind] = &[CaseKind::RecallTop5, CaseKind::Morphology];
+const EXECUTABLE_KINDS: &[CaseKind] = &[
+    CaseKind::RecallTop5,
+    CaseKind::CrosslingualTop5,
+    CaseKind::Morphology,
+];
 
 // ── Загрузка ─────────────────────────────────────────────────────────────
 
@@ -541,6 +559,12 @@ pub struct CaseOutcome {
     /// Причина пропуска или разбор провала — «ожидалось / пришло» для печати
     /// (FR-026). У `PASS` пусто: объяснять нечего.
     pub detail: Option<String>,
+    /// Вклад в `mrr`: `1 / позиция` (с единицы) первого ожидаемого узла в
+    /// выдаче для посчитанных `recall_top5`/`crosslingual_top5`, `0.0` —
+    /// когда ни один ожидаемый узел не найден вовсе. `None` — для любого
+    /// другого вида и для `SKIP`, чтобы такой кейс не вошёл ни в сумму, ни в
+    /// счётчик [`EvalReport::mrr`].
+    pub reciprocal_rank: Option<f64>,
 }
 
 /// Учёт одного вида. `eligible` не поле, а вычисление: два числа, обязанные
@@ -582,7 +606,13 @@ pub struct EvalReport {
     pub failed: usize,
     pub skipped: usize,
     /// Учёт по видам в порядке [`CaseKind::ALL`].
-    pub by_kind: [KindTally; 5],
+    pub by_kind: [KindTally; 6],
+    /// Средний обратный ранг (mean reciprocal rank) по кейсам видов
+    /// `recall_top5` и `crosslingual_top5` вместе, посчитанным (не `SKIP`).
+    /// `None` — пригодных кейсов обоих видов нет: отсутствие числа, а не ноль,
+    /// потому что ноль — это измеренный провал, а отсутствие — что мерить
+    /// было нечего.
+    pub mrr: Option<f64>,
     /// По кейсу на строку файла, в порядке файла: `outcomes[i]` — про
     /// `cases[i]`, поэтому печать провала берёт `why` и метки из самого кейса.
     pub outcomes: Vec<CaseOutcome>,
@@ -633,6 +663,7 @@ fn tally_up(outcomes: Vec<CaseOutcome>, now: DateTime<Utc>) -> EvalReport {
         skipped: 0,
     });
     let (mut passed, mut failed, mut skipped) = (0usize, 0usize, 0usize);
+    let (mut mrr_sum, mut mrr_count) = (0.0f64, 0usize);
     for outcome in &outcomes {
         let tally = &mut by_kind[outcome.kind.index()];
         tally.cases += 1;
@@ -650,7 +681,18 @@ fn tally_up(outcomes: Vec<CaseOutcome>, now: DateTime<Utc>) -> EvalReport {
                 skipped += 1;
             }
         }
+        if let Some(rr) = outcome.reciprocal_rank {
+            mrr_sum += rr;
+            mrr_count += 1;
+        }
     }
+    // Нет пригодных кейсов ни одного из двух видов — `None`, а не `0.0`:
+    // отсутствие измерения печатается своим состоянием, не подменяется числом.
+    let mrr = if mrr_count == 0 {
+        None
+    } else {
+        Some(mrr_sum / mrr_count as f64)
+    };
     EvalReport {
         now,
         total: outcomes.len(),
@@ -658,6 +700,7 @@ fn tally_up(outcomes: Vec<CaseOutcome>, now: DateTime<Utc>) -> EvalReport {
         failed,
         skipped,
         by_kind,
+        mrr,
         digest: digest_of(&outcomes),
         outcomes,
     }
@@ -683,11 +726,21 @@ fn tally_up(outcomes: Vec<CaseOutcome>, now: DateTime<Utc>) -> EvalReport {
 /// (см. отчёт агента волны T018): довести до нормативной формы значило бы
 /// протащить `w` ещё и через `judge`/`judge_recall_top5`, и через CLI-вызов
 /// в `au` (`commands.rs`), что уже вне зоны той правки.
+///
+/// `query_vectors` — эмбеддинги тем `recall_top5`/`crosslingual_top5` кейсов,
+/// готовые заранее (спека 011): судья сам модель не грузит и не держит,
+/// он только смотрит по ключу `input.topic`. Пустая карта — обычный прогон
+/// без гибридного поиска: `judge_recall_top5` передаёт `None` дальше в
+/// `graph::recall_selection_hybrid`, а тот при `None` — буквально прежний
+/// путь (см. его доккомментарий). Ключ — сама строка темы, а не `id` кейса:
+/// у CLI (`commands.rs`), которое эту карту строит, тем меньше, чем кейсов,
+/// когда несколько кейсов делят одну тему, и эмбеддить дважды незачем.
 pub fn run(
     conn: &Connection,
     meta: &EvalMeta,
     cases: &[EvalCase],
     now: DateTime<Utc>,
+    query_vectors: &std::collections::HashMap<String, Vec<f32>>,
 ) -> Result<EvalReport> {
     // Версию проверяет и `load`, но `run` — публичная функция и не вправе
     // считать, что кейсы пришли именно оттуда.
@@ -712,12 +765,13 @@ pub fn run(
 
     let mut outcomes = Vec::with_capacity(cases.len());
     for case in cases {
-        let (verdict, detail) = judge(conn, case, now)?;
+        let (verdict, detail, reciprocal_rank) = judge(conn, case, now, query_vectors)?;
         outcomes.push(CaseOutcome {
             id: case.id.clone(),
             kind: case.kind(),
             verdict,
             detail,
+            reciprocal_rank,
         });
     }
     Ok(tally_up(outcomes, now))
@@ -730,7 +784,8 @@ fn judge(
     conn: &Connection,
     case: &EvalCase,
     now: DateTime<Utc>,
-) -> Result<(Verdict, Option<String>)> {
+    query_vectors: &std::collections::HashMap<String, Vec<f32>>,
+) -> Result<(Verdict, Option<String>, Option<f64>)> {
     // Похожее на секрет вырезается из выдачи раньше ранжирования
     // (`graph::search`, `nodes.retain(|n| !secret::is_secret_ref(n))`), так
     // что ожидать такой узел в топ-5 бессмысленно, а хранить его текст в
@@ -746,13 +801,23 @@ fn judge(
                 "во входе или ожидании кейса есть похожее на секрет («{head}…») — \
                  такой узел вырезается из выдачи до ранжирования"
             )),
+            None,
         ));
     }
     match &case.body {
-        CaseBody::RecallTop5 { input, expect } => judge_recall_top5(conn, input, expect, now),
-        CaseBody::Morphology { input, expect } => judge_morphology(conn, input, expect),
+        // `recall_top5` и `crosslingual_top5` утверждают о мире разное, но
+        // судятся одной функцией: разница в том, что проверяется, а не в том,
+        // как считается вердикт.
+        CaseBody::RecallTop5 { input, expect } | CaseBody::CrosslingualTop5 { input, expect } => {
+            let query_vector = query_vectors.get(&input.topic).map(Vec::as_slice);
+            judge_recall_top5(conn, input, expect, now, query_vector)
+        }
+        CaseBody::Morphology { input, expect } => {
+            let (verdict, detail) = judge_morphology(conn, input, expect)?;
+            Ok((verdict, detail, None))
+        }
         // Сюда не дойти: неисполнимые виды роняют прогон в `run` до судейства.
-        // Ветка существует затем, чтобы шестой вид, добавленный в enum, не
+        // Ветка существует затем, чтобы седьмой вид, добавленный в enum, не
         // прошёл молча.
         other => Err(EvalRunFailed::KindNotExecutable {
             id: case.id.clone(),
@@ -770,7 +835,7 @@ fn judge(
 /// Виды, которых этот бинарник не исполняет, до сюда не доходят.
 fn case_texts(case: &EvalCase) -> Vec<&str> {
     match &case.body {
-        CaseBody::RecallTop5 { input, .. } => {
+        CaseBody::RecallTop5 { input, .. } | CaseBody::CrosslingualTop5 { input, .. } => {
             let mut texts = vec![input.topic.as_str()];
             if let Some(project) = &input.project {
                 texts.push(project.as_str());
@@ -794,17 +859,20 @@ fn judge_recall_top5(
     input: &RecallInput,
     expect: &RecallExpect,
     now: DateTime<Utc>,
-) -> Result<(Verdict, Option<String>)> {
+    query_vector: Option<&[f32]>,
+) -> Result<(Verdict, Option<String>, Option<f64>)> {
     if input.topic.trim().is_empty() {
         return Ok((
             Verdict::Skip,
             Some("вход пуст: topic — пустая строка".into()),
+            None,
         ));
     }
     if expect.top5.is_empty() {
         return Ok((
             Verdict::Skip,
             Some("ожидание пусто: top5 не называет ни одного узла".into()),
+            None,
         ));
     }
     if let Some(project) = &input.project {
@@ -812,6 +880,7 @@ fn judge_recall_top5(
             return Ok((
                 Verdict::Skip,
                 Some(format!("проекта «{project}» в фикстуре нет")),
+                None,
             ));
         }
     }
@@ -836,17 +905,22 @@ fn judge_recall_top5(
                 "ожидаемых узлов нет в фикстуре: {}",
                 short_ids(&missing)
             )),
+            None,
         ));
     }
 
     let depth = input.depth.unwrap_or(DEFAULT_RECALL_DEPTH);
-    let selection = graph::recall_selection(conn, &input.topic, depth, now)?;
+    let selection = graph::recall_selection_hybrid(conn, &input.topic, depth, now, query_vector)?;
     let shown: Vec<&Node> = selection
         .knowledge
         .iter()
         .chain(selection.recent.iter())
         .collect();
     let top: Vec<&Node> = shown.iter().take(TOP_N).copied().collect();
+
+    // Вклад кейса в `mrr` — считается по кейсу, дошедшему до сюда (не
+    // `SKIP`), по той же выдаче `shown`, что и `positions_report`.
+    let reciprocal_rank = Some(reciprocal_rank_of(&expect.top5, &shown));
 
     let hits = expect
         .top5
@@ -858,7 +932,11 @@ fn judge_recall_top5(
         TopMode::All => hits == expect.top5.len(),
     };
     if !enough {
-        return Ok((Verdict::Fail, Some(positions_report(&expect.top5, &shown))));
+        return Ok((
+            Verdict::Fail,
+            Some(positions_report(&expect.top5, &shown)),
+            reciprocal_rank,
+        ));
     }
 
     // SC-002a механически: машинный узел на верхних пяти строках отменяет
@@ -876,10 +954,25 @@ fn judge_recall_top5(
                     "запрещённые типы в топ-5: {}",
                     offenders.join("; ")
                 )),
+                reciprocal_rank,
             ));
         }
     }
-    Ok((Verdict::Pass, None))
+    Ok((Verdict::Pass, None, reciprocal_rank))
+}
+
+/// Обратный ранг первого из `expected`, найденного в `shown` (с единицы), или
+/// `0.0`, если ни один не найден вовсе. Считается по всей выдаче, не только
+/// по топ-5: `mode` судит `PASS`/`FAIL`, а не ранг, поэтому здесь не участвует.
+fn reciprocal_rank_of(expected: &[Uuid], shown: &[&Node]) -> f64 {
+    let position = expected
+        .iter()
+        .filter_map(|id| shown.iter().position(|n| n.id == *id))
+        .min();
+    match position {
+        Some(idx) => 1.0 / (idx + 1) as f64,
+        None => 0.0,
+    }
 }
 
 /// `morphology` — правила целиком в `eval-cases.md` §2.2.
@@ -985,10 +1078,11 @@ fn short_ids(ids: &[Uuid]) -> String {
 /// Имя типа узла — то, каким его печатает выдача и каким его пишет кейс.
 ///
 /// Через serde, а не через `Debug`: `WorkLog` в файле кейсов называется
-/// `work_log`, и `format!("{:?}").to_lowercase()` дал бы `worklog`. Тип `run` —
-/// это `NodeType::Custom("run")`, а не вариант перечисления, и его имя лежит
-/// внутри варианта: `serde_json` завернул бы его в `{"custom":"run"}`, поэтому
-/// он разобран отдельной веткой.
+/// `work_log`, и `format!("{:?}").to_lowercase()` дал бы `worklog`. Тип `run`
+/// с 16.09.2026 — вариант перечисления `NodeType::Run`, печатается тем же
+/// общим путём serde; ветка `NodeType::Custom(name)` разобрана отдельно ради
+/// произвольных строковых типов, чьё имя лежит внутри варианта, а не ради
+/// `run`.
 fn type_name(node: &Node) -> String {
     match &node.node_type {
         NodeType::Custom(name) => name.clone(),
@@ -1005,6 +1099,7 @@ mod tests {
 
     const META: &str = r#"{"meta":{"version":1,"as_of":"2026-09-08T00:00:00Z","fixture":"fixtures/eval/aurelius-2026-09-08.db","fixture_sha256":"3f9c1b7a"}}"#;
     const CASE_RECALL: &str = r#"{"id":"recall-a","kind":"recall_top5","input":{"topic":"лесенка замка"},"expect":{"top5":["8c1d0f52-3b7a-4d19-9f2e-6a0c4b18d7e5"]},"why":"владелец, 08.09.2026","tags":["by:owner"]}"#;
+    const CASE_CROSSLINGUAL: &str = r#"{"id":"crosslingual-a","kind":"crosslingual_top5","input":{"topic":"утечка памяти в тесте"},"expect":{"top5":["8c1d0f52-3b7a-4d19-9f2e-6a0c4b18d7e5"]},"why":"владелец, 16.09.2026","tags":["by:owner"]}"#;
     const CASE_MORPH: &str = r#"{"id":"morph-a","kind":"morphology","input":{"query":"перезагрузкам"},"expect":{"non_empty":true},"why":"владелец, 08.09.2026","tags":["by:owner","phase-E"]}"#;
 
     fn outcome(id: &str, kind: CaseKind, verdict: Verdict) -> CaseOutcome {
@@ -1013,6 +1108,14 @@ mod tests {
             kind,
             verdict,
             detail: None,
+            reciprocal_rank: None,
+        }
+    }
+
+    fn outcome_with_rank(id: &str, kind: CaseKind, verdict: Verdict, rr: f64) -> CaseOutcome {
+        CaseOutcome {
+            reciprocal_rank: Some(rr),
+            ..outcome(id, kind, verdict)
         }
     }
 
@@ -1191,6 +1294,105 @@ mod tests {
         assert_eq!(morph.eligible(), 0);
     }
 
+    /// `mrr` — среднее по `recall_top5` и `crosslingual_top5` вместе;
+    /// `SKIP` и прочие виды в сумму и счётчик не входят.
+    #[test]
+    fn mrr_averages_recall_and_crosslingual_together_and_excludes_skips_and_other_kinds() {
+        let report = tally_up(
+            vec![
+                outcome_with_rank("r-first", CaseKind::RecallTop5, Verdict::Pass, 1.0),
+                outcome_with_rank("x-fourth", CaseKind::CrosslingualTop5, Verdict::Fail, 0.25),
+                outcome_with_rank("r-missing", CaseKind::RecallTop5, Verdict::Fail, 0.0),
+                outcome("r-skip", CaseKind::RecallTop5, Verdict::Skip),
+                outcome("m-pass", CaseKind::Morphology, Verdict::Pass),
+            ],
+            at("2026-09-08T00:00:00Z"),
+        );
+        let mrr = report.mrr.expect("три пригодных кейса дают число");
+        assert!((mrr - (1.0 + 0.25 + 0.0) / 3.0).abs() < 1e-9, "mrr={mrr}");
+    }
+
+    /// Ни одного пригодного кейса `recall_top5`/`crosslingual_top5` —
+    /// `None`, а не `0.0`: отсутствие измерения не печатается как провал.
+    #[test]
+    fn mrr_is_none_without_eligible_recall_or_crosslingual_cases() {
+        let report = tally_up(
+            vec![
+                outcome("r-skip", CaseKind::RecallTop5, Verdict::Skip),
+                outcome("m-pass", CaseKind::Morphology, Verdict::Pass),
+            ],
+            at("2026-09-08T00:00:00Z"),
+        );
+        assert!(report.mrr.is_none());
+    }
+
+    /// Обратный ранг — по первому найденному из ожидаемых, независимо от
+    /// того, сколько их и в каком порядке перечислены; ни одного не найдено
+    /// — ноль, а не отказ.
+    #[test]
+    fn reciprocal_rank_of_finds_earliest_match_or_zero() {
+        let a = Uuid::parse_str("8c1d0f52-3b7a-4d19-9f2e-6a0c4b18d7e5").expect("uuid");
+        let b = Uuid::parse_str("b0a74e19-52cd-4f83-91a6-7d3e0c5b8f24").expect("uuid");
+        let node_a = test_node(a);
+        let node_b = test_node(b);
+        let shown = [&node_a, &node_b];
+
+        assert_eq!(reciprocal_rank_of(&[b], &shown), 0.5);
+        assert_eq!(reciprocal_rank_of(&[a, b], &shown), 1.0);
+        let missing = Uuid::parse_str("c7f31a08-9e42-4bd6-8a15-2f60c9d47e3b").expect("uuid");
+        assert_eq!(reciprocal_rank_of(&[missing], &shown), 0.0);
+        assert_eq!(reciprocal_rank_of(&[], &shown), 0.0);
+    }
+
+    /// `crosslingual_top5` разбирается тем же телом, что `recall_top5`, и
+    /// судится той же функцией — не копией: доказывается тем, что вход,
+    /// непригодный до всякого обращения к базе (пустая тема), даёт тот же
+    /// `SKIP` с той же причиной у обоих видов.
+    #[test]
+    fn crosslingual_top5_reuses_recall_judging() {
+        let case: EvalCase =
+            serde_json::from_str(CASE_CROSSLINGUAL).expect("crosslingual-кейс разбирается");
+        assert_eq!(case.kind(), CaseKind::CrosslingualTop5);
+        assert!(EXECUTABLE_KINDS.contains(&CaseKind::CrosslingualTop5));
+
+        let blank = CASE_CROSSLINGUAL.replace("утечка памяти в тесте", "   ");
+        let blank: EvalCase =
+            serde_json::from_str(&blank).expect("кейс с пустой темой разбирается");
+        let conn = Connection::open_in_memory().expect("память под соединение");
+        let (verdict, detail, rr) = judge(
+            &conn,
+            &blank,
+            at("2026-09-08T00:00:00Z"),
+            &std::collections::HashMap::new(),
+        )
+        .expect("пустая тема не трогает базу");
+        assert_eq!(verdict, Verdict::Skip);
+        assert!(detail.as_deref().is_some_and(|d| d.contains("пуст")));
+        assert!(rr.is_none());
+    }
+
+    /// Узел для тестов ранга: содержимое не важно, важен только `id`.
+    fn test_node(id: Uuid) -> Node {
+        Node {
+            id,
+            node_type: NodeType::Concept,
+            label: "x".into(),
+            note: None,
+            source: "test".into(),
+            data: serde_json::Value::Null,
+            created_at: at("2026-09-08T00:00:00Z"),
+            updated_at: at("2026-09-08T00:00:00Z"),
+            memory_kind: crate::models::MemoryKind::Semantic,
+            last_accessed_at: at("2026-09-08T00:00:00Z"),
+            access_count: 0,
+            content_hash: None,
+            created_by: None,
+            updated_by: None,
+            deleted_at: None,
+            sync_seq: None,
+        }
+    }
+
     /// Порядок видов задан в одном месте — иначе две формы отчёта разошлись бы.
     #[test]
     fn kind_order_is_fixed() {
@@ -1199,6 +1401,7 @@ mod tests {
             names,
             vec![
                 "recall_top5",
+                "crosslingual_top5",
                 "morphology",
                 "refusal",
                 "snapshot_contains",
@@ -1220,8 +1423,14 @@ mod tests {
         let (meta, cases) = parse(&format!("{META}\n{refusal}")).expect("файл разбирается");
         let conn = Connection::open_in_memory().expect("память под соединение");
 
-        let err = run(&conn, &meta, &cases, at("2026-09-08T00:00:00Z"))
-            .expect_err("вид refusal этот бинарник не исполняет");
+        let err = run(
+            &conn,
+            &meta,
+            &cases,
+            at("2026-09-08T00:00:00Z"),
+            &std::collections::HashMap::new(),
+        )
+        .expect_err("вид refusal этот бинарник не исполняет");
         let refused = err
             .chain()
             .find_map(|c| c.downcast_ref::<EvalRunFailed>())
@@ -1240,7 +1449,14 @@ mod tests {
     fn empty_case_set_runs_and_reports_nothing() {
         let (meta, cases) = parse(META).expect("одна meta");
         let conn = Connection::open_in_memory().expect("память под соединение");
-        let report = run(&conn, &meta, &cases, at("2026-09-08T00:00:00Z")).expect("прогон");
+        let report = run(
+            &conn,
+            &meta,
+            &cases,
+            at("2026-09-08T00:00:00Z"),
+            &std::collections::HashMap::new(),
+        )
+        .expect("прогон");
         assert_eq!(report.total, 0);
         for kind in CaseKind::ALL {
             assert!(!report.tally(kind).has_cases());
@@ -1255,7 +1471,14 @@ mod tests {
         let (meta, cases) = parse(&format!("{META}\n{wildcard}")).expect("файл разбирается");
         let conn = Connection::open_in_memory().expect("память под соединение");
 
-        let report = run(&conn, &meta, &cases, at("2026-09-08T00:00:00Z")).expect("прогон");
+        let report = run(
+            &conn,
+            &meta,
+            &cases,
+            at("2026-09-08T00:00:00Z"),
+            &std::collections::HashMap::new(),
+        )
+        .expect("прогон");
         assert_eq!(report.skipped, 1);
         assert_eq!(report.tally(CaseKind::Morphology).eligible(), 0);
         assert!(report.outcomes[0]
@@ -1271,7 +1494,14 @@ mod tests {
         let (meta, cases) = parse(&format!("{META}\n{leaky}")).expect("файл разбирается");
         let conn = Connection::open_in_memory().expect("память под соединение");
 
-        let report = run(&conn, &meta, &cases, at("2026-09-08T00:00:00Z")).expect("прогон");
+        let report = run(
+            &conn,
+            &meta,
+            &cases,
+            at("2026-09-08T00:00:00Z"),
+            &std::collections::HashMap::new(),
+        )
+        .expect("прогон");
         assert_eq!(report.skipped, 1);
         assert!(report.outcomes[0]
             .detail
@@ -1329,7 +1559,10 @@ mod tests {
     }
 
     /// Имя типа берётся из serde, а не из `Debug`: `WorkLog` в файле кейсов
-    /// пишется `work_log`, а `run` — это `Custom("run")`.
+    /// пишется `work_log`. `run` с 16.09.2026 — вариант перечисления
+    /// `NodeType::Run`, не `Custom("run")` (тот остаётся только формой старых
+    /// строк, пришедших синком, см. `rank.rs:type_weight`), и печатается тем
+    /// же общим путём serde, что и любой другой известный тип.
     #[test]
     fn type_name_matches_what_the_case_file_writes() {
         let node = |t: NodeType| Node {
@@ -1352,6 +1585,6 @@ mod tests {
         };
         assert_eq!(type_name(&node(NodeType::WorkLog)), "work_log");
         assert_eq!(type_name(&node(NodeType::File)), "file");
-        assert_eq!(type_name(&node(NodeType::Custom("run".into()))), "run");
+        assert_eq!(type_name(&node(NodeType::Run)), "run");
     }
 }

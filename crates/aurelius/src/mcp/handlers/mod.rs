@@ -177,6 +177,40 @@ pub(crate) fn sync_push_if_enabled(conn: &Connection, project: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Спека 011 («hybrid everywhere»): вектор запроса для трёх ручек, которые
+// берут тему/запрос — `memory_search`, `memory_recall`, `memory_context`.
+// Мостик sync→async — тот же приём, что у `sync_pull_if_enabled`/
+// `sync_push_if_enabled` выше: обработчик остаётся синхронной функцией
+// (менять на async — раздувать это по всему диспетчеру MCP), а сервер уже
+// живёт под tokio-рантаймом, поэтому один блокирующий `block_on` внутри него
+// безопасен.
+// ---------------------------------------------------------------------------
+
+/// Просит у демона вектор запроса — тонкая обёртка над
+/// [`aurelius_core::graph::query_vector_for_search`] (единственная реализация
+/// лесенки отказа, спека 011): сама ручка не решает, что делать с сокетом, она
+/// только мостит синхронный вызов в асинхронный `request_vector` и отдаёт
+/// результат как есть. `(None, Some(reason))` на любом отказе — сокета нет,
+/// отказано в соединении, таймаут, демон ответил `{"error": ...}` — никогда
+/// `Err`: вызывающая ручка обязана продолжить по FTS5 и обязана показать
+/// `reason` в ответе (spec.md, ограничение №2).
+pub(crate) fn query_vector_for_topic(query: &str) -> (Option<Vec<f32>>, Option<String>) {
+    // `try_current`, не `current`: юнит-тесты ручек зовут их напрямую, вне
+    // сервера и вне какого-либо рантайма, а паниковать здесь нельзя (правило
+    // проекта — ни одного runtime-пути с паникой). Нет рантайма вокруг —
+    // тот же случай, что и отказ сокета: деградация к FTS5, а не крах.
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return (
+            None,
+            Some("нет tokio-рантайма вокруг вызова — векторная половина недоступна".to_owned()),
+        );
+    };
+    let path = db_path();
+    let home = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    handle.block_on(graph::query_vector_for_search(home, query))
+}
+
 pub(crate) fn node_brief(node: &aurelius_core::models::Node) -> serde_json::Value {
     json!({
         "id": node.id.to_string(),

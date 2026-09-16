@@ -314,12 +314,16 @@ mod tests {
         assert!(!out.contains(&n.id.to_string()), "{out}");
     }
 
-    // --- NodeType::Custom("run") печатается своим именем, не "custom" -------
-
+    // --- NodeType::Run печатается именем "run" через обычный serde-путь -----
+    //
+    // Живой путь пишет `NodeType::Run` (`graph/mod.rs:57`, `link_evidence_run`)
+    // с 16.09.2026; `Custom("run")` остаётся читаемой формой для строк,
+    // пришедших синком со старой версии (`rank.rs:type_weight`), но рендер
+    // её больше не пишет — тест целится в то, что реально выходит из графа.
     #[test]
-    fn custom_type_prints_its_own_name_not_the_variant_tag() {
+    fn run_type_prints_its_own_name_not_the_variant_tag() {
         let n = node(
-            NodeType::Custom("run".to_owned()),
+            NodeType::Run,
             "[aurelius] прогон: npm test",
             None,
             json!({}),

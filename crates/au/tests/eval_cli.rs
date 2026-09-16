@@ -477,8 +477,8 @@ fn a_case_file_with_only_a_meta_line_says_there_are_no_cases() {
     assert!(out.contains("кейсов 0:"), "учёт кейсов: {out}");
     assert_eq!(
         out.matches("нет кейсов").count(),
-        5,
-        "все пять видов обязаны сказать «нет кейсов»: {out}"
+        aurelius_core::eval::CaseKind::ALL.len(),
+        "каждый вид обязан сказать «нет кейсов»: {out}"
     );
     assert!(
         !out.contains(" 0/0 ") && !out.contains("0 %"),
