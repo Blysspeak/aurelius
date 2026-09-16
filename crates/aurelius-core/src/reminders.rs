@@ -405,6 +405,31 @@ pub fn due(
     select_pending(conn, now, owner_filter, limit)
 }
 
+/// Session delivery includes personal reminders and the current project only.
+/// Scope is applied before LIMIT, so another project's queue cannot starve it.
+pub fn due_for_session(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Reminder>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {REMINDER_COLUMNS} FROM reminders
+         WHERE state = 'pending' AND due_at <= ?1 AND owner IN ('ai', 'both')
+           AND (project IS NULL OR project = ?2)
+         ORDER BY due_at ASC LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(
+        params![
+            now.timestamp(),
+            project,
+            i64::try_from(limit).unwrap_or(i64::MAX)
+        ],
+        row_to_reminder,
+    )?;
+    Ok(rows.filter_map(std::result::Result::ok).collect())
+}
+
 /// То же самое, но `due_at <= now - grace`. Это то, чем демон второй волны
 /// зовёт с `Some(Owner::Me)`: окно `grace` И ЕСТЬ защита от двойной
 /// доставки, потому что живая сессия, уже забравшая напоминание
@@ -709,6 +734,46 @@ mod tests {
             project: None,
             repeat_spec: None,
         }
+    }
+
+    #[test]
+    fn session_due_scopes_before_limit_and_preserves_personal_reminders() {
+        let conn = test_conn();
+        let now = Utc::now();
+        for i in 0..5 {
+            let mut foreign =
+                new_reminder(&format!("foreign {i}"), now - Duration::hours(2), Owner::Ai);
+            foreign.project = Some("other".into());
+            add(&conn, foreign).expect("foreign");
+        }
+        let mut own = new_reminder("own", now - Duration::hours(1), Owner::Ai);
+        own.project = Some("current".into());
+        add(&conn, own).expect("own");
+        add(
+            &conn,
+            new_reminder("personal", now - Duration::minutes(30), Owner::Both),
+        )
+        .expect("personal");
+        add(
+            &conn,
+            new_reminder("human only", now - Duration::minutes(30), Owner::Me),
+        )
+        .expect("human");
+        let names = |rows: Vec<Reminder>| rows.into_iter().map(|r| r.text).collect::<Vec<_>>();
+        assert_eq!(
+            names(due_for_session(&conn, now, Some("current"), 2).expect("scoped")),
+            ["own", "personal"]
+        );
+        assert_eq!(
+            names(due_for_session(&conn, now, None, 2).expect("personal only")),
+            ["personal"]
+        );
+        assert_eq!(
+            due(&conn, now, Some(Owner::Ai), 20)
+                .expect("global unchanged")
+                .len(),
+            7
+        );
     }
 
     #[test]
