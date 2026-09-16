@@ -397,12 +397,25 @@ pub fn merge_nodes(conn: &Connection, source: Uuid, target: Uuid) -> Result<Merg
 
     let mut stats = MergeStats::default();
 
+    // `OR IGNORE`, not plain `UPDATE`: `idx_edges_unique` is a total index
+    // over `(from_id, to_id, relation)`, blind to `deleted_at`, so rewiring
+    // an edge onto a triple the target already carries is not a rare corner
+    // case — two facts about the same project both carry a `belongs_to` edge
+    // to that project, so any merge of two such facts collides on the very
+    // first edge. A plain `UPDATE` aborts the whole statement on that
+    // constraint violation (rolling the merge back and leaving it unusable
+    // for exactly the case it exists for); `OR IGNORE` skips only the
+    // colliding row and keeps the target's existing edge, which is the
+    // correct dedup outcome — target and source agreed on that edge, so
+    // there is nothing to add. The skipped source row stays pointed at
+    // `source` and is soft-deleted along with it by `delete_node` below, so
+    // it does not linger as an orphan.
     let rewired_from = conn.execute(
-        "UPDATE edges SET from_id = ?1 WHERE from_id = ?2",
+        "UPDATE OR IGNORE edges SET from_id = ?1 WHERE from_id = ?2",
         params![&tgt_str, &src_str],
     )?;
     let rewired_to = conn.execute(
-        "UPDATE edges SET to_id = ?1 WHERE to_id = ?2",
+        "UPDATE OR IGNORE edges SET to_id = ?1 WHERE to_id = ?2",
         params![&tgt_str, &src_str],
     )?;
     stats.edges_rewired = rewired_from + rewired_to;
@@ -1174,6 +1187,103 @@ mod tests {
         assert!(
             families.is_empty(),
             "нет subject, начинающегося с xhub:refunds"
+        );
+    }
+
+    /// Ядро дефекта: два факта об одном проекте оба несут `belongs_to` на тот
+    /// же узел проекта — рефайр `source`'а сталкивается с уже существующим у
+    /// `target` ребром той же тройки `(from, to, relation)` и раньше ронял
+    /// `UPDATE` целиком через `idx_edges_unique`. Слияние обязано пережить
+    /// это ровно на том случае, ради которого инструмент существует.
+    #[test]
+    fn merge_survives_a_shared_edge_and_keeps_the_union_without_duplicates_or_self_loops() {
+        let (_tmp, conn) = setup();
+
+        let project = add_node(
+            &conn,
+            NodeType::Project,
+            "aurelius",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add project");
+        let source = add_node(
+            &conn,
+            NodeType::Concept,
+            "источник",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add source");
+        let target = add_node(
+            &conn,
+            NodeType::Concept,
+            "цель",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add target");
+
+        // Общее ребро: обе записи принадлежат одному проекту — то, что раньше
+        // ломало merge_nodes.
+        add_edge(&conn, source.id, project.id, Relation::BelongsTo, 1.0)
+            .expect("source belongs_to");
+        add_edge(&conn, target.id, project.id, Relation::BelongsTo, 1.0)
+            .expect("target belongs_to");
+        // Ребро, уникальное для source — обязано переехать на target.
+        let other = add_node(
+            &conn,
+            NodeType::Concept,
+            "третий узел",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add other");
+        add_edge(&conn, source.id, other.id, Relation::RelatedTo, 1.0).expect("source related_to");
+        // Ребро source -> target напрямую: после рефайра from_id это станет
+        // самопетлёй target -> target, которая не должна пережить merge.
+        add_edge(&conn, source.id, target.id, Relation::RelatedTo, 1.0).expect("source -> target");
+
+        let stats = merge_nodes(&conn, source.id, target.id).expect("merge must succeed");
+        assert_eq!(
+            stats.self_loops_removed, 1,
+            "source -> target рефайрится в target -> target и обязан быть снят"
+        );
+
+        let edges = get_all_edges(&conn).expect("edges after merge");
+        assert!(
+            edges.iter().any(|e| e.from_id == target.id
+                && e.to_id == other.id
+                && e.relation.to_string() == Relation::RelatedTo.to_string()),
+            "уникальное ребро source обязано переехать на target: {edges:?}"
+        );
+        assert!(
+            edges.iter().any(|e| e.from_id == target.id
+                && e.to_id == project.id
+                && e.relation.to_string() == Relation::BelongsTo.to_string()),
+            "belongs_to на проект обязан остаться на target: {edges:?}"
+        );
+        assert_eq!(
+            edges.iter().filter(|e| e.to_id == project.id).count(),
+            1,
+            "belongs_to на проект не должен задвоиться: {edges:?}"
+        );
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.from_id == target.id && e.to_id == target.id),
+            "самопетля target -> target не должна пережить merge: {edges:?}"
+        );
+
+        assert!(
+            get_node(&conn, &source.id.to_string())
+                .expect("lookup source")
+                .is_none(),
+            "source обязан быть удалён после merge"
         );
     }
 }
