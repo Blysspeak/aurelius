@@ -94,6 +94,10 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "integer",
                             "description": "Maximum results (default: 20)",
                             "default": 20
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Calling session's identity, used for query-correction telemetry (which pathways this session's recalls take). Defaults to a placeholder when omitted."
                         }
                     },
                     "required": ["query"]
@@ -1013,7 +1017,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "doc_recall",
-                "description": "Full-text search across every document ever converted, even if the original file is gone. Returns matching snippets with the reference needed to read the full text via doc_read.",
+                "description": "Full-text search across every document ever converted, even if the original file is gone. Returns matching snippets with the reference needed to read the full text via doc_read. Unlike memory_search, this tool has no listing mode: an empty string or '*' matches nothing rather than returning recent documents — pass an actual search term.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1156,6 +1160,10 @@ pub fn tool_definitions() -> serde_json::Value {
                         "cases": {
                             "type": "string",
                             "description": "Path to a case file, when it is not the default fixtures/eval/cases.jsonl"
+                        },
+                        "db": {
+                            "type": "string",
+                            "description": "Path to the fixture database to score against, overriding meta.fixture in the case file (ignored under live: true, which always scores the live database)."
                         }
                     }
                 }
