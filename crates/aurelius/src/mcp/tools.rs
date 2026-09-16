@@ -1107,6 +1107,114 @@ pub fn tool_definitions() -> serde_json::Value {
                     },
                     "required": ["name"]
                 }
+            },
+            {
+                "name": "memory_pickup",
+                "description": "Bounded, ranked payload for rebuilding working state after a context wipe: anchor facet, the freshest session tail whose next_steps are not empty, the project's facet list, up to 8 open records under the anchor, and open critical-priority tasks. Call this after /clear instead of re-reading files.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": {
+                            "type": "string",
+                            "description": "Project to rebuild. Required: an anchor facet makes no sense without a scope to compute it in."
+                        }
+                    },
+                    "required": ["project"]
+                }
+            },
+            {
+                "name": "memory_journal",
+                "description": "List what a given run wrote. A session-end hook needs this to tell its own records from yesterday's — without it nothing carries the run.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "The run to list. Falls back to AURELIUS_SESSION_ID when omitted."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Cap on entries returned (default: 50)"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "memory_eval",
+                "description": "Score search quality against a frozen fixture: the argument about whether recall got better or worse acquires a number, and that number repeats tomorrow. Reads only. A run against the live database is marked incomparable and its numbers never go into research.md.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "live": {
+                            "type": "boolean",
+                            "description": "Run against the live database instead of the frozen fixture. The report comes back marked incomparable."
+                        },
+                        "now": {
+                            "type": "string",
+                            "description": "RFC3339 instant node ages are measured from. Defaults to meta.as_of of the case file — the clock is a parameter, never the system time."
+                        },
+                        "cases": {
+                            "type": "string",
+                            "description": "Path to a case file, when it is not the default fixtures/eval/cases.jsonl"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "task_criterion",
+                "description": "Mark one acceptance criterion of a task met, or unmark it. With neither flag, lists the task's criteria and the short handle each one is addressed by.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "UUID or label of the task"
+                        },
+                        "met": {
+                            "type": "string",
+                            "description": "Short handle of the criterion to mark met (from the listing)"
+                        },
+                        "unmet": {
+                            "type": "string",
+                            "description": "Short handle of the criterion to unmark"
+                        }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "db_check",
+                "description": "Verify database integrity. Read-only — never migrates, never writes. Run it before anything risky and after anything that touched the database.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "full": {
+                            "type": "boolean",
+                            "description": "Full integrity_check instead of the fast quick_check. Slower, and the only one that reads every page."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "db_backup",
+                "description": "Safe snapshot via SQLite VACUUM INTO — the only correct way to copy a live database. WRITES a new file; never copy aurelius.db with cp or rsync instead.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "out": {
+                            "type": "string",
+                            "description": "Destination path. Defaults to a timestamped file beside the database."
+                        }
+                    }
+                }
+            },
+            {
+                "name": "db_reindex_embeddings",
+                "description": "Queue nodes whose vector is missing for the daemon to embed. Returns in milliseconds and computes nothing itself: the daemon is the only process that loads the model, and it drains the queue in batches on its ticks. Not a long operation.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
             }
         ]
     })
