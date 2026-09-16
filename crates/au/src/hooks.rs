@@ -26,7 +26,7 @@ use crate::commands;
 /// One Claude Code hook JSON payload from stdin. Empty input or anything
 /// that isn't valid JSON is not an error worth reporting — it just means
 /// "no payload", the same as an interactive run with nothing piped in.
-fn read_payload() -> Option<Value> {
+pub(crate) fn read_payload() -> Option<Value> {
     serde_json::from_reader(std::io::stdin().lock()).ok()
 }
 
@@ -44,8 +44,45 @@ fn file_path_of(payload: &Value) -> Option<PathBuf> {
 
 /// The `cwd` field of a Claude Code hook payload, used by `reindex --hook`
 /// to find the project root.
-fn cwd_of(payload: &Value) -> Option<PathBuf> {
-    payload.get("cwd")?.as_str().map(PathBuf::from)
+pub(crate) fn cwd_of(payload: &Value) -> Option<PathBuf> {
+    payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("workspacePaths")?.as_array()?.first()?.as_str())
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Resolve hook scope from a real repository. Worktrees share the main
+/// repository's identity; arbitrary directory names never select task queues.
+pub(crate) fn hook_project(payload: Option<&Value>) -> Option<String> {
+    let from = match payload {
+        Some(payload) => cwd_of(payload)?,
+        None => std::env::current_dir().ok()?,
+    };
+    let output = std::process::Command::new("git")
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ])
+        .current_dir(&from)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut lines = stdout.lines();
+    let root = PathBuf::from(lines.next()?);
+    let common = PathBuf::from(lines.next()?);
+    let canonical = if common.file_name().is_some_and(|name| name == ".git") {
+        common.parent()?
+    } else {
+        root.as_path()
+    };
+    canonical.file_name()?.to_str().map(str::to_owned)
 }
 
 /// One line on stderr, gated behind `AURELIUS_HOOK_DEBUG=1` so a hook that
@@ -154,7 +191,7 @@ fn hook_event_name(payload: &Value) -> &str {
 }
 
 /// `au remind --hook` — the session-side consumer. Takes at most three
-/// reminders addressed to the AI (`reminders::due(.., Some(Owner::Ai), 3)`:
+/// reminders addressed to the AI in this project or without a project:
 /// a reminder addressed to the human alone must never be spent on a session
 /// that cannot act on it), stamps each with `mark_delivered(via = "session")`
 /// BEFORE printing it, and silently drops any that call returns `false`
@@ -181,18 +218,15 @@ pub async fn remind_hook() {
     };
 
     let now = chrono::Utc::now();
-    let candidates = match aurelius_core::reminders::due(
-        &conn,
-        now,
-        Some(aurelius_core::reminders::Owner::Ai),
-        3,
-    ) {
-        Ok(items) => items,
-        Err(e) => {
-            debug("remind", &format!("{e:#}"));
-            return;
-        }
-    };
+    let project = hook_project(Some(&payload));
+    let candidates =
+        match aurelius_core::reminders::due_for_session(&conn, now, project.as_deref(), 3) {
+            Ok(items) => items,
+            Err(e) => {
+                debug("remind", &format!("{e:#}"));
+                return;
+            }
+        };
     if candidates.is_empty() {
         return;
     }

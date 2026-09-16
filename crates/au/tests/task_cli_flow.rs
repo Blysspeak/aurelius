@@ -320,6 +320,29 @@ fn judge_hook_prints_ripe_block_for_ripe_task() {
     let project = "proj-judge-flow";
     let project_dir = home.0.join(project);
     std::fs::create_dir_all(&project_dir).expect("рабочий каталог проекта");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&project_dir)
+            .args(args)
+            .output()
+            .expect("git fixture");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "fixture",
+    ]);
 
     let (code, out, _) = run(
         &home,
@@ -356,8 +379,8 @@ fn judge_hook_prints_ripe_block_for_ripe_task() {
     );
     assert_eq!(code, 0);
 
-    let (code, judge_out, err) = run(&home, &["judge", "--hook"]);
-    assert_eq!(code, 0, "judge --hook: {judge_out} {err}");
+    let (code, judge_out) = run_in(&home, &project_dir, &["judge", "--hook"]);
+    assert_eq!(code, 0, "judge --hook: {judge_out}");
     assert!(
         judge_out.contains("Созревшие задачи"),
         "блок созревших задач обязан появиться в выводе хука: {judge_out}"
@@ -366,6 +389,125 @@ fn judge_hook_prints_ripe_block_for_ripe_task() {
         judge_out.contains("задача под судью"),
         "блок обязан назвать именно эту задачу: {judge_out}"
     );
+    assert!(judge_out.contains("готова к закрытию"));
+    assert!(!judge_out.contains("src/lib.rs"));
+    assert!(!judge_out.contains("cargo test --workspace"));
+    let (code, detailed, _) = run(&home, &["task", "ripe", "--json"]);
+    assert_eq!(code, 0);
+    assert!(detailed.contains("cargo test --workspace"));
+    assert!(detailed.contains("src/lib.rs"));
+    let (code, from_payload) = run_with_stdin_in(
+        &home,
+        &home.0,
+        &["judge", "--hook"],
+        &serde_json::json!({"cwd": project_dir}).to_string(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(from_payload, judge_out, "hook cwd wins over process cwd");
+    let (code, from_ag) = run_with_stdin_in(
+        &home,
+        &home.0,
+        &["judge", "--hook"],
+        &serde_json::json!({"workspacePaths": [project_dir]}).to_string(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(from_ag, judge_out);
+    let nested = project_dir.join("src/nested");
+    std::fs::create_dir_all(&nested).expect("nested cwd");
+    let worktree = home.0.join("unrelated-worktree-name");
+    git(&[
+        "worktree",
+        "add",
+        "--detach",
+        "-q",
+        worktree.to_str().expect("fixture path"),
+    ]);
+    for cwd in [&nested, &worktree] {
+        let (code, scoped) = run_with_stdin_in(
+            &home,
+            &home.0,
+            &["judge", "--hook"],
+            &serde_json::json!({"cwd": cwd}).to_string(),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            scoped, judge_out,
+            "nested and worktree cwd share project identity"
+        );
+        let (code, snapshot) = run_with_stdin_in(
+            &home,
+            &home.0,
+            &["snapshot", "--hook"],
+            &serde_json::json!({"cwd": cwd}).to_string(),
+        );
+        assert_eq!(code, 0);
+        assert!(snapshot.contains("задача под судью"));
+    }
+    for payload in [
+        "{}".to_owned(),
+        serde_json::json!({"cwd": home.0}).to_string(),
+    ] {
+        let (code, quiet) = run_with_stdin_in(&home, &project_dir, &["judge", "--hook"], &payload);
+        assert_eq!(code, 0);
+        assert!(
+            quiet.is_empty(),
+            "no global queue for missing or foreign project"
+        );
+        let (code, snapshot) =
+            run_with_stdin_in(&home, &project_dir, &["snapshot", "--hook"], &payload);
+        assert_eq!(code, 0);
+        assert!(snapshot.is_empty(), "snapshot hooks require a project too");
+    }
+}
+
+#[test]
+fn reminder_hook_does_not_consume_foreign_project_queue() {
+    let home = TmpHome::dir("reminder-scope");
+    let project = "reminder-current";
+    let cwd = home.0.join(project);
+    std::fs::create_dir_all(&cwd).expect("repo dir");
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&cwd)
+        .status()
+        .expect("git init")
+        .success());
+    for (name, project) in [
+        ("foreign one", "other"),
+        ("foreign two", "other"),
+        ("foreign three", "other"),
+        ("foreign four", "other"),
+        ("own reminder", project),
+    ] {
+        let (code, out, err) = run(
+            &home,
+            &[
+                "remind",
+                "add",
+                name,
+                "--project",
+                project,
+                "--for",
+                "ai",
+                "--at",
+                "2020-01-01T00:00:00Z",
+            ],
+        );
+        assert_eq!(code, 0, "{out} {err}");
+    }
+    let (code, out) = run_with_stdin_in(
+        &home,
+        &home.0,
+        &["remind", "--hook"],
+        &serde_json::json!({"cwd": cwd, "hook_event_name":"UserPromptSubmit"}).to_string(),
+    );
+    assert_eq!(code, 0);
+    assert!(out.contains("own reminder"));
+    assert!(!out.contains("foreign"));
+    let (code, pending, _) = run(&home, &["remind", "list", "--state", "pending", "--json"]);
+    assert_eq!(code, 0);
+    assert_eq!(pending.matches("foreign").count(), 4);
+    assert!(!pending.contains("own reminder"));
 }
 
 /// `au secret add/list/rm` — полный успешный путь: запись координаты,
