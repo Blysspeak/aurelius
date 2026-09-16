@@ -40,6 +40,12 @@ pub struct Traversal {
     /// 1-based BFS depth at which the budget cut the walk, if it did.
     /// `Some(0)` would mean even the seed set did not fit.
     pub truncated_at_depth: Option<u32>,
+    /// Нормированный RRF-скор посевных узлов (спека 011, `search::hybrid_seeds`),
+    /// ключ — `Node::id`. Пуст на обычном пути (`context_with_report_seeded`,
+    /// `query_vector: None`) — там посев по-прежнему даёт голый `search()`, и
+    /// ни один узел здесь не появляется, так что `recall_selection` подставляет
+    /// всем узлам фиксированный `RankWeights::r_traversed`, как и раньше.
+    pub seed_r: std::collections::HashMap<uuid::Uuid, f64>,
 }
 
 pub fn context(conn: &Connection, topic: &str, depth: u32) -> Result<(Vec<Node>, Vec<Edge>)> {
@@ -79,11 +85,34 @@ pub fn context_with_report_seeded(
     depth: u32,
     seeds: usize,
 ) -> Result<Traversal> {
-    let seeds = search(conn, topic, seeds)?;
-    if seeds.is_empty() {
+    context_with_report_seeded_hybrid(conn, topic, depth, seeds, None)
+}
+
+/// Тот же обход, что [`context_with_report_seeded`], но посев — слияние FTS5
+/// и векторного KNN (`search::hybrid_seeds`, спека 011), когда подан вектор
+/// запроса. `query_vector: None` — не подобие старого пути, а буквально он:
+/// зовётся тот же `search()`, что и раньше, и [`Traversal::seed_r`] остаётся
+/// пуст.
+pub fn context_with_report_seeded_hybrid(
+    conn: &Connection,
+    topic: &str,
+    depth: u32,
+    seeds: usize,
+    query_vector: Option<&[f32]>,
+) -> Result<Traversal> {
+    let (seed_nodes, seed_r) = match query_vector {
+        Some(vector) => search::hybrid_seeds(conn, topic, vector, seeds)?,
+        None => (
+            search(conn, topic, seeds)?,
+            std::collections::HashMap::new(),
+        ),
+    };
+    if seed_nodes.is_empty() {
         return Ok(Traversal::default());
     }
-    walk(conn, seeds, depth)
+    let mut traversal = walk(conn, seed_nodes, depth)?;
+    traversal.seed_r = seed_r;
+    Ok(traversal)
 }
 
 /// Готовая выдача recall: что показывают читателю и чем ответ признаётся
@@ -136,25 +165,48 @@ pub struct RecallSelection {
 /// фикстуре, и системные часы внутри неё сделали бы прогон невоспроизводимым
 /// — тот же довод, что и у `rank::score` (T013).
 ///
-/// Эта функция не отличает узел-посев от узла, пришедшего обходом — обеим
-/// группам подставляется один и тот же нейтральный `RankWeights::r_traversed`.
-/// Настоящий нормированный bm25 у посевов уже существует внутри
-/// `search::search_ranked` (T015), но наружу за пределы `search.rs` он
-/// сегодня не отдаётся; прокидывание этого числа сюда — известный пробел вне
-/// объёма этой задачи (см. отчёт агента волны T018). Различие между узлами
-/// при равном `r` решают оставшиеся четыре множителя — `P`, `R`, `A`, `T`.
+/// Без вектора запроса эта функция не отличает узел-посев от узла,
+/// пришедшего обходом — обеим группам подставляется один и тот же
+/// нейтральный `RankWeights::r_traversed` (T018, известный пробел прежних
+/// волн). Спека 011 закрывает этот пробел ровно для посева, и ровно когда
+/// вектор подан — см. [`recall_selection_hybrid`], которой эта функция
+/// делегирует с `query_vector: None`.
 pub fn recall_selection(
     conn: &Connection,
     topic: &str,
     depth: u32,
     now: DateTime<Utc>,
 ) -> Result<RecallSelection> {
+    recall_selection_hybrid(conn, topic, depth, now, None)
+}
+
+/// Тот же сбор, что [`recall_selection`], но посев — слияние FTS5 и
+/// векторного KNN (спека 011, `search::hybrid_seeds`), когда подан вектор
+/// запроса.
+///
+/// `query_vector: None` — не подобие прежнего пути, а он же буквально:
+/// [`context_with_report_seeded_hybrid`] с `None` зовёт тот же голый
+/// `search()`, что и до этой правки, и `Traversal::seed_r` остаётся пуст —
+/// тогда все узлы по-прежнему получают один и тот же `r_traversed`.
+///
+/// Когда вектор подан и посев нашёлся слиянием, посевные узлы получают свой
+/// нормированный RRF-скор вместо `r_traversed`; узлы, пришедшие уже обходом
+/// графа (не входившие в слитый посев), различие между собой при равном `r`
+/// по-прежнему решают оставшиеся четыре множителя — `P`, `R`, `A`, `T`.
+pub fn recall_selection_hybrid(
+    conn: &Connection,
+    topic: &str,
+    depth: u32,
+    now: DateTime<Utc>,
+    query_vector: Option<&[f32]>,
+) -> Result<RecallSelection> {
     let Traversal {
         nodes: context_nodes,
         hidden_nodes,
         truncated_at_depth,
+        seed_r,
         ..
-    } = context_with_report_seeded(conn, topic, depth, RECALL_SEEDS)?;
+    } = context_with_report_seeded_hybrid(conn, topic, depth, RECALL_SEEDS, query_vector)?;
     let total_graph_nodes = context_nodes.len();
 
     let mut knowledge = vec![];
@@ -182,8 +234,8 @@ pub fn recall_selection(
     }
 
     let weights = rank::RankWeights::default();
-    let mut knowledge = sort_by_score(knowledge, &weights, now);
-    let mut recent = sort_by_score(recent, &weights, now);
+    let mut knowledge = sort_by_score(knowledge, &weights, now, &seed_r);
+    let mut recent = sort_by_score(recent, &weights, now, &seed_r);
 
     let matched_knowledge = knowledge.len();
     let matched_recent = recent.len();
@@ -203,13 +255,24 @@ pub fn recall_selection(
 
 /// Сортировка одной группы (`knowledge` либо `episodic_tail`) по
 /// `rank::score`, невозрастающе. Общая точка для обеих групп —
-/// `recall_selection` не заводит второго компаратора: обе зовут ровно эту
-/// функцию, которая сама зовёт ровно `rank::score`.
-fn sort_by_score(nodes: Vec<Node>, weights: &rank::RankWeights, now: DateTime<Utc>) -> Vec<Node> {
+/// `recall_selection_hybrid` не заводит второго компаратора: обе зовут ровно
+/// эту функцию, которая сама зовёт ровно `rank::score`.
+///
+/// `seed_r` — нормированный RRF-скор посевных узлов (спека 011,
+/// `Traversal::seed_r`): узел, чей `id` в нём есть, получает свой `r`; любой
+/// другой — по-прежнему `weights.r_traversed`. Пустая карта (обычный путь без
+/// вектора запроса) даёт `r_traversed` всем — ровно прежнее поведение.
+fn sort_by_score(
+    nodes: Vec<Node>,
+    weights: &rank::RankWeights,
+    now: DateTime<Utc>,
+    seed_r: &std::collections::HashMap<uuid::Uuid, f64>,
+) -> Vec<Node> {
     let mut scored: Vec<(f64, Node)> = nodes
         .into_iter()
         .map(|node| {
-            let s = rank::score(weights, &node, weights.r_traversed, now);
+            let r = seed_r.get(&node.id).copied().unwrap_or(weights.r_traversed);
+            let s = rank::score(weights, &node, r, now);
             (s, node)
         })
         .collect();

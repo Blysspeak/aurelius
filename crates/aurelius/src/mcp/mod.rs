@@ -148,6 +148,9 @@ async fn handle_tools_call(
             "memory_merge" => handlers::memory_merge(&arguments),
             "memory_snapshot" => handlers::memory_snapshot(&arguments),
             "memory_consolidate" => handlers::memory_consolidate(&arguments),
+            "memory_pickup" => handlers::memory_pickup(&arguments),
+            "memory_journal" => handlers::memory_journal(&arguments),
+            "memory_eval" => handlers::memory_eval(&arguments),
             "task_create" => handlers::task_create(&arguments),
             "task_update" => handlers::task_update(&arguments),
             "task_list" => handlers::task_list(&arguments),
@@ -155,6 +158,7 @@ async fn handle_tools_call(
             "task_view" => handlers::task_view(&arguments),
             "task_stats" => handlers::task_stats(&arguments),
             "task_ripe" => handlers::task_ripe(&arguments),
+            "task_criterion" => handlers::task_criterion(&arguments),
             "reminder_add" => handlers::reminder_add(&arguments),
             "reminder_list" => handlers::reminder_list(&arguments),
             "reminder_show" => handlers::reminder_show(&arguments),
@@ -170,6 +174,9 @@ async fn handle_tools_call(
             "skill_get" => handlers::skill_get(&arguments),
             "skill_save" => handlers::skill_save(&arguments),
             "skill_remove" => handlers::skill_remove(&arguments),
+            "db_check" => handlers::db_check(&arguments),
+            "db_backup" => handlers::db_backup(&arguments),
+            "db_reindex_embeddings" => handlers::db_reindex_embeddings(&arguments),
             _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
         };
 

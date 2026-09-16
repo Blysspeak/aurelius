@@ -480,6 +480,8 @@ pub enum DbAction {
         #[arg(long)]
         full: bool,
     },
+    /// Apply pending schema migrations
+    Migrate,
     /// Safe snapshot via SQLite VACUUM INTO — the only correct way to copy a live database
     Backup {
         /// Destination file (default: aurelius-<UTC timestamp>.db next to the database)
@@ -497,6 +499,9 @@ pub enum DbAction {
         #[arg(long, requires = "hook")]
         min_hours: Option<u64>,
     },
+    /// Queue live nodes missing a vector for the daemon to embed (Phase D,
+    /// 011-dense-retrieval) — marks the work and exits, loads no model itself
+    ReindexEmbeddings,
 }
 
 #[derive(Subcommand)]
@@ -713,7 +718,12 @@ enum Commands {
     /// поэтому часы живут ровно здесь, одним процессом с файловым замком, а
     /// не в MCP и не в сессии. Каждый такт забирает у `reminders::overdue_undelivered`
     /// напоминания для `Owner::Me`/`Owner::Both`, перезревшие на `--grace` —
-    /// `Owner::Ai` принадлежит сессии, и демон их никогда не трогает
+    /// `Owner::Ai` принадлежит сессии, и демон их никогда не трогает. Тем же
+    /// принципом единственности демон (в долгоживущем режиме, без `--once`)
+    /// — единственный процесс, которому разрешено держать в памяти модель
+    /// эмбеддинга bge-m3: после доставки напоминаний такта он бере́т
+    /// ограниченную пачку из `embedding_queue` и досчитывает вектора уже
+    /// загруженной моделью (спека 011-dense-retrieval, фаза D)
     Daemon {
         /// Пауза между тактами, секунд
         #[arg(long, default_value = "60")]

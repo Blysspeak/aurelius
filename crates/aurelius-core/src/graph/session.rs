@@ -253,7 +253,7 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
 
     let label = format!("[{project}] {}", Utc::now().format("%Y-%m-%d %H:%M"));
     let session_data = with_agent_session(session_data, input.agent_session);
-    let (session, fresh) = match input.key {
+    let (session, fresh, _replaced) = match input.key {
         Some(key) => {
             // `upsert_node_by_key` кладёт ключ в `data`, поэтому ему нужен
             // именно объект. `session_data` собран объектом двумя строками
@@ -262,10 +262,14 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
                 serde_json::Value::Object(map) => map,
                 other => anyhow::bail!("данные сессии перестали быть объектом: {other}"),
             };
+            // Пишущий знает свой тип константой и ничего, кроме `Session`,
+            // под этим ключом не ждёт — `expected_type` совпадает с типом
+            // записи, а не отдельно от него.
             super::upsert_node_by_key(
                 conn,
                 key,
                 NodeType::Session,
+                Some(NodeType::Session),
                 &label,
                 Some(summary),
                 input.source,
@@ -285,6 +289,7 @@ pub fn record_session(conn: &Connection, input: &SessionInput<'_>) -> Result<Ses
                 Some(&hash),
             )?,
             true,
+            None,
         ),
     };
 

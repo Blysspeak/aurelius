@@ -3,14 +3,14 @@ use aurelius_core::{
     graph, indexer,
     models::{MemoryKind, NodeType, Relation},
     provenance::{self, Provenance, Resolution},
-    window,
+    tasks, window,
 };
 use serde_json::json;
 use uuid::Uuid;
 
 use super::{
     apply_secret_bypass, edge_brief, node_detail, open_db, parse_node_type, parse_relation,
-    parse_since, resolve_node,
+    parse_since, query_vector_for_topic, resolve_node, resolve_task_node,
 };
 
 /// Бит-и-Дело, ступень 3: превратить recall в транзакцию. Отфильтровать
@@ -49,16 +49,44 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     let since = params.get("since").and_then(|s| s.as_str());
 
     let conn = open_db()?;
-    let outcome = if let Some(type_str) = type_filter {
+    // Векторная половина — только у нефильтрованного пути: `dense_search`
+    // (как и `search_typed`) не знает типа узла, и заводить вторую, типовую
+    // KNN-выборку ради одной ручки — за пределами этой волны (спека 011:
+    // "hybrid everywhere" даёт вектор темам и запросам, а не переизобретает
+    // typed-поиск).
+    let (outcome, vector_notice) = if let Some(type_str) = type_filter {
         let node_type = parse_node_type(type_str);
         let (terms, unmatched) = graph::query_terms(&conn, query)?;
-        graph::SearchOutcome {
-            nodes: graph::search_typed(&conn, query, &node_type, limit)?,
-            terms,
-            unmatched_terms: unmatched,
-        }
+        (
+            graph::SearchOutcome {
+                nodes: graph::search_typed(&conn, query, &node_type, limit)?,
+                terms,
+                unmatched_terms: unmatched,
+            },
+            None,
+        )
     } else {
-        graph::search_ranked(&conn, query, limit)?
+        let outcome = graph::search_ranked(&conn, query, limit)?;
+        let (vector, notice) = query_vector_for_topic(query);
+        match vector {
+            Some(vector) => match graph::hybrid_seeds(&conn, query, &vector, limit) {
+                Ok((nodes, _scores)) => (
+                    graph::SearchOutcome {
+                        nodes,
+                        terms: outcome.terms,
+                        unmatched_terms: outcome.unmatched_terms,
+                    },
+                    None,
+                ),
+                Err(e) => (
+                    outcome,
+                    Some(format!(
+                        "гибридный поиск не выполнился, отвечаю по полнотекстовому — {e}"
+                    )),
+                ),
+            },
+            None => (outcome, notice),
+        }
     };
     let hint = outcome.diagnosis();
     let unmatched = outcome.unmatched_terms;
@@ -84,6 +112,12 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         "count": nodes.len(),
         "unmatched_terms": unmatched,
         "query_hint": hint,
+        // `None` — гибридный путь сработал или не потребовался (фильтр по
+        // типу). `Some` — причина, по которой ответ дан по чистому
+        // полнотекстовому индексу; поле, а не только строка в тексте — так
+        // потребитель JSON видит деградацию, а не только человек (spec.md,
+        // ограничение №2).
+        "vector_notice": vector_notice,
         "results": nodes.iter().map(node_detail).collect::<Vec<_>>(),
     }))
 }
@@ -132,7 +166,26 @@ fn memory_context_with_conn(
         .unwrap_or(u64::from(MEMORY_CONTEXT_DEFAULT_DEPTH)) as u32;
     let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
 
-    let (nodes, edges) = graph::context(conn, topic, depth)?;
+    let (vector, notice) = query_vector_for_topic(topic);
+    let (traversal, vector_notice) = match vector {
+        Some(vector) => match graph::context_with_report_seeded_hybrid(
+            conn,
+            topic,
+            depth,
+            graph::DEFAULT_SEEDS,
+            Some(&vector),
+        ) {
+            Ok(t) => (t, None),
+            Err(e) => (
+                graph::context_with_report(conn, topic, depth)?,
+                Some(format!(
+                    "гибридный обход не выполнился, отвечаю по полнотекстовому — {e}"
+                )),
+            ),
+        },
+        None => (graph::context_with_report(conn, topic, depth)?, notice),
+    };
+    let (nodes, edges) = (traversal.nodes, traversal.edges);
 
     let total = nodes.len();
     let capped_nodes: Vec<_> = nodes.iter().take(limit).collect();
@@ -176,6 +229,10 @@ fn memory_context_with_conn(
         "edges": relevant_edges,
         "returned": capped_nodes.len(),
         "total": total,
+        // Как и у `memory_search`: `None` — гибрид сработал, `Some` —
+        // причина отката к полнотекстовому обходу, отдельным полем, не
+        // только строкой (spec.md, ограничение №2).
+        "vector_notice": vector_notice,
         // Честный отчёт об урезании — молчаливая обрезка хуже длинного
         // ответа: читатель обязан узнать, сколько осталось за кадром и как
         // это достать, а не догадываться по разнице returned/total.
@@ -551,6 +608,65 @@ pub fn memory_gc() -> Result<serde_json::Value> {
         "duplicate_nodes_removed": dup_nodes,
         "bankrupt_scanned": gc.scanned,
         "bankrupt_absorbed": gc.absorbed,
+    }))
+}
+
+/// `task_criterion` — MCP door onto `au task criterion <id> [--met|--unmet] <criterion>`
+/// (`crates/au/src/commands.rs`, `TaskAction::Criterion`; the underlying
+/// logic — `tasks::task_criteria`/`resolve_criterion`/`set_criterion_met` —
+/// lives in `aurelius_core::tasks` and is called here exactly as the CLI
+/// calls it, not reimplemented). Marks one acceptance criterion of a task
+/// met or unmet, addressed by the stable handle a listing call prints (or by
+/// its exact text, or `#N`) — never by position, since adding a criterion
+/// renumbers every one after it. With neither `met` nor `unmet`, lists the
+/// task's criteria and each one's handle, the same "list first, act second"
+/// shape the CLI has.
+///
+/// Marking a criterion met is a record of progress, not a closing condition:
+/// neither `task_ripe` nor `task_update`'s status transition reads these
+/// marks — closing a task stays a decision made through `task_update`.
+pub fn task_criterion(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let id = params
+        .get("id")
+        .and_then(|i| i.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing 'id' parameter (task UUID or label)"))?;
+    let met = params.get("met").and_then(|m| m.as_str());
+    let unmet = params.get("unmet").and_then(|m| m.as_str());
+    if met.is_some() && unmet.is_some() {
+        anyhow::bail!("pass only one of 'met' or 'unmet', not both");
+    }
+
+    let conn = open_db()?;
+    let task = resolve_task_node(&conn, id)?;
+    let criteria = tasks::task_criteria(&task.data);
+
+    if let Some(selector) = met.or(unmet) {
+        let mark = unmet.is_none();
+        let criterion = tasks::resolve_criterion(&criteria, selector)?;
+        let handle = criterion.handle.clone();
+        let text = criterion.text.clone();
+        let changed = tasks::set_criterion_met(&conn, task.id, &handle, mark)?;
+        return Ok(json!({
+            "id": task.id.to_string(),
+            "label": task.label,
+            "handle": handle,
+            "text": text,
+            "met": mark,
+            "changed": changed,
+        }));
+    }
+
+    let orphaned_marks = tasks::orphaned_criteria_marks(&task.data);
+    Ok(json!({
+        "id": task.id.to_string(),
+        "label": task.label,
+        "criteria": criteria.iter().map(|c| json!({
+            "handle": c.handle,
+            "text": c.text,
+            "met": c.met_at.is_some(),
+            "met_at": c.met_at.map(|t| t.to_rfc3339()),
+        })).collect::<Vec<_>>(),
+        "orphaned_marks": orphaned_marks,
     }))
 }
 

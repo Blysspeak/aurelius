@@ -34,3 +34,6 @@ regex = { workspace = true }
 sha2 = { workspace = true }
 zstd = { workspace = true }
 tokio = { workspace = true }
+sqlite-vec = "0.1.9"
+fastembed = { version = "6.1.0", default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "cuda", "std"] }

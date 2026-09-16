@@ -8,6 +8,8 @@
 pub mod codec;
 pub mod db;
 pub mod differ;
+pub mod embed;
+pub mod embed_socket;
 pub mod eval;
 pub mod fts;
 pub mod graph;

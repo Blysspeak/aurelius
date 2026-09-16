@@ -7,6 +7,7 @@ use aurelius_core::{
 };
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::{
     hooks, DbAction, DocAction, GraphAction, HomeAction, IdentityAction, RemindAction,
@@ -251,11 +252,15 @@ pub async fn note(args: NoteArgs) -> Result<()> {
     let conflicts =
         provenance::guard_subject(&conn, prov.subject.as_deref(), resolution.is_some(), None)?;
 
-    let (node, created) = match args.key.as_deref() {
+    // `expected_type: None` — здесь тип назван явным флагом `--type`
+    // (умолчание `decision`), и это не ожидание, а выбор: подмена типа под
+    // тем же ключом легитимна, её нужно лишь показать, а не отвергать.
+    let (node, created, replaced) = match args.key.as_deref() {
         Some(key) => graph::upsert_node_by_key(
             &conn,
             key,
             args.r#type,
+            None,
             &label,
             Some(&text),
             "manual",
@@ -274,6 +279,7 @@ pub async fn note(args: NoteArgs) -> Result<()> {
                 None,
             )?,
             true,
+            None,
         ),
     };
 
@@ -328,6 +334,15 @@ pub async fn note(args: NoteArgs) -> Result<()> {
     match args.project.as_deref() {
         Some(proj_name) => println!("✓ {verb}: [{}] {} → {proj_name}", node.id, node.label),
         None => println!("✓ {verb}: [{}] {}", node.id, node.label),
+    }
+    // Не за debug-флагом и не подтверждением: подтверждение обходят через
+    // неделю по привычке, а строка в обычном выводе читается каждый раз.
+    if let Some(old) = &replaced {
+        let was = format!("{:?}", old.node_type).to_lowercase();
+        let now_type = format!("{:?}", node.node_type).to_lowercase();
+        if was != now_type {
+            println!("  ⚠ тип узла изменён: {was} → {now_type}");
+        }
     }
     // Уверенность печатается всегда, кроме измеренной: молчание о происхождении
     // и есть та беда, ради которой поля заводились.
@@ -684,9 +699,34 @@ pub async fn relate(args: RelateArgs) -> Result<()> {
 
 pub async fn context(topic: &str, depth: u32, verbose: bool) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
-    let (nodes, edges) = graph::context(&conn, topic, depth)?;
+    // Векторная половина — та же лесенка, что и у `search()` (спека 011,
+    // волна «hybrid everywhere»): демон недоступен — тихой деградации не
+    // будет, причина печатается явно, а не проглатывается.
+    let (vector, notice) = graph::query_vector_for_search(&embed_socket_home(), topic).await;
+    let (traversal, vector_notice) = match vector {
+        Some(vector) => match graph::context_with_report_seeded_hybrid(
+            &conn,
+            topic,
+            depth,
+            graph::DEFAULT_SEEDS,
+            Some(&vector),
+        ) {
+            Ok(t) => (t, None),
+            Err(e) => (
+                graph::context_with_report(&conn, topic, depth)?,
+                Some(format!(
+                    "гибридный обход не выполнился, отвечаю по полнотекстовому — {e}"
+                )),
+            ),
+        },
+        None => (graph::context_with_report(&conn, topic, depth)?, notice),
+    };
+    let (nodes, edges) = (traversal.nodes, traversal.edges);
     if nodes.is_empty() {
         println!("No nodes found for '{}'", topic);
+        if let Some(notice) = &vector_notice {
+            println!("  {notice}");
+        }
         return Ok(());
     }
     println!(
@@ -695,6 +735,9 @@ pub async fn context(topic: &str, depth: u32, verbose: bool) -> Result<()> {
         nodes.len(),
         edges.len()
     );
+    if let Some(notice) = &vector_notice {
+        println!("  {notice}");
+    }
     println!();
     for node in &nodes {
         let type_label = serde_json::to_string(&node.node_type).unwrap_or_default();
@@ -756,20 +799,97 @@ fn print_sync_conflict(node: &aurelius_core::models::Node) {
     }
 }
 
+/// Итог одного вызова поиска — общий для человеческого и машинного вывода
+/// (спека 011, волна «hybrid everywhere»). Раньше у `au search` была только
+/// одна форма вывода; вторая, машинная, ниже (`search_json`) обязана видеть
+/// ровно те же узлы и то же сообщение о деградации, а не пересчитывать их
+/// заново — иначе однажды они разойдутся молча, и один и тот же запрос
+/// начнёт по-разному отвечать в зависимости от того, как его спросили.
+struct SearchRun {
+    nodes: Vec<aurelius_core::models::Node>,
+    /// `None` — гибридный путь сработал или не потребовался. `Some` — причина,
+    /// по которой ответ дан по чистому полнотекстовому индексу (spec.md,
+    /// ограничение №2: деградация обязана быть явной, а не тихой).
+    vector_notice: Option<String>,
+    /// «Не нашлось» и «запрос не сработал» — разные ответы: первое означает
+    /// «иди выясняй», второе — «спроси иначе» ([`graph::SearchOutcome::diagnosis`]).
+    diagnosis: Option<String>,
+    terms: Vec<String>,
+    unmatched_terms: Vec<String>,
+}
+
+/// Один поиск, оба выхода. Векторная половина — надстройка над тем же
+/// полнотекстовым `outcome`, не замена ему: демон недоступен (сокета нет,
+/// отказ, таймаут) — тихой деградации не будет, `vector_notice` обязан
+/// появиться в обоих выводах (спека 011 §6, ограничение №2).
+///
+/// `home` — каталог сокета, параметром, а не жёстко `db_path()` внутри: так
+/// эта функция тестируется на временном каталоге без сокета, не трогая
+/// боевой `$AURELIUS_HOME/embed.sock` (который на машине разработчика вполне
+/// может быть жив прямо во время `cargo test`).
+async fn run_search(
+    conn: &rusqlite::Connection,
+    home: &std::path::Path,
+    query: &str,
+    limit: usize,
+) -> Result<SearchRun> {
+    let outcome = graph::search_ranked(conn, query, limit)?;
+    let diagnosis = outcome.diagnosis();
+    let terms = outcome.terms.clone();
+    let unmatched_terms = outcome.unmatched_terms.clone();
+
+    let (vector, notice) = graph::query_vector_for_search(home, query).await;
+    let (nodes, vector_notice) = match vector {
+        Some(vector) => match graph::hybrid_seeds(conn, query, &vector, limit) {
+            Ok((nodes, _scores)) => (nodes, None),
+            Err(e) => (
+                outcome.nodes,
+                Some(format!(
+                    "гибридный поиск не выполнился, отвечаю по полнотекстовому — {e}"
+                )),
+            ),
+        },
+        None => (outcome.nodes, notice),
+    };
+
+    Ok(SearchRun {
+        nodes,
+        vector_notice,
+        diagnosis,
+        terms,
+        unmatched_terms,
+    })
+}
+
+/// `db_path()`'s каталог — там же лежит `embed.sock` (тот же принцип, что и
+/// у `db_reindex_embeddings_cli` и у `daemon()`: сокет рядом с базой, которую
+/// он обслуживает, путь берётся из активного `AURELIUS_HOME`, не хардкодится).
+fn embed_socket_home() -> PathBuf {
+    let home = db_path();
+    home.parent()
+        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
+}
+
 pub async fn search(query: &str) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
-    let outcome = graph::search_ranked(&conn, query, 20)?;
-    // «Не нашлось» и «запрос не сработал» — разные ответы: первое означает «иди
-    // выясняй», второе — «спроси иначе».
-    let blind = outcome
-        .diagnosis()
+    let run = run_search(&conn, &embed_socket_home(), query, 20).await?;
+    let blind = run
+        .diagnosis
+        .as_deref()
         .map_or_else(String::new, |d| format!("\n  {d}"));
-    if outcome.nodes.is_empty() {
+
+    if run.nodes.is_empty() {
         println!("No results for '{query}'{blind}");
+        if let Some(notice) = &run.vector_notice {
+            println!("  {notice}");
+        }
         return Ok(());
     }
-    println!("{} results:{blind}", outcome.nodes.len());
-    for node in outcome.nodes {
+    println!("{} results:{blind}", run.nodes.len());
+    if let Some(notice) = &run.vector_notice {
+        println!("  {notice}");
+    }
+    for node in run.nodes {
         let type_label = serde_json::to_string(&node.node_type).unwrap_or_default();
         println!(
             "  [{type_label}] {} — {}",
@@ -777,6 +897,46 @@ pub async fn search(query: &str) -> Result<()> {
             node.note.unwrap_or_default()
         );
     }
+    Ok(())
+}
+
+/// Машинная форма `au search` — тот же `run_search`, что и человеческая
+/// (спека 011, волна «hybrid everywhere»): раньше `--json`-путь у поиска
+/// свёлся бы ко второй копии этой же лесенки и разошёлся бы с человеческим
+/// выводом молча (найдено измерением: без гибридного слоя цель стояла на
+/// седьмой позиции человеческого вывода и отсутствовала в машинном вовсе —
+/// один и тот же запрос отвечал двумя разными списками узлов). Пометка о
+/// недоступности векторной половины идёт отдельным полем `vector_notice`, а
+/// не только строкой в тексте — потребитель, который её не прочтёт, хуже
+/// человека, читающего строку в консоли.
+///
+/// CLI-проводка (`--json` на `Commands::Search` в `main.rs`) в объём этой
+/// правки не входит: `main.rs` не входит в список файлов, которые эта волна
+/// вправе трогать (см. отчёт агента к волне «hybrid everywhere»). Функция уже
+/// собрана и проверена (см. тест ниже), и добавить одну строку диспетчеризации
+/// в `main.rs` — отдельная, ничем не рискованная правка следующей волны.
+/// `#[allow(dead_code)]` — ровно поэтому: без диспетчеризации в `main.rs`
+/// ничто в бинарнике эту функцию не зовёт, а `-D warnings` иначе отказывает
+/// сборке из-за живого, проверенного, но пока не подключённого снаружи кода.
+#[allow(dead_code)]
+pub async fn search_json(query: &str) -> Result<()> {
+    let conn = open_and_ensure(&db_path())?;
+    let run = run_search(&conn, &embed_socket_home(), query, 20).await?;
+    let out = json!({
+        "query": query,
+        "count": run.nodes.len(),
+        "results": run.nodes.iter().map(|n| json!({
+            "id": n.id.to_string(),
+            "type": n.node_type,
+            "label": n.label,
+            "note": n.note,
+        })).collect::<Vec<_>>(),
+        "terms": run.terms,
+        "unmatched_terms": run.unmatched_terms,
+        "query_hint": run.diagnosis,
+        "vector_notice": run.vector_notice,
+    });
+    println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
 
@@ -3084,6 +3244,16 @@ pub async fn daemon(interval_secs: u64, grace_spec: &str, once: bool, as_json: b
         return Ok(());
     }
 
+    // Модель — надстройка над тактом, не его условие: `once` выше уже
+    // вышел бы без неё, а здесь, в долгоживущем режиме, её отсутствие
+    // так же не мешает первому же такту ниже. Тот же `SharedModel`
+    // (`Arc<Mutex<TextEmbedding>>`), который слушает сокет, отдаётся и
+    // сюда — на разбор `embedding_queue` в цикле ниже, чтобы у демона была
+    // ровно одна загруженная копия весов на оба потребителя, а не по одной
+    // на каждый.
+    let home = db.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let embed = start_embed_socket(home);
+
     // SIGTERM — единственный сигнал, о котором просит порядок: дождаться,
     // пока текущий такт закончится, и выйти чисто. Выход через `return`
     // роняет `_lock` (`Drop`), снимая файл замка — второй нитке кода для
@@ -3092,14 +3262,220 @@ pub async fn daemon(interval_secs: u64, grace_spec: &str, once: bool, as_json: b
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("подписка на SIGTERM")?;
     loop {
+        // Напоминания — ПЕРВЫМИ, эмбеддинг — только после: это настоящая
+        // работа демона, эмбеддинг лишь пристроен к такту (ограничение
+        // задачи 011-dense-retrieval, фаза D). Ошибка разбора очереди не
+        // должна уронить весь демон — напоминания следующего такта важнее
+        // одной пачки векторов, поэтому она только логируется.
         let delivered = daemon_tick(&conn, chrono::Utc::now(), grace, 50)?;
         print_daemon_tick(delivered, as_json);
+        if let Some((_, model)) = &embed {
+            if let Err(e) = drain_embedding_queue(&conn, model, EMBED_DRAIN_BATCH).await {
+                hooks::debug("daemon", &format!("очередь эмбеддинга: {e}"));
+            }
+        }
         tokio::select! {
             () = tokio::time::sleep(interval) => {}
             _ = sigterm.recv() => break,
         }
     }
+    // Симметрично `start_embed_socket`: и задача, и её файл сокета —
+    // принадлежность этого запуска демона, снимаются вместе с ним же,
+    // тем же порядком, каким `_lock`'s `Drop` снимает файл замка.
+    if let Some((task, _)) = embed {
+        task.abort();
+        let _ = std::fs::remove_file(aurelius_core::embed_socket::socket_path(home));
+    }
     Ok(())
+}
+
+/// Поднимает embed-сокет (спека 011, `data-model.md` §6) поверх уже
+/// работающего демона — надстройка над его настоящей работой, не условие
+/// для неё. Любая неудача (весов нет, ONNX Runtime не поднялся, `bind`
+/// отказал) уходит в stderr и возвращает `None`: демон обязан продолжить
+/// тикать и без сокета, а не остановиться на этом шаге (ограничение №1
+/// задачи 011-dense-retrieval).
+///
+/// Файл сокета, оставшийся от предыдущего запуска этого же демона (упал
+/// без `SIGTERM`, не успел снять), удаляется до `bind` — тем же приёмом,
+/// каким `acquire_daemon_lock` перехватывает мёртвый лок: раз замок
+/// демона (`acquire_daemon_lock`) уже взят этим процессом, никакой другой
+/// демон файл сокета сейчас не держит.
+///
+/// Возвращает и задачу сокета, и `SharedModel` отдельно: демон держит
+/// вторую копию хэндла (дешёвый `Arc::clone`, не второй экземпляр весов),
+/// чтобы `drain_embedding_queue` могла запросить у той же модели ещё один
+/// инференс, пока сокет параллельно обслуживает `au recall`.
+fn start_embed_socket(
+    home: &std::path::Path,
+) -> Option<(
+    tokio::task::JoinHandle<()>,
+    aurelius_core::embed_socket::SharedModel,
+)> {
+    let socket_path = aurelius_core::embed_socket::socket_path(home);
+    let model = match aurelius_core::embed::init_bge_m3() {
+        Ok(model) => model,
+        Err(e) => {
+            eprintln!("embed-сокет: bge-m3 не поднялась, векторный поиск отключён — {e}");
+            return None;
+        }
+    };
+    let shared: aurelius_core::embed_socket::SharedModel = Arc::new(Mutex::new(model));
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = match tokio::net::UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!(
+                "embed-сокет: не удалось занять {} — {e}",
+                socket_path.display()
+            );
+            return None;
+        }
+    };
+    println!("✓ embed-сокет: {}", socket_path.display());
+    let task = tokio::spawn(aurelius_core::embed_socket::serve(
+        listener,
+        Arc::clone(&shared),
+    ));
+    Some((task, shared))
+}
+
+/// Сколько строк `embedding_queue` демон разбирает за один такт. Держит в
+/// узде то, что констанция задачи 011-dense-retrieval называет абсолютным:
+/// такт обязан доставить напоминания и уйти спать, а не застрять на всей
+/// очереди сразу — очередь в 20000 узлов имеет право разбираться много
+/// тактов подряд, опоздавшее напоминание из-за этого — нет.
+const EMBED_DRAIN_BATCH: usize = 16;
+
+/// Одна строка `embedding_queue`, готовая к отправке в модель — вместе с
+/// колонками узла, из которых `embed::format_for_embedding` (Contextual
+/// Prepending) собирает текст, и с `rowid`, потому что `node_embeddings`
+/// (sqlite-vec) адресуется им, а не строковым `id`.
+struct QueuedNode {
+    node_id: String,
+    rowid: i64,
+    node_type: String,
+    label: String,
+    note: Option<String>,
+    created_at: String,
+}
+
+/// Один такт разбора очереди: до `limit` самых старых живых строк
+/// `embedding_queue`, эмбеддинг уже загруженной `model`, запись векторов и
+/// уход из очереди — одной транзакцией на пачку. Инференс идёт через
+/// `spawn_blocking` на клоне `Arc` (тот же приём, что и в
+/// `embed_socket::handle_connection`): такт демона не должен держать
+/// исполнитель `tokio` заблокированным на синхронной CPU/GPU-работе дольше,
+/// чем нужно — сокет параллельно обслуживает `au recall` той же моделью.
+///
+/// Строка покидает очередь только ПОСЛЕ успешной записи своего вектора
+/// (`data-model.md` §1a): при ошибке инференса на всей пачке ни одна
+/// строка не удаляется, у каждой растёт `attempts`, и следующий такт
+/// подхватит их снова. Мёртвые узлы (`deleted_at` выставлен между
+/// постановкой в очередь и этим тактом) в выборку `pending` не попадают
+/// вовсе — их строки остаются в очереди, но никогда не участвуют в лимите
+/// пачки, так что живую работу не блокируют.
+async fn drain_embedding_queue(
+    conn: &rusqlite::Connection,
+    model: &aurelius_core::embed_socket::SharedModel,
+    limit: usize,
+) -> Result<usize> {
+    let pending: Vec<QueuedNode> = {
+        let mut stmt = conn.prepare(
+            "SELECT q.node_id, n.rowid, n.node_type, n.label, n.note, n.created_at
+               FROM embedding_queue q
+               JOIN nodes n ON n.id = q.node_id
+              WHERE n.deleted_at IS NULL
+              ORDER BY q.queued_at
+              LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                Ok(QueuedNode {
+                    node_id: row.get(0)?,
+                    rowid: row.get(1)?,
+                    node_type: row.get(2)?,
+                    label: row.get(3)?,
+                    note: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let texts: Vec<String> = pending
+        .iter()
+        .map(|p| {
+            let project = p
+                .label
+                .strip_prefix('[')
+                .and_then(|rest| rest.split_once(']'))
+                .map_or("global", |(proj, _)| proj);
+            let node_type = p.node_type.trim_matches('"');
+            let body = p.note.as_deref().unwrap_or(&p.label);
+            aurelius_core::embed::format_for_embedding(
+                project,
+                node_type,
+                &p.label,
+                &p.created_at,
+                body,
+            )
+        })
+        .collect();
+
+    let blocking_model = Arc::clone(model);
+    let embedded = tokio::task::spawn_blocking(move || {
+        let mut guard = match blocking_model.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        aurelius_core::embed::embed_batch(&mut guard, texts)
+    })
+    .await;
+
+    let vectors = match embedded {
+        Ok(Ok(vectors)) => vectors,
+        Ok(Err(e)) => {
+            for p in &pending {
+                conn.execute(
+                    "UPDATE embedding_queue SET attempts = attempts + 1 WHERE node_id = ?1",
+                    rusqlite::params![p.node_id],
+                )?;
+            }
+            return Err(e);
+        }
+        Err(join_err) => {
+            for p in &pending {
+                conn.execute(
+                    "UPDATE embedding_queue SET attempts = attempts + 1 WHERE node_id = ?1",
+                    rusqlite::params![p.node_id],
+                )?;
+            }
+            return Err(anyhow::anyhow!("инференс эмбеддинга упал: {join_err}"));
+        }
+    };
+
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    for (p, vector) in pending.iter().zip(vectors) {
+        let bytes: &[u8] = bytemuck::cast_slice(&vector);
+        tx.execute(
+            "INSERT INTO node_embeddings(rowid, embedding) \
+             VALUES (?1, vec_quantize_int8(?2, 'unit'))",
+            rusqlite::params![p.rowid, bytes],
+        )?;
+        tx.execute(
+            "DELETE FROM embedding_queue WHERE node_id = ?1",
+            rusqlite::params![p.node_id],
+        )?;
+    }
+    let done = pending.len();
+    tx.commit()?;
+    Ok(done)
 }
 
 /// Координаты секретов (спека 007, US4, T040): `au secret add / list / rm`.
@@ -3455,19 +3831,20 @@ fn format_ripe_hook_block(ripe: &[RipeReport]) -> Option<String> {
         return None;
     }
     let mut out = format!("### Созревшие задачи ({})\n", ripe.len());
-    for r in ripe {
-        out.push_str(&format!(
-            "- {} [{}] — улика: {} → exit {} @ {}",
-            r.label,
-            r.id,
-            r.evidence.command,
-            r.evidence.exit_code,
-            r.evidence.at.to_rfc3339()
-        ));
-        if !r.files.is_empty() {
-            out.push_str(&format!("; изменено: {}", r.files.join(", ")));
+    for r in ripe.iter().take(3) {
+        let mut chars = r.label.chars();
+        let mut title: String = chars
+            .by_ref()
+            .take(120)
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if chars.next().is_some() {
+            title.push('…');
         }
-        out.push('\n');
+        out.push_str(&format!("- {title} — готова к закрытию\n"));
+    }
+    if ripe.len() > 3 {
+        out.push_str(&format!("Ещё задач: {}\n", ripe.len() - 3));
     }
     Some(out)
 }
@@ -3541,9 +3918,16 @@ pub async fn skills(hook: bool) -> Result<()> {
 /// регулярками значит зависеть от вёрстки, и смена вёрстки ломает потребителя
 /// молча.
 pub async fn snapshot(project: Option<String>, hook: bool, json_out: bool) -> Result<()> {
+    let derived = if hook {
+        hooks::hook_project(hooks::read_payload().as_ref())
+    } else {
+        project.or_else(current_dir_name)
+    };
+    if hook && derived.is_none() {
+        return Ok(());
+    }
     let run = || -> Result<String> {
         let conn = db::open(&db_path())?;
-        let derived = project.clone().or_else(current_dir_name);
         // Дистиллят освежаем раз в сутки прямо отсюда: консолидация — чистый
         // SQL, дешевле одного FTS-запроса, а слой 7 не протухает незаметно.
         if let Some(p) = derived.as_deref() {
@@ -3761,7 +4145,18 @@ pub async fn eval(
         Some(meta.fixture_sha256.clone())
     };
 
-    let report = eval::run(&conn, &meta, &case_list, moment)?;
+    // Гибридный поиск (спека 011) только под `--live`: замороженная фикстура
+    // таблицы векторов не несёт вовсе (снята 08.09.2026, до миграции v16), и
+    // загрузка bge-m3 ради неё ничего не меняет в ответе (`search::dense_search`
+    // деградирует к пустому списку молча), а несколько секунд загрузки платил
+    // бы каждый обычный прогон, включая тот, что держит эталонный digest.
+    let query_vectors = if live {
+        eval_query_vectors(&case_list)
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let report = eval::run(&conn, &meta, &case_list, moment, &query_vectors)?;
 
     let head = EvalHeader {
         cases: cases_path.display().to_string(),
@@ -3779,6 +4174,60 @@ pub async fn eval(
         eval_print_report(&head, &report);
     }
     Ok(())
+}
+
+/// Эмбеддинги тем `recall_top5`/`crosslingual_top5` кейсов для гибридного
+/// поиска (спека 011). Модель грузится один раз здесь и держится ровно на
+/// время этой функции — батч `au eval` судит десятки кейсов одним запуском,
+/// и единственная загрузка весов амортизируется на все них разом; короткоживущий
+/// интерактивный поиск (`au recall`) эту функцию не зовёт и весов не грузит
+/// вовсе (то же самое разделение труда, что и в MCP-обработчике `memory_recall`).
+///
+/// Ключ карты — сама тема, а не `id` кейса: несколько кейсов, разделяющих одну
+/// тему, эмбеддятся один раз.
+///
+/// Тема идёт в `embed_single` голой строкой, без `embed::format_for_embedding`
+/// (Contextual Prepending): у заметки на письме есть проект/тип/subject/дата,
+/// у темы поиска — только сам текст. Подставить заголовок с пустыми полями
+/// (`[Project:  | Type:  | ...]`) значило бы добавить запросу шум, которого
+/// нет в его смысле, и увести его ДАЛЬШЕ от эмбеддингов корпуса, а не ближе —
+/// bge-m3 асимметричен между документом и запросом именно в этом: контекст
+/// обогащает то, что ищут, а не то, чем ищут.
+///
+/// Отказ — не отказ всего прогона. Нет весов по `AURELIUS_MODELS_DIR`, не
+/// поднялся ONNX Runtime, конкретный запрос не эмбеддится — та же деградация
+/// к FTS-only, что и у самой таблицы `node_embeddings` (`search::dense_search`),
+/// просто на уровень выше: причина уходит в stderr, а не в stdout, потому что
+/// отчёт `au eval` сверяется побайтово между двумя прогонами (`eval_cli.rs`),
+/// и посторонняя строка в stdout сломала бы это сравнение.
+fn eval_query_vectors(cases: &[eval::EvalCase]) -> std::collections::HashMap<String, Vec<f32>> {
+    let mut out = std::collections::HashMap::new();
+    let mut model = match aurelius_core::embed::init_bge_m3() {
+        Ok(model) => model,
+        Err(e) => {
+            eprintln!("au eval --live: bge-m3 не поднялась, гибридный поиск отключён — {e}");
+            return out;
+        }
+    };
+    for case in cases {
+        let topic = match &case.body {
+            eval::CaseBody::RecallTop5 { input, .. }
+            | eval::CaseBody::CrosslingualTop5 { input, .. } => &input.topic,
+            _ => continue,
+        };
+        if topic.trim().is_empty() || out.contains_key(topic) {
+            continue;
+        }
+        match aurelius_core::embed::embed_single(&mut model, topic.clone()) {
+            Ok(vector) => {
+                out.insert(topic.clone(), vector);
+            }
+            Err(e) => {
+                eprintln!("au eval --live: запрос «{topic}» не эмбеддится — {e}");
+            }
+        }
+    }
+    out
 }
 
 /// Чем прогон себя называет: это данные вызова, а не измерения, поэтому они
@@ -4132,6 +4581,21 @@ pub async fn trace_cmd(
 pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
     use aurelius_core::{differ, ledger, obligations};
 
+    // Тот же приём, что и у `snapshot --hook`: проект берётся из хук-пейлоада
+    // (`hooks::hook_project`), а не из процессного cwd вслепую — иначе задача
+    // одного проекта созревала бы в предъявлении хука другого. Проект не
+    // разрешился (пейлоад без `cwd`, чужой или не-git каталог) — блок не
+    // печатается вовсе, а не откатывается на глобальный запрос по всем
+    // проектам разом: очередь без имени проекта не принадлежит никакому хуку.
+    let hook_project = if hook {
+        hooks::hook_project(hooks::read_payload().as_ref())
+    } else {
+        None
+    };
+    if hook && hook_project.is_none() {
+        return Ok(());
+    }
+
     let run = || -> Result<(differ::JudgeStats, Vec<RipeReport>)> {
         let conn = db::open(&db_path())?;
         // 4. Судья закрывает созревшие окна и реконсолидирует узлы.
@@ -4182,7 +4646,7 @@ pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
         // предъявляется без вопроса человека (FR-012); ручной вызов уже
         // отвечает своим текстом ниже.
         let ripe = if hook {
-            gather_ripe(&conn, None).unwrap_or_default()
+            gather_ripe(&conn, hook_project.as_deref()).unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -4261,7 +4725,60 @@ pub async fn db(action: DbAction) -> Result<()> {
                 db_backup_cli(&db_path(), out)
             }
         }
+        DbAction::Migrate => db_migrate_cli(&db_path()),
+        DbAction::ReindexEmbeddings => db_reindex_embeddings_cli(),
     }
+}
+
+/// `au db migrate` — применяет накопившиеся миграции схемы явно, а не
+/// попутно первой же команде, которая случайно откроет базу. `db::open` уже
+/// прогоняет всю цепочку миграций сам (см. его доккомментарий); эта команда
+/// только называет момент и печатает итоговую версию, чтобы применение
+/// миграции было видимым действием, а не побочным эффектом чего-то другого.
+fn db_migrate_cli(path: &std::path::Path) -> Result<()> {
+    db::open(path)?;
+    println!(
+        "✓ схема БД на версии {} ({})",
+        db::SCHEMA_VERSION,
+        path.display()
+    );
+    Ok(())
+}
+
+/// `au db reindex-embeddings` (спека 011, фаза D — переписана с фазы B: та
+/// версия сама грузила bge-m3 и считала вектора здесь же, второй копией
+/// весов рядом с демоном, который уже держит свою). Теперь это разметка
+/// работы, а не сама работа: находит живые узлы без вектора в
+/// `node_embeddings` и кладёт их `id` в `embedding_queue` — SQL и только
+/// SQL, ни одного вызова модели. Разбирает очередь один демон
+/// (`drain_embedding_queue`, `crates/au/src/commands.rs`), пачками, на
+/// каждом такте, уже загруженной моделью. `INSERT ... ON CONFLICT DO
+/// NOTHING`: узел, уже стоящий в очереди (например, только что поставленный
+/// туда записью), не должен потерять накопленный `attempts` через
+/// перезапись.
+fn db_reindex_embeddings_cli() -> Result<()> {
+    let path = db_path();
+    let conn = db::open(&path)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let queued = conn.execute(
+        "INSERT INTO embedding_queue (node_id, queued_at, attempts)
+           SELECT n.id, ?1, 0
+             FROM nodes n
+            WHERE n.deleted_at IS NULL
+              AND n.rowid NOT IN (SELECT rowid FROM node_embeddings)
+         ON CONFLICT (node_id) DO NOTHING",
+        rusqlite::params![now],
+    )?;
+
+    if queued == 0 {
+        println!(
+            "✓ переиндексировать нечего: у всех живых узлов уже есть вектор или они уже в очереди"
+        );
+    } else {
+        println!("✓ поставлено в очередь на эмбеддинг: {queued}");
+    }
+    Ok(())
 }
 
 pub async fn doc(action: DocAction) -> Result<()> {
@@ -4891,6 +5408,65 @@ async fn share_disable(project: &str) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Каталог без `embed.sock` — детерминированный «демон недоступен», не
+    /// зависящий от того, жив ли настоящий демон на машине, где идёт `cargo
+    /// test` (спека 011: сокет — файл в каталоге `AURELIUS_HOME`, у прогона
+    /// теста свой пустой каталог, и `request_vector` там не находит ничего).
+    fn no_socket_home(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("au-search-test-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("scratch dir for no-socket home");
+        dir
+    }
+
+    /// `search()` (человеческий вывод) и `search_json()` (машинный) зовут
+    /// один и тот же `run_search` с одними и теми же аргументами — тождество
+    /// набора id между двумя формами держится структурно, самим устройством
+    /// кода, а не совпадением. Измеренный до этой правки дефект: без общего
+    /// пути цель стояла на седьмой позиции человеческого вывода и отсутствовала
+    /// в машинном — один запрос отвечал двумя разными списками узлов.
+    ///
+    /// Заодно проверяет ограничение №2 (spec.md, спека 011): без сокета
+    /// деградация обязана быть явной (`vector_notice` заполнен), а не тихой —
+    /// и при этом полнотекстовая выдача (`nodes`) всё равно приходит.
+    #[tokio::test]
+    async fn search_and_search_json_share_one_path_and_agree_on_ids() {
+        let (_tmp, conn) = setup();
+        graph::add_node_full(
+            &conn,
+            NodeType::Concept,
+            "уникальная метка омега про гибридный поиск",
+            None,
+            "test",
+            json!({}),
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("node");
+
+        let home = no_socket_home("agree");
+        let run = run_search(&conn, &home, "омега", 20)
+            .await
+            .expect("run_search");
+        assert_eq!(run.nodes.len(), 1, "запись обязана найтись полным текстом");
+        assert!(
+            run.vector_notice.is_some(),
+            "без сокета деградация обязана быть явной, а не тихой"
+        );
+
+        let again = run_search(&conn, &home, "омега", 20)
+            .await
+            .expect("run_search again");
+        let ids: Vec<_> = run.nodes.iter().map(|n| n.id).collect();
+        let ids_again: Vec<_> = again.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(
+            ids, ids_again,
+            "человеческий и машинный выход обязаны видеть один и тот же набор id"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// Тот же приём, что и в тестах ядра (`aurelius-core::tasks`): настоящий
     /// temp-файл, не `:memory:` — `db::open` жёстко требует WAL.

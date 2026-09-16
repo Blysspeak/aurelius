@@ -31,6 +31,11 @@ pub enum NodeType {
     /// One anchor of external vendor documentation (spec 008); lives in
     /// `data.layer = "vendor-docs"` and stays out of snapshot layers 1-6.
     Doc,
+    /// Verification run recorded by `link_evidence_run` (spec 007). A real
+    /// variant, not `Custom("run")`: `rank::type_weight` matches node types by
+    /// name, and an unmatched type falls through to a neutral weight with no
+    /// compile error — see the comment on that match arm.
+    Run,
     Custom(String),
 }
 
@@ -59,6 +64,7 @@ impl NodeType {
         "user_fact",
         "digest",
         "doc",
+        "run",
     ];
 
     /// Строгий разбор: только известные имена. `None` оставляет решение
@@ -86,6 +92,7 @@ impl NodeType {
             "user_fact" => Self::UserFact,
             "digest" => Self::Digest,
             "doc" => Self::Doc,
+            "run" => Self::Run,
             _ => return None,
         })
     }

@@ -6,7 +6,7 @@ use aurelius_core::{
 };
 use serde_json::json;
 
-use super::{node_recall, open_db, resolve_node, sync_push_if_enabled};
+use super::{node_recall, open_db, query_vector_for_topic, resolve_node, sync_push_if_enabled};
 
 /// Строки массива параметра, пустой вектор при отсутствии или чужом типе.
 fn string_list(params: &serde_json::Value, key: &str) -> Vec<String> {
@@ -202,10 +202,29 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
     let depth = params.get("depth").and_then(|d| d.as_u64()).unwrap_or(2) as u32;
 
     let conn = open_db()?;
+    let now = chrono::Utc::now();
     // Обход, отсев, порядок и срезы — общий код ядра
-    // (`graph::recall_selection`). Он здесь не повторяется: `au eval` мерит
-    // боевой путь только пока путь один, а не копия в обработчике.
-    let selection = graph::recall_selection(&conn, topic, depth, chrono::Utc::now())?;
+    // (`graph::recall_selection`/`recall_selection_hybrid`). Он здесь не
+    // повторяется: `au eval` мерит боевой путь только пока путь один, а не
+    // копия в обработчике. Вопреки имени, `memory_recall` берёт ТЕМУ и ищет
+    // по ней — не точный ключ, как CLI-команда `au recall` (та осталась вне
+    // этой волны намеренно, см. отчёт агента), поэтому именно этот
+    // инструмент и получает векторную половину (спека 011).
+    let (vector, notice) = query_vector_for_topic(topic);
+    let (selection, vector_notice) = match vector {
+        Some(vector) => {
+            match graph::recall_selection_hybrid(&conn, topic, depth, now, Some(&vector)) {
+                Ok(s) => (s, None),
+                Err(e) => (
+                    graph::recall_selection(&conn, topic, depth, now)?,
+                    Some(format!(
+                        "гибридный обход не выполнился, отвечаю по полнотекстовому — {e}"
+                    )),
+                ),
+            }
+        }
+        None => (graph::recall_selection(&conn, topic, depth, now)?, notice),
+    };
 
     // Инкремент `access_count` — единственное, что осталось от сборки в
     // обработчике, и переезжать ему некуда: фикстура прогона открывается
@@ -239,6 +258,40 @@ pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
             "hidden_nodes": selection.hidden_nodes,
             "truncated_at_depth": selection.truncated_at_depth,
         },
+        // `None` — гибрид сработал, `Some` — причина отката к
+        // полнотекстовому обходу, отдельным полем (spec.md, ограничение №2).
+        "vector_notice": vector_notice,
+    }))
+}
+
+/// `memory_journal` — MCP door onto `au journal --session <s> --limit <n>`
+/// (`graph::nodes_by_agent_session`): every node written under one agent
+/// session (`data.agent_session`, the tag `memory_add`/`memory_session`
+/// stamp when a `session_id` is passed), oldest first. What an end-of-session
+/// hook replays to know what it itself wrote — not the project's whole
+/// traffic, and not `memory_recall`'s topic search: this is an exact key
+/// (the session id), addressed the same way `au journal --session` is.
+pub fn memory_journal(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let session_id = params
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing 'session_id' parameter"))?;
+    let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
+
+    let conn = open_db()?;
+    let nodes = graph::nodes_by_agent_session(&conn, session_id, limit)?;
+
+    Ok(json!({
+        "session_id": session_id,
+        "count": nodes.len(),
+        "entries": nodes.iter().map(|n| json!({
+            "id": n.id.to_string(),
+            "type": n.node_type,
+            "label": n.label,
+            "created_at": n.created_at.to_rfc3339(),
+        })).collect::<Vec<_>>(),
     }))
 }
 

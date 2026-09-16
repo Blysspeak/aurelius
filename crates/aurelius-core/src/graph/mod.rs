@@ -54,6 +54,19 @@ pub struct NoActiveTask {
 /// `project`: у сироты нет ребра `verified_by`, а значит нет и пути
 /// `run → task → belongs_to → project`, которым проект доставался раньше. Без
 /// поля такая улика не нашлась бы ни одной проектной выборкой.
+///
+/// Пишется через `upsert_node_by_key` (`crud.rs:128`), а не голым `add_node`:
+/// без ключа один и тот же прогон, повторённый N раз, заводил бы N узлов
+/// (измерено 16.09.2026: 4119 таких узлов из 25707, 2916 — дубликаты по
+/// метке). Ключ — обязательно с префиксом `run:`: `upsert_node_by_key` ищет
+/// совпадение только по значению `key` (`find_node_by_data_field`,
+/// `crud.rs:504`), без фильтра по типу или источнику — `expected_type:
+/// Some(NodeType::Run)` здесь ровно затем, чтобы совпадение по ключу с узлом
+/// чужого типа было отказом, а не тихой перезаписью чужой записи узлом
+/// прогона. Ключ без своего пространства имён мог бы случайно совпасть с
+/// чужим. `subject` — уже нормализованный хуком адрес прогона
+/// (`<project>:verify:<key>`); без него (вызов не от хука) в ключ идут
+/// проект и команда — обе формы всё равно живут под одним префиксом.
 pub fn link_evidence_run(
     conn: &rusqlite::Connection,
     task_id: Option<Uuid>,
@@ -64,26 +77,62 @@ pub fn link_evidence_run(
     artifact: Option<&str>,
 ) -> anyhow::Result<Uuid> {
     let label = format!("прогон: {command}");
-    let data = serde_json::json!({
-        "command": command,
-        "exit_code": exit_code,
-        "artifact": artifact,
-        "project": project,
-        "subject": subject,
-        // Провенанс прогона не спрашивается у вызывающего, а выводится: раз
-        // улика существует, прогон состоялся, командой служит он сам. Просить
-        // хук передать `--confidence measured` значило бы просить его ввести
-        // то, что уже известно отсюда.
-        "confidence": "measured",
-        "evidence": command,
-    });
-    let run = crud::add_node(
+    let key = match subject {
+        Some(subject) => format!("run:{subject}"),
+        None => format!("run:{}:{command}", project.unwrap_or("")),
+    };
+    let now = Utc::now();
+
+    // `upsert_node_by_key` заменяет `data` целиком — счётчик и первая метка
+    // времени читаются из старой записи ДО вызова и переносятся руками,
+    // иначе повтор сбрасывал бы счётчик на единицу и весь смысл схлопывания
+    // терялся.
+    let existing = crud::find_node_by_data_field(conn, "key", &key)?;
+    let run_count = existing
+        .as_ref()
+        .and_then(|n| n.data.get("run_count"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        + 1;
+    let first_seen_at = existing
+        .as_ref()
+        .and_then(|n| n.data.get("first_seen_at"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| now.to_rfc3339());
+
+    let mut data = serde_json::Map::new();
+    // Командой служит сама команда — улика, а не её адрес: `subject` лишь
+    // указывает, куда положить узел, и не подменяет собой то, что реально
+    // выполнялось.
+    data.insert("command".to_owned(), serde_json::json!(command));
+    data.insert("artifact".to_owned(), serde_json::json!(artifact));
+    data.insert("project".to_owned(), serde_json::json!(project));
+    data.insert("subject".to_owned(), serde_json::json!(subject));
+    // Провенанс прогона не спрашивается у вызывающего, а выводится: раз
+    // улика существует, прогон состоялся, командой служит он сам. Просить
+    // хук передать `--confidence measured` значило бы просить его ввести
+    // то, что уже известно отсюда.
+    data.insert("confidence".to_owned(), serde_json::json!("measured"));
+    data.insert("evidence".to_owned(), serde_json::json!(command));
+    data.insert("run_count".to_owned(), serde_json::json!(run_count));
+    data.insert("first_seen_at".to_owned(), serde_json::json!(first_seen_at));
+    data.insert(
+        "last_seen_at".to_owned(),
+        serde_json::json!(now.to_rfc3339()),
+    );
+    data.insert("last_exit_code".to_owned(), serde_json::json!(exit_code));
+
+    let (run, _created, _replaced) = crud::upsert_node_by_key(
         conn,
-        NodeType::Custom("run".to_owned()),
+        &key,
+        NodeType::Run,
+        Some(NodeType::Run),
         &label,
         None,
         "au-task-evidence",
         data,
+        MemoryKind::Semantic,
     )?;
     if let Some(task_id) = task_id {
         crud::add_edge(conn, task_id, run.id, Relation::VerifiedBy, 1.0)?;
