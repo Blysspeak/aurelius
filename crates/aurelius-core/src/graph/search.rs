@@ -131,8 +131,10 @@ pub fn search_ranked(conn: &Connection, query: &str, limit: usize) -> Result<Sea
 /// неё нет — порядок задаёт время, и убывающий номер позиции держит его
 /// без единой ничьей, чтобы [`tidy_for_emission`] ничего в ней не двигал.
 fn recent_scored(conn: &Connection, limit: usize) -> Result<(SearchOutcome, Vec<f64>)> {
-    let mut nodes = get_recent_nodes(conn, limit)?;
-    nodes.retain(|n| !crate::secret::is_secret_ref(n));
+    // Запас на отсев: прогоны пишутся каждым verify и иначе заняли бы ленту.
+    let mut nodes = get_recent_nodes(conn, limit * OVERFETCH)?;
+    nodes.retain(|n| !crate::secret::is_secret_ref(n) && !is_technical(n));
+    nodes.truncate(limit);
     let scores = (0..nodes.len()).map(|i| -(i as f64)).collect();
     Ok((
         SearchOutcome {
@@ -185,7 +187,7 @@ pub fn search_scored(
             Ok((node, raw_rank))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    fetched.retain(|(n, _)| !crate::secret::is_secret_ref(n));
+    fetched.retain(|(n, _)| !crate::secret::is_secret_ref(n) && !is_technical(n));
 
     // Посевы упорядочиваются нормированным bm25 и ничем иным (FR-008): ни
     // числа обращений (снято из `ORDER BY` — множитель `A` в `rank::score`
@@ -268,10 +270,50 @@ pub fn is_run(node: &Node) -> bool {
 }
 
 /// Запись без содержания: ни утверждения, ни тела — одна метка.
-fn is_bare(node: &Node) -> bool {
+pub(crate) fn is_bare(node: &Node) -> bool {
     let blank = |s: Option<&str>| s.is_none_or(|s| s.trim().is_empty());
     let claim = crate::provenance::Provenance::from_data(&node.data).claim;
     blank(claim.as_deref()) && blank(node.note.as_deref())
+}
+
+/// Бухгалтерия, а не знание: узел прогона и зависимость без содержания (ни
+/// `claim`, ни тела — то, что пишет индексатор: манифест в `data`, сама
+/// строка манифеста). В выдачу поиска и в векторы такие не идут — на
+/// 19.09.2026 по запросу «embed socket bge-m3» MCP отдавал два прогона и два
+/// `rust-embed` из двадцати строк. Зависимость с телом — записанное человеком
+/// знание («почему закреплена версия»), она остаётся.
+///
+/// Явный поиск по типу (`search_typed` с `run` или `dependency`) их находит:
+/// там это не шум, а сам вопрос.
+#[must_use]
+pub fn is_technical(node: &Node) -> bool {
+    is_run(node) || (matches!(node.node_type, NodeType::Dependency) && is_bare(node))
+}
+
+/// [`is_technical`] в SQL для узла под псевдонимом `n` — там, где узлы не
+/// читаются в память. Обе формы сверяет тест
+/// `technical_sql_agrees_with_is_technical`.
+pub const TECHNICAL_NODE_SQL: &str = "(n.node_type IN ('\"run\"', '{\"custom\":\"run\"}') \
+     OR (n.node_type = '\"dependency\"' \
+         AND TRIM(COALESCE(json_extract(n.data, '$.claim'), '')) = '' \
+         AND TRIM(COALESCE(n.note, '')) = ''))";
+
+/// Убрать из очереди векторов технические узлы ([`is_technical`]) — до
+/// того, как демон потратит на них модель. Очередь пополняют три двери
+/// (запись узла и оба `reindex-embeddings`, CLI и MCP), разбирает одна —
+/// поэтому отсев здесь, а не у каждой двери.
+///
+/// # Errors
+/// Ошибка запроса к `embedding_queue` или `nodes`.
+pub fn drop_technical_from_queue(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        &format!(
+            "DELETE FROM embedding_queue WHERE node_id IN (
+                SELECT n.id FROM embedding_queue q JOIN nodes n ON n.id = q.node_id
+                 WHERE {TECHNICAL_NODE_SQL})"
+        ),
+        [],
+    )?)
 }
 
 /// Вес совпадения по полям. Заголовок — то, что автор счёл сутью записи;
@@ -991,8 +1033,9 @@ pub fn dense_search(conn: &Connection, query_vector: &[f32], limit: usize) -> Re
         .collect::<Result<Vec<_>, _>>()?;
     // Находка 11 (FR-027) — тот же фильтр, что у обоих FTS-путей: координата
     // секрета не должна утечь через смысловое сходство точно так же, как не
-    // утекает через совпадение слов.
-    nodes.retain(|n| !crate::secret::is_secret_ref(n));
+    // утекает через совпадение слов. Технический узел — тоже: вектор у него
+    // мог появиться до того, как очередь перестала их принимать.
+    nodes.retain(|n| !crate::secret::is_secret_ref(n) && !is_technical(n));
     Ok(nodes)
 }
 
@@ -1254,6 +1297,93 @@ mod tests {
             vec![a.id, b.id, run_new.id],
             "на свободное место — один прогон, старший по скору"
         );
+
+        cleanup(&path, conn);
+    }
+
+    /// SQL-форма и Rust-форма «технического узла» обязаны совпадать: первая
+    /// решает, кому не считать вектор, вторая — кого не показывать.
+    #[test]
+    fn technical_sql_agrees_with_is_technical() {
+        let (path, conn) = temp_db();
+        let add = |t: NodeType, note: Option<&str>, data: serde_json::Value| {
+            super::super::add_node(&conn, t, "узел", note, "test", data).expect("add node")
+        };
+        let nodes = [
+            add(NodeType::Run, None, serde_json::json!({})),
+            add(NodeType::Custom("run".into()), None, serde_json::json!({})),
+            add(
+                NodeType::Dependency,
+                None,
+                serde_json::json!({"manifests": {}}),
+            ),
+            add(NodeType::Dependency, Some("  "), serde_json::json!({})),
+            add(
+                NodeType::Dependency,
+                None,
+                serde_json::json!({"claim": "закреплена"}),
+            ),
+            add(
+                NodeType::Dependency,
+                Some("почему 6.1"),
+                serde_json::json!({}),
+            ),
+            add(NodeType::Concept, None, serde_json::json!({})),
+        ];
+
+        let dropped = drop_technical_from_queue(&conn).expect("отсев очереди");
+
+        let queued: std::collections::HashSet<String> = conn
+            .prepare("SELECT node_id FROM embedding_queue")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        let expected: std::collections::HashSet<String> = nodes
+            .iter()
+            .filter(|n| !is_technical(n))
+            .map(|n| n.id.to_string())
+            .collect();
+        assert_eq!(queued, expected);
+        assert_eq!(dropped, 4);
+
+        cleanup(&path, conn);
+    }
+
+    /// Поиск и лента по `*` технических узлов не отдают; явный фильтр по
+    /// типу — отдаёт, там это сам вопрос.
+    #[test]
+    fn search_hides_technical_nodes_but_a_type_filter_finds_them() {
+        let (path, conn) = temp_db();
+        let add = |t: NodeType, label: &str, note: Option<&str>| {
+            super::super::add_node(&conn, t, label, note, "test", serde_json::json!({}))
+                .expect("add node")
+        };
+        let dep = add(NodeType::Dependency, "rust-embed", None);
+        add(NodeType::Run, "прогон: embed socket", None);
+        let concept = add(NodeType::Concept, "embed socket демона", Some("сокет"));
+
+        let found: Vec<_> = search(&conn, "embed", 10)
+            .expect("поиск")
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(found, vec![concept.id]);
+
+        let recent: Vec<_> = search(&conn, "*", 10)
+            .expect("лента")
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(recent, vec![concept.id]);
+
+        let typed: Vec<_> = search_typed(&conn, "embed", &NodeType::Dependency, 10)
+            .expect("поиск по типу")
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(typed, vec![dep.id]);
 
         cleanup(&path, conn);
     }

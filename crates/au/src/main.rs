@@ -502,6 +502,17 @@ pub enum DbAction {
     /// Queue live nodes missing a vector for the daemon to embed (Phase D,
     /// 011-dense-retrieval) — marks the work and exits, loads no model itself
     ReindexEmbeddings,
+    /// Show what three rules would remove (orphan run/dependency stubs,
+    /// non-newest digests, empty project stubs); nothing with a claim is ever
+    /// removed. Dry run unless --apply
+    Prune {
+        /// Remove the listed nodes (soft delete, one transaction)
+        #[arg(long)]
+        apply: bool,
+        /// Machine-readable plan: every candidate, not a sample
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

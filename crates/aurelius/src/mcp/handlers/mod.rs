@@ -33,6 +33,44 @@ pub(crate) fn open_db() -> anyhow::Result<Connection> {
     Ok(db::open(&db_path())?)
 }
 
+/// `memory_add` с привязкой в момент записи ([`graph::attach_on_write`]):
+/// без `project` проект выводится из префикса метки или git-репозитория
+/// каталога сервера (`graph::infer_project`). Эта дверь дала 382 из 444
+/// записей знания без единого ребра на 19.09.2026 — предупреждение
+/// `attachment_warning` вызывающие читали и шли дальше.
+///
+/// Обёртка, а не правка `crud::memory_add`: наряд 19.09.2026 не открывал
+/// `crud.rs` для правки. Перенести внутрь, когда тот файл будет в работе.
+/// Локальное определение перекрывает одноимённое из `pub use crud::*`.
+pub fn memory_add(params: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let mut out = crud::memory_add(params)?;
+    // Узел уже записан: сбой привязки не превращает успех в ошибку.
+    let Ok(conn) = open_db() else {
+        return Ok(out);
+    };
+    let Some(node) = out
+        .get("id")
+        .and_then(|id| id.as_str())
+        .and_then(|id| graph::get_node(&conn, id).ok().flatten())
+    else {
+        return Ok(out);
+    };
+    let project = params
+        .get("project")
+        .and_then(|p| p.as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            graph::infer_project(&conn, &node.label, std::env::current_dir().ok().as_deref())
+        });
+    let attached = graph::attach_on_write(&conn, &node, project.as_deref());
+    if attached.project.is_some() {
+        out["project"] = json!(attached.project);
+        out["attachment_warning"] = serde_json::Value::Null;
+    }
+    out["subject_peer"] = json!(attached.subject_peer.map(|id| id.to_string()));
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Stale-binary detection: installing a new `aurelius` binary over
 // `~/.local/bin/aurelius` does not touch an already-running MCP server

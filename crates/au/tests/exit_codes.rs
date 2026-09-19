@@ -634,8 +634,19 @@ fn section<'a>(snapshot: &'a str, title: &str) -> &'a str {
     }
 }
 
+/// Одно число из базы временного дома — после того, как `au` отработал.
+fn count(home: &TmpHome, sql: &str) -> i64 {
+    let conn = rusqlite::Connection::open(home.0.join("aurelius.db")).expect("открыть базу");
+    conn.query_row(sql, [], |r| r.get(0)).expect("посчитать")
+}
+
+const RUN_NODES: &str =
+    "SELECT COUNT(*) FROM nodes WHERE node_type = '\"run\"' AND deleted_at IS NULL";
+
 /// Законная ситуация не имеет права выглядеть кривым вызовом: у «нет активной
-/// задачи» свой код, а сама улика при этом СОХРАНЕНА узлом без ребра.
+/// задачи» свой код. Узла проекта нет — нет и узла прогона: сирота без
+/// единого ребра не находилась ни одной выборкой, а прогон уже лежит в
+/// журнале вызывающего.
 #[test]
 fn evidence_without_an_active_task_has_its_own_code() {
     let home = TmpHome::dir("evidence-noactive");
@@ -657,6 +668,58 @@ fn evidence_without_an_active_task_has_its_own_code() {
         code, NO_ACTIVE_TASK,
         "отсутствие активной задачи — состояние проекта, а не ошибка вызова"
     );
+    assert_eq!(
+        count(&home, RUN_NODES),
+        0,
+        "узел прогона без привязки не пишется"
+    );
+}
+
+/// Узел проекта есть, задачи нет — прогон цепляется к проекту ребром.
+#[test]
+fn evidence_without_a_task_hangs_on_an_existing_project() {
+    let home = TmpHome::dir("evidence-project");
+    let (code, _) = run(
+        &home,
+        &[
+            "note",
+            "--project",
+            "демо",
+            "--claim",
+            "узел проекта заведён",
+            "--confidence",
+            "reported",
+        ],
+        None,
+    );
+    assert_eq!(code, 0);
+    let (code, _) = run(
+        &home,
+        &[
+            "task",
+            "evidence",
+            "--project",
+            "демо",
+            "--command",
+            "cargo test",
+            "--exit",
+            "0",
+        ],
+        None,
+    );
+    assert_eq!(code, NO_ACTIVE_TASK);
+    assert_eq!(count(&home, RUN_NODES), 1);
+    assert_eq!(
+        count(
+            &home,
+            "SELECT COUNT(*) FROM edges e
+               JOIN nodes r ON r.id = e.from_id AND r.node_type = '\"run\"'
+               JOIN nodes p ON p.id = e.to_id AND p.node_type = '\"project\"' AND p.label = 'демо'
+              WHERE e.relation = 'belongs_to' AND e.deleted_at IS NULL"
+        ),
+        1,
+        "прогон без задачи обязан висеть на проекте"
+    );
 }
 
 /// Обратная сторона: настоящая ошибка вызова обязана остаться единицей, иначе
@@ -670,6 +733,115 @@ fn evidence_without_a_target_is_still_a_usage_error() {
         None,
     );
     assert_eq!(code, USAGE, "ни id, ни --project — это кривой вызов");
+}
+
+/// Запись без `--project` привязывается к проекту своего git-репозитория в
+/// момент записи — но только к уже существующему узлу проекта: без него
+/// запись всё равно успешна, а заглушка проекта не заводится.
+#[test]
+fn a_note_is_linked_to_its_repository_project_as_it_is_written() {
+    let home = TmpHome::dir("note-attach");
+    let repo = home.0.join("демо-репо");
+    std::fs::create_dir_all(&repo).expect("каталог репозитория");
+    let git = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .status()
+        .expect("git init");
+    assert!(git.success());
+    let note_in_repo = |claim: &str| {
+        let out = au(
+            &home,
+            &[
+                "note",
+                "--claim",
+                claim,
+                "--confidence",
+                "reported",
+                "--json",
+            ],
+        )
+        .current_dir(&repo)
+        .stdin(Stdio::null())
+        .output()
+        .expect("запустить au в репозитории");
+        (
+            out.status.code().expect("процесс завершился сам"),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let projects =
+        "SELECT COUNT(*) FROM nodes WHERE node_type = '\"project\"' AND deleted_at IS NULL";
+    let linked = "SELECT COUNT(*) FROM edges e JOIN nodes p ON p.id = e.to_id
+                   WHERE e.relation = 'belongs_to' AND e.deleted_at IS NULL AND p.label = 'демо-репо'";
+
+    let (code, _) = note_in_repo("до узла проекта");
+    assert_eq!(code, 0, "нет узла проекта — не повод отказать записи");
+    assert_eq!(count(&home, projects), 0, "выведенный проект не заводится");
+
+    let (code, _) = run(
+        &home,
+        &[
+            "note",
+            "--project",
+            "демо-репо",
+            "--claim",
+            "проект назван явно",
+            "--confidence",
+            "reported",
+        ],
+        None,
+    );
+    assert_eq!(code, 0);
+    let (code, out) = note_in_repo("после узла проекта");
+    assert_eq!(code, 0);
+    assert!(out.contains("\"project\":\"демо-репо\""), "{out}");
+    assert_eq!(
+        count(&home, linked),
+        2,
+        "явная и выведенная запись на проекте"
+    );
+}
+
+/// `au db prune` без `--apply` только показывает таблицу; с `--apply` снимает
+/// ровно её. Узел с `claim` не снимается ни тем, ни другим.
+#[test]
+fn prune_is_a_dry_run_until_apply() {
+    let home = TmpHome::dir("prune");
+    {
+        let conn = aurelius_core::db::open(&home.0.join("aurelius.db")).expect("открыть базу");
+        for (label, data) in [
+            ("прогон: сирота", serde_json::json!({})),
+            ("прогон: с выводом", serde_json::json!({"claim": "exit 0"})),
+        ] {
+            aurelius_core::graph::add_node(
+                &conn,
+                aurelius_core::models::NodeType::Run,
+                label,
+                None,
+                "test",
+                data,
+            )
+            .expect("засеять прогон");
+        }
+    }
+
+    let (code, out) = run(&home, &["db", "prune"], None);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("TechnicalOrphan · 1"), "{out}");
+    assert_eq!(
+        count(&home, RUN_NODES),
+        2,
+        "пробный прогон ничего не снимает"
+    );
+
+    let (code, out) = run(&home, &["db", "prune", "--apply"], None);
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        count(&home, RUN_NODES),
+        1,
+        "снята сирота, прогон с claim остался"
+    );
 }
 
 /// `--claim` несёт утверждение целиком; требовать вдобавок позиционный текст

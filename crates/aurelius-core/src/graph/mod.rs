@@ -38,22 +38,37 @@ use uuid::Uuid;
 /// что законная ситуация была неотличима от кривого вызова. Тот же принцип,
 /// по которому разведены [`LeaseError::NoTasksAvailable`] (10) и
 /// [`LeaseError::Busy`] (11).
+///
+/// `run: None` — узла прогона нет вовсе: не было и узла проекта, к которому
+/// его прицепить (см. [`link_evidence_run`]).
 #[derive(Debug, thiserror::Error)]
-#[error("в проекте '{project}' нет активной задачи — улика сохранена без привязки: {run}")]
+#[error("в проекте '{project}' нет активной задачи — {}", run_fate(.run))]
 pub struct NoActiveTask {
     pub project: String,
-    pub run: uuid::Uuid,
+    pub run: Option<uuid::Uuid>,
+}
+
+fn run_fate(run: &Option<uuid::Uuid>) -> String {
+    match run {
+        Some(run) => format!("улика привязана к проекту без задачи: {run}"),
+        None => "узла проекта нет, узел улики не заведён; прогон остался в журнале вызывающего"
+            .to_owned(),
+    }
 }
 
 /// Заводит узел прогона и связывает его с задачей ребром `verified_by`
 /// (спека 007, T013/T014, data-model.md «Ребро»). Улика внутри `data.evidence`
 /// задачи — для быстрого чтения без обхода графа; этот узел и ребро — для
 /// обратного пути: от прогона к задаче, которую он подтвердил.
-/// `task_id: None` — улика прогона, которой не к чему прицепиться: в проекте
-/// нет активной задачи. Узел всё равно пишется, и именно поэтому в него кладётся
-/// `project`: у сироты нет ребра `verified_by`, а значит нет и пути
-/// `run → task → belongs_to → project`, которым проект доставался раньше. Без
-/// поля такая улика не нашлась бы ни одной проектной выборкой.
+///
+/// `task_id: None` — в проекте нет активной задачи. Тогда узел цепляется
+/// ребром `belongs_to` к УЖЕ существующему узлу проекта, а если такого нет
+/// (или проект не назван) — не пишется вовсе, `Ok(None)`. Раньше он писался
+/// без единого ребра: 19.09.2026 таких сирот было 81 из 401, ни одна
+/// выборка через граф их не находила. Сам прогон при этом не теряется —
+/// команда, код возврата, артефакт и `subject` уже лежат в журнале
+/// вызывающего (ulika). Узел проекта здесь не заводится: пустая заглушка
+/// проекта — тот же мусор, только другого типа.
 ///
 /// Пишется через `upsert_node_by_key` (`crud.rs:128`), а не голым `add_node`:
 /// без ключа один и тот же прогон, повторённый N раз, заводил бы N узлов
@@ -75,7 +90,15 @@ pub fn link_evidence_run(
     command: &str,
     exit_code: i64,
     artifact: Option<&str>,
-) -> anyhow::Result<Uuid> {
+) -> anyhow::Result<Option<Uuid>> {
+    let project_node = match (task_id, project) {
+        (Some(_), _) => None,
+        (None, Some(project)) => match crud::find_project_by_label(conn, project)? {
+            Some(node) => Some(node.id),
+            None => return Ok(None),
+        },
+        (None, None) => return Ok(None),
+    };
     let label = format!("прогон: {command}");
     let key = match subject {
         Some(subject) => format!("run:{subject}"),
@@ -137,7 +160,10 @@ pub fn link_evidence_run(
     if let Some(task_id) = task_id {
         crud::add_edge(conn, task_id, run.id, Relation::VerifiedBy, 1.0)?;
     }
-    Ok(run.id)
+    if let Some(project_id) = project_node {
+        crud::add_edge(conn, run.id, project_id, Relation::BelongsTo, 1.0)?;
+    }
+    Ok(Some(run.id))
 }
 
 /// Заводит координату секрета — узел `Config` с признаком `kind: "secret_ref"`
@@ -183,6 +209,183 @@ pub fn list_secret_refs(
     let mut nodes = search::typed_in_project(conn, &NodeType::Config, project, 500)?;
     nodes.retain(crate::secret::is_secret_ref);
     Ok(nodes)
+}
+
+/// Правило `au db prune`. Других нет: всё, что несёт `claim`, не удаляется
+/// никогда, а знание без связей только считается ([`PrunePlan::unlinked_knowledge`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneRule {
+    /// Прогон или зависимость без рёбер, без `claim` и без тела.
+    TechnicalOrphan,
+    /// Дистиллят, не самый свежий для своего проекта.
+    StaleDigest,
+    /// Узел проекта без рёбер, без содержания и без единой записи, которая
+    /// называла бы его своим (префикс метки `[p]` или `data.project`).
+    EmptyProject,
+}
+
+impl PruneRule {
+    #[must_use]
+    pub fn why(self) -> &'static str {
+        match self {
+            Self::TechnicalOrphan => {
+                "прогон или зависимость без рёбер, claim и тела: ни одна выборка через граф \
+                 его не находит, прогон лежит в журнале ulika, зависимость — в манифесте"
+            }
+            Self::StaleDigest => {
+                "не самый свежий дистиллят проекта: близнец от гонки параллельных \
+                 `au snapshot --hook`, снапшот читает только один"
+            }
+            Self::EmptyProject => {
+                "узел проекта без рёбер, без содержания и без записей под его именем: \
+                 заглушка, которую никто не наполнил"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PruneCandidate {
+    pub rule: PruneRule,
+    pub id: Uuid,
+    pub node_type: String,
+    pub label: String,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PrunePlan {
+    pub candidates: Vec<PruneCandidate>,
+    /// Живых узлов всего — чтобы было видно, от чего доля.
+    pub live_nodes: usize,
+    /// Узлы с `claim` или телом и без единого ребра, по типу. Не в счёт:
+    /// дистилляты (их пишет машина) и то, что глобально по замыслу — проект,
+    /// факт о владельце, навык (та же тройка, которой `memory_add` не
+    /// предупреждает о непривязанности). Не удаляются: причина их сиротства —
+    /// писатель без привязки, а не лишняя запись.
+    pub unlinked_knowledge: std::collections::BTreeMap<String, usize>,
+}
+
+/// Имя типа так, как оно лежит в базе: `user_fact`, а не `userfact`.
+fn type_name(node_type: &NodeType) -> String {
+    match serde_json::to_value(node_type) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => format!("{node_type:?}").to_lowercase(),
+    }
+}
+
+/// Что снял бы `au db prune`, ничего не трогая. Один проход по живым узлам и
+/// концам живых рёбер: правила зависят от состояния графа целиком (кто
+/// свежее, кто кого называет своим), и запрос на узел здесь стоил бы сотни
+/// полных просмотров.
+///
+/// # Errors
+/// Ошибка чтения `nodes` или `edges`.
+pub fn prune_plan(conn: &rusqlite::Connection) -> anyhow::Result<PrunePlan> {
+    let mut linked = std::collections::HashSet::new();
+    let mut stmt = conn.prepare("SELECT from_id, to_id FROM edges WHERE deleted_at IS NULL")?;
+    for pair in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+        let (from, to) = pair?;
+        linked.insert(from);
+        linked.insert(to);
+    }
+    let nodes = crud::get_all_nodes(conn)?;
+    let has_claim = |n: &Node| {
+        crate::provenance::Provenance::from_data(&n.data)
+            .claim
+            .is_some_and(|c| !c.trim().is_empty())
+    };
+
+    let mut owners = std::collections::HashSet::new();
+    let mut newest_digest: std::collections::HashMap<String, &Node> =
+        std::collections::HashMap::new();
+    let digest_owner = |n: &Node| {
+        n.data
+            .get("project")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(|| n.label.clone(), str::to_owned)
+    };
+    for n in &nodes {
+        if let Some((p, _)) = n.label.strip_prefix('[').and_then(|r| r.split_once(']')) {
+            owners.insert(p.to_owned());
+        }
+        if let Some(p) = n.data.get("project").and_then(serde_json::Value::as_str) {
+            owners.insert(p.to_owned());
+        }
+        if matches!(n.node_type, NodeType::Digest) {
+            let slot = newest_digest.entry(digest_owner(n)).or_insert(n);
+            if (n.updated_at, n.created_at) > (slot.updated_at, slot.created_at) {
+                *slot = n;
+            }
+        }
+    }
+
+    let mut plan = PrunePlan {
+        live_nodes: nodes.len(),
+        ..PrunePlan::default()
+    };
+    for n in &nodes {
+        let edgeless = !linked.contains(&n.id.to_string());
+        let rule = match &n.node_type {
+            t if (search::is_run(n) || matches!(t, NodeType::Dependency))
+                && edgeless
+                && search::is_bare(n) =>
+            {
+                Some(PruneRule::TechnicalOrphan)
+            }
+            NodeType::Digest
+                if !has_claim(n)
+                    && newest_digest
+                        .get(&digest_owner(n))
+                        .is_some_and(|newest| newest.id != n.id) =>
+            {
+                Some(PruneRule::StaleDigest)
+            }
+            NodeType::Project if edgeless && search::is_bare(n) && !owners.contains(&n.label) => {
+                Some(PruneRule::EmptyProject)
+            }
+            _ => None,
+        };
+        match rule {
+            Some(rule) => plan.candidates.push(PruneCandidate {
+                rule,
+                id: n.id,
+                node_type: type_name(&n.node_type),
+                label: n.label.clone(),
+            }),
+            None if edgeless
+                && !search::is_bare(n)
+                && !matches!(
+                    n.node_type,
+                    NodeType::Digest | NodeType::Project | NodeType::UserFact | NodeType::Skill
+                ) =>
+            {
+                *plan
+                    .unlinked_knowledge
+                    .entry(type_name(&n.node_type))
+                    .or_default() += 1;
+            }
+            None => {}
+        }
+    }
+    plan.candidates.sort_by_key(|c| c.rule);
+    Ok(plan)
+}
+
+/// Снять всё, что нашёл [`prune_plan`], — мягко, как [`delete_node`]
+/// (`deleted_at`, отменяемо), одной транзакцией: план считается уже под
+/// замком записи, так что снимается ровно то, что посчитано.
+///
+/// # Errors
+/// Ошибка плана или удаления; тогда не снято ничего.
+pub fn prune_apply(conn: &rusqlite::Connection) -> anyhow::Result<PrunePlan> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let plan = prune_plan(&tx)?;
+    for candidate in &plan.candidates {
+        crud::delete_node(&tx, candidate.id)?;
+    }
+    tx.commit()?;
+    Ok(plan)
 }
 
 /// Степень каждого узла внутри уже найденного подграфа обхода: по скольким
