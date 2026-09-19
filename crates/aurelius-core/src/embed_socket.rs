@@ -130,24 +130,41 @@ async fn request_vector_inner(socket: &Path, query: &str) -> Result<Vec<f32>, St
 // ---------------------------------------------------------------------------
 
 /// How long the weights stay loaded with no embed call when
-/// `AURELIUS_EMBED_IDLE_SECS` is unset. FP32 bge-m3 on CUDA holds ~3.3 GiB
-/// of VRAM, while one query needs ~110 ms of it.
-pub const DEFAULT_IDLE_SECS: u64 = 300;
+/// `AURELIUS_EMBED_IDLE_SECS` is unset. Zero — never unload.
+///
+/// Решение владельца 19.09.2026: ответ памяти обязан укладываться в секунду, а
+/// холодная загрузка — это 1.4-1.6 с на CPU (и ~2 с на CUDA). Поэтому по
+/// умолчанию модель висит резидентно: замер 19.09 — RSS демона 1722 МБ, тёплый
+/// запрос 65-80 мс. Это системная память, а не видеопамять: карта остаётся
+/// свободной. Ленивое поведение целиком возвращается двумя переменными:
+/// `AURELIUS_EMBED_IDLE_SECS=<секунды>` и `AURELIUS_EMBED_PRELOAD=0`.
+pub const DEFAULT_IDLE_SECS: u64 = 0;
 
 /// `AURELIUS_EMBED_IDLE_SECS`: whole seconds, `0` = never unload (`None`).
 ///
 /// # Errors
 /// A value that is not a whole number of seconds.
 pub fn parse_idle_secs(raw: Option<&str>) -> Result<Option<Duration>, String> {
-    match raw.map(str::trim) {
-        None | Some("") => Ok(Some(Duration::from_secs(DEFAULT_IDLE_SECS))),
-        Some(v) => match v.parse::<u64>() {
-            Ok(0) => Ok(None),
-            Ok(secs) => Ok(Some(Duration::from_secs(secs))),
-            Err(_) => Err(format!(
-                "AURELIUS_EMBED_IDLE_SECS={v}: expected whole seconds, 0 disables unloading"
-            )),
-        },
+    let secs = match raw.map(str::trim) {
+        None | Some("") => DEFAULT_IDLE_SECS,
+        Some(v) => v.parse::<u64>().map_err(|_| {
+            format!("AURELIUS_EMBED_IDLE_SECS={v}: expected whole seconds, 0 disables unloading")
+        })?,
+    };
+    Ok(if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    })
+}
+
+/// `AURELIUS_EMBED_PRELOAD`: `0` возвращает ленивую загрузку — модель встаёт
+/// первым запросом, а не за стартом демона. Всё остальное (и отсутствие
+/// переменной) — предзагрузка.
+pub fn preload_from_env() -> bool {
+    match std::env::var("AURELIUS_EMBED_PRELOAD") {
+        Ok(v) => !matches!(v.trim(), "0" | "false" | "no"),
+        Err(_) => true,
     }
 }
 
@@ -228,6 +245,15 @@ impl<M> Lazy<M> {
             State::Failed(reason) => Err(anyhow::anyhow!("bge-m3 не поднялась — {reason}")),
             State::Unloaded => Err(anyhow::anyhow!("bge-m3 не загружена")),
         }
+    }
+
+    /// Загружает модель заранее, чтобы первый запрос не платил за холодный
+    /// старт: тот же путь, что у `with`, но без инференса. Ответ памяти обязан
+    /// укладываться в секунду, а холодная загрузка — это 1.4-1.6 с (решение
+    /// владельца 19.09.2026). Ошибка ничего не роняет: она оседает в
+    /// `State::Failed` ровно так же, как осела бы при ленивой загрузке.
+    pub fn preload(&self) -> anyhow::Result<()> {
+        self.with(|_| Ok(()))
     }
 
     /// Takes the model out when it has sat unused for the idle timeout, so
@@ -437,11 +463,12 @@ mod tests {
     }
 
     #[test]
-    fn idle_secs_default_zero_and_garbage() {
-        assert_eq!(
-            parse_idle_secs(None).unwrap(),
-            Some(Duration::from_secs(DEFAULT_IDLE_SECS))
-        );
+    fn idle_secs_default_is_never_unload_and_garbage_is_refused() {
+        // По умолчанию простоев нет: ответ памяти обязан укладываться в
+        // секунду, а холодная загрузка — это 1.4-1.6 с (решение владельца
+        // 19.09.2026). Ленивое поведение включается числом секунд явно.
+        assert_eq!(parse_idle_secs(None).unwrap(), None);
+        assert_eq!(parse_idle_secs(Some("")).unwrap(), None);
         assert_eq!(
             parse_idle_secs(Some("45")).unwrap(),
             Some(Duration::from_secs(45))
