@@ -643,7 +643,14 @@ enum Commands {
         verbose: bool,
     },
     /// Search the knowledge graph
-    Search { query: String },
+    Search {
+        query: String,
+        /// How many results to print. The default of 5 is where the
+        /// retrieval pipeline ends (decision of 2026-09-13); a larger value
+        /// is honoured as asked, never capped
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
+        limit: u32,
+    },
     /// Read one record back by exact key — a node UUID, or the exact
     /// `--subject` a fact was written with. Nothing here is fuzzy: `search`
     /// and `context` go through the full-text index, which does not cover the
@@ -1040,7 +1047,7 @@ async fn run(cli: Cli) -> Result<()> {
             depth,
             verbose,
         } => commands::context(&topic, depth, verbose).await,
-        Commands::Search { query } => commands::search(&query).await,
+        Commands::Search { query, limit } => commands::search(&query, limit as usize).await,
         Commands::Recall(args) => commands::recall(args).await,
         Commands::Sync => {
             commands::removed(

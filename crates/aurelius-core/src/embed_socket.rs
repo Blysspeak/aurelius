@@ -1,9 +1,10 @@
 //! Unix-socket protocol for handing out a query embedding without every
 //! process loading its own copy of bge-m3 (спека `011-dense-retrieval`,
 //! `data-model.md` §6). The daemon is the single owner of the weights: it
-//! loads them once at startup and serves this socket; `au search` and
-//! anything else that needs a query vector asks over the socket instead of
-//! loading the model itself.
+//! serves this socket from startup, loads the weights on the first embed
+//! request and drops them again after `AURELIUS_EMBED_IDLE_SECS` without
+//! one ([`Lazy`]); `au search` and anything else that needs a query vector
+//! asks over the socket instead of loading the model itself.
 //!
 //! Exchange is one request, one response, no long-lived connection: the
 //! client writes a JSON object, half-closes its write side, the server
@@ -12,8 +13,8 @@
 //! exactly one JSON value before the writer is done.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::{Duration, Instant};
 
 use fastembed::TextEmbedding;
 use serde::{Deserialize, Serialize};
@@ -74,8 +75,13 @@ pub async fn request_vector(
 ) -> Result<Vec<f32>, String> {
     match tokio::time::timeout(timeout, request_vector_inner(socket, query)).await {
         Ok(result) => result,
+        // The daemon loads the weights lazily and drops them after idle
+        // time (`Lazy`), so a cold load outlasting `timeout` is the usual
+        // reason here, not a dead daemon — the load goes on after the
+        // client gives up, and the next request finds the model up.
         Err(_) => Err(format!(
-            "нет ответа от embed-сокета {} за {timeout:?}",
+            "нет ответа от embed-сокета {} за {timeout:?} — вероятно, демон \
+             поднимает модель после простоя, следующий запрос её застанет",
             socket.display()
         )),
     }
@@ -117,17 +123,146 @@ async fn request_vector_inner(socket: &Path, query: &str) -> Result<Vec<f32>, St
 }
 
 // ---------------------------------------------------------------------------
-// Server side — run by `au daemon` once bge-m3 is loaded. Never called if
-// the model failed to load; the daemon's tick loop keeps running either
-// way (спека 011 §6, ограничение №1 — model loading is an addition to the
-// daemon's real job, never a precondition for it).
+// Server side — run by `au daemon` from startup, before any weights exist.
+// A failed load answers each request with `{"error": ...}` and the daemon's
+// tick loop keeps running either way (спека 011 §6, ограничение №1 — model
+// loading is an addition to the daemon's real job, never a precondition).
 // ---------------------------------------------------------------------------
 
-/// A handle to the daemon's single in-memory copy of bge-m3, shared between
-/// this socket's connection loop and `au daemon`'s embedding-queue drain
-/// step (`drain_embedding_queue`, `crates/au/src/commands.rs`) — both lock
-/// the same weights rather than either holding, let alone loading, its own.
-pub type SharedModel = Arc<Mutex<TextEmbedding>>;
+/// How long the weights stay loaded with no embed call when
+/// `AURELIUS_EMBED_IDLE_SECS` is unset. FP32 bge-m3 on CUDA holds ~3.3 GiB
+/// of VRAM, while one query needs ~110 ms of it.
+pub const DEFAULT_IDLE_SECS: u64 = 300;
+
+/// `AURELIUS_EMBED_IDLE_SECS`: whole seconds, `0` = never unload (`None`).
+///
+/// # Errors
+/// A value that is not a whole number of seconds.
+pub fn parse_idle_secs(raw: Option<&str>) -> Result<Option<Duration>, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(Some(Duration::from_secs(DEFAULT_IDLE_SECS))),
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) => Ok(None),
+            Ok(secs) => Ok(Some(Duration::from_secs(secs))),
+            Err(_) => Err(format!(
+                "AURELIUS_EMBED_IDLE_SECS={v}: expected whole seconds, 0 disables unloading"
+            )),
+        },
+    }
+}
+
+/// The daemon's idle timeout. A bad value keeps the default and says so
+/// once, instead of failing the daemon: the model is an addition to its
+/// real job, never a precondition for it.
+pub fn idle_from_env() -> Option<Duration> {
+    let raw = std::env::var("AURELIUS_EMBED_IDLE_SECS").ok();
+    parse_idle_secs(raw.as_deref()).unwrap_or_else(|reason| {
+        eprintln!("embed: {reason}; using {DEFAULT_IDLE_SECS}s");
+        Some(Duration::from_secs(DEFAULT_IDLE_SECS))
+    })
+}
+
+enum State<M> {
+    Unloaded,
+    Loaded {
+        model: M,
+        last_used: Instant,
+    },
+    /// Sticky until the daemon restarts, as a startup failure was before
+    /// lazy loading: retrying would re-pay the attempt on every queue tick.
+    Failed(String),
+}
+
+/// One lazily loaded model behind one lock: the load happens under the same
+/// mutex as inference, so concurrent first requests wait for a single copy
+/// of the weights instead of each loading its own.
+pub struct Lazy<M> {
+    state: Mutex<State<M>>,
+    load: Box<dyn Fn() -> anyhow::Result<M> + Send + Sync>,
+    idle: Option<Duration>,
+}
+
+impl<M> Lazy<M> {
+    /// Loads nothing yet. `idle: None` never unloads.
+    pub fn new(
+        load: Box<dyn Fn() -> anyhow::Result<M> + Send + Sync>,
+        idle: Option<Duration>,
+    ) -> Self {
+        Self {
+            state: Mutex::new(State::Unloaded),
+            load,
+            idle,
+        }
+    }
+
+    /// Runs `f` on the model, loading it first if needed. Blocks for the
+    /// whole load and inference, so callers run it on `spawn_blocking`.
+    ///
+    /// # Errors
+    /// The load failed (now or earlier), or `f` itself failed.
+    pub fn with<R>(&self, f: impl FnOnce(&mut M) -> anyhow::Result<R>) -> anyhow::Result<R> {
+        // A poisoned lock (a previous call panicked mid inference) still
+        // holds a usable model; no runtime path here may panic itself.
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if matches!(*state, State::Unloaded) {
+            *state = match (self.load)() {
+                Ok(model) => State::Loaded {
+                    model,
+                    last_used: Instant::now(),
+                },
+                Err(e) => {
+                    eprintln!("embed: load failed, vector search off until restart — {e}");
+                    State::Failed(e.to_string())
+                }
+            };
+        }
+        match &mut *state {
+            State::Loaded { model, last_used } => {
+                let out = f(model);
+                *last_used = Instant::now();
+                out
+            }
+            State::Failed(reason) => Err(anyhow::anyhow!("bge-m3 не поднялась — {reason}")),
+            State::Unloaded => Err(anyhow::anyhow!("bge-m3 не загружена")),
+        }
+    }
+
+    /// Takes the model out when it has sat unused for the idle timeout, so
+    /// the caller can drop it off the lock. Never waits: a held lock means a
+    /// request is running, which is not idle.
+    pub fn take_idle(&self) -> Option<(M, Duration)> {
+        let idle = self.idle?;
+        let mut state = match self.state.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        match std::mem::replace(&mut *state, State::Unloaded) {
+            State::Loaded { model, last_used } if last_used.elapsed() >= idle => {
+                Some((model, last_used.elapsed()))
+            }
+            other => {
+                *state = other;
+                None
+            }
+        }
+    }
+}
+
+/// The daemon's single lazily loaded bge-m3, shared between this socket's
+/// connection loop and `au daemon`'s embedding-queue drain step
+/// (`drain_embedding_queue`, `crates/au/src/commands.rs`) — both go through
+/// the same holder rather than either holding, let alone loading, its own.
+pub type SharedModel = Arc<Lazy<TextEmbedding>>;
+
+/// The production holder: bge-m3 via `embed::init_bge_m3`, unloaded after
+/// `idle` without a call.
+pub fn shared_bge_m3(idle: Option<Duration>) -> SharedModel {
+    Arc::new(Lazy::new(Box::new(crate::embed::init_bge_m3), idle))
+}
 
 /// Accepts connections on `listener` forever, each handled with the shared
 /// `model`. Runs until the daemon's caller aborts the task (on `SIGTERM`) —
@@ -181,17 +316,11 @@ async fn handle_connection(mut stream: UnixStream, model: &SharedModel) -> anyho
 }
 
 /// Runs on a blocking-pool thread (`spawn_blocking`): `TextEmbedding::embed`
-/// is synchronous CPU/GPU work, not something to hold the async executor's
-/// thread hostage for. A poisoned mutex (a previous request panicked mid
-/// inference) still holds a perfectly usable model — recovered with
-/// `into_inner` rather than propagated, since there is no cleanup a caller
-/// could meaningfully do about it and no runtime path here may panic itself.
+/// — and on the first request after startup or an idle unload, the load
+/// itself — is synchronous CPU/GPU work, not something to hold the async
+/// executor's thread hostage for.
 fn embed_locked(model: &SharedModel, text: String) -> anyhow::Result<Vec<f32>> {
-    let mut guard = match model.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    crate::embed::embed_single(&mut guard, text)
+    model.with(|m| crate::embed::embed_single(m, text))
 }
 
 #[cfg(test)]
@@ -229,6 +358,96 @@ mod tests {
             Response::Error { error } => assert_eq!(error, "boom"),
             Response::Vector { .. } => panic!("expected Error"),
         }
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A stand-in model: the value is the load ordinal, `loads` counts calls.
+    fn counting(loads: &Arc<AtomicUsize>, idle: Option<Duration>) -> Lazy<usize> {
+        let loads = Arc::clone(loads);
+        Lazy::new(
+            Box::new(move || Ok(loads.fetch_add(1, Ordering::SeqCst) + 1)),
+            idle,
+        )
+    }
+
+    #[test]
+    fn nothing_loads_until_the_first_call_and_then_only_once() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let lazy = counting(&loads, None);
+        assert_eq!(loads.load(Ordering::SeqCst), 0);
+        assert_eq!(lazy.with(|m| Ok(*m)).unwrap(), 1);
+        assert_eq!(lazy.with(|m| Ok(*m)).unwrap(), 1);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn idle_model_is_taken_out_and_reloaded_on_the_next_call() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let lazy = counting(&loads, Some(Duration::from_millis(1)));
+        lazy.with(|_| Ok(())).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        let (model, quiet) = lazy.take_idle().expect("idle model is taken");
+        assert_eq!(model, 1);
+        assert!(quiet >= Duration::from_millis(1));
+        assert!(lazy.take_idle().is_none(), "nothing left to take");
+        assert_eq!(lazy.with(|m| Ok(*m)).unwrap(), 2);
+    }
+
+    #[test]
+    fn fresh_busy_or_never_unloading_model_is_not_taken() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let fresh = counting(&loads, Some(Duration::from_secs(3600)));
+        fresh.with(|_| Ok(())).unwrap();
+        assert!(fresh.take_idle().is_none());
+
+        let never = counting(&loads, None);
+        never.with(|_| Ok(())).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(never.take_idle().is_none());
+
+        // Mid-call the lock is held: `take_idle` returns at once instead of
+        // waiting, and the running call keeps its model.
+        let busy = counting(&loads, Some(Duration::from_millis(1)));
+        busy.with(|_| Ok(())).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        busy.with(|_| {
+            assert!(busy.take_idle().is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn failed_load_is_reported_and_not_retried() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let lazy: Lazy<usize> = Lazy::new(
+            Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("no weights"))
+            }),
+            Some(Duration::from_millis(1)),
+        );
+        let first = lazy.with(|m| Ok(*m)).unwrap_err().to_string();
+        assert!(first.contains("no weights"), "{first}");
+        assert!(lazy.with(|m| Ok(*m)).is_err());
+        assert!(lazy.take_idle().is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn idle_secs_default_zero_and_garbage() {
+        assert_eq!(
+            parse_idle_secs(None).unwrap(),
+            Some(Duration::from_secs(DEFAULT_IDLE_SECS))
+        );
+        assert_eq!(
+            parse_idle_secs(Some("45")).unwrap(),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(parse_idle_secs(Some("0")).unwrap(), None);
+        assert!(parse_idle_secs(Some("5m")).is_err());
     }
 
     #[tokio::test]

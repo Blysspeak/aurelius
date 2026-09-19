@@ -124,26 +124,46 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>>
 /// назначение или место хранения. Явный `secret_list` идёт другим путём
 /// (`typed_in_project` внутри `list_secret_refs`) и фильтр не задевает.
 pub fn search_ranked(conn: &Connection, query: &str, limit: usize) -> Result<SearchOutcome> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() || trimmed == "*" {
-        let mut nodes = get_recent_nodes(conn, limit)?;
-        nodes.retain(|n| !crate::secret::is_secret_ref(n));
-        return Ok(SearchOutcome {
+    Ok(search_scored(conn, query, limit)?.0)
+}
+
+/// Лента последних узлов вместо поиска (пустой запрос или `*`). Скоров у
+/// неё нет — порядок задаёт время, и убывающий номер позиции держит его
+/// без единой ничьей, чтобы [`tidy_for_emission`] ничего в ней не двигал.
+fn recent_scored(conn: &Connection, limit: usize) -> Result<(SearchOutcome, Vec<f64>)> {
+    let mut nodes = get_recent_nodes(conn, limit)?;
+    nodes.retain(|n| !crate::secret::is_secret_ref(n));
+    let scores = (0..nodes.len()).map(|i| -(i as f64)).collect();
+    Ok((
+        SearchOutcome {
             nodes,
             terms: Vec::new(),
             unmatched_terms: Vec::new(),
-        });
+        },
+        scores,
+    ))
+}
+
+/// [`search_ranked`] вместе с нормированным bm25 каждого узла (параллельно
+/// `nodes`) — для выдачи, которой нужны ничьи ([`tidy_for_emission`]).
+/// Скоры идут вторым значением, а не полем `SearchOutcome`: ту литералом
+/// собирает MCP-крейт (`handlers/crud.rs`), и новое поле сломало бы его.
+///
+/// # Errors
+/// Ошибка запроса к FTS-таблице или к `nodes`.
+pub fn search_scored(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<(SearchOutcome, Vec<f64>)> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return recent_scored(conn, limit);
     }
     // Строка от человека — текст, а не выражение FTS5 (см. crate::fts).
     let parsed = crate::fts::parse(trimmed);
     if parsed.expr.is_empty() {
-        let mut nodes = get_recent_nodes(conn, limit)?;
-        nodes.retain(|n| !crate::secret::is_secret_ref(n));
-        return Ok(SearchOutcome {
-            nodes,
-            terms: Vec::new(),
-            unmatched_terms: Vec::new(),
-        });
+        return recent_scored(conn, limit);
     }
     // T015: `rank` (bm25) выходит наружу вместе с узлом — раньше он жил
     // только внутри SQL (в `ORDER BY`), в SELECT-лист не входил и наружу не
@@ -179,14 +199,58 @@ pub fn search_ranked(conn: &Connection, query: &str, limit: usize) -> Result<Sea
         .map(|((node, _), r)| (node, r))
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let mut nodes: Vec<Node> = scored.into_iter().map(|(node, _)| node).collect();
-    nodes.truncate(limit);
+    scored.truncate(limit);
+    let (nodes, scores): (Vec<Node>, Vec<f64>) = scored.into_iter().unzip();
 
-    Ok(SearchOutcome {
-        nodes,
-        unmatched_terms: unmatched_terms(conn, &parsed.terms)?,
-        terms: parsed.terms,
-    })
+    Ok((
+        SearchOutcome {
+            nodes,
+            unmatched_terms: unmatched_terms(conn, &parsed.terms)?,
+            terms: parsed.terms,
+        },
+        scores,
+    ))
+}
+
+/// Гигиена выдачи поверх уже посчитанного порядка: скоры не трогает, а
+/// значит, не меняет и того, что считается релевантным — только сколько
+/// строк уходит наружу и в каком порядке при ничьей.
+///
+/// - Выкидывает строку, которую читатель увидел бы дважды: тот же тип, та
+///   же метка И то же тело (`note`); остаётся первая, то есть старшая по
+///   скору. Тело входит в ключ нарочно: одна метка при разных телах — это
+///   разное знание (в живом графе 19.09.2026 таких групп 281 из 550 групп с
+///   общей меткой, например 15 `work_log` с одной меткой и 15 разными
+///   телами), и склейка по одной метке выбросила бы его.
+/// - При равном скоре пустые записи (ни `claim`, ни тела — например, узел
+///   зависимости `rust-embed` от индексатора) идут после содержательных.
+/// - Оставляет первые `limit`.
+///
+/// `scored` — узлы со скором, по убыванию скора.
+#[must_use]
+pub fn tidy_for_emission(scored: Vec<(Node, f64)>, limit: usize) -> Vec<Node> {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<(Node, f64)> = scored
+        .into_iter()
+        .filter(|(n, _)| {
+            let node_type = serde_json::to_string(&n.node_type).unwrap_or_default();
+            seen.insert((node_type, n.label.clone(), n.note.clone()))
+        })
+        .collect();
+    // Устойчивая сортировка: вне ничьих порядок входа не меняется.
+    kept.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| is_bare(&a.0).cmp(&is_bare(&b.0)))
+    });
+    kept.truncate(limit);
+    kept.into_iter().map(|(n, _)| n).collect()
+}
+
+/// Запись без содержания: ни утверждения, ни тела — одна метка.
+fn is_bare(node: &Node) -> bool {
+    let blank = |s: Option<&str>| s.is_none_or(|s| s.trim().is_empty());
+    let claim = crate::provenance::Provenance::from_data(&node.data).claim;
+    blank(claim.as_deref()) && blank(node.note.as_deref())
 }
 
 /// Вес совпадения по полям. Заголовок — то, что автор счёл сутью записи;
@@ -918,8 +982,24 @@ pub fn hybrid_seeds(
     query_vector: &[f32],
     limit: usize,
 ) -> Result<(Vec<Node>, std::collections::HashMap<uuid::Uuid, f64>)> {
-    let fts_nodes = search_ranked(conn, query, FUSION_POOL)?.nodes;
-    let dense_nodes = dense_search(conn, query_vector, FUSION_POOL)?;
+    hybrid_seeds_pooled(conn, query, query_vector, limit, FUSION_POOL)
+}
+
+/// [`hybrid_seeds`] с пулом каждой стороны `pool` вместо [`FUSION_POOL`] —
+/// для выдачи, которую попросили длиннее, чем влезает в слияние двух
+/// top-50 (`au search --limit`): иначе она молча обрезалась бы на сотне.
+///
+/// # Errors
+/// Ошибка `search_ranked` или `dense_search`.
+pub fn hybrid_seeds_pooled(
+    conn: &Connection,
+    query: &str,
+    query_vector: &[f32],
+    limit: usize,
+    pool: usize,
+) -> Result<(Vec<Node>, std::collections::HashMap<uuid::Uuid, f64>)> {
+    let fts_nodes = search_ranked(conn, query, pool)?.nodes;
+    let dense_nodes = dense_search(conn, query_vector, pool)?;
 
     let mut by_id: std::collections::HashMap<uuid::Uuid, Node> = std::collections::HashMap::new();
     let mut fts_rank: std::collections::HashMap<uuid::Uuid, usize> =
@@ -1013,6 +1093,53 @@ mod tests {
             p.push(suffix);
             let _ = std::fs::remove_file(std::path::PathBuf::from(p));
         }
+    }
+
+    /// Гигиена выдачи: строка, которую читатель увидел бы дважды, уходит
+    /// один раз; одна метка при разных телах — разные записи; пустая запись
+    /// уступает содержательной только при ничьей, а не при более высоком
+    /// скоре; `limit` режет уже после склейки.
+    #[test]
+    fn tidy_drops_repeated_rows_and_puts_bare_ones_last_only_at_a_tie() {
+        let (path, conn) = temp_db();
+        let add = |label: &str, note: Option<&str>, data: serde_json::Value| {
+            super::super::add_node(&conn, NodeType::Dependency, label, note, "test", data)
+                .expect("add node")
+        };
+        let bare = add("rust-embed", None, serde_json::json!({}));
+        let bare_twin = add("rust-embed", None, serde_json::json!({}));
+        let with_note = add("fastembed", Some("bge-m3 runtime"), serde_json::json!({}));
+        let other_note = add("fastembed", Some("pinned to 6.1"), serde_json::json!({}));
+        let with_claim = add("ort", None, serde_json::json!({"claim": "load-dynamic"}));
+        let bare_high = add("hf-hub", None, serde_json::json!({}));
+
+        let scored = vec![
+            (bare_high.clone(), 1.0),
+            (bare.clone(), 0.9),
+            (bare_twin, 0.9),
+            (with_note.clone(), 0.9),
+            (with_claim.clone(), 0.9),
+            (other_note.clone(), 0.5),
+        ];
+        let ids: Vec<_> = tidy_for_emission(scored.clone(), 10)
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                bare_high.id,
+                with_note.id,
+                with_claim.id,
+                bare.id,
+                other_note.id
+            ]
+        );
+
+        let top: Vec<_> = tidy_for_emission(scored, 3).iter().map(|n| n.id).collect();
+        assert_eq!(top, vec![bare_high.id, with_note.id, with_claim.id]);
+
+        cleanup(&path, conn);
     }
 
     /// Дефис в FTS5 — оператор `NOT`, и запрос `skills-store` отвечал «no such
