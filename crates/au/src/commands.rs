@@ -7,7 +7,7 @@ use aurelius_core::{
 };
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::{
     hooks, DbAction, DocAction, GraphAction, HomeAction, IdentityAction, RemindAction,
@@ -814,38 +814,60 @@ struct SearchRun {
 /// эта функция тестируется на временном каталоге без сокета, не трогая
 /// боевой `$AURELIUS_HOME/embed.sock` (который на машине разработчика вполне
 /// может быть жив прямо во время `cargo test`).
+///
+/// Выдача проходит `graph::tidy_for_emission` (повторы строк, пустые записи
+/// при ничьей), поэтому кандидатов берётся больше `limit`, и пул растёт,
+/// пока не наберётся `limit` различных строк или пока он не кончится:
+/// склейка повторов не имеет права молча вернуть меньше, чем просили.
 async fn run_search(
     conn: &rusqlite::Connection,
     home: &std::path::Path,
     query: &str,
     limit: usize,
 ) -> Result<SearchRun> {
-    let outcome = graph::search_ranked(conn, query, limit)?;
-    let diagnosis = outcome.diagnosis();
-    let terms = outcome.terms.clone();
-    let unmatched_terms = outcome.unmatched_terms.clone();
-
     let (vector, notice) = graph::query_vector_for_search(home, query).await;
-    let (nodes, vector_notice) = match vector {
-        Some(vector) => match graph::hybrid_seeds(conn, query, &vector, limit) {
-            Ok((nodes, _scores)) => (nodes, None),
-            Err(e) => (
-                outcome.nodes,
-                Some(format!(
-                    "гибридный поиск не выполнился, отвечаю по полнотекстовому — {e}"
-                )),
-            ),
-        },
-        None => (outcome.nodes, notice),
-    };
-
-    Ok(SearchRun {
-        nodes,
-        vector_notice,
-        diagnosis,
-        terms,
-        unmatched_terms,
-    })
+    let mut want = limit.saturating_mul(2);
+    loop {
+        let (outcome, fts_scores) = graph::search_scored(conn, query, want)?;
+        let diagnosis = outcome.diagnosis();
+        let fts: Vec<_> = outcome.nodes.into_iter().zip(fts_scores).collect();
+        let (candidates, vector_notice) = match &vector {
+            Some(vector) => {
+                let pool = want.max(graph::FUSION_POOL);
+                match graph::hybrid_seeds_pooled(conn, query, vector, want, pool) {
+                    Ok((nodes, scores)) => (
+                        nodes
+                            .into_iter()
+                            .map(|n| {
+                                let score = scores.get(&n.id).copied().unwrap_or(0.0);
+                                (n, score)
+                            })
+                            .collect(),
+                        None,
+                    ),
+                    Err(e) => (
+                        fts,
+                        Some(format!(
+                            "гибридный поиск не выполнился, отвечаю по полнотекстовому — {e}"
+                        )),
+                    ),
+                }
+            }
+            None => (fts, notice.clone()),
+        };
+        let exhausted = candidates.len() < want;
+        let nodes = graph::tidy_for_emission(candidates, limit);
+        if nodes.len() >= limit || exhausted {
+            return Ok(SearchRun {
+                nodes,
+                vector_notice,
+                diagnosis,
+                terms: outcome.terms,
+                unmatched_terms: outcome.unmatched_terms,
+            });
+        }
+        want = want.saturating_mul(2);
+    }
 }
 
 /// `db_path()`'s каталог — там же лежит `embed.sock` (тот же принцип, что и
@@ -857,9 +879,9 @@ fn embed_socket_home() -> PathBuf {
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
 }
 
-pub async fn search(query: &str) -> Result<()> {
+pub async fn search(query: &str, limit: usize) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
-    let run = run_search(&conn, &embed_socket_home(), query, 20).await?;
+    let run = run_search(&conn, &embed_socket_home(), query, limit).await?;
     let blind = run
         .diagnosis
         .as_deref()
@@ -906,9 +928,9 @@ pub async fn search(query: &str) -> Result<()> {
 /// ничто в бинарнике эту функцию не зовёт, а `-D warnings` иначе отказывает
 /// сборке из-за живого, проверенного, но пока не подключённого снаружи кода.
 #[allow(dead_code)]
-pub async fn search_json(query: &str) -> Result<()> {
+pub async fn search_json(query: &str, limit: usize) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
-    let run = run_search(&conn, &embed_socket_home(), query, 20).await?;
+    let run = run_search(&conn, &embed_socket_home(), query, limit).await?;
     let out = json!({
         "query": query,
         "count": run.nodes.len(),
@@ -3234,10 +3256,10 @@ pub async fn daemon(interval_secs: u64, grace_spec: &str, once: bool, as_json: b
     // Модель — надстройка над тактом, не его условие: `once` выше уже
     // вышел бы без неё, а здесь, в долгоживущем режиме, её отсутствие
     // так же не мешает первому же такту ниже. Тот же `SharedModel`
-    // (`Arc<Mutex<TextEmbedding>>`), который слушает сокет, отдаётся и
+    // (ленивый `embed_socket::Lazy`), который слушает сокет, отдаётся и
     // сюда — на разбор `embedding_queue` в цикле ниже, чтобы у демона была
-    // ровно одна загруженная копия весов на оба потребителя, а не по одной
-    // на каждый.
+    // не больше одной загруженной копии весов на оба потребителя, а не по
+    // одной на каждый.
     let home = db.parent().unwrap_or_else(|| std::path::Path::new("."));
     let embed = start_embed_socket(home);
 
@@ -3260,6 +3282,14 @@ pub async fn daemon(interval_secs: u64, grace_spec: &str, once: bool, as_json: b
             if let Err(e) = drain_embedding_queue(&conn, model, EMBED_DRAIN_BATCH).await {
                 hooks::debug("daemon", &format!("очередь эмбеддинга: {e}"));
             }
+            // Простой — после разбора очереди: пачка этого же такта только
+            // что обновила время последнего вызова. `take_idle` не ждёт
+            // замка, а сам drop (освобождение арены ONNX и видеопамяти)
+            // уходит в пул блокирующих задач, вне замка — сокет его не ждёт.
+            if let Some((idle_model, quiet)) = model.take_idle() {
+                let _ = tokio::task::spawn_blocking(move || drop(idle_model)).await;
+                eprintln!("embed: unloaded after {}s idle", quiet.as_secs());
+            }
         }
         tokio::select! {
             () = tokio::time::sleep(interval) => {}
@@ -3278,10 +3308,14 @@ pub async fn daemon(interval_secs: u64, grace_spec: &str, once: bool, as_json: b
 
 /// Поднимает embed-сокет (спека 011, `data-model.md` §6) поверх уже
 /// работающего демона — надстройка над его настоящей работой, не условие
-/// для неё. Любая неудача (весов нет, ONNX Runtime не поднялся, `bind`
-/// отказал) уходит в stderr и возвращает `None`: демон обязан продолжить
-/// тикать и без сокета, а не остановиться на этом шаге (ограничение №1
-/// задачи 011-dense-retrieval).
+/// для неё. Веса здесь НЕ грузятся: `embed_socket::Lazy` поднимает bge-m3
+/// на первом запросе (сокет или очередь) и снимает после
+/// `AURELIUS_EMBED_IDLE_SECS` простоя — иначе демон держал бы ~3.3 ГиБ
+/// видеопамяти всё время ради запроса в ~110 мс. Отказ загрузки уходит
+/// в stderr и в ответ сокета (`{"error": ...}` → `vector_notice` у
+/// клиента), такт при этом продолжается. `bind` отказал — `None`: демон
+/// обязан продолжить тикать и без сокета (ограничение №1 задачи
+/// 011-dense-retrieval).
 ///
 /// Файл сокета, оставшийся от предыдущего запуска этого же демона (упал
 /// без `SIGTERM`, не успел снять), удаляется до `bind` — тем же приёмом,
@@ -3300,14 +3334,8 @@ fn start_embed_socket(
     aurelius_core::embed_socket::SharedModel,
 )> {
     let socket_path = aurelius_core::embed_socket::socket_path(home);
-    let model = match aurelius_core::embed::init_bge_m3() {
-        Ok(model) => model,
-        Err(e) => {
-            eprintln!("embed-сокет: bge-m3 не поднялась, векторный поиск отключён — {e}");
-            return None;
-        }
-    };
-    let shared: aurelius_core::embed_socket::SharedModel = Arc::new(Mutex::new(model));
+    let shared =
+        aurelius_core::embed_socket::shared_bge_m3(aurelius_core::embed_socket::idle_from_env());
     let _ = std::fs::remove_file(&socket_path);
     let listener = match tokio::net::UnixListener::bind(&socket_path) {
         Ok(listener) => listener,
@@ -3348,7 +3376,8 @@ struct QueuedNode {
 }
 
 /// Один такт разбора очереди: до `limit` самых старых живых строк
-/// `embedding_queue`, эмбеддинг уже загруженной `model`, запись векторов и
+/// `embedding_queue`, эмбеддинг через общую `model` (грузит веса, если
+/// простой их снял — только когда очередь не пуста), запись векторов и
 /// уход из очереди — одной транзакцией на пачку. Инференс идёт через
 /// `spawn_blocking` на клоне `Arc` (тот же приём, что и в
 /// `embed_socket::handle_connection`): такт демона не должен держать
@@ -3417,11 +3446,7 @@ async fn drain_embedding_queue(
 
     let blocking_model = Arc::clone(model);
     let embedded = tokio::task::spawn_blocking(move || {
-        let mut guard = match blocking_model.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        aurelius_core::embed::embed_batch(&mut guard, texts)
+        blocking_model.with(|m| aurelius_core::embed::embed_batch(m, texts))
     })
     .await;
 

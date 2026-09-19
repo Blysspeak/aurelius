@@ -303,3 +303,67 @@ fn a_superseded_subject_comes_back_with_its_chain() {
     );
     assert_eq!(chain[0]["id"], new);
 }
+
+// ---------------------------------------------------------------------------
+// `au search` — how much of the ranked answer is printed. The home has no
+// embed socket, so this is the full-text path with its printed notice.
+// ---------------------------------------------------------------------------
+
+/// Result rows only: each opens with two spaces and a bracketed type; the
+/// vector notice and the header line do not.
+fn result_rows(out: &str) -> Vec<&str> {
+    out.lines().filter(|l| l.starts_with("  [")).collect()
+}
+
+/// Twelve identical rows rank above seven distinct ones, so the first pool of
+/// candidates is twins only. The default still prints five distinct rows,
+/// the twin once, and `--limit` reaches every distinct row there is.
+#[test]
+fn search_prints_five_distinct_rows_by_default_and_honours_a_larger_limit() {
+    let home = TmpHome::dir("search-limit");
+    let mut twin_ids = std::collections::HashSet::new();
+    for _ in 0..12 {
+        twin_ids.insert(note(
+            &home,
+            &[
+                "--type",
+                "concept",
+                "--label",
+                "zephyr zephyr twin",
+                "zephyr zephyr zephyr",
+            ],
+        ));
+    }
+    assert_eq!(twin_ids.len(), 12, "twelve separate records, not one");
+    for i in 0..7 {
+        note(
+            &home,
+            &[
+                "--type",
+                "concept",
+                "--label",
+                &format!("zephyr distinct {i}"),
+                &format!("zephyr body number {i}, padded with enough other words to rank lower"),
+            ],
+        );
+    }
+
+    let (code, out, err) = run(&home, &["search", "zephyr"]);
+    assert_eq!(code, 0, "{out}{err}");
+    let rows = result_rows(&out);
+    assert_eq!(rows.len(), 5, "default is five rows: {out}");
+    assert!(out.starts_with("5 results:"), "{out}");
+    let twins = rows
+        .iter()
+        .filter(|r| r.contains("zephyr zephyr twin"))
+        .count();
+    assert_eq!(twins, 1, "an identical row is printed once: {out}");
+
+    let (code, out, err) = run(&home, &["search", "zephyr", "--limit", "50"]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert_eq!(
+        result_rows(&out).len(),
+        8,
+        "every distinct row, the twin once, no cap: {out}"
+    );
+}
