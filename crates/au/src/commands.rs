@@ -3931,10 +3931,13 @@ pub async fn skills(hook: bool) -> Result<()> {
     Ok(())
 }
 
-/// Семислойный снапшот памяти. С `--hook` печатает SessionStart-JSON для
-/// прямой инъекции в контекст; проект тогда берётся из имени текущей папки,
-/// а любой сбой глотается (exit 0, пустой вывод) — хук не имеет права
-/// ломать старт сессии.
+/// Снапшот памяти. С `--hook` печатает SessionStart-JSON для прямой инъекции
+/// в контекст; проект тогда выводится из репозитория, в котором стоит сессия
+/// (`hooks::hook_project`), а вне репозитория снапшот собирается глобальный и
+/// сам говорит об этом в заголовке. Хук не отвечает пустотой никогда: пустой
+/// ответ неотличим от пустой памяти, и 19.09.2026 сессия вне репозитория
+/// просыпалась без памяти вовсе. Сбой сборки — тоже не тишина, а строка с
+/// причиной; код выхода всегда 0, хук не имеет права ломать старт сессии.
 /// С `--json` вместо markdown печатается машинная форма
 /// `{"project":…,"facts":[…]}`: пустой `facts` при коде 0 — «нечего сказать»,
 /// отсутствие вывода или ненулевой код — «сломан». Разбирать markdown
@@ -3954,9 +3957,6 @@ pub async fn snapshot(project: Option<String>, hook: bool, json_out: bool) -> Re
         .as_ref()
         .and_then(hooks::cwd_of)
         .or_else(|| std::env::current_dir().ok());
-    if hook && derived.is_none() {
-        return Ok(());
-    }
     let run = || -> Result<String> {
         let conn = db::open(&db_path())?;
         // Дистиллят освежаем раз в сутки прямо отсюда: консолидация — чистый
@@ -3980,31 +3980,42 @@ pub async fn snapshot(project: Option<String>, hook: bool, json_out: bool) -> Re
         }
         // Нет репозитория или git не ответил за таймаут — слоя нет, без
         // заглушки и без ошибки: остальной снапшот от этого не зависит.
-        let repo = aurelius_core::git::locate(&conn, cwd.as_deref(), derived.as_deref())
+        // Нет проекта — тоже нет: глобальный срез не знает, где стоит
+        // сессия (пейлоад без `cwd`), и репозиторий каталога процесса
+        // встал бы под заголовок «глобально» чужим.
+        let repo = derived
+            .as_deref()
+            .and_then(|p| aurelius_core::git::locate(&conn, cwd.as_deref(), Some(p)))
             .and_then(|r| aurelius_core::git::read(&r));
         graph::build_snapshot_in(&conn, derived.as_deref(), repo.as_ref())
     };
 
-    match run() {
-        Ok(md) => {
-            if hook {
-                let out = json!({
-                    "suppressOutput": true,
-                    "hookSpecificOutput": {
-                        "hookEventName": "SessionStart",
-                        "additionalContext": md,
-                    }
-                });
-                println!("{}", serde_json::to_string(&out)?);
-            } else {
-                println!("{md}");
+    let emit = |md: &str| -> Result<()> {
+        let out = json!({
+            "suppressOutput": true,
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": md,
             }
+        });
+        println!("{}", serde_json::to_string(&out)?);
+        Ok(())
+    };
+    match run() {
+        Ok(md) if hook => emit(&md),
+        Ok(md) => {
+            println!("{md}");
             Ok(())
         }
         Err(e) if hook => {
-            // Молча: сломанный хук хуже отсутствующего снапшота.
+            // Не молча: сломанный хук хуже отсутствующего снапшота, но
+            // пустой ответ хуже строки с причиной — по нему не видно, что
+            // память вообще была.
             tracing::warn!("snapshot hook failed: {e}");
-            Ok(())
+            emit(&format!(
+                "# Память недоступна\nСнапшот не собрался: {}\n",
+                graph::clip(&e.to_string(), 300)
+            ))
         }
         Err(e) => Err(e),
     }

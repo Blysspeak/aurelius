@@ -9,7 +9,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    edge_brief, node_detail, open_db, parse_node_type, parse_relation, parse_since,
+    edge_brief, node_detail, node_hit, open_db, parse_node_type, parse_relation, parse_since,
     query_vector_for_topic, resolve_node, resolve_task_node,
 };
 
@@ -39,12 +39,22 @@ fn instrument_recall(
     corrections
 }
 
+/// Сколько находок `memory_search` отдаёт без явного `limit` — столько же,
+/// сколько `au search` (`Commands::Search` в `crates/au/src/main.rs`,
+/// решение 13.09.2026: пять — там, где кончается конвейер выдачи). Две двери
+/// к одному поиску с разными дефолтами отвечали на один вопрос списками
+/// разной длины; больше — через `limit`, он не урезается.
+const SEARCH_DEFAULT_LIMIT: u64 = 5;
+
 pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     let query = params
         .get("query")
         .and_then(|q| q.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'query' parameter"))?;
-    let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.as_u64())
+        .unwrap_or(SEARCH_DEFAULT_LIMIT) as usize;
     let type_filter = params.get("type").and_then(|t| t.as_str());
     let since = params.get("since").and_then(|s| s.as_str());
 
@@ -118,7 +128,7 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         // потребитель JSON видит деградацию, а не только человек (spec.md,
         // ограничение №2).
         "vector_notice": vector_notice,
-        "results": nodes.iter().map(node_detail).collect::<Vec<_>>(),
+        "results": nodes.iter().map(|n| node_hit(n, query)).collect::<Vec<_>>(),
     }))
 }
 

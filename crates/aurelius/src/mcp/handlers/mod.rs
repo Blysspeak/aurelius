@@ -307,6 +307,24 @@ pub(crate) fn node_recall(node: &aurelius_core::models::Node, query: &str) -> se
     record
 }
 
+/// Строка списка находок `memory_search` — форма [`node_recall`] плюс `stale`.
+/// Список находок не карточка записи: [`node_detail`] отдавал на каждую `data`
+/// целиком, полный `note`, `source`, авторов и блок происхождения, и
+/// 19.09.2026 двадцать находок на «embed socket bge-m3» стоили 38 754 байта
+/// против 3 110 у `au search` на том же запросе. `stale` оставлен: это
+/// единственное из происхождения, по чему действуют, не открывая запись. За
+/// телом идут по `id` — `au recall <id>`.
+pub(crate) fn node_hit(node: &aurelius_core::models::Node, query: &str) -> serde_json::Value {
+    let stale = aurelius_core::provenance::Provenance::from_data(&node.data)
+        .staleness(node.created_at, chrono::Utc::now())
+        .map(|s| s.note());
+    let mut hit = node_recall(node, query);
+    if let Some(fields) = hit.as_object_mut() {
+        fields.insert("stale".to_owned(), json!(stale));
+    }
+    hit
+}
+
 /// Кусок текста вокруг первого совпадения любого слова запроса, по границе
 /// слова. Совпадения нет — берётся начало: запись всё равно отобрана обходом,
 /// и показать её начало честнее, чем не показать ничего.
@@ -616,5 +634,60 @@ mod recall_shape_tests {
         }
         assert_eq!(a["subject"], "demo:embed:owner");
         assert_eq!(a["confidence"], "measured");
+    }
+
+    /// Находка поиска — не карточка записи: ни `data`, ни полного `note`, ни
+    /// авторов с происхождением; `stale` есть всегда, окно — только без claim.
+    #[test]
+    fn search_hit_is_a_summary_not_a_record_dump() {
+        use super::node_hit;
+        let conn = temp_conn();
+        let body = format!("{} сокет демона рядом с базой", "вступление ".repeat(60));
+        let bare = graph::add_node(
+            &conn,
+            NodeType::Concept,
+            "сокет эмбеддингов",
+            Some(&body),
+            "test",
+            serde_json::json!({ "skill_body": "x".repeat(4000) }),
+        )
+        .expect("add bare");
+        let claimed = graph::add_node(
+            &conn,
+            NodeType::Decision,
+            "демон держит модель",
+            Some(&body),
+            "test",
+            serde_json::json!({ "claim": "Модель висит резидентно", "confidence": "measured",
+                                "evidence": "cargo test", "subject": "demo:embed:resident" }),
+        )
+        .expect("add claimed");
+
+        for node in [&bare, &claimed] {
+            let hit = node_hit(node, "сокет");
+            for key in [
+                "data",
+                "note",
+                "source",
+                "created_by",
+                "updated_by",
+                "provenance",
+                "access_count",
+                "memory_kind",
+            ] {
+                assert!(hit.get(key).is_none(), "лишнее поле {key}: {hit}");
+            }
+            for key in ["id", "type", "claim", "confidence", "subject", "stale"] {
+                assert!(hit.get(key).is_some(), "нет поля {key}: {hit}");
+            }
+            let date = hit["created_at"].as_str().expect("created_at строкой");
+            assert_eq!(date.len(), 10, "created_at обязан быть датой: {date}");
+        }
+
+        let bare_hit = node_hit(&bare, "сокет");
+        let window = bare_hit["window"].as_str().expect("окно при пустом claim");
+        assert!(window.contains("сокет"), "окно не на совпадении: {window}");
+        assert!(window.chars().count() < body.chars().count());
+        assert!(node_hit(&claimed, "сокет")["window"].is_null());
     }
 }

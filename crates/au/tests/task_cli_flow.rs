@@ -453,10 +453,18 @@ fn judge_hook_prints_ripe_block_for_ripe_task() {
             quiet.is_empty(),
             "no global queue for missing or foreign project"
         );
+        // Снапшот, в отличие от очереди судьи, без проекта не молчит: пустой
+        // ответ хука будил сессию без памяти. Он отдаёт глобальный срез, так
+        // и говорит, и не подставляет репозиторий каталога процесса.
         let (code, snapshot) =
             run_with_stdin_in(&home, &project_dir, &["snapshot", "--hook"], &payload);
         assert_eq!(code, 0);
-        assert!(snapshot.is_empty(), "snapshot hooks require a project too");
+        let json: serde_json::Value = serde_json::from_str(&snapshot).expect("hook JSON");
+        let md = json["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext");
+        assert!(md.starts_with("# Память · глобально · "), "{md}");
+        assert!(md.contains("\n## 1 · Репозиторий\n— пусто\n"), "{md}");
     }
 }
 

@@ -74,7 +74,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_search",
-                "description": "Full-text search across the knowledge graph using FTS5. Use empty string or '*' to list recent nodes. Supports optional type filtering.",
+                "description": "Full-text search across the knowledge graph using FTS5. Use empty string or '*' to list recent nodes. Supports optional type filtering. Each hit is a summary, not the record: id, type, label (dropped when it only repeats the claim), claim, created_at as a date, confidence, subject, stale, and a window around the match when the claim is empty. The whole record (note, data, provenance) is read by id: `au recall <id>`.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -92,8 +92,8 @@ pub fn tool_definitions() -> serde_json::Value {
                         },
                         "limit": {
                             "type": "integer",
-                            "description": "Maximum results (default: 20)",
-                            "default": 20
+                            "description": "Maximum results (default: 5, same as `au search`). Pass a larger value for more; it is honoured as asked",
+                            "default": 5
                         },
                         "session_id": {
                             "type": "string",
