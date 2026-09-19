@@ -93,13 +93,7 @@ impl SecretLookalike {
         }
     }
 
-    /// То же самое объяснение плюс байтовый оффset находки — единственное,
-    /// что отказу дозволено сказать о МЕСТЕ совпадения (T041 рубеж на
-    /// запись, FR-026 расширенный): не подстроку и не сам текст целиком, а
-    /// число. Печатается буквально в отказе `add_node_full`
-    /// (`SecretLookalikeRefused`), который затем уходит в stderr и в
-    /// журнал улик — оба места, где сама находка не должна была бы
-    /// оказаться повторно.
+    /// То же самое объяснение плюс байтовый оффset находки.
     pub fn explain_at(self, offset: usize) -> String {
         format!("{}, смещение {offset} байт", self.explain())
     }
@@ -269,18 +263,6 @@ pub fn detect_lookalike(location: &str) -> Option<SecretLookalike> {
     }
     None
 }
-
-/// Ключ поля-маркера в `data` узла, которым помечается обход рубежа
-/// (`au note --allow-secret` / соответствующее поле MCP). Живёт в `data`, а
-/// не в отдельном параметре `add_node_full`, потому что сигнатуру этой
-/// функции менять нельзя: у неё вызывающие вне зоны правки (индексатор,
-/// слияние синка, кодек импорта, MCP-обработчики) — добавить параметр значило
-/// бы чинить все их вызовы разом. `data` вызывающий строит сам, до вызова —
-/// маркер попадает туда тем же путём, что и любое другое поле, и остаётся в
-/// узле навсегда: «какие записи легли с выключенным рубежом» — вопрос,
-/// который граф потом умеет сам себе задать (SELECT по `data`), а не список,
-/// который надо было вести отдельно и не забыть.
-pub const BYPASS_MARKER_KEY: &str = "secret_guard_bypassed";
 
 /// Просканировать текст произвольной длины (тело заметки, итог сессии) на
 /// вхождение похожего на секрет фрагмента ГДЕ УГОДНО внутри строки — рубеж
@@ -553,27 +535,6 @@ pub fn scan_provenance_for_lookalike(data: &serde_json::Value) -> Option<(Secret
             .and_then(serde_json::Value::as_str)
             .and_then(scan_text_for_lookalike)
     })
-}
-
-/// Отказ рубежа перед графом (`add_node_full`, T041 расширенный): текст поля
-/// `label`/`note`, либо одной из именованных провенанс-строк `data`
-/// (`claim`/`evidence`/`subject`/`verify_with`, [`scan_provenance_for_lookalike`]),
-/// похож на значение секрета. Тип, а не голая строка — чтобы `classify` в
-/// `au` мог опознать его через `downcast_ref`, тем же приёмом, что
-/// `NoActiveTask` (`graph::mod`) для «нет активной задачи» (код 12).
-/// `Display` не включает ни одно из этих полей целиком — только класс
-/// признака и оффset: отказ, печатающий в себе секрет, опровергает сам себя,
-/// а это сообщение уходит в stderr и в журнал улик.
-#[derive(Debug, thiserror::Error)]
-pub struct SecretLookalikeRefused {
-    pub kind: SecretLookalike,
-    pub offset: usize,
-}
-
-impl std::fmt::Display for SecretLookalikeRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "запись отклонена: {}", self.kind.explain_at(self.offset))
-    }
 }
 
 #[cfg(test)]

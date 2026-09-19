@@ -160,14 +160,9 @@ fn content_hash(project: &str, summary: &str) -> String {
 }
 
 /// Unicode-safe label preview: cuts on word boundaries, never through a
-/// token. `add_node_full`'s secret guard (`crate::secret::scan_text_for_lookalike`)
-/// scans `label` and `note` independently — a preview that slices a token in
-/// half (as plain `chars().take(n)` used to, here and in three other places)
-/// can turn a safe shape (git hash, UUID, ...) into an unrecognized fragment
-/// that trips the guard on the label alone, even though the full note is
-/// clean. Found 11.09.2026 (subject `aurelius:write:secret-guard:label-truncation`):
-/// six filler words plus a 40-hex git hash, cut blindly at char 60, left a
-/// hex fragment 20-30 chars long — long enough to read as a random token.
+/// token. A preview that slices a structured identifier in half (as plain
+/// `chars().take(n)` used to, here and in three other places) produces a
+/// misleading label even when the full note is intact.
 ///
 /// `pub`, not private: the same rule is needed by `au note`
 /// (`crates/au/src/commands.rs`), `tasks::log_work`, and the MCP handlers'

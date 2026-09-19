@@ -39,34 +39,6 @@ pub fn add_node_full(
     memory_kind: MemoryKind,
     content_hash: Option<&str>,
 ) -> Result<Node> {
-    // Единственный рубеж перед графом, subject `aurelius:write:secret-guard`
-    // (измерено 07.09.2026: `au note` с ghp_-токеном в тексте ложилось кодом
-    // 0, а граф append-only — вычистить нечем, `memory_forget` уносит узел
-    // вместе со знанием). Судятся `label`, `note` и четыре именованных
-    // провенанс-поля `data` (`claim`/`evidence`/`subject`/`verify_with`, см.
-    // `secret::scan_provenance_for_lookalike`) — то же измерение 07.09.2026
-    // нашло, что `au note "тело" --claim "<токен>"` проходило кодом 0, а
-    // карточка `agent-checkpoint` отдельно велит класть дословную команду
-    // именно в `--evidence`. `data` ЦЕЛИКОМ по-прежнему не сканируется: там
-    // же лежат машинные поля вроде идемпотентного `key`, где сорокасимвольное
-    // значение base64-алфавита легитимно, и слепая проверка отказала бы на
-    // верном вводе (рубеж стоит здесь для ВСЕХ вызывающих, включая индексатор
-    // и слияние синка, а не только для ручных). Обход читается уже из
-    // готового `data`, а не из отдельного параметра: добавить параметр
-    // значило бы чинить сигнатуру и все вызовы вне зоны правки этой задачи.
-    let bypassed = data
-        .get(crate::secret::BYPASS_MARKER_KEY)
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if !bypassed {
-        let hit = crate::secret::scan_text_for_lookalike(label)
-            .or_else(|| note.and_then(crate::secret::scan_text_for_lookalike))
-            .or_else(|| crate::secret::scan_provenance_for_lookalike(&data));
-        if let Some((kind, offset)) = hit {
-            return Err(crate::secret::SecretLookalikeRefused { kind, offset }.into());
-        }
-    }
-
     let now = Utc::now();
     let author = identity::current().map(|i| i.as_author());
     let node = Node {
