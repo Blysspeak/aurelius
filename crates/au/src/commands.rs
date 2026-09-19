@@ -282,22 +282,25 @@ pub async fn note(args: NoteArgs) -> Result<()> {
         }
     }
 
-    // Link to project if specified. Повтор безвреден: на (from, to, relation)
-    // висит уникальный индекс, а add_edge вставляет через OR IGNORE.
+    // Названный явно проект заводится, если его ещё нет, — как и раньше.
+    // Выведенный (префикс метки, git-репозиторий каталога) — только
+    // находится: `attach_on_write` узлов проекта не заводит.
     if let Some(proj_name) = args.project.as_deref() {
-        let project_node = match graph::find_project_by_label(&conn, proj_name)? {
-            Some(n) => n,
-            None => graph::add_node(
+        if graph::find_project_by_label(&conn, proj_name)?.is_none() {
+            graph::add_node(
                 &conn,
                 NodeType::Project,
                 proj_name,
                 None,
                 "auto",
                 serde_json::json!({}),
-            )?,
-        };
-        graph::add_edge(&conn, node.id, project_node.id, Relation::BelongsTo, 1.0)?;
+            )?;
+        }
     }
+    let project = args.project.clone().or_else(|| {
+        graph::infer_project(&conn, &node.label, std::env::current_dir().ok().as_deref())
+    });
+    let attached = graph::attach_on_write(&conn, &node, project.as_deref());
 
     if args.json {
         let out = json!({
@@ -305,7 +308,8 @@ pub async fn note(args: NoteArgs) -> Result<()> {
             "label": node.label,
             "type": node.node_type,
             "memory_kind": node.memory_kind,
-            "project": args.project,
+            "project": attached.project,
+            "subject_peer": attached.subject_peer.map(|id| id.to_string()),
             "created": created,
             "session": agent_session,
             "confidence": prov.confidence_or_default().as_str(),
@@ -318,7 +322,7 @@ pub async fn note(args: NoteArgs) -> Result<()> {
     }
 
     let verb = if created { "Saved" } else { "Updated" };
-    match args.project.as_deref() {
+    match attached.project.as_deref() {
         Some(proj_name) => println!("✓ {verb}: [{}] {} → {proj_name}", node.id, node.label),
         None => println!("✓ {verb}: [{}] {}", node.id, node.label),
     }
@@ -2320,7 +2324,9 @@ pub async fn task(action: TaskAction) -> Result<()> {
                         // сотрут, код возврата не воспроизведёшь. Раньше здесь
                         // стоял голый bail, и улика исчезала вместе с ним, а
                         // вызывающий об этом не узнавал: `record-verify.mjs`
-                        // выбрасывает результат. Пишем сироту, потом отказываем.
+                        // выбрасывает результат. Узел цепляется к проекту, если
+                        // узел проекта есть; иначе не пишется — прогон уже в
+                        // журнале вызывающего. Потом отказываем.
                         None => {
                             let run = graph::link_evidence_run(
                                 &conn,
@@ -2375,7 +2381,7 @@ pub async fn task(action: TaskAction) -> Result<()> {
             if as_json {
                 let out = json!({
                     "id": task.id.to_string(),
-                    "run_id": run_id.to_string(),
+                    "run_id": run_id.map(|id| id.to_string()),
                     "command": command,
                     "exit_code": exit,
                 });
@@ -3415,6 +3421,8 @@ async fn drain_embedding_queue(
     model: &aurelius_core::embed_socket::SharedModel,
     limit: usize,
 ) -> Result<usize> {
+    // Прогонам и пустым зависимостям вектор не нужен: в поиск они не идут.
+    graph::drop_technical_from_queue(conn)?;
     let pending: Vec<QueuedNode> = {
         let mut stmt = conn.prepare(
             "SELECT q.node_id, n.rowid, n.node_type, n.label, n.note, n.created_at
@@ -4773,7 +4781,84 @@ pub async fn db(action: DbAction) -> Result<()> {
         }
         DbAction::Migrate => db_migrate_cli(&db_path()),
         DbAction::ReindexEmbeddings => db_reindex_embeddings_cli(),
+        DbAction::Prune { apply, json } => db_prune_cli(apply, json),
     }
+}
+
+/// Сколько строк каждого правила печатать человеку; полный список — `--json`.
+const PRUNE_SAMPLE: usize = 15;
+
+/// `au db prune` — таблица по правилу (сколько, почему, образцы) ДО любого
+/// действия; с `--apply` — то же и затем снятие одной транзакцией.
+fn db_prune_cli(apply: bool, as_json: bool) -> Result<()> {
+    let conn = db::open(&db_path())?;
+    let plan = if apply {
+        graph::prune_apply(&conn)?
+    } else {
+        graph::prune_plan(&conn)?
+    };
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string(&json!({ "applied": apply, "plan": plan }))?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "au db prune — {}",
+        if apply {
+            "снято (мягко: deleted_at, отменяемо)"
+        } else {
+            "пробный прогон, ничего не снято; --apply снимет"
+        }
+    );
+    for rule in [
+        graph::PruneRule::TechnicalOrphan,
+        graph::PruneRule::StaleDigest,
+        graph::PruneRule::EmptyProject,
+    ] {
+        let rows: Vec<_> = plan.candidates.iter().filter(|c| c.rule == rule).collect();
+        println!("\n{rule:?} · {}\n  почему: {}", rows.len(), rule.why());
+        for c in rows.iter().take(PRUNE_SAMPLE) {
+            let id = c.id.to_string();
+            println!(
+                "  {} {:<10} {}",
+                &id[..8],
+                c.node_type,
+                graph::label_preview(&c.label, 70)
+            );
+        }
+        if rows.len() > PRUNE_SAMPLE {
+            println!(
+                "  … ещё {} (полный список: --json)",
+                rows.len() - PRUNE_SAMPLE
+            );
+        }
+    }
+    let unlinked: usize = plan.unlinked_knowledge.values().sum();
+    let by_type = plan
+        .unlinked_knowledge
+        .iter()
+        .map(|(t, n)| format!("{t} {n}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    println!(
+        "\nНе снимается · знание без связей (claim или тело, ни одного ребра): {unlinked}\n  {by_type}\n  \
+         почему: причина — запись без привязки к проекту, а не лишний узел; \
+         с этой правки au note и memory_add привязывают при записи"
+    );
+    println!(
+        "\nИтого {}: {} из {} живых узлов",
+        if apply {
+            "снято"
+        } else {
+            "к снятию"
+        },
+        plan.candidates.len(),
+        plan.live_nodes
+    );
+    Ok(())
 }
 
 /// `au db migrate` — применяет накопившиеся миграции схемы явно, а не

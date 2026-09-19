@@ -13,7 +13,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::git::RepoState;
 use crate::models::{MemoryKind, Node, NodeType};
@@ -712,26 +712,34 @@ pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
 
     let label = format!("[{project}] дистиллят");
     let type_str = serde_json::to_string(&NodeType::Digest)?;
-    let existing: Option<String> = conn
+    // Поиск и запись — под одним замком записи. Без него несколько сессий,
+    // стартовавших разом (каждая зовёт `au snapshot --hook` своим процессом),
+    // все видели «дистиллята нет» и все вставляли свой: в живой базе
+    // 19.09.2026 копии одного проекта рождены с разницей 49 нс - 6 мкс.
+    // `IMMEDIATE` берёт замок до чтения, второй писатель ждёт на
+    // `busy_timeout` и находит уже вставленный узел. Ошибка чтения больше не
+    // выдаётся за «узла нет» (`.ok()` делал из неё вставку близнеца), а из
+    // уже накопленных близнецов обновляется самый свежий — остальных снимает
+    // `au db prune`.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let existing: Option<String> = tx
         .query_row(
-            "SELECT id FROM nodes WHERE node_type = ?1 AND label = ?2 AND deleted_at IS NULL",
+            "SELECT id FROM nodes WHERE node_type = ?1 AND label = ?2 AND deleted_at IS NULL
+              ORDER BY updated_at DESC LIMIT 1",
             rusqlite::params![type_str, label],
             |r| r.get(0),
         )
-        .ok();
-    if let Some(id) = existing {
-        conn.execute(
+        .optional()?;
+    let node = if let Some(id) = existing {
+        tx.execute(
             "UPDATE nodes SET note = ?1, updated_at = ?2 WHERE id = ?3",
             rusqlite::params![note, Utc::now().to_rfc3339(), id],
         )?;
-        let found = typed_recent(conn, &NodeType::Digest, Some(project), 1)?;
-        found
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("дистиллят обновлён, но не читается"))
+        super::get_node(&tx, &id)?
+            .ok_or_else(|| anyhow::anyhow!("дистиллят обновлён, но не читается"))?
     } else {
         super::add_node_full(
-            conn,
+            &tx,
             NodeType::Digest,
             &label,
             Some(&note),
@@ -739,8 +747,10 @@ pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
             serde_json::json!({ "project": project }),
             MemoryKind::Semantic,
             None,
-        )
-    }
+        )?
+    };
+    tx.commit()?;
+    Ok(node)
 }
 
 #[cfg(test)]
@@ -952,6 +962,54 @@ mod tests {
             )
             .expect("count");
         assert_eq!(n, 1);
+    }
+
+    /// Последовательный повтор дублей не давал никогда (тест выше зелёный с
+    /// 12.08), а в живой базе 19.09.2026 лежало 102 дистиллята на 92 проекта:
+    /// копии одного проекта рождены с разницей 49 нс - 6 мкс. Так стартуют
+    /// несколько сессий разом — каждая зовёт `au snapshot --hook` своим
+    /// процессом, и все видят «дистиллята нет» до того, как первый его вставил.
+    #[test]
+    fn concurrent_consolidate_from_separate_connections_leaves_one_digest() {
+        let dir = std::env::temp_dir().join(format!("aurelius-snap-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let path = dir.join("test.db");
+        // Соединения открываются заранее и по очереди: гонка нужна на
+        // дистилляте, а не на миграции свежей базы.
+        let conns: Vec<Connection> = (0..8)
+            .map(|_| db::open(&path).expect("open test db"))
+            .collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(conns.len()));
+        let workers: Vec<_> = conns
+            .into_iter()
+            .map(|conn| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    consolidate(&conn, "demo").map(|n| n.id)
+                })
+            })
+            .collect();
+        let ids: Vec<uuid::Uuid> = workers
+            .into_iter()
+            .map(|w| w.join().expect("поток").expect("consolidate"))
+            .collect();
+
+        let conn = db::open(&path).expect("reopen");
+        let type_str = serde_json::to_string(&NodeType::Digest).expect("type");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE node_type = ?1 AND deleted_at IS NULL",
+                [type_str],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(n, 1, "параллельные вызовы обязаны оставить один дистиллят");
+        assert!(
+            ids.windows(2).all(|w| w[0] == w[1]),
+            "все вызовы обязаны вернуть один и тот же узел: {ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Регресс: раньше слой «В работе» брал 8 самых свежих открытых задач ОДНИМ

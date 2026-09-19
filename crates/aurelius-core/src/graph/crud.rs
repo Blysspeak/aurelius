@@ -724,6 +724,85 @@ pub fn get_nodes_by_type(conn: &Connection, node_type: &NodeType) -> Result<Vec<
     Ok(nodes)
 }
 
+/// Проект записи, когда его не назвали: префикс метки `[проект]`, иначе
+/// git-репозиторий каталога `cwd` — то же каноническое имя, что у
+/// `hook_project` (рабочее дерево носит имя основного репозитория). Голое имя
+/// каталога без git проектом не считается: из `/tmp` или домашнего каталога
+/// иначе рождались бы проекты, которых никто не называл.
+pub fn infer_project(
+    conn: &Connection,
+    label: &str,
+    cwd: Option<&std::path::Path>,
+) -> Option<String> {
+    if let Some((project, _)) = label
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+    {
+        if !project.is_empty() {
+            return Some(project.to_owned());
+        }
+    }
+    crate::git::locate(conn, cwd, None).map(|repo| repo.name)
+}
+
+/// Что досталось записи при привязке ([`attach_on_write`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Attached {
+    /// Проект, к узлу которого поставлено ребро `belongs_to`.
+    pub project: Option<String>,
+    /// Прежняя запись того же `subject`, с которой поставлено `related_to`.
+    pub subject_peer: Option<Uuid>,
+}
+
+/// Привязать только что записанное знание в момент записи: ребро
+/// `belongs_to` к узлу проекта и `related_to` к самой свежей прежней записи
+/// того же `subject`. Совет «свяжи через `au relate`» не исполнялся: на
+/// 19.09.2026 без единого ребра лежали 182 решения, 138 понятий, 103 решения
+/// проблем и 75 проблем, почти все — записи без `project`.
+///
+/// Узел проекта здесь не заводится — только находится: пустая заглушка
+/// проекта сама по себе мусор. С записью того же предмета, уже связанной
+/// (ребро `supersedes`/`refines` от разрешения противоречия), второе ребро не
+/// ставится. Всё fail-soft: узел к этому моменту уже записан, и отказ
+/// привязки не имеет права выглядеть отказом записи — непривязанное просто
+/// не попадает в ответ.
+pub fn attach_on_write(conn: &Connection, node: &Node, project: Option<&str>) -> Attached {
+    let project = project.and_then(|name| {
+        let hub = find_project_by_label(conn, name).ok().flatten()?;
+        if hub.id == node.id {
+            return None;
+        }
+        add_edge(conn, node.id, hub.id, Relation::BelongsTo, 1.0).ok()?;
+        Some(name.to_owned())
+    });
+    let subject_peer = Provenance::from_data(&node.data)
+        .subject
+        .and_then(|subject| {
+            // Свежие первыми; сам узел — самый свежий, поэтому двух хватает.
+            find_nodes_by_data_field(conn, crate::provenance::SUBJECT_KEY, &subject, 2).ok()
+        })
+        .and_then(|peers| peers.into_iter().find(|n| n.id != node.id))
+        .and_then(|peer| {
+            let linked: bool = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM edges WHERE deleted_at IS NULL
+                        AND ((from_id = ?1 AND to_id = ?2) OR (from_id = ?2 AND to_id = ?1)))",
+                    params![node.id.to_string(), peer.id.to_string()],
+                    |r| r.get(0),
+                )
+                .ok()?;
+            if linked {
+                return None;
+            }
+            add_edge(conn, node.id, peer.id, Relation::RelatedTo, 1.0).ok()?;
+            Some(peer.id)
+        });
+    Attached {
+        project,
+        subject_peer,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,5 +1336,85 @@ mod tests {
                 .is_none(),
             "source обязан быть удалён после merge"
         );
+    }
+
+    fn knowledge(conn: &Connection, label: &str, subject: Option<&str>) -> Node {
+        add_node(
+            conn,
+            NodeType::Decision,
+            label,
+            Some("тело"),
+            "test",
+            serde_json::json!({ "claim": label, "subject": subject }),
+        )
+        .expect("add knowledge")
+    }
+
+    #[test]
+    fn attach_on_write_links_project_and_subject_peer() {
+        let (_tmp, conn) = setup();
+        let hub = add_node(
+            &conn,
+            NodeType::Project,
+            "демо",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add project");
+        let old = knowledge(&conn, "старое", Some("демо:предмет"));
+        let new = knowledge(&conn, "новое", Some("демо:предмет"));
+
+        let attached = attach_on_write(&conn, &new, Some("демо"));
+
+        assert_eq!(attached.project.as_deref(), Some("демо"));
+        assert_eq!(attached.subject_peer, Some(old.id));
+        assert!(find_edge(&conn, new.id, hub.id, &Relation::BelongsTo)
+            .expect("edge lookup")
+            .is_some());
+        assert!(find_edge(&conn, new.id, old.id, &Relation::RelatedTo)
+            .expect("edge lookup")
+            .is_some());
+    }
+
+    /// Нет узла проекта — нет ребра, нет ошибки и нет новой заглушки проекта.
+    #[test]
+    fn attach_on_write_is_fail_soft_and_creates_no_project() {
+        let (_tmp, conn) = setup();
+        let node = knowledge(&conn, "одинокое", None);
+
+        let attached = attach_on_write(&conn, &node, Some("нет-такого"));
+
+        assert_eq!(attached, Attached::default());
+        assert!(get_nodes_by_type(&conn, &NodeType::Project)
+            .expect("projects")
+            .is_empty());
+    }
+
+    /// Разрешённое противоречие уже связало записи — второе ребро не нужно.
+    #[test]
+    fn attach_on_write_skips_a_peer_already_linked() {
+        let (_tmp, conn) = setup();
+        let old = knowledge(&conn, "старое", Some("предмет"));
+        let new = knowledge(&conn, "новое", Some("предмет"));
+        add_edge(&conn, new.id, old.id, Relation::Supersedes, 1.0).expect("supersedes");
+
+        let attached = attach_on_write(&conn, &new, None);
+
+        assert_eq!(attached.subject_peer, None);
+        assert!(find_edge(&conn, new.id, old.id, &Relation::RelatedTo)
+            .expect("edge lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn infer_project_takes_the_label_prefix_first() {
+        let (_tmp, conn) = setup();
+        assert_eq!(
+            infer_project(&conn, "[xhub] лимит ретраев", None).as_deref(),
+            Some("xhub")
+        );
+        assert_eq!(infer_project(&conn, "[] пустой префикс", None), None);
+        assert_eq!(infer_project(&conn, "без префикса", None), None);
     }
 }
