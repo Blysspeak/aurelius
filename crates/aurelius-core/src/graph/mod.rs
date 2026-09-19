@@ -212,12 +212,17 @@ pub fn list_secret_refs(
 }
 
 /// Правило `au db prune`. Других нет: всё, что несёт `claim`, не удаляется
-/// никогда, а знание без связей только считается ([`PrunePlan::unlinked_knowledge`]).
+/// никогда — кроме прогона ([`PruneRule::TechnicalJunk`]), — а знание без
+/// связей только считается ([`PrunePlan::unlinked_knowledge`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PruneRule {
     /// Прогон или зависимость без рёбер, без `claim` и без тела.
     TechnicalOrphan,
+    /// Остальное техническое ([`search::is_technical`]) с рёбрами или без:
+    /// любой прогон, зависимость без `claim` и тела. Сирот забирает
+    /// [`Self::TechnicalOrphan`] — его счёт цитируется в отчётах владельца.
+    TechnicalJunk,
     /// Дистиллят, не самый свежий для своего проекта.
     StaleDigest,
     /// Узел проекта без рёбер, без содержания и без единой записи, которая
@@ -232,6 +237,11 @@ impl PruneRule {
             Self::TechnicalOrphan => {
                 "прогон или зависимость без рёбер, claim и тела: ни одна выборка через граф \
                  его не находит, прогон лежит в журнале ulika, зависимость — в манифесте"
+            }
+            Self::TechnicalJunk => {
+                "любой прогон и зависимость без claim и тела, даже с рёбрами: история проверки \
+                 живёт в data.evidence задачи, прогон и ребро verified_by — её зеркало, \
+                 зависимость — строка манифеста"
             }
             Self::StaleDigest => {
                 "не самый свежий дистиллят проекта: близнец от гонки параллельных \
@@ -333,6 +343,7 @@ pub fn prune_plan(conn: &rusqlite::Connection) -> anyhow::Result<PrunePlan> {
             {
                 Some(PruneRule::TechnicalOrphan)
             }
+            _ if search::is_technical(n) => Some(PruneRule::TechnicalJunk),
             NodeType::Digest
                 if !has_claim(n)
                     && newest_digest

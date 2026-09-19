@@ -4815,6 +4815,7 @@ fn db_prune_cli(apply: bool, as_json: bool) -> Result<()> {
     );
     for rule in [
         graph::PruneRule::TechnicalOrphan,
+        graph::PruneRule::TechnicalJunk,
         graph::PruneRule::StaleDigest,
         graph::PruneRule::EmptyProject,
     ] {
