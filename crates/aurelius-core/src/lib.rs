@@ -12,6 +12,7 @@ pub mod embed;
 pub mod embed_socket;
 pub mod eval;
 pub mod fts;
+pub mod git;
 pub mod graph;
 pub mod home;
 pub mod identity;

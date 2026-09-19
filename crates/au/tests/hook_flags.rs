@@ -209,3 +209,69 @@ fn reindex_hook_is_silent_and_exits_zero() {
     assert_eq!(code, 0, "reindex --hook must exit 0 outside a git repo");
     assert!(out.is_empty(), "the hook must not write to stdout: {out:?}");
 }
+
+/// `snapshot --hook` from inside a repository opens with the repository
+/// layer: name, branch, dirt and the last commit, all in the payload the
+/// waking model reads. Outside any repository the hook stays silent — its
+/// project is derived from the repository (`hook_project`), so there is no
+/// scope to snapshot at all.
+#[test]
+fn snapshot_hook_leads_with_the_repository_it_stands_in() {
+    let home = TmpHome::dir("snapshot-hook");
+    let repo = home.0.join("wakedemo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "trunk"]);
+    std::fs::write(repo.join("a.txt"), "a").expect("write");
+    git(&["add", "a.txt"]);
+    git(&["commit", "-q", "-m", "wake up here"]);
+    std::fs::write(repo.join("dirty.txt"), "d").expect("write");
+
+    let payload = serde_json::json!({"cwd": repo.to_string_lossy()}).to_string();
+    let (code, out) = run(&home, &["snapshot", "--hook"], Some(&payload));
+    assert_eq!(code, 0);
+    let json: serde_json::Value = serde_json::from_str(&out).expect("hook JSON");
+    let md = json["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additionalContext");
+    assert!(md.starts_with("# Память · wakedemo · "), "{md}");
+    assert!(
+        md.contains("## 1 · Репозиторий\n- wakedemo on trunk, no upstream\n"),
+        "{md}"
+    );
+    assert!(md.contains("- 1 changed: dirty.txt\n"), "{md}");
+    assert!(md.contains(" wake up here\n"), "{md}");
+    assert!(
+        out.len() <= 4000,
+        "payload over the ceiling: {} bytes",
+        out.len()
+    );
+
+    let outside = home.0.join("plain");
+    std::fs::create_dir_all(&outside).expect("create plain dir");
+    let payload = serde_json::json!({"cwd": outside.to_string_lossy()}).to_string();
+    let (code, out) = run(&home, &["snapshot", "--hook"], Some(&payload));
+    assert_eq!(code, 0);
+    assert!(
+        out.is_empty(),
+        "outside a repository the hook is silent: {out:?}"
+    );
+}

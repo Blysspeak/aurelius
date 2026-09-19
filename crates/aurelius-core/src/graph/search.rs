@@ -224,6 +224,11 @@ pub fn search_scored(
 ///   телами), и склейка по одной метке выбросила бы его.
 /// - При равном скоре пустые записи (ни `claim`, ни тела — например, узел
 ///   зависимости `rust-embed` от индексатора) идут после содержательных.
+/// - Узел прогона (`run`) — бухгалтерия улик, а не знание: в выдачу идёт
+///   самое большее один, и только на место, которое знанию нечем занять.
+///   Каждый `verify-run` пишет такой узел, и они вытесняли знание из выдачи
+///   тех самых слов, которыми их проверяли (19.09.2026: два `["run"] прогон:
+///   …` из пяти строк по запросу «embed socket bge-m3», 396 узлов в графе).
 /// - Оставляет первые `limit`.
 ///
 /// `scored` — узлы со скором, по убыванию скора.
@@ -242,8 +247,24 @@ pub fn tidy_for_emission(scored: Vec<(Node, f64)>, limit: usize) -> Vec<Node> {
         b.1.total_cmp(&a.1)
             .then_with(|| is_bare(&a.0).cmp(&is_bare(&b.0)))
     });
-    kept.truncate(limit);
-    kept.into_iter().map(|(n, _)| n).collect()
+    let (runs, mut knowledge): (Vec<_>, Vec<_>) = kept.into_iter().partition(|(n, _)| is_run(n));
+    knowledge.truncate(limit);
+    if knowledge.len() < limit {
+        knowledge.extend(runs.into_iter().take(1));
+    }
+    knowledge.into_iter().map(|(n, _)| n).collect()
+}
+
+/// Узел прогона — и нынешний `NodeType::Run`, и старая форма
+/// `Custom("run")`, которая ещё лежит в живом графе (тот же разбор, что у
+/// `rank::type_weight`).
+#[must_use]
+pub fn is_run(node: &Node) -> bool {
+    match &node.node_type {
+        NodeType::Run => true,
+        NodeType::Custom(s) => s == "run",
+        _ => false,
+    }
 }
 
 /// Запись без содержания: ни утверждения, ни тела — одна метка.
@@ -711,6 +732,61 @@ pub fn typed_in_project(
     Ok(nodes)
 }
 
+/// Факты о владельце для первого слоя снапшота: принадлежащие проекту по
+/// [`project_scope_sql`] — первыми, затем глобальные, каждая группа свежими
+/// первыми.
+///
+/// Глобальный факт — тот, что не связан ни с одним проектом: ни префикса
+/// `[проект]`, ни ребра к узлу типа `project`. Факт, связанный с ДРУГИМ
+/// проектом, не попадает никогда. Раньше слой брал 12 свежих фактов без
+/// области вовсе; замер 19.09.2026 на области aurelius — ни одна из двенадцати
+/// строк не касалась aurelius (xhub, boostix, diktor, ulika). Принадлежность
+/// решается связями, а не угадыванием по тексту.
+///
+/// `project` = `None` — только глобальные.
+pub fn owner_facts(conn: &Connection, project: Option<&str>, limit: usize) -> Result<Vec<Node>> {
+    let type_str = serde_json::to_string(&NodeType::UserFact)?;
+    let project_type = serde_json::to_string(&NodeType::Project)?;
+    let unassociated = "(n.label NOT LIKE '[%]%' \
+          AND NOT EXISTS (SELECT 1 FROM edges ae \
+                            JOIN nodes ap ON ap.id = CASE WHEN ae.from_id = n.id \
+                                                          THEN ae.to_id ELSE ae.from_id END \
+                           WHERE (ae.from_id = n.id OR ae.to_id = n.id) \
+                             AND ae.deleted_at IS NULL \
+                             AND ap.deleted_at IS NULL \
+                             AND ap.node_type = ?2))";
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(type_str), Box::new(project_type)];
+    let (filter, order) = match project {
+        Some(p) => {
+            params_vec.push(Box::new(p.to_string()));
+            let scope = project_scope_sql("n", 3);
+            (
+                format!("({scope} OR {unassociated})"),
+                format!("{scope} DESC, n.updated_at DESC"),
+            )
+        }
+        None => (unassociated.to_owned(), "n.updated_at DESC".to_owned()),
+    };
+    let limit_idx = params_vec.len() + 1;
+    let sql = format!(
+        "SELECT {NODE_COLS}
+           FROM nodes n
+          WHERE n.node_type = ?1 AND n.deleted_at IS NULL AND {filter}
+          ORDER BY {order}
+          LIMIT ?{limit_idx}"
+    );
+    params_vec.push(Box::new(limit as i64));
+
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let nodes = stmt
+        .query_map(params_refs.as_slice(), row_to_node)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nodes)
+}
+
 /// Проблемы без связанного решения. `project` = `None` — глобально.
 pub fn get_unsolved_problems(
     conn: &Connection,
@@ -837,11 +913,14 @@ pub fn get_tasks_filtered(
 }
 
 /// Сколько ждать ответа от демона на embed-сокете, прежде чем сдаться и
-/// уйти на чистый FTS5 (спека 011, `data-model.md` §6). Живой сокет отвечает
-/// на порядок быстрее — это запас на инференс под нагрузкой, не ожидаемая
-/// норма; мёртвый сокет не имеет права держать вызывающего дольше, чем занял
-/// бы ответ без него вовсе.
-const EMBED_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// уйти на чистый FTS5 (спека 011, `data-model.md` §6).
+///
+/// Пять секунд, а не две: демон поднимает модель лениво и снимает после
+/// простоя, холодная загрузка измерена в 1.5–3.7 с, и при двух секундах
+/// первый поиск после паузы молча уходил на полнотекстовый. Мёртвый сокет
+/// этого запаса не стоит: нет файла или отказ в соединении возвращаются
+/// сразу, ждёт только живой демон, который грузит веса.
+const EMBED_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Просит у демона вектор запроса и превращает любой отказ в понятную
 /// причину — никогда в ошибку, которую вызывающий обязан разбирать.
@@ -1138,6 +1217,43 @@ mod tests {
 
         let top: Vec<_> = tidy_for_emission(scored, 3).iter().map(|n| n.id).collect();
         assert_eq!(top, vec![bare_high.id, with_note.id, with_claim.id]);
+
+        cleanup(&path, conn);
+    }
+
+    /// Прогон — бухгалтерия, а не знание: даже с высшим скором он не вытесняет
+    /// знание, а на свободное место встаёт самое большее один — и старой
+    /// формы `Custom("run")` это касается так же.
+    #[test]
+    fn run_rows_yield_to_knowledge_and_fill_at_most_one_free_slot() {
+        let (path, conn) = temp_db();
+        let add = |t: NodeType, label: &str| {
+            super::super::add_node(&conn, t, label, Some(label), "test", serde_json::json!({}))
+                .expect("add node")
+        };
+        let run_new = add(NodeType::Run, "прогон: cargo test");
+        let run_old = add(NodeType::Custom("run".into()), "прогон: au search");
+        let a = add(NodeType::Decision, "решение про сокет");
+        let b = add(NodeType::Concept, "понятие про сокет");
+
+        let scored = vec![
+            (run_new.clone(), 1.0),
+            (run_old, 0.95),
+            (a.clone(), 0.5),
+            (b.clone(), 0.4),
+        ];
+        let full: Vec<_> = tidy_for_emission(scored.clone(), 2)
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(full, vec![a.id, b.id], "знания хватает — прогонов нет");
+
+        let short: Vec<_> = tidy_for_emission(scored, 5).iter().map(|n| n.id).collect();
+        assert_eq!(
+            short,
+            vec![a.id, b.id, run_new.id],
+            "на свободное место — один прогон, старший по скору"
+        );
 
         cleanup(&path, conn);
     }
