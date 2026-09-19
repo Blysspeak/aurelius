@@ -212,9 +212,10 @@ fn reindex_hook_is_silent_and_exits_zero() {
 
 /// `snapshot --hook` from inside a repository opens with the repository
 /// layer: name, branch, dirt and the last commit, all in the payload the
-/// waking model reads. Outside any repository the hook stays silent — its
-/// project is derived from the repository (`hook_project`), so there is no
-/// scope to snapshot at all.
+/// waking model reads. Outside any repository there is no project to derive
+/// (`hook_project`), and the hook used to answer with nothing — a session
+/// woke with no memory at all. Now it falls back to the global snapshot,
+/// says so under the header, and keeps the repository layer empty.
 #[test]
 fn snapshot_hook_leads_with_the_repository_it_stands_in() {
     let home = TmpHome::dir("snapshot-hook");
@@ -271,7 +272,36 @@ fn snapshot_hook_leads_with_the_repository_it_stands_in() {
     let (code, out) = run(&home, &["snapshot", "--hook"], Some(&payload));
     assert_eq!(code, 0);
     assert!(
-        out.is_empty(),
-        "outside a repository the hook is silent: {out:?}"
+        !out.is_empty(),
+        "outside a repository the hook must not answer with nothing"
     );
+    let json: serde_json::Value = serde_json::from_str(&out).expect("hook JSON");
+    let md = json["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additionalContext");
+    assert!(md.starts_with("# Память · глобально · "), "{md}");
+    assert!(md.contains("Проект не определён"), "scope unsaid:\n{md}");
+    assert!(md.contains("\n## 1 · Репозиторий\n— пусто\n"), "{md}");
+    assert!(
+        out.len() <= 4000,
+        "payload over the ceiling: {} bytes",
+        out.len()
+    );
+}
+
+/// A snapshot that cannot be built is not silence either: the hook still
+/// exits 0, and the payload names the failure instead of looking like an
+/// empty memory.
+#[test]
+fn snapshot_hook_names_a_failure_instead_of_answering_with_nothing() {
+    let home = TmpHome::dir("snapshot-hook-broken");
+    std::fs::write(home.0.join("aurelius.db"), vec![0x5a; 8192]).expect("write junk db");
+    let payload = serde_json::json!({"cwd": home.0.to_string_lossy()}).to_string();
+    let (code, out) = run(&home, &["snapshot", "--hook"], Some(&payload));
+    assert_eq!(code, 0, "a hook never fails the session start");
+    let json: serde_json::Value = serde_json::from_str(&out).expect("hook JSON");
+    let md = json["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("additionalContext");
+    assert!(md.starts_with("# Память недоступна\n"), "{md}");
 }

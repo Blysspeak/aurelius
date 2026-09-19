@@ -37,6 +37,13 @@ const B_DIGEST: usize = 300;
 /// [`build_snapshot_in`]); репозиторий, владелец и «В работе» — никогда.
 const B_TOTAL: usize = 3850;
 
+/// Строка под заголовком снапшота без проекта. Хук пробуждения выводит проект
+/// из репозитория и вне репозитория раньше не отдавал ничего — сессия
+/// просыпалась без памяти вовсе. Теперь он отдаёт глобальный срез, и срез
+/// обязан сам сказать, что он не проектный и как попросить проектный.
+const GLOBAL_SCOPE_NOTE: &str =
+    "Проект не определён — срез по всей памяти, не по проекту. Срез проекта: memory_status(project=…).\n";
+
 /// Строк в слоях «Владелец», «В работе» (вместе с активными, пока их не
 /// больше) и «Приёмы».
 const OWNER_ROWS: usize = 3;
@@ -513,13 +520,13 @@ fn escaped_len(md: &str) -> usize {
 }
 
 /// Собрать снапшот. `repo` — состояние репозитория, в котором стоит сессия
-/// (см. [`crate::git::locate`]); `None` — слоя «Репозиторий» нет вовсе, без
-/// заглушки. Вызывается хуком на старте каждой сессии и обязан быть
-/// мгновенным: git читает вызывающий, здесь только граф.
+/// (см. [`crate::git::locate`]); `None` — слой «Репозиторий» пуст. Вызывается
+/// хуком на старте каждой сессии и обязан быть мгновенным: git читает
+/// вызывающий, здесь только граф.
 ///
-/// Слои нумеруются 1..N подряд: пустой слой не печатается, и номера за ним
-/// сдвигаются. Показывать пустой слой с причиной отвергнуто — строка «пусто»
-/// оплачивается на каждом запросе сессии, а действовать по ней нечем.
+/// Скелет постоянен: слои нумеруются 1..N по месту в списке, пустой слой
+/// печатается «— пусто» (почему — у `render` ниже). `project` = `None` —
+/// глобальный срез, и заголовок говорит об этом строкой `GLOBAL_SCOPE_NOTE`.
 pub fn build_snapshot_in(
     conn: &Connection,
     project: Option<&str>,
@@ -536,14 +543,26 @@ pub fn build_snapshot_in(
     // без бюджетного среза, так что ни одна не теряется из-за нехватки места;
     // защита от неограниченного разрастания — аварийный предел ACTIVE_TASK_CAP
     // уже применён в gather(). Здесь просто печатаем, сколько не поместилось.
-    let mut working = lines(&g.active_tasks, usize::MAX, usize::MAX, |n| {
+    //
+    // «Ни одна не теряется» — про проект, в котором стоит сессия: активная
+    // задача одна на проект. Глобальный срез — это по одной на каждый проект
+    // сразу: 19.09.2026 их было 19, слой занял 2.4 КБ, бюджет снял сессии,
+    // решения и приёмы целиком, а потолок 4000 байт держался случайно. Без
+    // проекта активные идут под обычный бюджет слоя, остальные — счётчиком.
+    let (active_rows, active_budget) = match project {
+        Some(_) => (usize::MAX, usize::MAX),
+        None => (WORKING_ROWS, B_WORKING),
+    };
+    let mut working = lines(&g.active_tasks, active_rows, active_budget, |n| {
         Some(task_line(n))
     });
-    if g.active_overflow > 0 {
-        working.push_str(&format!(
-            "- …и ещё {} активных не поместилось\n",
-            g.active_overflow
-        ));
+    let cut = match project {
+        Some(_) => 0,
+        None => g.active_tasks.len().saturating_sub(working.lines().count()),
+    };
+    let hidden = g.active_overflow + cut;
+    if hidden > 0 {
+        working.push_str(&format!("- …и ещё {hidden} активных не поместилось\n"));
     }
     let active_used = working.len();
 
@@ -626,6 +645,9 @@ pub fn build_snapshot_in(
     // слое сессий» падал по причине, к сессиям не относящейся.
     let render = |sections: &[(&str, String, Option<u8>)]| {
         let mut md = format!("# Память · {scope} · {date}\n");
+        if project.is_none() {
+            md.push_str(GLOBAL_SCOPE_NOTE);
+        }
         for (i, (title, body, _)) in sections.iter().enumerate() {
             let body = if body.is_empty() {
                 "— пусто\n"
@@ -1069,6 +1091,62 @@ mod tests {
             md.contains("## 6 · Решения и знания"),
             "пустой слой остаётся в скелете с постоянным номером:\n{md}"
         );
+    }
+
+    /// Тот же перебор активных в глобальном срезе (хук вне репозитория): там
+    /// активные — по одной на каждый проект, и печатать их без среза значит
+    /// отдать весь бюджет им. Здесь они идут под бюджет слоя, остальные —
+    /// счётчиком, и знание остаётся в срезе.
+    #[test]
+    fn global_snapshot_puts_active_tasks_under_the_layer_budget() {
+        let conn = test_conn();
+        let long_title = "слово ".repeat(40);
+        for i in 0..15 {
+            super::super::add_node(
+                &conn,
+                NodeType::Task,
+                &format!("[p{i}] {long_title}{i}"),
+                Some("нота"),
+                "test",
+                serde_json::json!({
+                    "status": "active",
+                    "activated_at": format!("2021-01-{:02}T00:00:00Z", i + 1),
+                }),
+            )
+            .expect("add active task");
+        }
+        let decision_text = "решение, которое глобальный срез обязан сохранить";
+        super::super::add_node(
+            &conn,
+            NodeType::Decision,
+            "решение",
+            Some(decision_text),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add decision");
+
+        let md = build_snapshot(&conn, None).expect("snapshot");
+
+        let working: Vec<&str> = md
+            .split("\n## ")
+            .find(|s| s.contains("· В работе\n"))
+            .expect("working layer")
+            .lines()
+            .skip(1)
+            .collect();
+        let rows = working.iter().filter(|l| l.contains("слово")).count();
+        assert!(
+            (1..=WORKING_ROWS).contains(&rows),
+            "активные вне бюджета слоя: {rows}\n{md}"
+        );
+        let hidden = 15 - rows;
+        assert!(
+            md.contains(&format!("- …и ещё {hidden} активных не поместилось\n")),
+            "скрытые активные обязаны быть посчитаны:\n{md}"
+        );
+        assert!(md.contains(decision_text), "знание снято бюджетом:\n{md}");
+        assert!(escaped_len(&md) <= B_TOTAL, "{}", escaped_len(&md));
     }
 
     /// T044/FR-027: снапшот проекта с записанными координатами секретов не

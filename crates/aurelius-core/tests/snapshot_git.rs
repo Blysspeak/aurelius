@@ -161,6 +161,60 @@ fn repository_layer_vanishes_outside_a_repository_and_nothing_else_changes() {
     assert_eq!(without_repo_layer(&inside), without_repo_layer(&outside));
 }
 
+/// Каталог сессии вне репозитория и проект не определён: хук пробуждения
+/// отдаёт глобальный срез. Он обязан назвать свою область, держать слой
+/// «Репозиторий» пустым, а скелет — тем же 1..N без дыр, и не терять знание.
+#[test]
+fn global_snapshot_outside_a_repository_names_its_scope_and_keeps_the_skeleton() {
+    let name = format!("scoped{}", std::process::id());
+    let elsewhere = TmpDir::new("not-a-repo");
+    let conn = conn_in(&elsewhere.0);
+    seed_graph(&conn, &name);
+
+    assert_eq!(git::locate(&conn, Some(&elsewhere.0), None), None);
+    let global = graph::build_snapshot_in(&conn, None, None).expect("global");
+    let scoped = graph::build_snapshot_in(&conn, Some(&name), None).expect("scoped");
+
+    assert!(global.starts_with("# Память · глобально · "), "{global}");
+    assert!(
+        global
+            .lines()
+            .nth(1)
+            .is_some_and(|l| l.starts_with("Проект не определён")),
+        "глобальный срез обязан сказать, что он не проектный:\n{global}"
+    );
+    assert!(
+        !scoped.contains("Проект не определён"),
+        "проектный срез не несёт строки глобального:\n{scoped}"
+    );
+    assert!(
+        global.contains("\n## 1 · Репозиторий\n— пусто\n"),
+        "{global}"
+    );
+
+    let titles = |md: &str| -> Vec<String> {
+        md.lines()
+            .filter_map(|l| l.strip_prefix("## "))
+            .map(|l| l.split(" · ").nth(1).unwrap_or_default().to_owned())
+            .collect()
+    };
+    assert_eq!(
+        titles(&global),
+        titles(&scoped),
+        "скелет не зависит от области"
+    );
+    for (i, line) in global.lines().filter(|l| l.starts_with("## ")).enumerate() {
+        assert!(
+            line.starts_with(&format!("## {} · ", i + 1)),
+            "номера слоёв 1..N без дыр: {line}\n{global}"
+        );
+    }
+    assert!(
+        global.contains("sqlite"),
+        "знание пропало из среза:\n{global}"
+    );
+}
+
 /// Шаг 2: каталог сессии не репозиторий, но граф знает корень проекта с тем же
 /// именем — слой находится по нему.
 #[test]
