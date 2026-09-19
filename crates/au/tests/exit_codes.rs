@@ -804,7 +804,8 @@ fn a_note_is_linked_to_its_repository_project_as_it_is_written() {
 }
 
 /// `au db prune` без `--apply` только показывает таблицу; с `--apply` снимает
-/// ровно её. Узел с `claim` не снимается ни тем, ни другим.
+/// ровно её. Прогон снимается и с `claim`: сирота — `TechnicalOrphan`,
+/// остальные — `TechnicalJunk`.
 #[test]
 fn prune_is_a_dry_run_until_apply() {
     let home = TmpHome::dir("prune");
@@ -829,6 +830,7 @@ fn prune_is_a_dry_run_until_apply() {
     let (code, out) = run(&home, &["db", "prune"], None);
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("TechnicalOrphan · 1"), "{out}");
+    assert!(out.contains("TechnicalJunk · 1"), "{out}");
     assert_eq!(
         count(&home, RUN_NODES),
         2,
@@ -839,9 +841,12 @@ fn prune_is_a_dry_run_until_apply() {
     assert_eq!(code, 0, "{out}");
     assert_eq!(
         count(&home, RUN_NODES),
-        1,
-        "снята сирота, прогон с claim остался"
+        0,
+        "сняты оба: сирота и прогон с claim"
     );
+    let (code, out) = run(&home, &["db", "prune"], None);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("TechnicalJunk · 0"), "повтор пуст: {out}");
 }
 
 /// `--claim` несёт утверждение целиком; требовать вдобавок позиционный текст
