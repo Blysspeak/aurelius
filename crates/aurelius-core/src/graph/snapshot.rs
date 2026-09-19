@@ -1,27 +1,52 @@
 //! Слой 7-уровневой памяти: замороженный снапшот и дистилляция.
 //!
-//! Снапшот — компактный Markdown (жёсткий бюджет символов на слой, ~4.5К всего),
-//! который инжектится в контекст агента ОДИН раз при старте сессии. Урок
-//! hermes-agent: маленький курируемый срез в системном промпте бьёт большой
-//! JSON по запросу — и не ломает prefix-cache, потому что заморожен на сессию.
+//! Снапшот — компактный Markdown (жёсткий потолок байт на слой и
+//! [`B_TOTAL`] на всё), который инжектится в контекст агента ОДИН раз при
+//! старте сессии. Урок hermes-agent: маленький курируемый срез в системном
+//! промпте бьёт большой JSON по запросу — и не ломает prefix-cache, потому что
+//! заморожен на сессию. Но и платится он каждым следующим запросом сессии,
+//! поэтому здесь только то, что нужно в первую секунду: где стоит репозиторий,
+//! как работать с владельцем, что открыто в ЭТОМ проекте.
 //!
-//! Дистиллят (слой 7) — структурная выжимка без LLM: незакрытые next_steps
+//! Дистиллят — структурная выжимка без LLM: незакрытые next_steps
 //! последних сессий + нерешённые проблемы, пересобирается consolidate().
 
 use anyhow::Result;
 use chrono::Utc;
 use rusqlite::Connection;
 
+use crate::git::RepoState;
 use crate::models::{MemoryKind, Node, NodeType};
 use crate::secret::is_secret_ref;
 
-/// Бюджеты слоёв в символах. Сумма ~4500 — порядка 1.5К токенов.
-const B_IDENTITY: usize = 600;
-const B_WORKING: usize = 1000;
-const B_EPISODIC: usize = 800;
-const B_SEMANTIC: usize = 900;
-const B_PROCEDURAL: usize = 500;
-const B_DIGEST: usize = 500;
+/// Потолки слоёв в БАЙТАХ, а не в символах: снапшот оплачивается байтами на
+/// каждом запросе сессии, а кириллица вдвое дороже латиницы. Слой
+/// «Репозиторий» держит свой потолок в [`crate::git`].
+const B_IDENTITY: usize = 400;
+const B_WORKING: usize = 800;
+const B_PRESSURE: usize = 300;
+const B_EPISODIC: usize = 700;
+const B_SEMANTIC: usize = 700;
+const B_PROCEDURAL: usize = 400;
+const B_DIGEST: usize = 300;
+
+/// Потолок всего снапшота — длина markdown внутри JSON-строки, с
+/// экранированием. Обёртка SessionStart-хука добавляет около ста байт, так
+/// что весь ответ хука не больше 4000. При переборе слои снимаются целиком,
+/// начиная с наименее нужных при пробуждении (см. `drop_rank` в
+/// [`build_snapshot_in`]); репозиторий, владелец и «В работе» — никогда.
+const B_TOTAL: usize = 3850;
+
+/// Строк в слоях «Владелец», «В работе» (вместе с активными, пока их не
+/// больше) и «Приёмы».
+const OWNER_ROWS: usize = 3;
+const WORKING_ROWS: usize = 3;
+const SKILL_ROWS: usize = 3;
+
+/// Потолок строки, у которой нет `claim`, в символах — ровно столько,
+/// сколько `claim` может занять при записи. Первая фраза длиннее не режется
+/// на полуслове, а строка снимается целиком.
+const ROW_CHARS: usize = 240;
 
 /// Аварийный предел слоя активных задач (FR-018): сколько задач в состоянии
 /// `active` показывается, даже если их заведено больше. Инвариант «одна
@@ -85,7 +110,9 @@ fn annotate(node: &Node, text: String) -> String {
     out
 }
 
-/// Строки слоя: по одной на узел, суммарно не больше budget.
+/// Строки слоя: по одной на узел, не больше `max_rows` строк и `budget` байт.
+/// Узел, для которого `line` ничего не вернул, пропускается, и место
+/// достаётся следующему.
 ///
 /// Координаты секретов ([`is_secret_ref`]) отсеиваются — FR-027: они отдаются
 /// по запросу (`au secret list`) и НЕ ДОЛЖНЫ попадать в подаваемую память
@@ -95,16 +122,178 @@ fn annotate(node: &Node, text: String) -> String {
 /// однажды расширят. Правило живёт в `secret`, рядом с остальными правилами о
 /// секретах, и переиспользуется отсюда и из поиска — двух копий у него быть не
 /// должно, иначе они разойдутся молча.
-fn layer(nodes: &[Node], per_line: usize, budget: usize) -> String {
+fn lines<'a>(
+    nodes: impl IntoIterator<Item = &'a Node>,
+    max_rows: usize,
+    budget: usize,
+    line: impl Fn(&Node) -> Option<String>,
+) -> String {
     let mut out = String::new();
-    for n in nodes.iter().filter(|n| !is_secret_ref(n)) {
-        let line = format!("- {}\n", annotate(n, body(n, per_line)));
-        if out.chars().count() + line.chars().count() > budget {
+    let mut rows = 0;
+    for n in nodes.into_iter().filter(|n| !is_secret_ref(n)) {
+        if rows >= max_rows {
             break;
         }
-        out.push_str(&line);
+        let Some(text) = line(n) else { continue };
+        let row = format!("- {text}\n");
+        if out.len() + row.len() > budget {
+            break;
+        }
+        out.push_str(&row);
+        rows += 1;
     }
     out
+}
+
+/// Слой в прежней форме: `claim` целиком или тело по границе слова, с
+/// пометкой происхождения.
+fn layer(nodes: &[Node], per_line: usize, budget: usize) -> String {
+    lines(nodes, usize::MAX, budget, |n| {
+        Some(annotate(n, body(n, per_line)))
+    })
+}
+
+/// Метка без префикса `[проект] ` — в слое своего проекта он повторяет
+/// заголовок снапшота.
+fn strip_project_prefix(label: &str) -> &str {
+    label
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .map_or(label, |(_, tail)| tail)
+}
+
+/// Метка — всего лишь копия текста: префикс или обрезка с многоточием,
+/// какую пишут сами `memory_add`/`au note`, когда метку не назвали. Такую
+/// метку показывать рядом с текстом — значит отдать одно и то же дважды.
+///
+/// `pub`: то же правило нужно `node_recall` в MCP-крейте; вторая копия
+/// разошлась бы с этой молча.
+#[must_use]
+pub fn label_repeats(label: &str, text: &str) -> bool {
+    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let head = norm(
+        strip_project_prefix(label)
+            .trim_end()
+            .trim_end_matches(['…', '.'])
+            .trim_end(),
+    );
+    head.is_empty() || norm(text).starts_with(&head)
+}
+
+/// Первая фраза текста — до первой точки, восклицательного или
+/// вопросительного знака с пробелом после или до конца строки. Длиннее
+/// [`ROW_CHARS`] — `None`: фраза не режется посередине, строка снимается.
+fn first_sentence(text: &str) -> Option<String> {
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    let one = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let end = [". ", "! ", "? "]
+        .iter()
+        .filter_map(|p| one.find(p).map(|i| i + 1))
+        .min()
+        .unwrap_or(one.len());
+    let sentence = one[..end].to_owned();
+    (sentence.chars().count() <= ROW_CHARS).then_some(sentence)
+}
+
+/// Строка владельца: его метка — заголовок, который автор дал правилу.
+/// Метка-копия текста заменяется `claim`, а без него — первой фразой тела.
+/// Пометка происхождения не ставится: факт о владельце по своей природе
+/// сказан им самим, и `[reported]` на каждой строке — фон, а не сведение.
+fn owner_line(n: &Node) -> Option<String> {
+    let claim = crate::provenance::Provenance::from_data(&n.data).claim;
+    let copied = [claim.as_deref(), n.note.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|t| label_repeats(&n.label, t));
+    if !copied {
+        return Some(strip_project_prefix(&n.label).to_owned());
+    }
+    claim.or_else(|| n.note.as_deref().and_then(first_sentence))
+}
+
+/// Строка задачи: `claim`, а без него — заголовок из метки. Первая фраза
+/// тела задачи — это предыстория («Найдено 16.09 по свидетельствам…»), а
+/// что делать, `task_create` кладёт в заголовок в повелительной форме.
+/// Происхождение не помечается: задача — намерение, а не утверждение о мире.
+fn task_line(n: &Node) -> String {
+    crate::provenance::Provenance::from_data(&n.data)
+        .claim
+        .unwrap_or_else(|| strip_project_prefix(&n.label).to_owned())
+}
+
+/// Строка слоя «В работе»: задача — [`task_line`]; прочее — `claim`, а без
+/// него первая фраза тела, если влезает в [`ROW_CHARS`], иначе ничего.
+fn work_line(n: &Node) -> Option<String> {
+    if matches!(n.node_type, NodeType::Task) {
+        return Some(task_line(n));
+    }
+    let text = match crate::provenance::Provenance::from_data(&n.data).claim {
+        Some(claim) => claim,
+        None => first_sentence(n.note.as_deref().unwrap_or(&n.label))?,
+    };
+    Some(annotate(n, text))
+}
+
+/// Убрать списки абсолютных путей после двоеточия: «файлов затронуто 14:
+/// /home/…/a.rs, /home/…/b.rs» → «файлов затронуто 14». Чекпоинт сессии
+/// сообщает, сколько файлов тронул, а не какие: пути принадлежат слою
+/// «Репозиторий», и там их не больше трёх.
+fn drop_path_lists(text: &str) -> String {
+    let is_path = |w: &str| {
+        let b = w.as_bytes();
+        w.starts_with('/')
+            || w.starts_with("~/")
+            || w.starts_with(r"\\?\")
+            || (b.len() > 2
+                && b[0].is_ascii_alphabetic()
+                && b[1] == b':'
+                && (b[2] == b'\\' || b[2] == b'/'))
+    };
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        if w.ends_with(':') && words.get(i + 1).is_some_and(|next| is_path(next)) {
+            out.push(w.trim_end_matches(':').to_owned());
+            i += 1;
+            let mut closed_sentence = false;
+            while i < words.len() && is_path(words[i]) {
+                closed_sentence = words[i].ends_with('.');
+                i += 1;
+            }
+            if closed_sentence {
+                if let Some(last) = out.last_mut() {
+                    last.push('.');
+                }
+            }
+            continue;
+        }
+        out.push(w.to_owned());
+        i += 1;
+    }
+    out.join(" ")
+}
+
+/// Строка слоя «Последние сессии»: как прежде, но без списков путей.
+fn session_line(n: &Node, per_line: usize) -> String {
+    let text = match crate::provenance::Provenance::from_data(&n.data).claim {
+        Some(claim) => drop_path_lists(&claim),
+        None => clip(
+            &drop_path_lists(n.note.as_deref().unwrap_or(&n.label)),
+            per_line,
+        ),
+    };
+    annotate(n, text)
+}
+
+/// Строка карточки навыка: имя — ключ для `skill_get` — и начало условия
+/// загрузки. Без имени строка бесполезна: по ней карточку не достать.
+fn skill_line(n: &Node) -> String {
+    match n.note.as_deref().filter(|t| !t.trim().is_empty()) {
+        Some(trigger) => format!("{} — {}", n.label, clip(trigger, 60)),
+        None => n.label.clone(),
+    }
 }
 
 /// Свежие узлы типа в области проекта. Тонкая обёртка над общим предикатом
@@ -196,6 +385,8 @@ struct Gathered {
     decisions: Vec<Node>,
     concepts: Vec<Node>,
     skills: Vec<Node>,
+    /// Сколько карточек навыков всего — для строки-указателя на остальные.
+    skills_total: usize,
     digest: Vec<Node>,
 }
 
@@ -207,17 +398,30 @@ fn gather(conn: &Connection, project: Option<&str>) -> Result<Gathered> {
     let active_overflow = active_tasks.len().saturating_sub(ACTIVE_TASK_CAP);
     active_tasks.truncate(ACTIVE_TASK_CAP);
 
+    // Прочие открытые — свежими первыми. Выборка сортирует по приоритету, и
+    // с лимитом 8 самая свежая задача большого бэклога в неё просто не
+    // попадала; берётся всё и режется уже по свежести.
+    let mut other_tasks =
+        super::get_tasks_filtered(conn, project, Some(OTHER_OPEN_TASK_STATUSES), None, 200)?;
+    other_tasks.sort_by_key(|n| std::cmp::Reverse(n.updated_at));
+    other_tasks.truncate(8);
+
+    let skill_type = serde_json::to_string(&NodeType::Skill)?;
+    let skills_total: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE node_type = ?1 AND deleted_at IS NULL",
+            [skill_type],
+            |r| r.get::<_, i64>(0),
+        )?
+        .try_into()
+        .unwrap_or(0);
+
     Ok(Gathered {
-        identity: typed_recent(conn, &NodeType::UserFact, None, 12)?,
+        // Своё и глобальное; связанное с другим проектом — никогда.
+        identity: super::owner_facts(conn, project, 12)?,
         active_tasks,
         active_overflow,
-        other_tasks: super::get_tasks_filtered(
-            conn,
-            project,
-            Some(OTHER_OPEN_TASK_STATUSES),
-            None,
-            8,
-        )?,
+        other_tasks,
         problems: super::get_unsolved_problems(conn, project, 6)?,
         // Гроссбух давления (ступень 6): открытые обязательства по напряжению —
         // недоделанное лезет наверх само. Best-effort: пусто при отсутствии таблиц.
@@ -234,7 +438,9 @@ fn gather(conn: &Connection, project: Option<&str>) -> Result<Gathered> {
         sessions: typed_recent(conn, &NodeType::Session, project, 3)?,
         decisions: typed_recent(conn, &NodeType::Decision, project, 8)?,
         concepts: typed_recent(conn, &NodeType::Concept, project, 5)?,
-        skills: typed_recent(conn, &NodeType::Skill, None, 8)?,
+        // Навыки межпроектны по природе — фильтра по проекту нет, есть потолок.
+        skills: typed_recent(conn, &NodeType::Skill, None, SKILL_ROWS)?,
+        skills_total,
         digest: typed_recent(conn, &NodeType::Digest, project, 1)?
             .into_iter()
             .filter(|n| n.note.as_deref() != Some(EMPTY_DIGEST))
@@ -294,10 +500,32 @@ pub fn snapshot_facts(conn: &Connection, project: Option<&str>) -> Result<Snapsh
     })
 }
 
-/// Собрать семислойный снапшот. Только чтение, без сети и индексации —
-/// вызывается хуком на старте каждой сессии и обязан быть мгновенным.
+/// Собрать снапшот без слоя «Репозиторий». Только чтение, без сети и
+/// индексации. Дверь MCP (`memory_snapshot`) зовёт именно его: у сервера нет
+/// своего знания о том, где стоит сессия.
 pub fn build_snapshot(conn: &Connection, project: Option<&str>) -> Result<String> {
-    let ts = Utc::now().format("%Y-%m-%d %H:%M");
+    build_snapshot_in(conn, project, None)
+}
+
+/// Длина markdown внутри JSON-строки — то, во что он обойдётся в ответе хука.
+fn escaped_len(md: &str) -> usize {
+    serde_json::to_string(md).map_or(md.len(), |s| s.len())
+}
+
+/// Собрать снапшот. `repo` — состояние репозитория, в котором стоит сессия
+/// (см. [`crate::git::locate`]); `None` — слоя «Репозиторий» нет вовсе, без
+/// заглушки. Вызывается хуком на старте каждой сессии и обязан быть
+/// мгновенным: git читает вызывающий, здесь только граф.
+///
+/// Слои нумеруются 1..N подряд: пустой слой не печатается, и номера за ним
+/// сдвигаются. Показывать пустой слой с причиной отвергнуто — строка «пусто»
+/// оплачивается на каждом запросе сессии, а действовать по ней нечем.
+pub fn build_snapshot_in(
+    conn: &Connection,
+    project: Option<&str>,
+    repo: Option<&RepoState>,
+) -> Result<String> {
+    let date = Utc::now().format("%Y-%m-%d");
     let scope = project.unwrap_or("глобально");
 
     let g = gather(conn, project)?;
@@ -308,26 +536,26 @@ pub fn build_snapshot(conn: &Connection, project: Option<&str>) -> Result<String
     // без бюджетного среза, так что ни одна не теряется из-за нехватки места;
     // защита от неограниченного разрастания — аварийный предел ACTIVE_TASK_CAP
     // уже применён в gather(). Здесь просто печатаем, сколько не поместилось.
-    let mut working = layer(&g.active_tasks, 160, usize::MAX);
+    let mut working = lines(&g.active_tasks, usize::MAX, usize::MAX, |n| {
+        Some(task_line(n))
+    });
     if g.active_overflow > 0 {
         working.push_str(&format!(
             "- …и ещё {} активных не поместилось\n",
             g.active_overflow
         ));
     }
-    let active_used = working.chars().count();
+    let active_used = working.len();
 
-    // Остаток бюджета «В работе» — прочим открытым задачам (FR-019), а то, что
-    // они не выбрали, — проблемам. Раньше половины делились поровну и
-    // фиксированно: пустая проблема не отдавала место задачам и наоборот.
-    let working_rest = B_WORKING.saturating_sub(active_used);
-    let other = layer(&g.other_tasks, 160, working_rest);
-    let other_used = other.chars().count();
-    working.push_str(&other);
-    working.push_str(&layer(
-        &g.problems,
-        160,
-        working_rest.saturating_sub(other_used),
+    // Остаток слоя — прочим открытым задачам и проблемам вперемешку, свежим
+    // первыми, до WORKING_ROWS строк вместе с активными.
+    let mut open: Vec<&Node> = g.other_tasks.iter().chain(&g.problems).collect();
+    open.sort_by_key(|n| std::cmp::Reverse(n.updated_at));
+    working.push_str(&lines(
+        open,
+        WORKING_ROWS.saturating_sub(g.active_tasks.len()),
+        B_WORKING.saturating_sub(active_used),
+        work_line,
     ));
 
     // Если активные перебрали весь бюджет слоя, разница вычитается у слоя ниже
@@ -338,36 +566,87 @@ pub fn build_snapshot(conn: &Connection, project: Option<&str>) -> Result<String
     let mut semantic = layer(&g.decisions, 150, semantic_budget * 2 / 3);
     semantic.push_str(&layer(&g.concepts, 150, semantic_budget / 3));
 
-    let pressure = g
-        .pressure
-        .iter()
-        .map(|line| format!("- {line}\n"))
-        .collect::<String>();
+    let mut pressure = String::new();
+    for line in &g.pressure {
+        let row = format!("- {line}\n");
+        if pressure.len() + row.len() > B_PRESSURE {
+            break;
+        }
+        pressure.push_str(&row);
+    }
 
-    let (identity, sessions, skills, digest) = (&g.identity, &g.sessions, &g.skills, &g.digest);
+    let mut skills = lines(&g.skills, SKILL_ROWS, B_PROCEDURAL, |n| Some(skill_line(n)));
+    let skills_rest = g.skills_total.saturating_sub(g.skills.len());
+    if !skills.is_empty() && skills_rest > 0 {
+        skills.push_str(&format!(
+            "- ещё {skills_rest} — memory_search(query), тело — skill_get(name)\n"
+        ));
+    }
 
-    let sections: [(&str, String); 8] = [
-        ("1 · Владелец", layer(identity, 120, B_IDENTITY)),
-        ("2 · В работе (задачи и открытые проблемы)", working),
-        ("3 · Давление (незакрытые обязательства)", pressure),
-        ("4 · Последние сессии", layer(sessions, 250, B_EPISODIC)),
-        ("5 · Решения и знания", semantic),
-        ("6 · Приёмы", layer(skills, 100, B_PROCEDURAL)),
+    // (заголовок, тело, очередь на снятие при переборе B_TOTAL: больший
+    // номер снимается раньше; `None` — не снимается никогда).
+    let mut sections: Vec<(&str, String, Option<u8>)> = vec![
         (
-            "7 · Архив",
+            "Репозиторий",
+            repo.map(crate::git::render).unwrap_or_default(),
+            None,
+        ),
+        (
+            "Владелец",
+            lines(&g.identity, OWNER_ROWS, B_IDENTITY, owner_line),
+            None,
+        ),
+        ("В работе", working, None),
+        ("Давление", pressure, Some(4)),
+        (
+            "Последние сессии",
+            lines(&g.sessions, usize::MAX, B_EPISODIC, |n| {
+                Some(session_line(n, 160))
+            }),
+            Some(1),
+        ),
+        ("Решения и знания", semantic, Some(2)),
+        ("Приёмы", skills, Some(3)),
+        (
+            "Архив",
             format!(
                 "- {nodes} узлов, {edges} рёбер; глубже — memory_recall(topic) / memory_search(query)\n"
             ),
+            None,
         ),
-        ("8 · Дистиллят", layer(digest, B_DIGEST, B_DIGEST)),
+        ("Дистиллят", layer(&g.digest, 140, B_DIGEST), Some(5)),
     ];
 
-    let mut md = format!("# Память Aurelius · {scope} · {ts} UTC\n");
-    for (title, body) in sections {
-        if body.is_empty() {
-            continue;
+    // Скелет снапшота постоянен: номер слоя — его место в списке, а не место
+    // среди непустых, и пустой слой печатается пустым. Это стоит несколько
+    // байт на строку, но номер слоя обязан значить одно и то же в разных
+    // сессиях. 19.09 проверено, чем обходится обратное: в пустом доме снапшот
+    // печатал «1 · Последние сессии», «2 · Решения и знания» — номера съезжали
+    // от того, какие слои оказались пустыми, а тест «сессия обязана лежать в
+    // слое сессий» падал по причине, к сессиям не относящейся.
+    let render = |sections: &[(&str, String, Option<u8>)]| {
+        let mut md = format!("# Память · {scope} · {date}\n");
+        for (i, (title, body, _)) in sections.iter().enumerate() {
+            let body = if body.is_empty() {
+                "— пусто\n"
+            } else {
+                body.as_str()
+            };
+            md.push_str(&format!("\n## {} · {title}\n{body}", i + 1));
         }
-        md.push_str(&format!("\n## {title}\n{body}"));
+        md
+    };
+    let mut md = render(&sections);
+    while escaped_len(&md) > B_TOTAL {
+        let victim = sections
+            .iter_mut()
+            .filter(|s| !s.1.is_empty() && s.2.is_some())
+            .max_by_key(|s| s.2);
+        match victim {
+            Some(section) => section.1.clear(),
+            None => break,
+        }
+        md = render(&sections);
     }
     Ok(md)
 }
@@ -474,8 +753,11 @@ mod tests {
         )
         .expect("add user fact");
         let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
-        assert!(md.starts_with("# Память Aurelius · demo"));
-        assert!(md.contains("1 · Владелец"));
+        assert!(md.starts_with("# Память · demo · "));
+        // Скелет постоянен: Репозиторий — всегда первый слой, Владелец — второй.
+        // Пустой слой печатается пустым, а не исчезает вместе со своим номером.
+        assert!(md.contains("## 1 · Репозиторий"), "снапшот:\n{md}");
+        assert!(md.contains("## 2 · Владелец"));
         // Общий потолок: снапшот обязан оставаться маленьким при любом графе.
         assert!(md.chars().count() < 6_000, "снапшот распух: {}", md.len());
     }
@@ -515,7 +797,7 @@ mod tests {
             "узел, связанный с проектом ребром, обязан попадать в снапшот; было:\n{md}"
         );
         assert!(
-            md.contains("5 · Решения и знания"),
+            md.contains("· Решения и знания"),
             "слой решений пуст:\n{md}"
         );
     }
@@ -570,8 +852,8 @@ mod tests {
         let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
 
         assert!(
-            md.contains("слои 1-6 не доезжают"),
-            "свежая задача в backlog обязана быть видна:\n{md}"
+            md.contains("- починить снапшот\n"),
+            "свежая задача в backlog обязана быть видна заголовком:\n{md}"
         );
     }
 
@@ -681,8 +963,8 @@ mod tests {
         let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
 
         assert!(
-            md.contains("чиним слой активных задач в снапшоте"),
-            "активная задача обязана присутствовать целиком среди 200 открытых:\n{md}"
+            md.contains("- актуальная работа\n"),
+            "активная задача обязана присутствовать среди 200 открытых:\n{md}"
         );
     }
 
@@ -723,16 +1005,17 @@ mod tests {
             "сообщение о переполнении обязано назвать точное число:\n{md}"
         );
 
+        // Строка задачи — её заголовок (метка без префикса проекта).
         for i in 0..3 {
-            let note = format!("нота активной задачи {i:02}");
+            let row = format!("- активная задача {i:02}\n");
             assert!(
-                !md.contains(&note),
+                !md.contains(&row),
                 "самая старая активная задача {i} обязана уйти в overflow, а не остаться в дампе:\n{md}"
             );
         }
-        let newest_note = format!("нота активной задачи {:02}", total - 1);
+        let newest_row = format!("- активная задача {:02}\n", total - 1);
         assert!(
-            md.contains(&newest_note),
+            md.contains(&newest_row),
             "самая свежая активная задача обязана остаться в дампе:\n{md}"
         );
     }
@@ -740,20 +1023,20 @@ mod tests {
     /// Находка 10: когда активные задачи съедают весь бюджет «В работе» и
     /// ещё сверху, разница вычитается у бюджета «Решения и знания» (FR-017)
     /// — ветка `semantic_budget = B_SEMANTIC.saturating_sub(...)` тоже не
-    /// была покрыта ни одним тестом. 15 активных задач с длинными note
+    /// была покрыта ни одним тестом. 15 активных задач с длинными заголовками
     /// (печатаются без бюджетного среза — FR-017) суммарно намного больше
     /// `B_WORKING + B_SEMANTIC`, так что семантический бюджет обязан
     /// обнулиться, а слой решений — исчезнуть целиком, а не просто ужаться.
     #[test]
     fn active_tasks_overrunning_working_budget_shrink_semantic_layer() {
         let conn = test_conn();
-        let long_note = "слово ".repeat(40); // ~240 символов — больше per_line=160
+        let long_title = "слово ".repeat(40); // ~240 символов, ~440 байт на строку
         for i in 0..15 {
             super::super::add_node(
                 &conn,
                 NodeType::Task,
-                &format!("[demo] активная {i}"),
-                Some(&format!("{long_note}{i}")),
+                &format!("[demo] {long_title}{i}"),
+                Some("нота"),
                 "test",
                 serde_json::json!({
                     "status": "active",
@@ -779,9 +1062,12 @@ mod tests {
             !md.contains(decision_text),
             "decision обязан пропасть при обнулённом семантическом бюджете:\n{md}"
         );
+        // Заголовок остаётся на своём месте и с постоянным номером: исчезающий
+        // заголовок сдвигал номера всех слоёв ниже, и «6 · Решения и знания» в
+        // одной сессии значило не то же, что в другой.
         assert!(
-            !md.contains("5 · Решения и знания"),
-            "пустой слой решений не обязан печатать заголовок:\n{md}"
+            md.contains("## 6 · Решения и знания"),
+            "пустой слой остаётся в скелете с постоянным номером:\n{md}"
         );
     }
 
@@ -927,15 +1213,17 @@ mod tests {
             .map(|i| format!("слово{i}"))
             .collect::<Vec<_>>()
             .join(" ");
+        // Решение без claim: его тело режется по бюджету строки. Строка
+        // владельца — метка целиком, её обрезка здесь ничего не проверила бы.
         super::super::add_node(
             &conn,
-            NodeType::UserFact,
-            "владелец",
+            NodeType::Decision,
+            "[demo] решение",
             Some(&long_note),
             "test",
             serde_json::json!({}),
         )
-        .expect("add user fact");
+        .expect("add decision");
 
         let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
 
@@ -961,5 +1249,144 @@ mod tests {
             checked > 0,
             "тест ничего не проверил — ни одна запись не была обрезана"
         );
+    }
+
+    /// Чекпоинт сессии сообщает, сколько файлов тронул, а не какие.
+    #[test]
+    fn session_rows_report_file_count_not_paths() {
+        let text = "[чекпоинт 150k] ходов 0. правок 36. улик зелёных 8. файлов затронуто 3: \
+                    /home/u/p/crates/au/src/commands.rs, /home/u/p/crates/au/src/main.rs, \
+                    /home/u/p/crates/au/tests/exit_codes.rs";
+        assert_eq!(
+            drop_path_lists(text),
+            "[чекпоинт 150k] ходов 0. правок 36. улик зелёных 8. файлов затронуто 3"
+        );
+        // Путь в середине фразы без двоеточия — не список, он остаётся.
+        let plain = "503 на /api/v1/widgets у клиентов";
+        assert_eq!(drop_path_lists(plain), plain);
+    }
+
+    #[test]
+    fn label_repeats_catches_prefix_and_truncation_only() {
+        let claim = "Демон единственный владелец BGE-M3 и на чтении";
+        assert!(label_repeats(
+            "Демон единственный владелец BGE-M3 и на чт…",
+            claim
+        ));
+        assert!(label_repeats(
+            "[aurelius] Демон единственный владелец...",
+            claim
+        ));
+        assert!(!label_repeats("recall: посев 12, глубина 2", claim));
+    }
+
+    /// «В работе»: не больше трёх строк, свежие первыми; первая фраза длиннее
+    /// потолка не режется на полуслове — строка снимается, место достаётся
+    /// следующей.
+    #[test]
+    fn working_layer_keeps_three_freshest_and_never_clips_a_sentence() {
+        let conn = test_conn();
+        let long = format!("{}.", "слово ".repeat(60).trim_end());
+        for (i, note) in [
+            "старая проблема. хвост",
+            "вторая проблема. хвост",
+            long.as_str(),
+            "третья проблема. хвост",
+            "свежая проблема. хвост",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let node = super::super::add_node(
+                &conn,
+                NodeType::Problem,
+                &format!("[demo] проблема {i}"),
+                Some(note),
+                "test",
+                serde_json::json!({}),
+            )
+            .expect("add problem");
+            conn.execute(
+                "UPDATE nodes SET updated_at = ?1, created_at = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    format!("2026-09-0{}T00:00:00+00:00", i + 1),
+                    node.id.to_string()
+                ],
+            )
+            .expect("date problem");
+        }
+
+        let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
+        let layer: Vec<&str> = md
+            .split("\n## ")
+            .find(|s| s.contains("· В работе"))
+            .expect("слой «В работе»")
+            .lines()
+            .skip(1)
+            .collect();
+
+        assert_eq!(layer.len(), 3, "три строки, не больше:\n{md}");
+        assert!(layer[0].starts_with("- свежая проблема."), "{layer:?}");
+        assert!(layer[1].starts_with("- третья проблема."), "{layer:?}");
+        assert!(layer[2].starts_with("- вторая проблема."), "{layer:?}");
+        assert!(
+            !md.contains("слово слово"),
+            "длинная фраза обязана сняться:\n{md}"
+        );
+        assert!(!md.contains("хвост"), "только первая фраза:\n{md}");
+    }
+
+    /// Весь снапшот не больше потолка при любом графе: лишнее снимается слоями
+    /// с низа очереди, а репозиторий, владелец и «В работе» остаются.
+    #[test]
+    fn whole_snapshot_stays_under_total_ceiling() {
+        let conn = test_conn();
+        let long = "длинное слово ".repeat(30);
+        for t in [
+            NodeType::Decision,
+            NodeType::Concept,
+            NodeType::Session,
+            NodeType::Skill,
+            NodeType::Problem,
+        ] {
+            for i in 0..10 {
+                super::super::add_node(
+                    &conn,
+                    t.clone(),
+                    &format!("[demo] узел {i}"),
+                    Some(&long),
+                    "test",
+                    serde_json::json!({}),
+                )
+                .expect("add node");
+            }
+        }
+        super::super::add_node(
+            &conn,
+            NodeType::UserFact,
+            "правило владельца",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add user fact");
+        let repo = crate::git::RepoState {
+            name: "demo".into(),
+            head: crate::git::Head::Branch("main".into()),
+            upstream: None,
+            changed: 1,
+            paths: vec!["a.rs".into()],
+            commits: Vec::new(),
+        };
+
+        let md = build_snapshot_in(&conn, Some("demo"), Some(&repo)).expect("snapshot");
+
+        assert!(
+            escaped_len(&md) <= B_TOTAL,
+            "{} байт:\n{md}",
+            escaped_len(&md)
+        );
+        assert!(md.contains("## 1 · Репозиторий"), "{md}");
+        assert!(md.contains("· Владелец\n- правило владельца"), "{md}");
     }
 }

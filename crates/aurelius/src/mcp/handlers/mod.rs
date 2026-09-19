@@ -272,6 +272,11 @@ const RECALL_WINDOW: usize = 200;
 /// тем, чего здесь НЕТ — `data` не отдаётся никогда. Именно она раздувала
 /// выдачу: тело карточки навыка уходило целиком, и три записи стоили тысячи
 /// токенов. За телом идут по `id`, отдельным вызовом и осознанно.
+///
+/// `label` не отдаётся, когда он лишь префикс или обрезка `claim` (правило
+/// общее со снапшотом, `graph::label_repeats`): 19.09.2026 у 6-7 из 12 записей
+/// ответа метка была копией утверждения рядом. `created_at` — датой: время
+/// до наносекунды читателю recall ни к чему.
 pub(crate) fn node_recall(node: &aurelius_core::models::Node, query: &str) -> serde_json::Value {
     let p = aurelius_core::provenance::Provenance::from_data(&node.data);
     let claim = p.claim.clone();
@@ -283,7 +288,7 @@ pub(crate) fn node_recall(node: &aurelius_core::models::Node, query: &str) -> se
             .as_deref()
             .map(|note| window_around(note, query, RECALL_WINDOW)),
     };
-    json!({
+    let mut record = json!({
         "id": node.id.to_string(),
         "type": node.node_type,
         "label": node.label,
@@ -291,8 +296,15 @@ pub(crate) fn node_recall(node: &aurelius_core::models::Node, query: &str) -> se
         "window": window,
         "subject": p.subject,
         "confidence": p.confidence_or_default().as_str(),
-        "created_at": node.created_at.to_rfc3339(),
-    })
+        "created_at": node.created_at.format("%Y-%m-%d").to_string(),
+    });
+    let label_copies_claim = claim
+        .as_deref()
+        .is_some_and(|c| graph::label_repeats(&node.label, c));
+    if let (true, Some(fields)) = (label_copies_claim, record.as_object_mut()) {
+        fields.remove("label");
+    }
+    record
 }
 
 /// Кусок текста вокруг первого совпадения любого слова запроса, по границе
@@ -545,5 +557,64 @@ mod recall_window_tests {
             window.contains("улик"),
             "окно должно вести длинное слово, а не предлог: {window}"
         );
+    }
+}
+
+#[cfg(test)]
+mod recall_shape_tests {
+    use super::node_recall;
+    use aurelius_core::graph;
+    use aurelius_core::models::NodeType;
+
+    fn temp_conn() -> rusqlite::Connection {
+        let dir =
+            std::env::temp_dir().join(format!("aurelius-recall-shape-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        aurelius_core::db::open(&dir.join("test.db")).expect("open test db")
+    }
+
+    /// Метка-обрезка утверждения не отдаётся, самостоятельная метка остаётся;
+    /// дата без времени; id, subject, type, confidence — всегда.
+    #[test]
+    fn label_copy_of_claim_is_dropped_and_created_at_is_a_date() {
+        let conn = temp_conn();
+        let claim = "Демон единственный владелец BGE-M3 и на чтении: сокет рядом с базой";
+        let copied = graph::add_node(
+            &conn,
+            NodeType::Decision,
+            "Демон единственный владелец BGE-M3 и на чт…",
+            Some("длинное обоснование"),
+            "test",
+            serde_json::json!({ "claim": claim, "confidence": "measured",
+                                "evidence": "cargo test", "subject": "demo:embed:owner" }),
+        )
+        .expect("add copied");
+        let own = graph::add_node(
+            &conn,
+            NodeType::Decision,
+            "recall: посев 12, глубина 2",
+            None,
+            "test",
+            serde_json::json!({ "claim": claim }),
+        )
+        .expect("add own");
+
+        let a = node_recall(&copied, "BGE-M3");
+        assert!(a.get("label").is_none(), "метка-копия claim осталась: {a}");
+        let b = node_recall(&own, "BGE-M3");
+        assert_eq!(b["label"], "recall: посев 12, глубина 2");
+
+        for r in [&a, &b] {
+            for key in ["id", "subject", "type", "confidence", "claim"] {
+                assert!(r.get(key).is_some(), "нет поля {key}: {r}");
+            }
+            let date = r["created_at"].as_str().expect("created_at строкой");
+            assert!(
+                chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok() && date.len() == 10,
+                "created_at обязан быть датой YYYY-MM-DD: {date}"
+            );
+        }
+        assert_eq!(a["subject"], "demo:embed:owner");
+        assert_eq!(a["confidence"], "measured");
     }
 }

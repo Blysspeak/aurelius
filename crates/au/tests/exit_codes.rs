@@ -218,22 +218,25 @@ fn session_lands_in_layer_four_and_relate_links_to_it() {
     assert_eq!(again["created"], false);
     assert_eq!(again["id"], edge["id"]);
 
-    // Главная проверка: сессия читается слоем 4, а не слоем 5.
+    // Главная проверка: сессия читается слоем сессий, а не среди решений.
+    // Номера — по постоянному скелету снапшота (Репозиторий, Владелец, В
+    // работе, Давление, Сессии, Знания, Приёмы, Архив, Дистиллят), поэтому
+    // сессии это 5, а знания 6 независимо от того, какие слои пусты.
     let (code, snapshot) = run(&home, &["snapshot", "--project", project], None);
     assert_eq!(code, 0, "снапшот: {snapshot}");
-    let layer4 = section(&snapshot, "4 · Последние сессии");
-    let layer5 = section(&snapshot, "5 · Решения и знания");
+    let sessions = section(&snapshot, "5 · Последние сессии");
+    let knowledge = section(&snapshot, "6 · Решения и знания");
     assert!(
-        layer4.contains(summary),
-        "снимок обязан быть в слое 4; снапшот:\n{snapshot}"
+        sessions.contains(summary),
+        "снимок обязан быть в слое сессий; снапшот:\n{snapshot}"
     );
     assert!(
-        !layer5.contains(summary),
+        !knowledge.contains(summary),
         "снимок не должен лежать среди решений; снапшот:\n{snapshot}"
     );
     assert!(
-        layer5.contains("коды возврата разведены"),
-        "решение сессии — как раз слой 5; снапшот:\n{snapshot}"
+        knowledge.contains("коды возврата разведены"),
+        "решение сессии — как раз слой знаний; снапшот:\n{snapshot}"
     );
 }
 

@@ -857,7 +857,12 @@ async fn run_search(
         };
         let exhausted = candidates.len() < want;
         let nodes = graph::tidy_for_emission(candidates, limit);
-        if nodes.len() >= limit || exhausted {
+        // Прогон занимает место только за нехваткой знания: пока пул не
+        // кончился, добор идёт до `limit` строк знания, а не до `limit`
+        // строк вообще — иначе прогон на последнем месте останавливал бы
+        // добор раньше, чем нашлось бы знание получше.
+        let knowledge = nodes.iter().filter(|n| !graph::is_run(n)).count();
+        if knowledge >= limit || exhausted {
             return Ok(SearchRun {
                 nodes,
                 vector_notice,
@@ -3922,11 +3927,19 @@ pub async fn skills(hook: bool) -> Result<()> {
 /// регулярками значит зависеть от вёрстки, и смена вёрстки ломает потребителя
 /// молча.
 pub async fn snapshot(project: Option<String>, hook: bool, json_out: bool) -> Result<()> {
+    let payload = if hook { hooks::read_payload() } else { None };
     let derived = if hook {
-        hooks::hook_project(hooks::read_payload().as_ref())
+        hooks::hook_project(payload.as_ref())
     } else {
         project.or_else(current_dir_name)
     };
+    // Каталог сессии для слоя «Репозиторий»: `cwd` хук-пейлоада, тот же, из
+    // которого `hook_project` вывел проект, — иначе слой и проект могли бы
+    // смотреть в разные места. Без пейлоада — каталог процесса.
+    let cwd = payload
+        .as_ref()
+        .and_then(hooks::cwd_of)
+        .or_else(|| std::env::current_dir().ok());
     if hook && derived.is_none() {
         return Ok(());
     }
@@ -3951,7 +3964,11 @@ pub async fn snapshot(project: Option<String>, hook: bool, json_out: bool) -> Re
             let facts = graph::snapshot_facts(&conn, derived.as_deref())?;
             return Ok(serde_json::to_string(&facts)?);
         }
-        graph::build_snapshot(&conn, derived.as_deref())
+        // Нет репозитория или git не ответил за таймаут — слоя нет, без
+        // заглушки и без ошибки: остальной снапшот от этого не зависит.
+        let repo = aurelius_core::git::locate(&conn, cwd.as_deref(), derived.as_deref())
+            .and_then(|r| aurelius_core::git::read(&r));
+        graph::build_snapshot_in(&conn, derived.as_deref(), repo.as_ref())
     };
 
     match run() {
