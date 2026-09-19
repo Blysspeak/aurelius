@@ -110,13 +110,6 @@ pub struct NoteArgs {
     /// Falls back to `AURELIUS_SESSION_ID`.
     #[arg(long)]
     pub session: Option<String>,
-    /// Bypass the secret-lookalike refusal at the write boundary
-    /// (`add_node_full`, subject `aurelius:write:secret-guard`). The bypass
-    /// is marked in the node's `data` (`secret::BYPASS_MARKER_KEY`), not
-    /// merely allowed silently — a bypass nobody can find afterwards is the
-    /// same as having no guard at all.
-    #[arg(long)]
-    pub allow_secret: bool,
     #[command(flatten)]
     pub provenance: ProvenanceArgs,
     /// How this relates to an existing fact about the same subject:
@@ -233,12 +226,6 @@ pub async fn note(args: NoteArgs) -> Result<()> {
     let mut data = serde_json::Map::new();
     if let Some(id) = agent_session.as_deref() {
         data.insert(graph::AGENT_SESSION_KEY.to_owned(), id.into());
-    }
-    if args.allow_secret {
-        data.insert(
-            aurelius_core::secret::BYPASS_MARKER_KEY.to_owned(),
-            serde_json::Value::Bool(true),
-        );
     }
     let mut prov_data = serde_json::Value::Object(serde_json::Map::new());
     prov.write_into(&mut prov_data);
@@ -3479,10 +3466,8 @@ async fn drain_embedding_queue(
 }
 
 /// Координаты секретов (спека 007, US4, T040): `au secret add / list / rm`.
-/// FR-025 запрещает хранить значение — `Add` прогоняет `--where` через
-/// `secret::detect_lookalike` (T041) ДО записи; попадание отклоняет вызов с
-/// объяснением, какой признак сработал (FR-026), обычной ошибкой (код 1),
-/// а не паникой.
+/// Значение хранится ровно так, как передал вызывающий; функция не пытается
+/// угадывать по форме, является ли строка ключом или координатой.
 pub async fn secret(action: SecretAction) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
 
@@ -3493,12 +3478,6 @@ pub async fn secret(action: SecretAction) -> Result<()> {
             purpose,
             project,
         } => {
-            if let Some(hit) = aurelius_core::secret::detect_lookalike(&location) {
-                anyhow::bail!(
-                    "координата отклонена: {} — исправь --where на место хранения, а не сам секрет",
-                    hit.explain()
-                );
-            }
             let node = graph::add_secret_ref(
                 &conn,
                 project.as_deref(),

@@ -539,7 +539,6 @@ fixed by calling differently, the second by hand — retrying it is pointless.
 | `10` | `au task claim`/`renew`/`release`/`give-up`: the pool is empty, or the lease expired and was reissued to someone else. A shift counts consecutive `10`s to know the queue is exhausted |
 | `11` | the same commands: the database is held by another writer. Distinct from `10` on purpose — otherwise the owner's own hand-run session reads as an empty queue and the shift exits reporting success |
 | `12` | `au task evidence`: nothing to attach the run to — the project has no active task. The evidence **is stored**, as a node without an edge; the code says "not attached", not "not written" |
-| `13` | the secret guard refused the text: a field reads like the secret's value itself. Nothing was written — the graph is append-only and there is no way to scrub a recorded secret. Bypass explicitly with `--allow-secret` |
 | `14` | `au eval`: no run, no numbers — the fixture's sha256 did not match `meta.fixture_sha256`, `meta.version` is unknown, or the run needed to write. A failing *case* is not this code: an incomparable number is worse than a missing one |
 
 Codes above `2` are neither: the call was right and the database is intact. Each names a state

@@ -552,10 +552,10 @@ fn evidence_on_missing_task_is_a_usage_error() {
     );
 }
 
-/// T043 (спека 007, US4, FR-026): `--where`, похожий на само значение ключа,
-/// отклоняется с кодом вызова, а не создаёт узел молча.
+/// Координаты секретов принимают и длинные значения ключевой формы: запись
+/// не должна угадывать назначение строки по её внешнему виду.
 #[test]
-fn secret_add_rejects_key_lookalike_and_creates_no_node() {
+fn secret_add_accepts_key_lookalike() {
     let home = TmpHome::dir("secret-lookalike");
     let (code, out) = run(
         &home,
@@ -572,8 +572,8 @@ fn secret_add_rejects_key_lookalike_and_creates_no_node() {
         None,
     );
     assert_eq!(
-        code, USAGE,
-        "похожая на ключ координата — ошибка вызова: {out}"
+        code, 0,
+        "координата ключевой формы должна записываться: {out}"
     );
 
     let (list_code, list_out) = run(
@@ -581,12 +581,12 @@ fn secret_add_rejects_key_lookalike_and_creates_no_node() {
         &["secret", "list", "--project", "aurelius", "--json"],
         None,
     );
-    assert_eq!(list_code, 0, "список читается даже без единой записи");
+    assert_eq!(list_code, 0, "список читается после записи");
     let refs: serde_json::Value = serde_json::from_str(list_out.trim()).expect("JSON списка");
     assert_eq!(
-        refs,
-        serde_json::json!([]),
-        "отклонённая запись не должна была создать узел: {list_out}"
+        refs.as_array().map(Vec::len),
+        Some(1),
+        "запись должна быть видна: {list_out}"
     );
 }
 

@@ -936,14 +936,6 @@ mod exit {
     /// Улика при этом СОХРАНЕНА узлом без ребра — код говорит «не привязано»,
     /// а не «не записано».
     pub const NO_ACTIVE_TASK: u8 = 12;
-    /// Рубеж перед графом (`add_node_full`, subject
-    /// `aurelius:write:secret-guard`): текст поля похож на само значение
-    /// секрета. Не ошибка вызова и не ошибка хранилища — вызов был правильным,
-    /// отказал ИМЕННО этот текст, и обходится это не повтором того же
-    /// вызова, а явным `--allow-secret`. Ничего не записано: в отличие от
-    /// `NO_ACTIVE_TASK`, здесь нет половинчатого узла — граф append-only, и
-    /// вычистить записанный секрет нечем.
-    pub const SECRET_LOOKALIKE: u8 = 13;
     /// `au eval`: прогон не состоялся, и чисел нет — sha256 фикстуры не сошёлся
     /// с `meta.fixture_sha256`, `meta.version` незнакома, либо проверке
     /// потребовалась запись. Не ошибка вызова и не ошибка хранилища: вызов был
@@ -982,12 +974,6 @@ fn classify(err: &anyhow::Error) -> u8 {
         .any(|c| c.is::<aurelius_core::graph::NoActiveTask>())
     {
         return exit::NO_ACTIVE_TASK;
-    }
-    if err
-        .chain()
-        .any(|c| c.is::<aurelius_core::secret::SecretLookalikeRefused>())
-    {
-        return exit::SECRET_LOOKALIKE;
     }
     // `au daemon`: другой экземпляр уже держит замок и жив — не ошибка
     // хранилища и не ошибка вызова, а отдельный код именно затем, чтобы
