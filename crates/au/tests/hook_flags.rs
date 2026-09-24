@@ -281,7 +281,7 @@ fn snapshot_hook_leads_with_the_repository_it_stands_in() {
         .expect("additionalContext");
     assert!(md.starts_with("# Память · глобально · "), "{md}");
     assert!(md.contains("Проект не определён"), "scope unsaid:\n{md}");
-    assert!(md.contains("\n## 1 · Репозиторий\n— пусто\n"), "{md}");
+    assert!(!md.contains("Репозиторий"), "{md}");
     assert!(
         out.len() <= 4000,
         "payload over the ceiling: {} bytes",

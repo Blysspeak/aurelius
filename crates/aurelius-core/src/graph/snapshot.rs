@@ -22,12 +22,11 @@ use crate::secret::is_secret_ref;
 /// Потолки слоёв в БАЙТАХ, а не в символах: снапшот оплачивается байтами на
 /// каждом запросе сессии, а кириллица вдвое дороже латиницы. Слой
 /// «Репозиторий» держит свой потолок в [`crate::git`].
-const B_IDENTITY: usize = 400;
+const B_IDENTITY: usize = 600;
 const B_WORKING: usize = 800;
 const B_PRESSURE: usize = 300;
 const B_EPISODIC: usize = 700;
 const B_SEMANTIC: usize = 700;
-const B_PROCEDURAL: usize = 400;
 const B_DIGEST: usize = 300;
 
 /// Потолок всего снапшота — длина markdown внутри JSON-строки, с
@@ -45,7 +44,8 @@ const GLOBAL_SCOPE_NOTE: &str =
     "Проект не определён — срез по всей памяти, не по проекту. Срез проекта: memory_status(project=…).\n";
 
 /// Строк в слоях «Владелец», «В работе» (вместе с активными, пока их не
-/// больше) и «Приёмы».
+/// больше); навыков — в машинной форме (в markdown их нет: индекс карточек
+/// приносит хук SessionStart).
 const OWNER_ROWS: usize = 3;
 const WORKING_ROWS: usize = 3;
 const SKILL_ROWS: usize = 3;
@@ -80,12 +80,18 @@ pub fn clip(s: &str, budget: usize) -> String {
         && !chars[end - 1].is_whitespace()
         && !chars[end].is_whitespace();
     if cuts_mid_word {
+        // Слово длиннее всего бюджета границы не имеет — режется по бюджету:
+        // потолок (им живёт и `task_list`) важнее целости одного слова.
         if let Some(boundary) = chars[..end].iter().rposition(|c| c.is_whitespace()) {
             end = boundary;
         }
     }
     let cut: String = chars[..end].iter().collect::<String>();
-    format!("{}…", cut.trim_end())
+    // Хвостовая пунктуация перед многоточием («слой,…») читается как обрыв.
+    format!(
+        "{}…",
+        cut.trim_end_matches(|c: char| c.is_whitespace() || ",;:—-(".contains(c))
+    )
 }
 
 /// Текст узла для выдачи.
@@ -213,7 +219,16 @@ fn owner_line(n: &Node) -> Option<String> {
         .flatten()
         .any(|t| label_repeats(&n.label, t));
     if !copied {
-        return Some(strip_project_prefix(&n.label).to_owned());
+        let label = strip_project_prefix(&n.label);
+        // Метка-заголовок при непустом теле («Табу Влада») без текста —
+        // голый ярлык: правило лежит в теле, и строка обязана его нести.
+        return Some(match n.note.as_deref().filter(|t| !t.trim().is_empty()) {
+            Some(note) => {
+                let text = first_sentence(note).unwrap_or_else(|| clip(note, 160));
+                format!("{label}: {text}")
+            }
+            None => label.to_owned(),
+        });
     }
     claim.or_else(|| n.note.as_deref().and_then(first_sentence))
 }
@@ -294,13 +309,20 @@ fn session_line(n: &Node, per_line: usize) -> String {
     annotate(n, text)
 }
 
-/// Строка карточки навыка: имя — ключ для `skill_get` — и начало условия
-/// загрузки. Без имени строка бесполезна: по ней карточку не достать.
-fn skill_line(n: &Node) -> String {
-    match n.note.as_deref().filter(|t| !t.trim().is_empty()) {
-        Some(trigger) => format!("{} — {}", n.label, clip(trigger, 60)),
-        None => n.label.clone(),
-    }
+/// Момент, с которого тянется хвост дистиллята: время самой свежей сессии
+/// на момент сборки (`data.tails_from`). Дистиллят старой сборки его не
+/// несёт — и датировать его нечем.
+fn tails_from(n: &Node) -> Option<chrono::DateTime<Utc>> {
+    n.data
+        .get("tails_from")
+        .and_then(|v| v.as_str())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// Приписка даты хвоста: « (с 24.09)».
+fn since(at: chrono::DateTime<Utc>) -> String {
+    format!(" (с {})", at.format("%d.%m"))
 }
 
 /// Свежие узлы типа в области проекта. Тонкая обёртка над общим предикатом
@@ -392,8 +414,6 @@ struct Gathered {
     decisions: Vec<Node>,
     concepts: Vec<Node>,
     skills: Vec<Node>,
-    /// Сколько карточек навыков всего — для строки-указателя на остальные.
-    skills_total: usize,
     digest: Vec<Node>,
 }
 
@@ -413,16 +433,6 @@ fn gather(conn: &Connection, project: Option<&str>) -> Result<Gathered> {
     other_tasks.sort_by_key(|n| std::cmp::Reverse(n.updated_at));
     other_tasks.truncate(8);
 
-    let skill_type = serde_json::to_string(&NodeType::Skill)?;
-    let skills_total: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM nodes WHERE node_type = ?1 AND deleted_at IS NULL",
-            [skill_type],
-            |r| r.get::<_, i64>(0),
-        )?
-        .try_into()
-        .unwrap_or(0);
-
     Ok(Gathered {
         // Своё и глобальное; связанное с другим проектом — никогда.
         identity: super::owner_facts(conn, project, 12)?,
@@ -436,7 +446,7 @@ fn gather(conn: &Connection, project: Option<&str>) -> Result<Gathered> {
             .map(|obs| {
                 obs.iter()
                     .map(|o| {
-                        let obj: String = o.object.chars().take(72).collect();
+                        let obj = clip(&o.object, 72);
                         format!("[{:.1}] {} → {}: {}", o.tension, o.debtor, o.creditor, obj)
                     })
                     .collect()
@@ -447,7 +457,6 @@ fn gather(conn: &Connection, project: Option<&str>) -> Result<Gathered> {
         concepts: typed_recent(conn, &NodeType::Concept, project, 5)?,
         // Навыки межпроектны по природе — фильтра по проекту нет, есть потолок.
         skills: typed_recent(conn, &NodeType::Skill, None, SKILL_ROWS)?,
-        skills_total,
         digest: typed_recent(conn, &NodeType::Digest, project, 1)?
             .into_iter()
             .filter(|n| n.note.as_deref() != Some(EMPTY_DIGEST))
@@ -524,8 +533,8 @@ fn escaped_len(md: &str) -> usize {
 /// хуком на старте каждой сессии и обязан быть мгновенным: git читает
 /// вызывающий, здесь только граф.
 ///
-/// Скелет постоянен: слои нумеруются 1..N по месту в списке, пустой слой
-/// печатается «— пусто» (почему — у `render` ниже). `project` = `None` —
+/// Пустой слой не печатается, слои нумеруются 1..N среди напечатанных
+/// (почему — у `render` ниже). `project` = `None` —
 /// глобальный срез, и заголовок говорит об этом строкой `GLOBAL_SCOPE_NOTE`.
 pub fn build_snapshot_in(
     conn: &Connection,
@@ -536,8 +545,6 @@ pub fn build_snapshot_in(
     let scope = project.unwrap_or("глобально");
 
     let g = gather(conn, project)?;
-    let nodes = super::count_nodes(conn)?;
-    let edges = super::count_edges(conn)?;
 
     // Активные задачи — высший приоритет слоя «В работе» (FR-017): рендерятся
     // без бюджетного среза, так что ни одна не теряется из-за нехватки места;
@@ -594,13 +601,30 @@ pub fn build_snapshot_in(
         pressure.push_str(&row);
     }
 
-    let mut skills = lines(&g.skills, SKILL_ROWS, B_PROCEDURAL, |n| Some(skill_line(n)));
-    let skills_rest = g.skills_total.saturating_sub(g.skills.len());
-    if !skills.is_empty() && skills_rest > 0 {
-        skills.push_str(&format!(
-            "- ещё {skills_rest} — memory_search(query), тело — skill_get(name)\n"
-        ));
-    }
+    // Хвост снимается, когда после него записано что-то новее: сессия,
+    // решение или знание проекта. 24.09 дистиллят звал «показать таблицу
+    // prune и только затем --apply», хотя работу закрыли 22-23.09 — записями
+    // concept/decision, а не сессией; правило «только по сессиям» его не
+    // сняло бы. Сессии и так — хвосты друг друга: показывается свежайшая.
+    let newest = |nodes: &[&Node]| nodes.iter().map(|n| n.created_at).max();
+    let latest_session = g.sessions.iter().max_by_key(|n| n.created_at);
+    let records: Vec<&Node> = g
+        .sessions
+        .iter()
+        .chain(&g.decisions)
+        .chain(&g.concepts)
+        .collect();
+    let last_record = newest(&records);
+    let episodic = lines(latest_session, 1, B_EPISODIC, |n| {
+        Some(format!("{}{}", session_line(n, 160), since(n.created_at)))
+    });
+    let digest = lines(&g.digest, usize::MAX, B_DIGEST, |n| {
+        let from = tails_from(n)?;
+        if last_record.is_some_and(|r| r > from) {
+            return None;
+        }
+        Some(format!("{}{}", annotate(n, body(n, 140)), since(from)))
+    });
 
     // (заголовок, тело, очередь на снятие при переборе B_TOTAL: больший
     // номер снимается раньше; `None` — не снимается никогда).
@@ -617,43 +641,23 @@ pub fn build_snapshot_in(
         ),
         ("В работе", working, None),
         ("Давление", pressure, Some(4)),
-        (
-            "Последние сессии",
-            lines(&g.sessions, usize::MAX, B_EPISODIC, |n| {
-                Some(session_line(n, 160))
-            }),
-            Some(1),
-        ),
+        ("Последние сессии", episodic, Some(1)),
         ("Решения и знания", semantic, Some(2)),
-        ("Приёмы", skills, Some(3)),
-        (
-            "Архив",
-            format!(
-                "- {nodes} узлов, {edges} рёбер; глубже — memory_recall(topic) / memory_search(query)\n"
-            ),
-            None,
-        ),
-        ("Дистиллят", layer(&g.digest, 140, B_DIGEST), Some(5)),
+        ("Дистиллят", digest, Some(5)),
     ];
 
-    // Скелет снапшота постоянен: номер слоя — его место в списке, а не место
-    // среди непустых, и пустой слой печатается пустым. Это стоит несколько
-    // байт на строку, но номер слоя обязан значить одно и то же в разных
-    // сессиях. 19.09 проверено, чем обходится обратное: в пустом доме снапшот
-    // печатал «1 · Последние сессии», «2 · Решения и знания» — номера съезжали
-    // от того, какие слои оказались пустыми, а тест «сессия обязана лежать в
-    // слое сессий» падал по причине, к сессиям не относящейся.
+    // Пустой слой не печатается вовсе, номер — место среди напечатанных.
+    // Прежде скелет был постоянным и пустой слой печатался «— пусто»: номер
+    // значил одно и то же между сессиями, но каждая заглушка и счётчик
+    // «Архива» оплачивались на каждом запросе, не неся ни одного действия.
+    // Потребителю, которому нужна устойчивая форма, — `au snapshot --json`.
     let render = |sections: &[(&str, String, Option<u8>)]| {
         let mut md = format!("# Память · {scope} · {date}\n");
         if project.is_none() {
             md.push_str(GLOBAL_SCOPE_NOTE);
         }
-        for (i, (title, body, _)) in sections.iter().enumerate() {
-            let body = if body.is_empty() {
-                "— пусто\n"
-            } else {
-                body.as_str()
-            };
+        let shown = sections.iter().filter(|s| !s.1.is_empty());
+        for (i, (title, body, _)) in shown.enumerate() {
             md.push_str(&format!("\n## {} · {title}\n{body}", i + 1));
         }
         md
@@ -677,8 +681,13 @@ pub fn build_snapshot_in(
 /// проблемы. Идемпотентно — один Digest-узел на проект, старый затирается.
 pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
     let sessions = typed_recent(conn, &NodeType::Session, Some(project), 5)?;
+    // Хвосты — только свежайшей сессии: у более старой её хвост либо
+    // подхвачен, либо закрыт следующей, и повторять его — звать сделать
+    // сделанное. Пустые next_steps свежайшей значат «хвостов нет».
+    let latest = sessions.iter().max_by_key(|n| n.created_at);
+    let tails_from = latest.map_or_else(Utc::now, |n| n.created_at);
     let mut steps: Vec<String> = Vec::new();
-    for s in &sessions {
+    if let Some(s) = latest {
         if let Some(arr) = s.data.get("next_steps").and_then(|v| v.as_array()) {
             for v in arr {
                 if let Some(t) = v.as_str() {
@@ -694,7 +703,7 @@ pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
 
     let mut note = String::new();
     if !steps.is_empty() {
-        note.push_str("Хвосты из сессий: ");
+        note.push_str("Хвосты из сессии: ");
         note.push_str(&steps.into_iter().take(8).collect::<Vec<_>>().join("; "));
         note.push('.');
     }
@@ -731,9 +740,13 @@ pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
         )
         .optional()?;
     let node = if let Some(id) = existing {
+        let mut data = super::get_node(&tx, &id)?.map_or_else(|| serde_json::json!({}), |n| n.data);
+        if let Some(obj) = data.as_object_mut() {
+            obj.insert("tails_from".to_owned(), tails_from.to_rfc3339().into());
+        }
         tx.execute(
-            "UPDATE nodes SET note = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![note, Utc::now().to_rfc3339(), id],
+            "UPDATE nodes SET note = ?1, data = ?2, updated_at = ?3 WHERE id = ?4",
+            rusqlite::params![note, data.to_string(), Utc::now().to_rfc3339(), id],
         )?;
         super::get_node(&tx, &id)?
             .ok_or_else(|| anyhow::anyhow!("дистиллят обновлён, но не читается"))?
@@ -744,7 +757,7 @@ pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
             &label,
             Some(&note),
             "consolidate",
-            serde_json::json!({ "project": project }),
+            serde_json::json!({ "project": project, "tails_from": tails_from.to_rfc3339() }),
             MemoryKind::Semantic,
             None,
         )?
@@ -786,10 +799,9 @@ mod tests {
         .expect("add user fact");
         let md = build_snapshot(&conn, Some("demo")).expect("snapshot");
         assert!(md.starts_with("# Память · demo · "));
-        // Скелет постоянен: Репозиторий — всегда первый слой, Владелец — второй.
-        // Пустой слой печатается пустым, а не исчезает вместе со своим номером.
-        assert!(md.contains("## 1 · Репозиторий"), "снапшот:\n{md}");
-        assert!(md.contains("## 2 · Владелец"));
+        // Пустой слой не печатается: без репозитория Владелец — первый.
+        assert!(!md.contains("Репозиторий"), "снапшот:\n{md}");
+        assert!(md.contains("## 1 · Владелец"), "снапшот:\n{md}");
         // Общий потолок: снапшот обязан оставаться маленьким при любом графе.
         assert!(md.chars().count() < 6_000, "снапшот распух: {}", md.len());
     }
@@ -1142,12 +1154,10 @@ mod tests {
             !md.contains(decision_text),
             "decision обязан пропасть при обнулённом семантическом бюджете:\n{md}"
         );
-        // Заголовок остаётся на своём месте и с постоянным номером: исчезающий
-        // заголовок сдвигал номера всех слоёв ниже, и «6 · Решения и знания» в
-        // одной сессии значило не то же, что в другой.
+        // Опустевший слой не печатается вовсе.
         assert!(
-            md.contains("## 6 · Решения и знания"),
-            "пустой слой остаётся в скелете с постоянным номером:\n{md}"
+            !md.contains("Решения и знания"),
+            "пустой слой не печатается:\n{md}"
         );
     }
 

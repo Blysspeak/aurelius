@@ -464,7 +464,7 @@ fn judge_hook_prints_ripe_block_for_ripe_task() {
             .as_str()
             .expect("additionalContext");
         assert!(md.starts_with("# Память · глобально · "), "{md}");
-        assert!(md.contains("\n## 1 · Репозиторий\n— пусто\n"), "{md}");
+        assert!(!md.contains("Репозиторий"), "{md}");
     }
 }
 

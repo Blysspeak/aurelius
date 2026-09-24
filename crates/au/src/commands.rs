@@ -3972,7 +3972,10 @@ pub async fn snapshot(project: Option<String>, hook: bool, json_out: bool) -> Re
         if let Some(p) = derived.as_deref() {
             let stale = conn
                 .query_row(
-                    "SELECT updated_at < datetime('now', '-1 day') FROM nodes
+                    // Без `tails_from` дистиллят старой сборки: снапшот его
+                    // не покажет (датировать нечем), пересобрать сразу.
+                    "SELECT updated_at < datetime('now', '-1 day')
+                            OR json_extract(data, '$.tails_from') IS NULL FROM nodes
                       WHERE node_type = '\"digest\"' AND label = ?1 AND deleted_at IS NULL",
                     [format!("[{p}] дистиллят")],
                     |r| r.get::<_, bool>(0),
