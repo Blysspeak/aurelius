@@ -54,7 +54,7 @@ pub async fn init() -> Result<()> {
 /// опечатка в `--type` иначе прошла бы молча: прежний CLI сводил всё
 /// неизвестное к `decision`, а MCP завёл бы `Custom("decison")`, которого не
 /// увидит ни одна выборка.
-fn parse_node_type_arg(s: &str) -> Result<NodeType, String> {
+pub(crate) fn parse_node_type_arg(s: &str) -> Result<NodeType, String> {
     NodeType::parse_known(s).ok_or_else(|| {
         format!(
             "неизвестный тип '{s}'. Известные: {}",
@@ -815,6 +815,11 @@ struct SearchRun {
     diagnosis: Option<String>,
     terms: Vec<String>,
     unmatched_terms: Vec<String>,
+    /// Скор каждого выданного узла: нормированный RRF на гибридном пути,
+    /// полнотекстовый — на откате.
+    scores: std::collections::HashMap<uuid::Uuid, f64>,
+    /// Какая половина нашла узел: `fts`, `dense` или `both`.
+    origin: std::collections::HashMap<uuid::Uuid, &'static str>,
 }
 
 /// Один поиск, оба выхода. Векторная половина — надстройка над тем же
@@ -831,13 +836,27 @@ struct SearchRun {
 /// при ничьей), поэтому кандидатов берётся больше `limit`, и пул растёт,
 /// пока не наберётся `limit` различных строк или пока он не кончится:
 /// склейка повторов не имеет права молча вернуть меньше, чем просили.
+///
+/// `types` (`au search --type`) фильтрует тот же слитый пул, векторная
+/// половина остаётся. Но dense-сторона не кончается никогда (у любого вектора
+/// есть соседи), и без потолка добор редкого типа дорастал до k=5120 —
+/// sqlite-vec отказывает выше 4096, поиск откатывался на полнотекстовый с
+/// ложной причиной за 2.7 с (замер 25.09.2026, `--type crate`). Поэтому
+/// с фильтром пул растёт не глубже [`FILTERED_POOL`] на сторону.
 async fn run_search(
     conn: &rusqlite::Connection,
     home: &std::path::Path,
     query: &str,
     limit: usize,
+    types: &[NodeType],
 ) -> Result<SearchRun> {
     let (vector, notice) = graph::query_vector_for_search(home, query).await;
+    let wanted: Vec<String> = types.iter().map(crate::search_json::type_name).collect();
+    let cap = if wanted.is_empty() {
+        usize::MAX
+    } else {
+        FILTERED_POOL.max(limit.saturating_mul(2))
+    };
     let mut want = limit.saturating_mul(2);
     loop {
         let (outcome, fts_scores) = graph::search_scored(conn, query, want)?;
@@ -868,14 +887,28 @@ async fn run_search(
             None => (fts, notice.clone()),
         };
         let exhausted = candidates.len() < want;
+        let hybrid = vector.is_some() && vector_notice.is_none();
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|(n, _)| {
+                wanted.is_empty() || wanted.contains(&crate::search_json::type_name(&n.node_type))
+            })
+            .collect();
+        let scores = candidates.iter().map(|(n, s)| (n.id, *s)).collect();
         let nodes = graph::tidy_for_emission(candidates, limit);
         // Прогон занимает место только за нехваткой знания: пока пул не
         // кончился, добор идёт до `limit` строк знания, а не до `limit`
         // строк вообще — иначе прогон на последнем месте останавливал бы
         // добор раньше, чем нашлось бы знание получше.
         let knowledge = nodes.iter().filter(|n| !graph::is_run(n)).count();
-        if knowledge >= limit || exhausted {
+        if knowledge >= limit || exhausted || want >= cap {
+            let origin = match (&vector, hybrid) {
+                (Some(v), true) => crate::search_json::origin(conn, query, v, want, &nodes)?,
+                _ => nodes.iter().map(|n| (n.id, "fts")).collect(),
+            };
             return Ok(SearchRun {
+                scores,
+                origin,
                 nodes,
                 vector_notice,
                 diagnosis,
@@ -883,9 +916,13 @@ async fn run_search(
                 unmatched_terms: outcome.unmatched_terms,
             });
         }
-        want = want.saturating_mul(2);
+        want = want.saturating_mul(2).min(cap);
     }
 }
+
+/// Потолок пула на сторону для `au search --type`: вчетверо глубже обычного
+/// слияния ([`graph::FUSION_POOL`]) и на порядок ниже предела k у sqlite-vec.
+const FILTERED_POOL: usize = graph::FUSION_POOL * 4;
 
 /// `db_path()`'s каталог — там же лежит `embed.sock` (тот же принцип, что и
 /// у `db_reindex_embeddings_cli` и у `daemon()`: сокет рядом с базой, которую
@@ -896,9 +933,9 @@ pub(crate) fn embed_socket_home() -> PathBuf {
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
 }
 
-pub async fn search(query: &str, limit: usize) -> Result<()> {
+pub async fn search(query: &str, limit: usize, types: &[NodeType]) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
-    let run = run_search(&conn, &embed_socket_home(), query, limit).await?;
+    let run = run_search(&conn, &embed_socket_home(), query, limit, types).await?;
     let blind = run
         .diagnosis
         .as_deref()
@@ -926,41 +963,25 @@ pub async fn search(query: &str, limit: usize) -> Result<()> {
     Ok(())
 }
 
-/// Машинная форма `au search` — тот же `run_search`, что и человеческая
-/// (спека 011, волна «hybrid everywhere»): раньше `--json`-путь у поиска
-/// свёлся бы ко второй копии этой же лесенки и разошёлся бы с человеческим
-/// выводом молча (найдено измерением: без гибридного слоя цель стояла на
-/// седьмой позиции человеческого вывода и отсутствовала в машинном вовсе —
-/// один и тот же запрос отвечал двумя разными списками узлов). Пометка о
-/// недоступности векторной половины идёт отдельным полем `vector_notice`, а
-/// не только строкой в тексте — потребитель, который её не прочтёт, хуже
-/// человека, читающего строку в консоли.
-///
-/// CLI-проводка (`--json` на `Commands::Search` в `main.rs`) в объём этой
-/// правки не входит: `main.rs` не входит в список файлов, которые эта волна
-/// вправе трогать (см. отчёт агента к волне «hybrid everywhere»). Функция уже
-/// собрана и проверена (см. тест ниже), и добавить одну строку диспетчеризации
-/// в `main.rs` — отдельная, ничем не рискованная правка следующей волны.
-/// `#[allow(dead_code)]` — ровно поэтому: без диспетчеризации в `main.rs`
-/// ничто в бинарнике эту функцию не зовёт, а `-D warnings` иначе отказывает
-/// сборке из-за живого, проверенного, но пока не подключённого снаружи кода.
-#[allow(dead_code)]
-pub async fn search_json(query: &str, limit: usize) -> Result<()> {
+/// Машинная форма `au search` — тот же `run_search`, что и человеческая:
+/// те же узлы, та же пометка `vector_notice` отдельным полем (задача
+/// 9b06c9da). Форма строки находки — в `search_json::hit`.
+pub async fn search_json(query: &str, limit: usize, types: &[NodeType]) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
-    let run = run_search(&conn, &embed_socket_home(), query, limit).await?;
+    let run = run_search(&conn, &embed_socket_home(), query, limit, types).await?;
     let out = json!({
         "query": query,
         "count": run.nodes.len(),
-        "results": run.nodes.iter().map(|n| json!({
-            "id": n.id.to_string(),
-            "type": n.node_type,
-            "label": n.label,
-            "note": n.note,
-        })).collect::<Vec<_>>(),
+        "vectors": run.vector_notice.is_none(),
+        "vector_notice": run.vector_notice,
+        "results": run.nodes.iter().map(|n| crate::search_json::hit(
+            n,
+            run.scores.get(&n.id).copied(),
+            run.origin.get(&n.id).copied().unwrap_or("fts"),
+        )).collect::<Vec<_>>(),
         "terms": run.terms,
         "unmatched_terms": run.unmatched_terms,
         "query_hint": run.diagnosis,
-        "vector_notice": run.vector_notice,
     });
     println!("{}", serde_json::to_string(&out)?);
     Ok(())
@@ -5589,7 +5610,7 @@ mod tests {
         .expect("node");
 
         let home = no_socket_home("agree");
-        let run = run_search(&conn, &home, "омега", 20)
+        let run = run_search(&conn, &home, "омега", 20, &[])
             .await
             .expect("run_search");
         assert_eq!(run.nodes.len(), 1, "запись обязана найтись полным текстом");
@@ -5598,7 +5619,7 @@ mod tests {
             "без сокета деградация обязана быть явной, а не тихой"
         );
 
-        let again = run_search(&conn, &home, "омега", 20)
+        let again = run_search(&conn, &home, "омега", 20, &[])
             .await
             .expect("run_search again");
         let ids: Vec<_> = run.nodes.iter().map(|n| n.id).collect();
