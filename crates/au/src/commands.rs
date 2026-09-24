@@ -890,7 +890,7 @@ async fn run_search(
 /// `db_path()`'s каталог — там же лежит `embed.sock` (тот же принцип, что и
 /// у `db_reindex_embeddings_cli` и у `daemon()`: сокет рядом с базой, которую
 /// он обслуживает, путь берётся из активного `AURELIUS_HOME`, не хардкодится).
-fn embed_socket_home() -> PathBuf {
+pub(crate) fn embed_socket_home() -> PathBuf {
     let home = db_path();
     home.parent()
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf)
@@ -4312,7 +4312,7 @@ struct EvalHeader {
 /// `.git`) — путь остаётся относительным, и его разберёт файловая система.
 /// `.git` бывает и файлом (рабочее дерево `git worktree`), поэтому проверяется
 /// существование, а не «это каталог».
-fn eval_from_repo_root(relative: &str) -> PathBuf {
+pub(crate) fn eval_from_repo_root(relative: &str) -> PathBuf {
     let mut dir = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(_) => return PathBuf::from(relative),
