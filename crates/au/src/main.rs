@@ -1,6 +1,7 @@
 mod commands;
 mod eval_search;
 mod hooks;
+mod search_json;
 mod view;
 
 use anyhow::Result;
@@ -662,6 +663,14 @@ enum Commands {
         /// is honoured as asked, never capped
         #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..))]
         limit: u32,
+        /// Print one JSON object (same hybrid path; `vector_notice` when the
+        /// vector half was skipped)
+        #[arg(long)]
+        json: bool,
+        /// Keep only these node types (repeatable or comma list); a typo is
+        /// refused, not answered with an empty list
+        #[arg(long = "type", value_delimiter = ',', value_parser = commands::parse_node_type_arg)]
+        types: Vec<aurelius_core::models::NodeType>,
     },
     /// Read one record back by exact key — a node UUID, or the exact
     /// `--subject` a fact was written with. Nothing here is fuzzy: `search`
@@ -1073,7 +1082,18 @@ async fn run(cli: Cli) -> Result<()> {
             depth,
             verbose,
         } => commands::context(&topic, depth, verbose).await,
-        Commands::Search { query, limit } => commands::search(&query, limit as usize).await,
+        Commands::Search {
+            query,
+            limit,
+            json,
+            types,
+        } => {
+            if json {
+                commands::search_json(&query, limit as usize, &types).await
+            } else {
+                commands::search(&query, limit as usize, &types).await
+            }
+        }
         Commands::Recall(args) => commands::recall(args).await,
         Commands::Sync => {
             commands::removed(
