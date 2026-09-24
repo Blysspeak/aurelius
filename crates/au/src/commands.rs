@@ -78,9 +78,11 @@ pub struct NoteArgs {
     /// --stdin, or when --claim already carries the whole assertion.
     #[arg(required_unless_present_any = ["stdin", "claim"])]
     pub text: Option<String>,
-    /// Node type — the same set the MCP tools accept
-    #[arg(short, long, default_value = "decision", value_parser = parse_node_type_arg)]
-    pub r#type: NodeType,
+    /// Node type — the same set the MCP tools accept (default: decision).
+    /// With --key, only an explicit --type may change the type of an
+    /// existing node; the default never does.
+    #[arg(short, long, value_parser = parse_node_type_arg)]
+    pub r#type: Option<NodeType>,
     /// Label (short name). Defaults to first 60 chars of text.
     #[arg(short, long)]
     pub label: Option<String>,
@@ -239,15 +241,21 @@ pub async fn note(args: NoteArgs) -> Result<()> {
     let conflicts =
         provenance::guard_subject(&conn, prov.subject.as_deref(), resolution.is_some(), None)?;
 
-    // `expected_type: None` — здесь тип назван явным флагом `--type`
-    // (умолчание `decision`), и это не ожидание, а выбор: подмена типа под
-    // тем же ключом легитимна, её нужно лишь показать, а не отвергать.
+    // Явный `--type` — выбор, и подмена типа под тем же ключом легитимна: её
+    // лишь показывают (`expected_type: None`). Умолчание `decision` — не выбор
+    // (задача af49ce11): без флага узел чужого типа под ключом — отказ,
+    // называющий оба типа, а не молчаливая перепись.
+    let node_type = args.r#type.clone().unwrap_or(NodeType::Decision);
+    let expected_type = match &args.r#type {
+        Some(_) => None,
+        None => Some(NodeType::Decision),
+    };
     let (node, created, replaced) = match args.key.as_deref() {
         Some(key) => graph::upsert_node_by_key(
             &conn,
             key,
-            args.r#type,
-            None,
+            node_type,
+            expected_type,
             &label,
             Some(&text),
             "manual",
@@ -257,7 +265,7 @@ pub async fn note(args: NoteArgs) -> Result<()> {
         None => (
             graph::add_node_full(
                 &conn,
-                args.r#type,
+                node_type,
                 &label,
                 Some(&text),
                 "manual",
