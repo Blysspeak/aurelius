@@ -17,7 +17,7 @@ use super::{
 /// `super::restart_needed`), so their absence reads as "unknown", not "no".
 fn server_block() -> serde_json::Value {
     let mut fields = serde_json::Map::new();
-    fields.insert("version".to_owned(), json!(env!("CARGO_PKG_VERSION")));
+    fields.insert("version".to_owned(), json!(crate::BUILD_VERSION));
     fields.insert(
         "started_at".to_owned(),
         json!(chrono::DateTime::<chrono::Utc>::from(server_started_at()).to_rfc3339()),

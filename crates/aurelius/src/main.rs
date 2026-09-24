@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
     // log lines on stderr would interleave with the answer.
     match parse_action(std::env::args().skip(1)) {
         Action::PrintVersion => {
-            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            println!("{} {}", env!("CARGO_PKG_NAME"), aurelius::BUILD_VERSION);
             return Ok(());
         }
         Action::PrintHelp => {

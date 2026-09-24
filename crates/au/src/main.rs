@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 
 #[derive(Parser)]
-#[command(name = "au", about = "Aurelius — personal knowledge graph", version)]
+#[command(name = "au", about = "Aurelius — personal knowledge graph", version = aurelius::BUILD_VERSION)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
