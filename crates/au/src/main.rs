@@ -1,4 +1,5 @@
 mod commands;
+mod eval_search;
 mod hooks;
 mod view;
 
@@ -873,6 +874,20 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Search-quality baseline: recall@5, recall@10 and MRR@10 of the
+    /// reference set, split by query class (ru/en/cross/key), for FTS-only,
+    /// dense-only and RRF-fused search. Reads only. Dense and RRF are skipped,
+    /// not failed, when the embedding daemon does not answer.
+    EvalSearch {
+        /// Case file; defaults to `fixtures/eval/search-baseline.jsonl`.
+        cases: Option<String>,
+        /// Database to measure; defaults to the live one.
+        #[arg(long)]
+        db: Option<String>,
+        /// One JSON object instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Switch or inspect which data/config directory au/aurelius use
     Home {
         #[command(subcommand)]
@@ -1112,6 +1127,7 @@ async fn run(cli: Cli) -> Result<()> {
             live,
             json,
         } => commands::eval(cases, db, now, live, json).await,
+        Commands::EvalSearch { cases, db, json } => eval_search::run(cases, db, json).await,
         Commands::Home { action } => commands::home(action).await,
         Commands::Identity { action } => commands::identity(action).await,
         Commands::Share { action } => commands::share(action).await,
