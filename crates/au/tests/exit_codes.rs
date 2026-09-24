@@ -219,13 +219,11 @@ fn session_lands_in_layer_four_and_relate_links_to_it() {
     assert_eq!(again["id"], edge["id"]);
 
     // Главная проверка: сессия читается слоем сессий, а не среди решений.
-    // Номера — по постоянному скелету снапшота (Репозиторий, Владелец, В
-    // работе, Давление, Сессии, Знания, Приёмы, Архив, Дистиллят), поэтому
-    // сессии это 5, а знания 6 независимо от того, какие слои пусты.
+    // Пустые слои не печатаются, номер плавает — ищем по заголовку.
     let (code, snapshot) = run(&home, &["snapshot", "--project", project], None);
     assert_eq!(code, 0, "снапшот: {snapshot}");
-    let sessions = section(&snapshot, "5 · Последние сессии");
-    let knowledge = section(&snapshot, "6 · Решения и знания");
+    let sessions = section(&snapshot, "Последние сессии");
+    let knowledge = section(&snapshot, "Решения и знания");
     assert!(
         sessions.contains(summary),
         "снимок обязан быть в слое сессий; снапшот:\n{snapshot}"
@@ -624,7 +622,7 @@ fn removed_commands_report_usage_error_with_a_clear_message() {
 
 /// Тело секции markdown-снапшота по её заголовку.
 fn section<'a>(snapshot: &'a str, title: &str) -> &'a str {
-    let Some(start) = snapshot.find(&format!("## {title}")) else {
+    let Some(start) = snapshot.find(&format!(" · {title}\n")) else {
         return "";
     };
     let rest = &snapshot[start..];

@@ -146,17 +146,12 @@ fn repository_layer_vanishes_outside_a_repository_and_nothing_else_changes() {
     // Вне репозитория и без записанного корня проекта — `None`, без заглушки.
     assert_eq!(git::locate(&conn, Some(&elsewhere.0), Some(&name)), None);
     let outside = graph::build_snapshot_in(&conn, Some(&name), None).expect("outside");
-    // Скелет постоянен: вне репозитория слой остаётся первым и с тем же
-    // номером, но пустым. Исчезающий заголовок сдвигал бы номера всех слоёв
-    // ниже, и «1 · Владелец» в одной сессии значило бы не то же, что в другой.
+    // Пустой слой не печатается: вне репозитория Владелец становится первым.
     assert!(
-        outside.contains("## 1 · Репозиторий\n— пусто\n"),
-        "вне репозитория слой обязан остаться пустым:\n{outside}"
+        !outside.contains("Репозиторий"),
+        "вне репозитория слоя нет:\n{outside}"
     );
-    assert!(
-        outside.contains("## 2 · Владелец\n"),
-        "владелец — второй слой постоянного скелета:\n{outside}"
-    );
+    assert!(outside.contains("## 1 · Владелец\n"), "{outside}");
 
     assert_eq!(without_repo_layer(&inside), without_repo_layer(&outside));
 }
@@ -187,10 +182,7 @@ fn global_snapshot_outside_a_repository_names_its_scope_and_keeps_the_skeleton()
         !scoped.contains("Проект не определён"),
         "проектный срез не несёт строки глобального:\n{scoped}"
     );
-    assert!(
-        global.contains("\n## 1 · Репозиторий\n— пусто\n"),
-        "{global}"
-    );
+    assert!(!global.contains("Репозиторий"), "{global}");
 
     let titles = |md: &str| -> Vec<String> {
         md.lines()
@@ -308,4 +300,93 @@ fn owner_rows_tied_to_another_project_are_dropped() {
             .all(|l| l.starts_with("- глобальное правило")),
         "{owner:?}"
     );
+}
+
+/// Заголовки напечатанных слоёв подряд, без номеров.
+fn titles(md: &str) -> Vec<&str> {
+    md.lines()
+        .filter_map(|l| l.strip_prefix("## "))
+        .filter_map(|l| l.split(" · ").nth(1))
+        .collect()
+}
+
+/// Правило 1: хвост дистиллята датирован, пока после его сессии ничего не
+/// записано, и снимается, как только появилась более новая сессия проекта.
+#[test]
+fn digest_tail_is_dated_and_dropped_once_a_newer_session_exists() {
+    let dir = TmpDir::new("tail");
+    let conn = conn_in(&dir.0);
+    seed_graph(&conn, "demo");
+    let session = |label: &str, steps: serde_json::Value| {
+        graph::add_node(
+            &conn,
+            NodeType::Session,
+            &format!("[demo] {label}"),
+            Some("сессия"),
+            "test",
+            serde_json::json!({ "project": "demo", "next_steps": steps }),
+        )
+        .expect("add session")
+    };
+    let first = session("s1", serde_json::json!(["показать таблицу prune"]));
+    graph::consolidate(&conn, "demo").expect("consolidate");
+
+    let md = graph::build_snapshot(&conn, Some("demo")).expect("snapshot");
+    let date = first.created_at.format("%d.%m");
+    assert!(md.contains("показать таблицу prune"), "{md}");
+    assert!(md.contains(&format!("(с {date})")), "хвост без даты:\n{md}");
+
+    session("s2", serde_json::json!([]));
+    let md = graph::build_snapshot(&conn, Some("demo")).expect("snapshot");
+    assert!(!md.contains("prune"), "протухший хвост остался:\n{md}");
+    assert!(!titles(&md).contains(&"Дистиллят"), "{md}");
+}
+
+/// Правило 2: слои без действия не печатаются, номера идут 1..N без дыр.
+#[test]
+fn empty_and_inert_layers_are_not_rendered_and_numbering_stays_dense() {
+    let dir = TmpDir::new("layers");
+    let conn = conn_in(&dir.0);
+    seed_graph(&conn, "demo");
+    graph::add_node(
+        &conn,
+        NodeType::UserFact,
+        "Запрет",
+        Some("Не поливать кактус чаще раза в месяц. Второе правило."),
+        "test",
+        serde_json::json!({}),
+    )
+    .expect("add titled fact");
+
+    let md = graph::build_snapshot(&conn, Some("demo")).expect("snapshot");
+    for gone in ["Давление", "Архив", "Приёмы", "Репозиторий"] {
+        assert!(!titles(&md).contains(&gone), "слой {gone} напечатан:\n{md}");
+    }
+    assert!(!md.contains("— пусто"), "{md}");
+    assert!(
+        md.contains("- Запрет: Не поливать кактус чаще раза в месяц."),
+        "голый ярлык владельца:\n{md}"
+    );
+    for (i, line) in md.lines().filter(|l| l.starts_with("## ")).enumerate() {
+        assert!(line.starts_with(&format!("## {} · ", i + 1)), "{md}");
+    }
+}
+
+/// Правило 3: обрезка — по границе слова, с многоточием, без висящей
+/// запятой перед ним.
+#[test]
+fn clip_cuts_on_word_boundary_and_keeps_ellipsis() {
+    let text = "первое слово, второеслово третье четвёртое пятое";
+    // От 8: короче первого слова границы нет, там режет потолок.
+    for budget in 8..text.chars().count() {
+        let cut = graph::clip(text, budget);
+        let head = cut.trim_end_matches('…');
+        assert!(cut.ends_with('…'), "{budget}: {cut}");
+        assert!(!head.ends_with(','), "висящая запятая: {cut}");
+        assert!(
+            text.split(' ')
+                .any(|w| head.ends_with(w.trim_end_matches(','))),
+            "разрез посреди слова при {budget}: {cut}"
+        );
+    }
 }
