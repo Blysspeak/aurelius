@@ -11,3 +11,7 @@
 pub mod doc;
 pub mod mcp;
 pub mod search;
+
+/// Версия пакета и происхождение сборки: `X.Y.Z (sha[-dirty])` либо
+/// `X.Y.Z (unknown)`, если собрано без git. Вшивается `build.rs`.
+pub const BUILD_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("AURELIUS_GIT"), ")");

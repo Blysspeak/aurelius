@@ -91,7 +91,7 @@ fn handle_initialize(id: Option<serde_json::Value>) -> JsonRpcResponse {
             },
             "serverInfo": {
                 "name": "aurelius",
-                "version": env!("CARGO_PKG_VERSION")
+                "version": crate::BUILD_VERSION
             }
         }),
     )
