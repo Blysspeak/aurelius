@@ -147,12 +147,69 @@ pub fn init_bge_m3() -> anyhow::Result<TextEmbedding> {
     }
 }
 
+/// Where the reranker may run, from `AURELIUS_RERANK` and the embed device.
+/// On CPU one rerank of 30 documents takes 5-13 s, far past the client's
+/// timeout, so CPU is only used when asked for explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankPolicy {
+    /// Never rerank; requests are answered with an error at once.
+    Off,
+    /// CUDA only; a CUDA failure is a load error, not a CPU fallback.
+    CudaOnly,
+    /// `AURELIUS_RERANK=cpu`: the embed device choice, CPU allowed.
+    Cpu(Device),
+}
+
+/// `AURELIUS_RERANK` = `auto` (default), `cpu` or `off`. `auto` with
+/// `AURELIUS_EMBED_DEVICE=cpu` is `Off` without touching CUDA.
+///
+/// # Errors
+/// Any other value, or an invalid `AURELIUS_EMBED_DEVICE`.
+pub fn parse_rerank_policy(
+    rerank: Option<&str>,
+    embed_device: Option<&str>,
+) -> anyhow::Result<RerankPolicy> {
+    let device = parse_device(embed_device)?;
+    match rerank.map(str::trim) {
+        None | Some("") => Ok(auto_policy(device)),
+        Some(v) if v.eq_ignore_ascii_case("auto") => Ok(auto_policy(device)),
+        Some(v) if v.eq_ignore_ascii_case("cpu") => Ok(RerankPolicy::Cpu(device)),
+        Some(v) if v.eq_ignore_ascii_case("off") => Ok(RerankPolicy::Off),
+        Some(other) => anyhow::bail!("AURELIUS_RERANK={other}: expected auto, cpu or off"),
+    }
+}
+
+fn auto_policy(device: Device) -> RerankPolicy {
+    match device {
+        Device::Cpu => RerankPolicy::Off,
+        Device::Auto => RerankPolicy::CudaOnly,
+    }
+}
+
+/// The policy read from the process environment.
+///
+/// # Errors
+/// See `parse_rerank_policy`.
+pub fn rerank_policy_from_env() -> anyhow::Result<RerankPolicy> {
+    parse_rerank_policy(
+        std::env::var("AURELIUS_RERANK").ok().as_deref(),
+        std::env::var("AURELIUS_EMBED_DEVICE").ok().as_deref(),
+    )
+}
+
 /// Loads the bge-reranker-v2-m3 cross-encoder the same way `init_bge_m3`
-/// loads bge-m3: CUDA first, proven by one real run, CPU on any CUDA failure,
-/// `AURELIUS_EMBED_DEVICE=cpu` skips CUDA. Weights are fetched into
-/// `models_dir()` on the first load when absent.
-pub fn init_bge_reranker() -> anyhow::Result<TextRerank> {
-    let device = parse_device(std::env::var("AURELIUS_EMBED_DEVICE").ok().as_deref())?;
+/// loads bge-m3: CUDA first, proven by one real run. Falls back to CPU only
+/// under `RerankPolicy::Cpu`; `Cpu(Device::Cpu)` skips CUDA. Weights are
+/// fetched into `models_dir()` on the first load when absent.
+///
+/// # Errors
+/// `RerankPolicy::Off`, a CUDA failure under `CudaOnly`, or a failed load.
+pub fn init_bge_reranker(policy: RerankPolicy) -> anyhow::Result<TextRerank> {
+    let (device, cpu_fallback) = match policy {
+        RerankPolicy::Off => anyhow::bail!("rerank off"),
+        RerankPolicy::CudaOnly => (Device::Auto, false),
+        RerankPolicy::Cpu(device) => (device, true),
+    };
     init_ort_runtime()?;
     let cache_dir = models_dir();
     let started = std::time::Instant::now();
@@ -167,7 +224,7 @@ pub fn init_bge_reranker() -> anyhow::Result<TextRerank> {
     if device == Device::Cpu {
         let model = load_cpu(cache_dir)?;
         eprintln!(
-            "rerank: loaded on CPU in {:.1}s (AURELIUS_EMBED_DEVICE=cpu)",
+            "rerank: loaded on CPU in {:.1}s (AURELIUS_RERANK=cpu, AURELIUS_EMBED_DEVICE=cpu)",
             started.elapsed().as_secs_f64()
         );
         return Ok(model);
@@ -191,6 +248,9 @@ pub fn init_bge_reranker() -> anyhow::Result<TextRerank> {
                 started.elapsed().as_secs_f64()
             );
             Ok(model)
+        }
+        Err(cuda_err) if !cpu_fallback => {
+            anyhow::bail!("rerank: CUDA failed, CPU not allowed (AURELIUS_RERANK=cpu) — {cuda_err}")
         }
         Err(cuda_err) => {
             let model = load_cpu(cache_dir)?;
@@ -266,5 +326,49 @@ mod tests {
     fn unknown_device_is_an_error_naming_the_variable() {
         let err = parse_device(Some("gpu")).unwrap_err().to_string();
         assert!(err.contains("AURELIUS_EMBED_DEVICE=gpu"), "{err}");
+    }
+
+    #[test]
+    fn rerank_auto_is_off_when_embed_device_is_cpu() {
+        assert_eq!(
+            parse_rerank_policy(None, Some("cpu")).unwrap(),
+            RerankPolicy::Off
+        );
+        assert_eq!(
+            parse_rerank_policy(Some("auto"), Some("cpu")).unwrap(),
+            RerankPolicy::Off
+        );
+    }
+
+    #[test]
+    fn rerank_auto_with_cuda_device_is_cuda_only() {
+        assert_eq!(
+            parse_rerank_policy(None, None).unwrap(),
+            RerankPolicy::CudaOnly
+        );
+        assert_eq!(
+            parse_rerank_policy(Some("AUTO"), Some("auto")).unwrap(),
+            RerankPolicy::CudaOnly
+        );
+    }
+
+    #[test]
+    fn rerank_cpu_enables_cpu_and_off_disables() {
+        assert_eq!(
+            parse_rerank_policy(Some("cpu"), Some("cpu")).unwrap(),
+            RerankPolicy::Cpu(Device::Cpu)
+        );
+        assert_eq!(
+            parse_rerank_policy(Some("cpu"), None).unwrap(),
+            RerankPolicy::Cpu(Device::Auto)
+        );
+        assert_eq!(
+            parse_rerank_policy(Some("off"), None).unwrap(),
+            RerankPolicy::Off
+        );
+        let err = parse_rerank_policy(Some("gpu"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AURELIUS_RERANK=gpu"), "{err}");
     }
 }

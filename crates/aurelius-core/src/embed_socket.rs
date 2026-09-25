@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
+use crate::embed::RerankPolicy;
 use fastembed::{TextEmbedding, TextRerank};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -351,14 +352,29 @@ pub fn shared_bge_m3(idle: Option<Duration>) -> SharedModel {
 /// The daemon's single lazily loaded bge-reranker-v2-m3. Process-wide rather
 /// than a `serve` argument so the daemon's call site stays as it is; created
 /// on first use with its own idle timeout, `AURELIUS_RERANK_IDLE_SECS`.
-fn shared_reranker() -> Arc<Lazy<TextRerank>> {
-    static RERANKER: OnceLock<Arc<Lazy<TextRerank>>> = OnceLock::new();
-    Arc::clone(RERANKER.get_or_init(|| {
-        Arc::new(Lazy::new(
-            Box::new(crate::embed::init_bge_reranker),
-            rerank_idle_from_env(),
-        ))
-    }))
+/// `None` when `AURELIUS_RERANK` resolves to off (decided once, from the
+/// environment alone): rerank requests then get an error at once.
+fn shared_reranker() -> Option<Arc<Lazy<TextRerank>>> {
+    static RERANKER: OnceLock<Option<Arc<Lazy<TextRerank>>>> = OnceLock::new();
+    RERANKER
+        .get_or_init(|| {
+            let policy = match crate::embed::rerank_policy_from_env() {
+                Ok(policy) => policy,
+                Err(e) => {
+                    eprintln!("rerank: {e}; rerank off");
+                    RerankPolicy::Off
+                }
+            };
+            if policy == RerankPolicy::Off {
+                eprintln!("rerank: off (AURELIUS_RERANK, AURELIUS_EMBED_DEVICE)");
+                return None;
+            }
+            Some(Arc::new(Lazy::new(
+                Box::new(move || crate::embed::init_bge_reranker(policy)),
+                rerank_idle_from_env(),
+            )))
+        })
+        .clone()
 }
 
 /// Accepts connections on `listener` forever, each handled with the shared
@@ -367,15 +383,15 @@ fn shared_reranker() -> Arc<Lazy<TextRerank>> {
 /// long as the daemon does.
 pub async fn serve(listener: UnixListener, model: SharedModel) {
     let reranker = shared_reranker();
-    if let Some(idle) = reranker.idle {
+    if let Some(idle) = reranker.as_ref().and_then(|r| r.idle) {
         // The daemon's tick loop only unloads bge-m3; the reranker is
         // unloaded here, checked a few times per idle period.
-        let watched = Arc::clone(&reranker);
+        let watched = reranker.clone();
         let every = (idle / 4).max(Duration::from_secs(1));
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;
-                if let Some((model, quiet)) = watched.take_idle() {
+                if let Some((model, quiet)) = watched.as_ref().and_then(|r| r.take_idle()) {
                     drop(model);
                     eprintln!("rerank: unloaded after {}s idle", quiet.as_secs());
                 }
@@ -388,7 +404,7 @@ pub async fn serve(listener: UnixListener, model: SharedModel) {
 async fn serve_with<R: Reranker>(
     listener: UnixListener,
     model: SharedModel,
-    reranker: Arc<Lazy<R>>,
+    reranker: Option<Arc<Lazy<R>>>,
 ) {
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -402,7 +418,7 @@ async fn serve_with<R: Reranker>(
             }
         };
         let model = Arc::clone(&model);
-        let reranker = Arc::clone(&reranker);
+        let reranker = reranker.clone();
         tokio::spawn(async move {
             let _ = handle_connection(stream, &model, &reranker).await;
         });
@@ -412,7 +428,7 @@ async fn serve_with<R: Reranker>(
 async fn handle_connection<R: Reranker>(
     mut stream: UnixStream,
     model: &SharedModel,
-    reranker: &Arc<Lazy<R>>,
+    reranker: &Option<Arc<Lazy<R>>>,
 ) -> anyhow::Result<()> {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
@@ -422,20 +438,27 @@ async fn handle_connection<R: Reranker>(
             op: Some(op),
             query,
             docs,
-        }) if op == "rerank" => {
-            let reranker = Arc::clone(reranker);
-            match tokio::task::spawn_blocking(move || reranker.with(|m| m.scores(&query, &docs)))
+        }) if op == "rerank" => match reranker {
+            None => Response::Error {
+                error: "rerank off".to_owned(),
+            },
+            Some(reranker) => {
+                let reranker = Arc::clone(reranker);
+                match tokio::task::spawn_blocking(move || {
+                    reranker.with(|m| m.scores(&query, &docs))
+                })
                 .await
-            {
-                Ok(Ok(scores)) => Response::Scores { scores },
-                Ok(Err(e)) => Response::Error {
-                    error: e.to_string(),
-                },
-                Err(e) => Response::Error {
-                    error: format!("инференс упал: {e}"),
-                },
+                {
+                    Ok(Ok(scores)) => Response::Scores { scores },
+                    Ok(Err(e)) => Response::Error {
+                        error: e.to_string(),
+                    },
+                    Err(e) => Response::Error {
+                        error: format!("инференс упал: {e}"),
+                    },
+                }
             }
-        }
+        },
         Ok(Incoming { op: Some(op), .. }) => Response::Error {
             error: format!("неизвестная операция {op}"),
         },
@@ -644,7 +667,7 @@ mod tests {
             Box::new(|| Err(anyhow::anyhow!("not in this test"))),
             None,
         ));
-        let reranker = Arc::new(Lazy::new(Box::new(|| Ok(FakeReranker)), None));
+        let reranker = Some(Arc::new(Lazy::new(Box::new(|| Ok(FakeReranker)), None)));
         let server = tokio::spawn(serve_with(listener, model, reranker));
 
         let path = socket.clone();
@@ -660,6 +683,37 @@ mod tests {
         // of a model that cannot load), not with scores.
         let err = request_vector(&socket, "q", Duration::from_secs(5)).await;
         assert!(err.unwrap_err().contains("not in this test"));
+
+        server.abort();
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[tokio::test]
+    async fn disabled_reranker_answers_rerank_with_an_immediate_error() {
+        // AURELIUS_EMBED_DEVICE=cpu with AURELIUS_RERANK unset resolves to off.
+        assert_eq!(
+            crate::embed::parse_rerank_policy(None, Some("cpu")).expect("policy"),
+            RerankPolicy::Off
+        );
+        let socket =
+            std::env::temp_dir().join(format!("au-embed-rerank-off-{}.sock", uuid::Uuid::new_v4()));
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let model: SharedModel = Arc::new(Lazy::new(
+            Box::new(|| Err(anyhow::anyhow!("not in this test"))),
+            None,
+        ));
+        let server = tokio::spawn(serve_with::<FakeReranker>(listener, model, None));
+
+        let path = socket.clone();
+        let started = Instant::now();
+        let scores = tokio::task::spawn_blocking(move || {
+            let docs = vec!["a".to_owned()];
+            crate::graph::rerank_scores_at(&path, "q", &docs, Duration::from_secs(5))
+        })
+        .await
+        .expect("join");
+        assert_eq!(scores, None);
+        assert!(started.elapsed() < Duration::from_millis(500));
 
         server.abort();
         let _ = std::fs::remove_file(&socket);
