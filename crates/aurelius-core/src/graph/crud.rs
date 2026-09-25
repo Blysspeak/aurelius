@@ -3,7 +3,7 @@ use crate::models::{Edge, MemoryKind, Node, NodeType, Relation};
 use crate::provenance::Provenance;
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::{row_to_edge, row_to_node};
@@ -340,8 +340,74 @@ pub fn delete_node(conn: &Connection, id: Uuid) -> Result<bool> {
              WHERE (from_id = ?2 OR to_id = ?2) AND deleted_at IS NULL",
             params![now_str, id_str],
         )?;
+        drop_node_vector(conn, &id_str)?;
     }
     Ok(affected > 0)
+}
+
+/// Whether the vec0 table `node_embeddings` exists: old fixtures and
+/// databases below schema v16 have none. Local twin of the private check in
+/// `search.rs`.
+fn node_embeddings_exist(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_embeddings')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Remove a node's vector and its pending embedding job. Called wherever a
+/// node becomes deleted: `dense_search` takes the KNN top k before filtering
+/// `deleted_at`, so a dead vector steals a slot from a live node, and a
+/// vector keyed by a freed rowid could later attach to an unrelated node.
+pub(crate) fn drop_node_vector(conn: &Connection, id_str: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM embedding_queue WHERE node_id = ?1",
+        params![id_str],
+    )?;
+    if !node_embeddings_exist(conn)? {
+        return Ok(());
+    }
+    let rowid: Option<i64> = conn
+        .query_row(
+            "SELECT rowid FROM nodes WHERE id = ?1",
+            params![id_str],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(rowid) = rowid {
+        conn.execute(
+            "DELETE FROM node_embeddings WHERE rowid = ?1",
+            params![rowid],
+        )?;
+    }
+    Ok(())
+}
+
+/// Remove every vector whose node is soft-deleted or gone, returning how many
+/// were removed. One-off cleanup for vectors orphaned before `delete_node`
+/// started dropping them. Rowids are collected first and deleted one by one:
+/// vec0 handles point deletes by rowid, not arbitrary WHERE clauses.
+pub fn purge_orphan_embeddings(conn: &Connection) -> Result<usize> {
+    if !node_embeddings_exist(conn)? {
+        return Ok(0);
+    }
+    let orphans: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "SELECT e.rowid FROM node_embeddings e
+              LEFT JOIN nodes n ON n.rowid = e.rowid
+              WHERE n.rowid IS NULL OR n.deleted_at IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for rowid in &orphans {
+        conn.execute(
+            "DELETE FROM node_embeddings WHERE rowid = ?1",
+            params![rowid],
+        )?;
+    }
+    Ok(orphans.len())
 }
 
 #[derive(Debug, Default)]
@@ -1416,5 +1482,100 @@ mod tests {
         );
         assert_eq!(infer_project(&conn, "[] пустой префикс", None), None);
         assert_eq!(infer_project(&conn, "без префикса", None), None);
+    }
+
+    fn plain(conn: &Connection, label: &str) -> Node {
+        add_node(
+            conn,
+            NodeType::Concept,
+            label,
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node")
+    }
+
+    fn put_vector(conn: &Connection, node: &Node) {
+        let bytes: Vec<u8> = (0..1024u32)
+            .flat_map(|i| ((i % 7) as f32 + 1.0).to_le_bytes())
+            .collect();
+        conn.execute(
+            "INSERT INTO node_embeddings(rowid, embedding)
+             SELECT rowid, vec_quantize_int8(?2, 'unit') FROM nodes WHERE id = ?1",
+            params![node.id.to_string(), bytes],
+        )
+        .expect("insert vector");
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).expect("count")
+    }
+
+    #[test]
+    fn delete_node_drops_its_vector_and_queue_row() {
+        let (_tmp, conn) = setup();
+        let keep = plain(&conn, "keep");
+        let gone = plain(&conn, "gone");
+        put_vector(&conn, &keep);
+        put_vector(&conn, &gone);
+
+        assert!(delete_node(&conn, gone.id).expect("delete"));
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM node_embeddings"), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM nodes WHERE deleted_at IS NULL"),
+            1
+        );
+        let queued: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM embedding_queue WHERE node_id = ?1",
+                params![gone.id.to_string()],
+                |r| r.get(0),
+            )
+            .expect("queue count");
+        assert_eq!(queued, 0);
+        assert_eq!(purge_orphan_embeddings(&conn).expect("purge"), 0);
+    }
+
+    #[test]
+    fn merge_leaves_no_orphan_vector() {
+        let (_tmp, conn) = setup();
+        let source = plain(&conn, "source");
+        let target = plain(&conn, "target");
+        put_vector(&conn, &source);
+        put_vector(&conn, &target);
+
+        merge_nodes(&conn, source.id, target.id).expect("merge");
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM node_embeddings"), 1);
+        assert_eq!(purge_orphan_embeddings(&conn).expect("purge"), 0);
+    }
+
+    #[test]
+    fn purge_removes_preexisting_orphans_once() {
+        let (_tmp, conn) = setup();
+        let live = plain(&conn, "live");
+        let soft = plain(&conn, "soft");
+        let hard = plain(&conn, "hard");
+        for n in [&live, &soft, &hard] {
+            put_vector(&conn, n);
+        }
+        // Orphans the old way: soft delete without touching vectors, and a
+        // hard delete as `memory_gc` does it.
+        conn.execute(
+            "UPDATE nodes SET deleted_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), soft.id.to_string()],
+        )
+        .expect("soft delete");
+        conn.execute(
+            "DELETE FROM nodes WHERE id = ?1",
+            params![hard.id.to_string()],
+        )
+        .expect("hard delete");
+
+        assert_eq!(purge_orphan_embeddings(&conn).expect("purge"), 2);
+        assert_eq!(purge_orphan_embeddings(&conn).expect("purge again"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM node_embeddings"), 1);
     }
 }
