@@ -6,7 +6,10 @@ use aurelius_core::{
 };
 use serde_json::json;
 
-use super::{node_compact, node_detail, open_db, resolve_task_node, truncate};
+use super::{
+    apply_probe_stale, node_compact, node_detail, open_db, probe_stale_notes, resolve_task_node,
+    truncate,
+};
 
 pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
     let conn = open_db()?;
@@ -779,11 +782,25 @@ fn task_view_with_conn(
         }
     }
 
-    let (timeline, work_logs_hidden) = branch_json(work_logs, full, item_cap, true);
-    let (decisions, decisions_hidden) = branch_json(decisions, full, item_cap, false);
-    let (problems, problems_hidden) = branch_json(problems, full, item_cap, false);
-    let (solutions, solutions_hidden) = branch_json(solutions, full, item_cap, false);
-    let (subtasks, subtasks_hidden) = branch_json(subtasks, full, item_cap, false);
+    // One probe read for the task and every node of its branch.
+    let rendered: Vec<&aurelius_core::models::Node> = std::iter::once(&task)
+        .chain(nodes.iter().filter(|n| n.id != task.id))
+        .collect();
+    let probe_notes = probe_stale_notes(conn, &rendered);
+    let with_probes = |(mut items, hidden): (Vec<serde_json::Value>, usize)| {
+        for item in &mut items {
+            apply_probe_stale(item, "/provenance/stale", &probe_notes);
+        }
+        (items, hidden)
+    };
+
+    let (timeline, work_logs_hidden) = with_probes(branch_json(work_logs, full, item_cap, true));
+    let (decisions, decisions_hidden) = with_probes(branch_json(decisions, full, item_cap, false));
+    let (problems, problems_hidden) = with_probes(branch_json(problems, full, item_cap, false));
+    let (solutions, solutions_hidden) = with_probes(branch_json(solutions, full, item_cap, false));
+    let (subtasks, subtasks_hidden) = with_probes(branch_json(subtasks, full, item_cap, false));
+    let mut task_json = node_detail(&task);
+    apply_probe_stale(&mut task_json, "/provenance/stale", &probe_notes);
 
     // Спека 007, T026: аддитивные поля из типизированных полей задачи
     // (`crates/aurelius-core/src/tasks.rs`) — ничего существующего не
@@ -798,7 +815,7 @@ fn task_view_with_conn(
 
     Ok(json!({
         // Сама задача НИКОГДА не режется: все поля целиком, как и раньше.
-        "task": node_detail(&task),
+        "task": task_json,
         "status": task.data.get("status"),
         "priority": task.data.get("priority"),
         "acceptance_criteria": task.data.get("acceptance_criteria"),
@@ -969,6 +986,25 @@ mod tests {
     /// Exactly what was missing: an agent that just ran a command must be
     /// able to record that through `task_log`, the same as through
     /// `memory_add`.
+    #[test]
+    fn task_view_shows_the_failing_probe_note() {
+        let (_tmp, conn) = setup();
+        let task = seed_task(&conn, "p", "probe task");
+        conn.execute(
+            "INSERT INTO probes (node_id, kind, expr, last_ok, checked_at)
+             VALUES (?1, 'file_exists', '/nowhere/task.rs', 0, 1758800000)",
+            [task.to_string()],
+        )
+        .expect("probe");
+
+        let v = task_view_with_conn(&conn, &json!({"id": task.to_string()})).expect("task_view");
+
+        let stale = v["task"]["provenance"]["stale"]
+            .as_str()
+            .expect("probe note");
+        assert!(stale.contains("/nowhere/task.rs"), "{stale}");
+    }
+
     #[test]
     fn task_log_with_measured_and_evidence_writes_provenance_on_worklog_and_inherits_on_decision() {
         let (_tmp, conn) = setup();

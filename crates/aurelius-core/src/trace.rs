@@ -81,7 +81,14 @@ pub fn ingest(conn: &Connection, t: &TraceInput<'_>) -> Result<i64> {
             t.state_hash_post,
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    let id = conn.last_insert_rowid();
+    if t.kind == TraceKind::FileEdit {
+        // Best effort: a probe refresh must never fail the trace itself.
+        if let Err(e) = crate::probes::refresh_after_edit(conn, &payload) {
+            tracing::warn!("could not refresh file probes after an edit: {e}");
+        }
+    }
+    Ok(id)
 }
 
 /// Rewrite already stored payloads through [`crate::secret::mask_secrets`] in

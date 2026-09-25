@@ -233,6 +233,43 @@ pub fn failing_for(
     Ok(out)
 }
 
+/// After a recorded edit of `path`, give every `file_exists` probe that names
+/// it a new passing row, so the passing check supersedes the old failure.
+/// A probe names the path when its expr equals it, or when the expr is a
+/// relative path the absolute path ends with (at a separator). Only probes
+/// whose latest row failed are touched; nothing happens for a relative
+/// `path` or a file that does not exist now. One query plus the inserts.
+pub fn refresh_after_edit(conn: &Connection, path: &str) -> Result<usize> {
+    let p = Path::new(path);
+    if !p.is_absolute() || !p.exists() {
+        return Ok(0);
+    }
+    let stale: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT p.node_id, p.expr FROM probes p
+             WHERE p.kind = 'file_exists' AND p.last_ok = 0
+               AND (p.expr = ?1
+                    OR (length(p.expr) < length(?1)
+                        AND substr(p.expr, 1, 1) NOT IN ('/', '\\')
+                        AND substr(?1, length(?1) - length(p.expr) + 1) = p.expr
+                        AND substr(?1, length(?1) - length(p.expr), 1) IN ('/', '\\')))
+               AND p.id = (SELECT MAX(q.id) FROM probes q
+                           WHERE q.node_id = p.node_id AND q.kind = p.kind AND q.expr = p.expr)",
+        )?;
+        let rows = stmt.query_map([path], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let now = Utc::now().timestamp();
+    for (node_id, expr) in &stale {
+        conn.execute(
+            "INSERT INTO probes (node_id, kind, expr, last_ok, checked_at)
+             VALUES (?1, 'file_exists', ?2, 1, ?3)",
+            rusqlite::params![node_id, expr, now],
+        )?;
+    }
+    Ok(stale.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,6 +363,47 @@ mod tests {
             rusqlite::params![node, expr, i64::from(ok), at],
         )
         .expect("insert probe");
+    }
+
+    #[test]
+    fn a_file_edit_trace_clears_the_failing_probe() {
+        let (path, conn) = probe_db();
+        let file = std::env::temp_dir().join(format!("probe-edit-{}.rs", uuid::Uuid::new_v4()));
+        std::fs::write(&file, "x").expect("write file");
+        let abs = file.to_string_lossy().into_owned();
+        let name = file
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        put(&conn, "a", &abs, false, 1);
+        put(&conn, "b", &name, false, 1);
+        put(&conn, "c", &format!("x{name}"), false, 1);
+        assert_eq!(failing_for(&conn, &["a", "b", "c"]).expect("q").len(), 3);
+
+        crate::trace::ingest(
+            &conn,
+            &crate::trace::TraceInput {
+                session_id: "s",
+                kind: crate::trace::TraceKind::FileEdit,
+                payload: &abs,
+                exit_code: None,
+                state_hash_pre: None,
+                state_hash_post: None,
+            },
+        )
+        .expect("ingest");
+
+        let left = failing_for(&conn, &["a", "b", "c"]).expect("q");
+        assert!(!left.contains_key("a"), "exact path refreshed");
+        assert!(!left.contains_key("b"), "relative suffix refreshed");
+        assert!(
+            left.contains_key("c"),
+            "a suffix without a separator is another file"
+        );
+        let _ = std::fs::remove_file(&file);
+        drop(conn);
+        drop_db(&path);
     }
 
     #[test]

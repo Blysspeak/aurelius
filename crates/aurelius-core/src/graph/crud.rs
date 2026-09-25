@@ -360,7 +360,7 @@ fn node_embeddings_exist(conn: &Connection) -> Result<bool> {
 /// node becomes deleted: `dense_search` takes the KNN top k before filtering
 /// `deleted_at`, so a dead vector steals a slot from a live node, and a
 /// vector keyed by a freed rowid could later attach to an unrelated node.
-pub(crate) fn drop_node_vector(conn: &Connection, id_str: &str) -> Result<()> {
+pub fn drop_node_vector(conn: &Connection, id_str: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM embedding_queue WHERE node_id = ?1",
         params![id_str],
