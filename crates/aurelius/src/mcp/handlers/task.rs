@@ -104,7 +104,7 @@ fn task_create_with_conn(
         }
     }
 
-    Ok(json!({
+    let mut response = json!({
         "id": task.id.to_string(),
         "label": task.label,
         "type": "task",
@@ -117,7 +117,9 @@ fn task_create_with_conn(
             "confidence": prov.confidence_or_default().as_str(),
             "subject": prov.subject,
         },
-    }))
+    });
+    super::super::params::report_shortened_claim(&prov, &mut response);
+    Ok(response)
 }
 
 pub fn task_update(params: &serde_json::Value) -> Result<serde_json::Value> {
@@ -573,6 +575,7 @@ fn task_log_with_conn(
             "subject": prov.subject,
         },
     });
+    super::super::params::report_shortened_claim(&prov, &mut response);
     if status == "backlog" {
         response["hint"] = json!(
             "This task was not activated: logging never changes status. \
