@@ -63,7 +63,10 @@ pub struct TraceInput<'a> {
 
 /// Записать след. Возвращает id строки журнала.
 pub fn ingest(conn: &Connection, t: &TraceInput<'_>) -> Result<i64> {
-    let payload: String = t.payload.chars().take(PAYLOAD_CAP).collect();
+    // Mask secrets before the insert: the AFTER INSERT trigger copies the
+    // payload into act_trace_fts, so neither table ever sees the raw value.
+    let capped: String = t.payload.chars().take(PAYLOAD_CAP).collect();
+    let payload = crate::secret::mask_secrets(&capped);
     conn.execute(
         "INSERT INTO act_trace
              (ts, session_id, kind, payload, exit_code, state_hash_pre, state_hash_post)
@@ -79,6 +82,62 @@ pub fn ingest(conn: &Connection, t: &TraceInput<'_>) -> Result<i64> {
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Rewrite already stored payloads through [`crate::secret::mask_secrets`] in
+/// one transaction; returns how many rows changed. Never wired to the CLI yet.
+///
+/// `act_trace` is append-only via the `act_trace_ro` trigger, so the trigger is
+/// dropped and recreated from its own `sqlite_master` text inside the same
+/// transaction (a failure rolls the drop back). `act_trace_fts` is an
+/// external-content FTS5 index fed only by an AFTER INSERT trigger, so each
+/// changed row gets an explicit FTS 'delete' of the old text and an insert of
+/// the new one; otherwise the old tokens would stay searchable.
+pub fn scrub_existing(conn: &Connection) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let changed: Vec<(i64, String, String)> = {
+        let mut stmt = tx.prepare("SELECT id, payload FROM act_trace")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, old) = row?;
+            let new = crate::secret::mask_secrets(&old);
+            if new != old {
+                out.push((id, old, new));
+            }
+        }
+        out
+    };
+    if changed.is_empty() {
+        return Ok(0);
+    }
+    let trigger_sql: Option<String> = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'act_trace_ro'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    tx.execute_batch("DROP TRIGGER IF EXISTS act_trace_ro")?;
+    for (id, old, new) in &changed {
+        tx.execute(
+            "INSERT INTO act_trace_fts(act_trace_fts, rowid, payload) VALUES ('delete', ?1, ?2)",
+            rusqlite::params![id, old],
+        )?;
+        tx.execute(
+            "UPDATE act_trace SET payload = ?2 WHERE id = ?1",
+            rusqlite::params![id, new],
+        )?;
+        tx.execute(
+            "INSERT INTO act_trace_fts(rowid, payload) VALUES (?1, ?2)",
+            rusqlite::params![id, new],
+        )?;
+    }
+    if let Some(sql) = trigger_sql {
+        tx.execute_batch(&sql)?;
+    }
+    tx.commit()?;
+    Ok(changed.len())
 }
 
 /// Хэш состояния файла для пары pre/post. Отсутствующий файл — тоже состояние
@@ -339,5 +398,79 @@ mod tests {
             vec![r"A:\workSpace\aurelius\crates\au\src\commands.rs".to_owned()],
             "файл своего проекта обязан пройти фильтр, чужого — нет"
         );
+    }
+
+    fn ingest_cmd(conn: &Connection, cmd: &str) -> i64 {
+        ingest(
+            conn,
+            &TraceInput {
+                session_id: "s1",
+                kind: TraceKind::ToolCall,
+                payload: cmd,
+                exit_code: Some(0),
+                state_hash_pre: None,
+                state_hash_post: None,
+            },
+        )
+        .expect("ingest")
+    }
+
+    fn fts_hits(conn: &Connection, q: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM act_trace_fts WHERE act_trace_fts MATCH ?1",
+            [q],
+            |r| r.get(0),
+        )
+        .expect("fts")
+    }
+
+    #[test]
+    fn ingest_stores_masked_payload() {
+        let conn = test_conn();
+        let id = ingest_cmd(&conn, "psql --password=hunter2 postgres://u:pw9@h/db");
+        let stored: String = conn
+            .query_row("SELECT payload FROM act_trace WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .expect("payload");
+        assert_eq!(stored, "psql --password=*** postgres://u:***@h/db");
+        assert_eq!(fts_hits(&conn, "hunter2"), 0);
+        assert_eq!(fts_hits(&conn, "psql"), 1);
+    }
+
+    #[test]
+    fn scrub_existing_masks_rows_and_index_then_is_idempotent() {
+        let conn = test_conn();
+        // Simulate rows written before masking existed: bypass ingest.
+        conn.execute(
+            "INSERT INTO act_trace (ts, session_id, kind, payload) VALUES
+                 (1, 's', 'tool_call', 'export PGPASSWORD=hunter2'),
+                 (2, 's', 'tool_call', 'git log 6784399')",
+            [],
+        )
+        .expect("raw insert");
+        assert_eq!(fts_hits(&conn, "hunter2"), 1);
+
+        assert_eq!(scrub_existing(&conn).expect("scrub"), 1);
+        let stored: String = conn
+            .query_row("SELECT payload FROM act_trace WHERE ts = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("payload");
+        assert_eq!(stored, "export PGPASSWORD=***");
+        assert_eq!(fts_hits(&conn, "hunter2"), 0);
+        assert_eq!(fts_hits(&conn, "PGPASSWORD"), 1);
+        assert_eq!(fts_hits(&conn, "6784399"), 1);
+        let integrity = conn.execute(
+            "INSERT INTO act_trace_fts(act_trace_fts) VALUES ('integrity-check')",
+            [],
+        );
+        assert!(integrity.is_ok(), "fts index out of sync: {integrity:?}");
+
+        assert_eq!(scrub_existing(&conn).expect("scrub again"), 0);
+        // The append-only guard is back in place.
+        assert!(conn
+            .execute("UPDATE act_trace SET payload = 'x'", [])
+            .is_err());
     }
 }
