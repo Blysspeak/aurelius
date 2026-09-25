@@ -203,8 +203,29 @@ pub fn score(w: &RankWeights, node: &Node, r: f64, now: DateTime<Utc>) -> f64 {
 }
 
 /// Reciprocal Rank Fusion — слияние FTS5 top-50 и dense KNN top-50 в один
-/// посев (спека 011, `data-model.md` §2). Константа из той же спеки.
-pub const RRF_K: f64 = 60.0;
+/// посев (спека 011, `data-model.md` §2).
+///
+/// `12`, а не `60` из спеки. При `k = 60` и пуле 50 ЛЮБОЙ узел из обоих
+/// списков бьёт ЛЮБОЙ узел из одного: худший двойной `2/(60+50) ≈ 0,0182`
+/// больше лучшего одиночного `1/(60+1) ≈ 0,0164`. На кросс-язычном запросе
+/// FTS цели не видит вовсе, а русские узлы, случайно совпавшие словами и
+/// лежащие где-то в хвосте dense, выталкивали dense-первое место за десятку
+/// (задача f12702e1). Малое `k` возвращает вес позиции. Замер 25.09.2026
+/// (`au eval-search`, живая база, вместе с [`SCRIPT_BLIND_SHARE`] = 0,4):
+/// k = 10…18 держит ru ≥ 92,9, en 100, cross 78,6; k = 8 роняет ru до 85,7,
+/// k = 20 роняет cross до 57,1.
+pub const RRF_K: f64 = 12.0;
+
+/// Доля dense-вклада, которую узел получает вместо FTS-вклада, когда FTS
+/// видеть его не могла: узел написан другим письмом, чем запрос (кириллица
+/// против латиницы), и общих слов у них нет по построению. Отсутствие в
+/// FTS-списке у такого узла — не свидетельство против него, а слепота
+/// движка; без замены он проигрывает любому узлу своего письма, которого
+/// FTS задела хоть одним словом. Замер 25.09.2026 при `RRF_K = 12`: 0,3…0,5
+/// держат все цели, 0,2 роняет cross до 71,4, 0 — до 50,0; при 1,0 (полная
+/// замена) ru падает до 64,3 — английские узлы на русский запрос
+/// получают двойной вес.
+pub const SCRIPT_BLIND_SHARE: f64 = 0.4;
 
 /// RRF-скор одного узла: сумма `1 / (k + ранг)` по спискам, где узел
 /// нашёлся. Складываются РАНГИ (позиция с единицы), а не сырые релевантности
@@ -212,10 +233,19 @@ pub const RRF_K: f64 = 60.0;
 /// `None` — узел не входит в этот список, и вклад по нему просто ноль, а не
 /// штраф за последнее место: движок, нашедший узел единственным, не наказан
 /// вторым, который его не увидел.
+///
+/// `fts_blind` — FTS не могла найти узел по построению (другое письмо, см.
+/// [`SCRIPT_BLIND_SHARE`]); тогда вместо нулевого FTS-вклада узел получает
+/// долю своего dense-вклада. Если FTS узел всё-таки нашла, её ранг главнее.
 #[must_use]
-pub fn rrf_score(fts_rank: Option<usize>, dense_rank: Option<usize>) -> f64 {
+pub fn rrf_score(fts_rank: Option<usize>, dense_rank: Option<usize>, fts_blind: bool) -> f64 {
     let term = |rank: Option<usize>| rank.map_or(0.0, |r| 1.0 / (RRF_K + r as f64));
-    term(fts_rank) + term(dense_rank)
+    let fts = match fts_rank {
+        Some(_) => term(fts_rank),
+        None if fts_blind => SCRIPT_BLIND_SHARE * term(dense_rank),
+        None => 0.0,
+    };
+    fts + term(dense_rank)
 }
 
 /// Мин-макс нормировка: растягивает сырые значения на весь `[0, 1]` —
@@ -225,7 +255,7 @@ pub fn rrf_score(fts_rank: Option<usize>, dense_rank: Option<usize>) -> f64 {
 /// Не [`normalize_bm25`]: та нормирует относительно медианы, что подходит
 /// bm25 (разброс на порядки между хорошим и плохим совпадением), но топит
 /// RRF-скор посевов (`search::hybrid_seeds`) в одну точку у `0.5`. Причина —
-/// в самой константе `RRF_K = 60`: она на порядок больше диапазона рангов
+/// в прежней константе `RRF_K = 60`: она на порядок больше диапазона рангов
 /// топ-12 (`1..=12`), поэтому `1/(k+1)` и `1/(k+12)` отличаются всего на
 /// ~18%, и медианное отношение `a/(a+median)` на такой узкой кучке чисел
 /// возвращает почти одно и то же значение всем. Тот самый провал,
@@ -555,8 +585,8 @@ mod tests {
     #[test]
     fn rrf_score_sums_both_lists_when_present_in_both() {
         // Первое место в обоих списках — наибольший возможный скор.
-        let both_first = rrf_score(Some(1), Some(1));
-        let one_only = rrf_score(Some(1), None);
+        let both_first = rrf_score(Some(1), Some(1), false);
+        let one_only = rrf_score(Some(1), None, false);
         assert!((both_first - 2.0 / (RRF_K + 1.0)).abs() < 1e-9);
         assert!(
             both_first > one_only,
@@ -569,13 +599,35 @@ mod tests {
         // Найден только dense-движком на первом месте — тот же вклад, что и
         // у чисто FTS-найденного на первом месте: складываются ранги, а не
         // штрафуется отсутствие во втором списке.
-        let fts_only = rrf_score(Some(1), None);
-        let dense_only = rrf_score(None, Some(1));
+        let fts_only = rrf_score(Some(1), None, false);
+        let dense_only = rrf_score(None, Some(1), false);
         assert!((fts_only - dense_only).abs() < 1e-12);
     }
 
     #[test]
     fn rrf_score_is_zero_when_absent_from_both() {
-        assert_eq!(rrf_score(None, None), 0.0);
+        assert_eq!(rrf_score(None, None, false), 0.0);
+        assert_eq!(rrf_score(None, None, true), 0.0);
+    }
+
+    #[test]
+    fn rrf_dense_first_beats_a_deep_hit_in_both_lists() {
+        // f12702e1: при k = 60 узел на 50-м месте в обоих списках обгонял
+        // dense-первое место. Правило слияния обязано держать обратное.
+        assert!(rrf_score(None, Some(1), false) > rrf_score(Some(30), Some(30), false));
+    }
+
+    #[test]
+    fn rrf_script_blind_node_gets_a_share_instead_of_zero() {
+        let seen_nowhere = rrf_score(None, Some(3), false);
+        let blind = rrf_score(None, Some(3), true);
+        let expected = (1.0 + SCRIPT_BLIND_SHARE) / (RRF_K + 3.0);
+        assert!((blind - expected).abs() < 1e-12);
+        assert!(blind > seen_nowhere);
+        // Нашла FTS — её ранг, а не замена.
+        assert_eq!(
+            rrf_score(Some(7), Some(3), true),
+            rrf_score(Some(7), Some(3), false)
+        );
     }
 }

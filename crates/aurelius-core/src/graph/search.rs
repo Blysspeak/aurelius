@@ -1075,7 +1075,7 @@ fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
 
 /// Слияние FTS5 и векторного поиска в посев обхода (спека 011,
 /// `data-model.md` §2, `spec.md` «Архитектура пайплайна»): top-50 с каждой
-/// стороны → RRF (`rank::rrf_score`, k=60) → верхние `limit`.
+/// стороны → RRF (`rank::rrf_score`, `rank::RRF_K`) → верхние `limit`.
 ///
 /// RRF складывает вклад по РАНГУ в каждом из двух списков, не по самой
 /// релевантности — оба списка совместимы уже по построению, нормализация
@@ -1140,8 +1140,14 @@ pub fn hybrid_seeds_pooled(
     let pool: Vec<(uuid::Uuid, f64)> = by_id
         .keys()
         .map(|id| {
-            let score =
-                super::rank::rrf_score(fts_rank.get(id).copied(), dense_rank.get(id).copied());
+            let blind = by_id
+                .get(id)
+                .is_some_and(|n| super::fusion::fts_blind_to(query, n));
+            let score = super::rank::rrf_score(
+                fts_rank.get(id).copied(),
+                dense_rank.get(id).copied(),
+                blind,
+            );
             (*id, score)
         })
         .collect();

@@ -1,5 +1,6 @@
 mod crud;
 mod export;
+mod fusion;
 mod import;
 mod lease;
 mod path;
@@ -13,6 +14,7 @@ mod traverse;
 
 pub use crud::*;
 pub use export::*;
+pub use fusion::*;
 pub use import::*;
 pub use lease::*;
 pub use path::*;
