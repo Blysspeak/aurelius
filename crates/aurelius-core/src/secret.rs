@@ -540,57 +540,143 @@ pub fn scan_provenance_for_lookalike(data: &serde_json::Value) -> Option<(Secret
 /// Marker that replaces a masked secret value in trace payloads.
 pub const SECRET_MASK: &str = "***";
 
+/// Whether a key (env var, flag, JSON field) names a secret, judged by its
+/// words rather than substrings: `max_tokens`, `tokens_used`, `tokenizer`,
+/// `secretary_name` and `passport` are not secrets, `access_token`,
+/// `GITHUB_TOKEN`, `x-api-key`, `clientSecret` and `PGPASSWORD` are.
+pub fn is_secret_key(key: &str) -> bool {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for c in key.chars() {
+        if matches!(c, '_' | '-' | '.') {
+            if !cur.is_empty() {
+                parts.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && prev_lower && !cur.is_empty() {
+            parts.push(std::mem::take(&mut cur));
+        }
+        prev_lower = c.is_lowercase();
+        cur.extend(c.to_lowercase());
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    let single = |p: &str| {
+        matches!(
+            p,
+            "password" | "passwd" | "pwd" | "pass" | "token" | "secret" | "apikey"
+        ) || p.ends_with("password")
+    };
+    let pair = |a: &str, b: &str| {
+        matches!(
+            (a, b),
+            ("api", "key")
+                | ("access", "key")
+                | ("private", "key")
+                | ("client", "secret")
+                | ("auth", "token")
+        )
+    };
+    parts.iter().any(|p| single(p)) || parts.windows(2).any(|w| pair(&w[0], &w[1]))
+}
+
+/// One masking rule. A keyed rule captures the key in the named group `key`
+/// and replaces the match only when [`is_secret_key`] accepts that key.
+struct MaskRule {
+    re: regex::Regex,
+    rep: &'static str,
+    keyed: bool,
+}
+
 // Static literal patterns: `.expect` can only fire on a typo in this source
 // (any test calling `mask_secrets` catches it), never on runtime input.
 #[allow(clippy::expect_used)]
-fn mask_rules() -> &'static [(regex::Regex, &'static str)] {
-    static RULES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> =
-        std::sync::OnceLock::new();
+fn mask_rules() -> &'static [MaskRule] {
+    static RULES: std::sync::OnceLock<Vec<MaskRule>> = std::sync::OnceLock::new();
     RULES.get_or_init(|| {
         [
             // Password part of URL userinfo: scheme://user:PASSWORD@host.
             (
                 r"([A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]+:)[^\s@/]+@",
                 "${1}***@",
+                false,
             ),
             // Authorization header value and bare Bearer tokens.
             (
                 r#"(?i)(authorization:\s*(?:bearer\s+|basic\s+|token\s+)?|\bbearer\s+)(?:"[^"]*"|'[^']*'|[^\s'"]+)"#,
                 "${1}***",
+                false,
             ),
             // Known token prefixes (GitHub, OpenAI/Anthropic, Slack, AWS, GitLab).
             (
                 r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:ant-)?[A-Za-z0-9_\-]{16,}|xox[bpa]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|glpat-[A-Za-z0-9_\-]{20,})",
                 "***",
+                false,
             ),
             // Quoted keys in JSON / dict style: "password": "x", 'token': 'y'.
             (
-                r#"(?i)(["'][A-Za-z0-9_\-]*(?:password|passwd|pwd|token|secret|api_key|apikey|access_key|private_key)[A-Za-z0-9_\-]*["']\s*:\s*)"[^"]*""#,
+                r#"(["'](?P<key>[A-Za-z0-9_.\-]+)["']\s*:\s*)"[^"]*""#,
                 "${1}\"***\"",
+                true,
             ),
             (
-                r#"(?i)(["'][A-Za-z0-9_\-]*(?:password|passwd|pwd|token|secret|api_key|apikey|access_key|private_key)[A-Za-z0-9_\-]*["']\s*:\s*)'[^']*'"#,
+                r#"(["'](?P<key>[A-Za-z0-9_.\-]+)["']\s*:\s*)'[^']*'"#,
                 "${1}'***'",
+                true,
             ),
             (
-                r#"(?i)(["'][A-Za-z0-9_\-]*(?:password|passwd|pwd|token|secret|api_key|apikey|access_key|private_key)[A-Za-z0-9_\-]*["']\s*:\s*)[^\s"',}\]]+"#,
+                r#"(["'](?P<key>[A-Za-z0-9_.\-]+)["']\s*:\s*)[^\s"',}\]]+"#,
                 "${1}***",
+                true,
             ),
             // Flag followed by a space: --password VALUE, --api-key VALUE.
             (
-                r#"(?i)(--(?:password|token|secret|api-key)\s+)(?:"[^"]*"|'[^']*'|[^\s'"\-][^\s'"]*)"#,
+                r#"(--(?P<key>[A-Za-z0-9][A-Za-z0-9_\-]*)\s+)(?:"[^"]*"|'[^']*'|[^\s'"\-][^\s'"]*)"#,
                 "${1}***",
+                true,
             ),
             // key=value / key: value where the key names a secret.
             (
-                r#"(?i)\b([A-Za-z0-9_\-]*(?:password|passwd|pwd|token|secret|api_key|apikey|access_key|private_key)[A-Za-z0-9_\-]*)(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s'"&;]+)"#,
-                "${1}${2}***",
+                r#"\b(?P<key>[A-Za-z0-9_.\-]+)(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s'"&;]+)"#,
+                "${key}${2}***",
+                true,
             ),
         ]
         .into_iter()
-        .map(|(re, rep)| (regex::Regex::new(re).expect("static regex"), rep))
+        .map(|(re, rep, keyed)| MaskRule {
+            re: regex::Regex::new(re).expect("static regex"),
+            rep,
+            keyed,
+        })
         .collect()
     })
+}
+
+/// Apply a keyed rule: mask matches whose `key` group names a secret. After a
+/// non-secret key the scan resumes right past the key, so a secret inside its
+/// value (`url: password=x`) is still found.
+fn apply_keyed(re: &regex::Regex, rep: &str, text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    while let Some(caps) = re.captures_at(text, pos) {
+        let (Some(whole), Some(key)) = (caps.get(0), caps.name("key")) else {
+            break;
+        };
+        out.push_str(&text[pos..whole.start()]);
+        if is_secret_key(key.as_str()) {
+            caps.expand(rep, &mut out);
+            pos = whole.end();
+        } else {
+            out.push_str(&text[whole.start()..key.end()]);
+            pos = key.end();
+        }
+    }
+    out.push_str(&text[pos..]);
+    out
 }
 
 /// Replace high-precision secret shapes in free text (trace payloads) with
@@ -599,9 +685,13 @@ fn mask_rules() -> &'static [(regex::Regex, &'static str)] {
 /// traces must keep. Idempotent: masking an already masked text is a no-op.
 pub fn mask_secrets(text: &str) -> String {
     let mut out = text.to_owned();
-    for (re, rep) in mask_rules() {
-        if re.is_match(&out) {
-            out = re.replace_all(&out, *rep).into_owned();
+    for rule in mask_rules() {
+        if rule.re.is_match(&out) {
+            out = if rule.keyed {
+                apply_keyed(&rule.re, rule.rep, &out)
+            } else {
+                rule.re.replace_all(&out, rule.rep).into_owned()
+            };
         }
     }
     out
@@ -1234,5 +1324,46 @@ mod tests {
              --token t {\"secret\": \"s\", 'pwd': 'p', \"api_key\": 5}",
         );
         assert_eq!(mask_secrets(&once), once);
+    }
+
+    #[test]
+    fn secret_keys_are_judged_by_whole_words() {
+        for key in [
+            "access_token",
+            "GITHUB_TOKEN",
+            "x-api-key",
+            "clientSecret",
+            "PGPASSWORD",
+        ] {
+            assert!(is_secret_key(key), "{key}");
+            for input in [
+                format!("{key}=v4lue"),
+                format!("{key}: v4lue"),
+                format!(r#"{{"{key}": "v4lue"}}"#),
+                format!("cmd --{key} v4lue"),
+            ] {
+                let masked = mask_secrets(&input);
+                assert!(!masked.contains("v4lue"), "{input} -> {masked}");
+            }
+        }
+        for key in [
+            "max_tokens",
+            "tokens_used",
+            "tokenizer",
+            "secretary_name",
+            "passport",
+        ] {
+            assert!(!is_secret_key(key), "{key}");
+            for input in [
+                format!("{key}=4096"),
+                format!("{key}: 4096"),
+                format!(r#"{{"{key}": 4096}}"#),
+                format!(r#"{{"{key}": "4096"}}"#),
+                format!("cmd --{key} 4096"),
+            ] {
+                assert_eq!(mask_secrets(&input), input);
+            }
+        }
+        assert_eq!(mask_secrets("url: password=x"), "url: password=***");
     }
 }
