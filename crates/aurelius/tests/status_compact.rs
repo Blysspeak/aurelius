@@ -114,12 +114,17 @@ impl Drop for Server {
 
 /// One decision with a note well past the clip budget, and one active task
 /// with three evidence runs (red, green, green) and the same long note.
-/// Returns the note text so assertions can compare against it directly.
-fn seed_fixture(conn: &rusqlite::Connection) -> String {
+/// The decision also carries a claim longer than any clip budget. Returns
+/// the note and the claim so assertions can compare against them directly.
+fn seed_fixture(conn: &rusqlite::Connection) -> (String, String) {
     let long_note = format!(
-        "fixture note that must survive whole in full mode and be clipped to an excerpt in \
-         compact mode; padded well past the two hundred character budget with filler: {}",
+        "fixture note that must survive whole in full mode and stay out of compact mode; \
+         padded well past the two hundred character budget with filler: {}",
         "filler ".repeat(40)
+    );
+    let long_claim = format!(
+        "fixture claim that must come back whole in compact mode {}",
+        "word ".repeat(60).trim_end()
     );
     graph::add_node(
         conn,
@@ -127,7 +132,7 @@ fn seed_fixture(conn: &rusqlite::Connection) -> String {
         "[fixture] decision with a long note",
         Some(&long_note),
         "test",
-        json!({}),
+        json!({"claim": long_claim}),
     )
     .expect("seed decision");
     graph::add_node_full(
@@ -150,38 +155,44 @@ fn seed_fixture(conn: &rusqlite::Connection) -> String {
         None,
     )
     .expect("seed task");
-    long_note
+    (long_note, long_claim)
 }
 
 #[test]
 fn memory_status_compact_vs_full_end_to_end() {
     let home = TempHome::new();
-    let long_note = {
+    let (long_note, long_claim) = {
         let conn = db::open(&home.db_path()).expect("open fixture database");
-        let note = seed_fixture(&conn);
+        let seeded = seed_fixture(&conn);
         // Release the fixture lock before the server opens it.
         drop(conn);
-        note
+        seeded
     };
 
     let mut server = Server::start(&home);
 
     let compact = server.call(1, r#"{"project":"fixture"}"#);
 
-    // (a) The long note comes back as a word-boundary excerpt near 200
-    // chars, flagged with note_truncated.
+    // (a) No note excerpt next to a claim: the claim is the one-line text,
+    // whole (never clipped), with a 10-character date and provenance reduced
+    // to its signal.
     let decision = &compact["recent_decisions"][0];
-    let note = decision["note"].as_str().expect("note is a string");
-    assert!(
-        note.chars().count() <= 220,
-        "compact note must be an excerpt, got {} chars",
-        note.chars().count()
-    );
-    assert!(note.ends_with('…'), "excerpt must end with the ellipsis");
-    assert_eq!(decision["note_truncated"], json!(true));
+    assert_eq!(decision["text"], json!(long_claim));
+    assert!(decision.get("note").is_none());
+    assert!(decision.get("note_truncated").is_none());
+    assert!(!decision.to_string().contains("filler"));
+    assert_eq!(decision["date"].as_str().map(str::len), Some(10));
+    assert!(decision["provenance"]["confidence"].is_string());
     // The raw `data` object stays out of compact items — everything it said
-    // is already surfaced as claim and provenance.
+    // is already surfaced as text and provenance.
     assert!(decision.get("data").is_none());
+    // A task without a claim shows its label as the text, no note either.
+    let task = &compact["active_tasks"][0];
+    assert_eq!(
+        task["text"],
+        json!("[fixture] active task with three evidence runs")
+    );
+    assert!(task.get("note").is_none());
 
     // (b) Evidence is the summary object with total 3 — total/green and a
     // last_green of command/exit_code/at only, no per-run array.
