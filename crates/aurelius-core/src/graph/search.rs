@@ -1001,6 +1001,11 @@ pub async fn query_vector_for_search(
 /// (спека 011, «Архитектура пайплайна»: FTS5 top-50 AND dense KNN top-50).
 pub const FUSION_POOL: usize = 50;
 
+/// Pool depth cap per side for a type-filtered hybrid search: four times
+/// [`FUSION_POOL`], well below sqlite-vec's k limit of 4096. Shared by
+/// `au search --type` and MCP `memory_search` with `type`.
+pub const FILTERED_POOL: usize = FUSION_POOL * 4;
+
 /// Ближайшие соседи вектора запроса в `node_embeddings` (миграция v15→v16,
 /// `db.rs`), ближайший первым. Пустой список — не ошибка, ни когда таблицы
 /// нет вовсе (фикстура на старой схеме), ни когда она есть, но пуста (векторы
