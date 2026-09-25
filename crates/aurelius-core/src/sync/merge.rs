@@ -280,6 +280,11 @@ fn upsert_node(conn: &Connection, node: &Node, seq: &mut i64) -> Result<PushOutc
                 existing.updated_at,
             );
             replace_node_row(conn, node, &data, *seq)?;
+            // A winning tombstone deletes the node here, bypassing
+            // `delete_node`, so its vector has to go the same way.
+            if node.deleted_at.is_some() {
+                crate::graph::drop_node_vector(conn, &id_str)?;
+            }
             Ok(PushOutcome::Accepted)
         }
         // Equal `updated_at` means the client is re-sending a version it
