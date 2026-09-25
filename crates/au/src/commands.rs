@@ -1110,6 +1110,7 @@ pub async fn recall(args: RecallArgs) -> Result<()> {
     // What gets added are the three things that are not on the node: the
     // project it belongs to, the run that wrote it, and the resolution chain.
     let mut record = aurelius::mcp::node_detail(&node);
+    apply_probe_note(&conn, &mut record, &node.id.to_string());
     let Some(fields) = record.as_object_mut() else {
         anyhow::bail!("node renderer returned something other than an object");
     };
@@ -1204,6 +1205,33 @@ fn recall_prefix(conn: &rusqlite::Connection, prefix: &str, as_json: bool) -> Re
         line("created", Some(&family.newest.created_at.to_rfc3339()));
     }
     Ok(())
+}
+
+/// Replace `provenance.stale` with the note of the newest failing probe, if
+/// any. Same wording as `probe_stale_note` in the MCP handlers (crate-private
+/// there): a failed probe outranks the age note. Best-effort, like the MCP side.
+fn apply_probe_note(conn: &rusqlite::Connection, record: &mut serde_json::Value, id: &str) {
+    let failing = match aurelius_core::probes::failing_for(conn, &[id]) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("warning: could not read probe results: {e}");
+            return;
+        }
+    };
+    let Some(p) = failing.get(id).and_then(|v| v.first()) else {
+        return;
+    };
+    let date = p
+        .checked_at
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map_or_else(|| "?".to_owned(), |d| d.format("%Y-%m-%d").to_string());
+    let note = format!(
+        "проба не прошла {date}: {} {} — перепроверь, прежде чем опираться",
+        p.kind, p.expr
+    );
+    if let Some(slot) = record.pointer_mut("/provenance/stale") {
+        *slot = json!(note);
+    }
 }
 
 /// Human-readable form of the record `node_detail` produced — rendered FROM
@@ -4812,7 +4840,160 @@ pub async fn db(action: DbAction) -> Result<()> {
         DbAction::Migrate => db_migrate_cli(&db_path()),
         DbAction::ReindexEmbeddings => db_reindex_embeddings_cli(),
         DbAction::Prune { apply, json } => db_prune_cli(apply, json),
+        DbAction::PurgeOrphans { apply } => {
+            let n = db_purge_orphans(&db::open(&db_path())?, apply)?;
+            report_maintenance(apply, n, "orphan vector(s)", "au db purge-orphans --apply");
+            Ok(())
+        }
+        DbAction::ScrubTrace { apply } => {
+            let n = db_scrub_trace(&db::open(&db_path())?, apply)?;
+            report_maintenance(
+                apply,
+                n,
+                "trace payload(s) to mask",
+                "au db scrub-trace --apply",
+            );
+            Ok(())
+        }
+        DbAction::TraceRetention { days, apply } => {
+            let n = db_trace_retention(&db::open(&db_path())?, days, apply)?;
+            report_maintenance(
+                apply,
+                n,
+                &format!("trace row(s) older than {days} days"),
+                &format!("au db trace-retention --days {days} --apply"),
+            );
+            Ok(())
+        }
+        DbAction::PruneBackups { keep, apply } => db_prune_backups_cli(&db_path(), keep, apply),
     }
+}
+
+/// One summary line for a dry-run-by-default maintenance command.
+fn report_maintenance(apply: bool, n: usize, what: &str, apply_cmd: &str) {
+    if apply {
+        println!("✓ {n} {what} processed");
+    } else {
+        println!("dry run: {n} {what}");
+        if n > 0 {
+            println!("  run `{apply_cmd}` to act");
+        }
+    }
+}
+
+/// `au db purge-orphans`: vectors whose node is soft-deleted or gone.
+fn db_purge_orphans(conn: &rusqlite::Connection, apply: bool) -> Result<usize> {
+    if apply {
+        return graph::purge_orphan_embeddings(conn);
+    }
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_embeddings')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_table {
+        return Ok(0);
+    }
+    // Same selection as `graph::purge_orphan_embeddings`.
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM node_embeddings e
+          LEFT JOIN nodes n ON n.rowid = e.rowid
+          WHERE n.rowid IS NULL OR n.deleted_at IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(usize::try_from(n)?)
+}
+
+/// `au db scrub-trace`: trace rows whose payload `mask_secrets` would change.
+fn db_scrub_trace(conn: &rusqlite::Connection, apply: bool) -> Result<usize> {
+    if apply {
+        return aurelius_core::trace::scrub_existing(conn);
+    }
+    let mut stmt = conn.prepare("SELECT payload FROM act_trace")?;
+    let mut rows = stmt.query([])?;
+    let mut n = 0;
+    while let Some(row) = rows.next()? {
+        let old: String = row.get(0)?;
+        if aurelius_core::secret::mask_secrets(&old) != old {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Shortest retention `au db trace-retention` accepts.
+const TRACE_RETENTION_MIN_DAYS: u32 = 30;
+
+/// `au db trace-retention`: traces older than `days` days.
+fn db_trace_retention(conn: &rusqlite::Connection, days: u32, apply: bool) -> Result<usize> {
+    if days < TRACE_RETENTION_MIN_DAYS {
+        anyhow::bail!("--days must be at least {TRACE_RETENTION_MIN_DAYS}, got {days}");
+    }
+    let cutoff = chrono::Utc::now().timestamp() - i64::from(days) * 86_400;
+    aurelius_core::trace::prune_trace_before(conn, cutoff, apply)
+}
+
+/// Backup snapshots (`aurelius-*.db`) next to the database and under
+/// `<data_dir>/backups`, newest first by mtime. The live `aurelius.db` has no
+/// dash and never matches.
+fn backup_snapshots(db: &std::path::Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let Some(dir) = db.parent() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for d in [dir.to_path_buf(), dir.join("backups")] {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("aurelius-") || !name.ends_with(".db") {
+                continue;
+            }
+            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                out.push((path, mtime));
+            }
+        }
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.1));
+    out
+}
+
+/// Snapshots beyond the `keep` newest; removed only with `apply`.
+fn db_prune_backups(db: &std::path::Path, keep: usize, apply: bool) -> Result<Vec<PathBuf>> {
+    let doomed: Vec<PathBuf> = backup_snapshots(db)
+        .into_iter()
+        .skip(keep)
+        .map(|(p, _)| p)
+        .collect();
+    if apply {
+        for p in &doomed {
+            std::fs::remove_file(p).with_context(|| format!("failed to remove {}", p.display()))?;
+        }
+    }
+    Ok(doomed)
+}
+
+fn db_prune_backups_cli(db: &std::path::Path, keep: usize, apply: bool) -> Result<()> {
+    let doomed = db_prune_backups(db, keep, apply)?;
+    for p in &doomed {
+        println!(
+            "  {} {}",
+            if apply { "removed" } else { "would remove" },
+            p.display()
+        );
+    }
+    report_maintenance(
+        apply,
+        doomed.len(),
+        &format!("backup(s) beyond the {keep} newest"),
+        &format!("au db prune-backups --keep {keep} --apply"),
+    );
+    Ok(())
 }
 
 /// Сколько строк каждого правила печатать человеку; полный список — `--json`.
@@ -5116,10 +5297,15 @@ fn db_backup_cli(path: &std::path::Path, out: Option<String>) -> Result<()> {
     }
     let dest = match out {
         Some(p) => PathBuf::from(p),
-        None => path.with_file_name(format!(
-            "aurelius-{}.db",
-            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
-        )),
+        None => {
+            let dir = path.with_file_name("backups");
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+            dir.join(format!(
+                "aurelius-{}.db",
+                chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+            ))
+        }
     };
     if dest.exists() {
         anyhow::bail!("destination already exists: {}", dest.display());
@@ -5570,6 +5756,202 @@ async fn share_disable(project: &str) -> Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Temp database on a uuid-named file; removed by the caller.
+    fn maint_db(tag: &str) -> (PathBuf, rusqlite::Connection) {
+        let path = std::env::temp_dir().join(format!("au-maint-{tag}-{}.db", uuid::Uuid::new_v4()));
+        let conn = db::open(&path).expect("open temp db");
+        (path, conn)
+    }
+
+    fn maint_node(conn: &rusqlite::Connection, label: &str) -> aurelius_core::models::Node {
+        graph::add_node(
+            conn,
+            aurelius_core::models::NodeType::Concept,
+            label,
+            None,
+            "test",
+            json!({}),
+        )
+        .expect("add node")
+    }
+
+    fn one(conn: &rusqlite::Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).expect("count")
+    }
+
+    #[test]
+    fn purge_orphans_counts_then_removes() {
+        let (path, conn) = maint_db("purge");
+        let keep = maint_node(&conn, "keep");
+        let gone = maint_node(&conn, "gone");
+        let bytes: Vec<u8> = (0..1024u32)
+            .flat_map(|i| ((i % 7) as f32 + 1.0).to_le_bytes())
+            .collect();
+        for n in [&keep, &gone] {
+            conn.execute(
+                "INSERT INTO node_embeddings(rowid, embedding)
+                 SELECT rowid, vec_quantize_int8(?2, 'unit') FROM nodes WHERE id = ?1",
+                rusqlite::params![n.id.to_string(), bytes],
+            )
+            .expect("vector");
+        }
+        // Soft-delete behind delete_node's back: an orphan from before it dropped vectors.
+        conn.execute(
+            "UPDATE nodes SET deleted_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+            [gone.id.to_string()],
+        )
+        .expect("tombstone");
+
+        assert_eq!(db_purge_orphans(&conn, false).expect("dry"), 1);
+        assert_eq!(one(&conn, "SELECT COUNT(*) FROM node_embeddings"), 2);
+        assert_eq!(db_purge_orphans(&conn, true).expect("apply"), 1);
+        assert_eq!(one(&conn, "SELECT COUNT(*) FROM node_embeddings"), 1);
+        assert_eq!(db_purge_orphans(&conn, false).expect("dry again"), 0);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scrub_trace_counts_then_masks() {
+        let (path, conn) = maint_db("scrub");
+        conn.execute(
+            "INSERT INTO act_trace (ts, session_id, kind, payload) VALUES
+                 (1, 's', 'tool_call', 'export PGPASSWORD=hunter2'),
+                 (2, 's', 'tool_call', 'git log 6784399')",
+            [],
+        )
+        .expect("raw insert");
+
+        assert_eq!(db_scrub_trace(&conn, false).expect("dry"), 1);
+        assert_eq!(
+            one(
+                &conn,
+                "SELECT COUNT(*) FROM act_trace WHERE payload LIKE '%hunter2%'"
+            ),
+            1
+        );
+        assert_eq!(db_scrub_trace(&conn, true).expect("apply"), 1);
+        assert_eq!(
+            one(
+                &conn,
+                "SELECT COUNT(*) FROM act_trace WHERE payload LIKE '%hunter2%'"
+            ),
+            0
+        );
+        assert_eq!(db_scrub_trace(&conn, false).expect("dry again"), 0);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn trace_retention_refuses_short_windows_counts_then_removes() {
+        let (path, conn) = maint_db("retention");
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO act_trace (ts, session_id, kind, payload) VALUES
+                 (?1, 's', 'tool_call', 'old'), (?2, 's', 'tool_call', 'new')",
+            rusqlite::params![now - 100 * 86_400, now - 86_400],
+        )
+        .expect("raw insert");
+
+        assert!(db_trace_retention(&conn, 29, false).is_err());
+        assert!(db_trace_retention(&conn, 29, true).is_err());
+        assert_eq!(db_trace_retention(&conn, 30, false).expect("dry"), 1);
+        assert_eq!(one(&conn, "SELECT COUNT(*) FROM act_trace"), 2);
+        assert_eq!(db_trace_retention(&conn, 30, true).expect("apply"), 1);
+        assert_eq!(one(&conn, "SELECT COUNT(*) FROM act_trace"), 1);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prune_backups_keeps_newest_across_both_places() {
+        let dir = std::env::temp_dir().join(format!("au-prune-backups-{}", uuid::Uuid::new_v4()));
+        let backups = dir.join("backups");
+        std::fs::create_dir_all(&backups).expect("mkdir");
+        let db = dir.join("aurelius.db");
+        std::fs::write(&db, b"live").expect("live db");
+        std::fs::write(dir.join("notes.txt"), b"x").expect("other file");
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let files = [
+            dir.join("aurelius-20260101T000000Z.db"),
+            backups.join("aurelius-20260102T000000Z.db"),
+            dir.join("aurelius-20260103T000000Z.db"),
+            backups.join("aurelius-20260104T000000Z.db"),
+        ];
+        for (i, f) in files.iter().enumerate() {
+            std::fs::write(f, b"snap").expect("snapshot");
+            let t = base + std::time::Duration::from_secs(60 * i as u64);
+            std::fs::File::options()
+                .write(true)
+                .open(f)
+                .and_then(|h| h.set_modified(t))
+                .expect("mtime");
+        }
+
+        let dry = db_prune_backups(&db, 2, false).expect("dry");
+        assert_eq!(dry, vec![files[1].clone(), files[0].clone()]);
+        assert!(files.iter().all(|f| f.exists()));
+
+        let applied = db_prune_backups(&db, 2, true).expect("apply");
+        assert_eq!(applied, dry);
+        assert!(!files[0].exists() && !files[1].exists());
+        assert!(files[2].exists() && files[3].exists() && db.exists());
+        assert!(db_prune_backups(&db, 2, false).expect("again").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_backup_goes_into_backups_dir() {
+        let dir = std::env::temp_dir().join(format!("au-backup-dir-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db_file = dir.join("aurelius.db");
+        drop(db::open(&db_file).expect("open"));
+        db_backup_cli(&db_file, None).expect("backup");
+        let snaps = backup_snapshots(&db_file);
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].0.parent(), Some(dir.join("backups").as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_record_carries_the_failing_probe_note() {
+        let (path, conn) = maint_db("probe");
+        let node = maint_node(&conn, "leans on a file");
+        let id = node.id.to_string();
+        let mut record = aurelius::mcp::node_detail(&node);
+        apply_probe_note(&conn, &mut record, &id);
+        let before = record.pointer("/provenance/stale").cloned();
+        assert!(!before
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.starts_with("проба")));
+
+        conn.execute(
+            "INSERT INTO probes (node_id, kind, expr, last_ok, checked_at)
+             VALUES (?1, 'file_exists', 'src/gone.rs', 0, 1790000000)",
+            [&id],
+        )
+        .expect("probe");
+        let mut record = aurelius::mcp::node_detail(&node);
+        apply_probe_note(&conn, &mut record, &id);
+        let date = chrono::DateTime::from_timestamp(1_790_000_000, 0)
+            .expect("ts")
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(
+            record.pointer("/provenance/stale").and_then(|v| v.as_str()),
+            Some(
+                format!(
+                    "проба не прошла {date}: file_exists src/gone.rs — перепроверь, прежде чем опираться"
+                )
+                .as_str()
+            )
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Каталог без `embed.sock` — детерминированный «демон недоступен», не
     /// зависящий от того, жив ли настоящий демон на машине, где идёт `cargo
