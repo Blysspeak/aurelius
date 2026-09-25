@@ -105,81 +105,81 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_add",
-                "description": "Add a new knowledge node to the graph. Supports structured data and memory classification. Pass 'project' so the node is linked to that project — without a link (or a '[project]' label prefix) the node is invisible to memory_status(project=…) and to the snapshot, and the response carries an 'attachment_warning' saying so.",
+                "description": "Add a knowledge node. Pass 'project': without it (or a '[project]' label prefix) the node is invisible to memory_status(project=…) and the snapshot, and the response carries 'attachment_warning'. Its provenance fields are reused by task/session tools.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "label": {
                             "type": "string",
-                            "description": "Short label for the node"
+                            "description": "Short label"
                         },
                         "project": {
                             "type": "string",
-                            "description": "Project this node belongs to. Creates the belongs_to edge for you (and the project node if missing). Omit only for genuinely global knowledge."
+                            "description": "Owning project (creates belongs_to edge). Omit only for global knowledge."
                         },
                         "type": {
                             "type": "string",
                             "enum": aurelius_core::models::NodeType::KNOWN,
-                            "description": "Node type. A typo used to become a custom type silently — a node no query filters on.",
+                            "description": "Node type.",
                             "default": "concept"
                         },
                         "note": {
                             "type": "string",
-                            "description": "Detailed note/description"
+                            "description": "Detailed note"
                         },
                         "source": {
                             "type": "string",
-                            "description": "Source of this knowledge (default: mcp)",
+                            "description": "Source (default: mcp)",
                             "default": "mcp"
                         },
                         "data": {
                             "type": "object",
-                            "description": "Arbitrary JSON metadata (alternatives considered, related commits, context, etc.)"
+                            "description": "Arbitrary JSON metadata"
                         },
                         "memory_kind": {
                             "type": "string",
                             "enum": ["semantic", "episodic"],
-                            "description": "Memory classification: semantic (facts, concepts) or episodic (events, sessions). Default: semantic",
+                            "description": "semantic (facts) or episodic (events)",
                             "default": "semantic"
                         },
                         "session_id": {
                             "type": "string",
-                            "description": "The run that wrote this. Without it nothing distinguishes this record from one written yesterday, and 'everything written in this session' cannot be selected at all. Readable back with `au journal --session <id>`."
+                            "description": "Writing run, for `au journal --session <id>`."
                         },
                         "confidence": {
                             "type": "string",
                             "enum": ["measured", "inferred", "reported", "unverified"],
-                            "description": "Where this came from. REQUIRED — a false claim otherwise lands exactly like a measured one. measured: obtained by a command/query, which must be quoted verbatim in 'evidence'. inferred: derived from something measured, not itself measured. reported: told by a human or docs, unchecked. unverified: origin not named. Anything but 'measured' is marked as such on the way out."
+                            "description": "REQUIRED origin. measured: from a command/query quoted verbatim in 'evidence'. inferred: derived from a measurement. reported: told by a human/docs, unchecked. unverified: origin unnamed. Non-measured is flagged on output."
                         },
                         "evidence": {
                             "type": "string",
-                            "description": "The command or query VERBATIM — what produced this. Required when confidence is 'measured': a measurement without the command that made it is an inference."
+                            "description": "The producing command/query VERBATIM. Required when confidence is 'measured'."
                         },
                         "measured_at": {
                             "type": "string",
-                            "description": "RFC 3339 timestamp of the measurement. Defaults to now for 'measured'. Pass it explicitly when recording something measured earlier."
+                            "description": "RFC 3339 time of measurement; defaults to now for 'measured'."
                         },
                         "claim": {
                             "type": "string",
-                            "description": "The assertion in one or two lines — returned WHOLE, never clipped mid-word. Max 240 chars; the long reasoning belongs in 'note', which is returned on demand."
+                            "description": "The assertion, returned whole. Max 240 chars; reasoning goes in 'note'."
                         },
                         "volatility": {
                             "type": "string",
                             "enum": ["immutable", "slow", "volatile"],
-                            "description": "How fast this stops being true. immutable: never (a function address, a commit sha). slow: rarely and visibly (a DB schema). volatile: quietly and at any moment (a value in .env, a process state). A stale fact is handed back with 'older than N days — re-check with …'. Omit when you do not know; a wrong default would be the same silent lie this field exists to prevent."
+                            "description": "immutable (commit sha), slow (DB schema), volatile (.env value). Stale facts return with a re-check note. Omit if unknown."
                         },
                         "verify_with": {
                             "type": "string",
-                            "description": "Command that re-checks this claim. Without it a staleness note reports trouble without saying how to close it."
+                            "description": "Command that re-checks the claim."
                         },
                         "subject": {
                             "type": "string",
-                            "description": "Identity of what is being asserted, e.g. 'xhub:.env:REFUND_REQUESTS_ENABLED'. Two facts sharing a subject cannot both be true, so a second one is refused until you say how to resolve it — see 'resolution'."
+                            "description": "Key of the asserted thing, e.g. 'xhub:.env:FLAG'. A second fact on the same subject is refused unless 'resolution' is given."
                         },
                         "resolution": {
                             "type": "string",
                             "enum": ["supersede", "refine", "coexist"],
-                            "description": "How this relates to the existing fact about the same 'subject'. supersede: the old one is no longer true (creates a supersedes edge). refine: the old one stays true, this makes it more precise. coexist: both hold — say so deliberately."
+                            "description": "Vs the fact on this subject. supersede: old is false (supersedes edge). refine: more precise. coexist: both hold."
                         },
                     },
                     "required": ["label", "confidence"]
@@ -252,7 +252,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_session",
-                "description": "Record a session summary with decisions made, problems solved, and next steps. Creates an episodic Session node linked to the project, plus Decision and Problem/Solution nodes. Optionally links to tasks. Returns active tasks for the project as a hint. Call this at the end of a productive session. Accepts the same provenance fields as memory_add (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way — they land on the session node; the decisions/problems/solutions it spawns inherit confidence/evidence but never subject or claim. resolution is not supported here: to supersede an existing fact by subject, use memory_add with resolution.",
+                "description": "Record a session summary at the end of a productive session: an episodic Session node linked to the project, plus Decision and Problem/Solution nodes; optionally links tasks; returns the project's active tasks. Accepts memory_add's provenance fields (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way; they land on the session node, spawned nodes inherit confidence/evidence but never subject or claim. resolution is not supported: to supersede a fact by subject, use memory_add.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -302,32 +302,32 @@ pub fn tool_definitions() -> serde_json::Value {
                         "confidence": {
                             "type": "string",
                             "enum": ["measured", "inferred", "reported", "unverified"],
-                            "description": "Where this came from. REQUIRED — a false claim otherwise lands exactly like a measured one. measured: obtained by a command/query, which must be quoted verbatim in 'evidence'. inferred: derived from something measured, not itself measured. reported: told by a human or docs, unchecked. unverified: origin not named. Anything but 'measured' is marked as such on the way out."
+                            "description": "Required. Provenance field, defined in memory_add."
                         },
                         "evidence": {
                             "type": "string",
-                            "description": "The command or query VERBATIM — what produced this. Required when confidence is 'measured': a measurement without the command that made it is an inference."
+                            "description": "As in memory_add."
                         },
                         "measured_at": {
                             "type": "string",
-                            "description": "RFC 3339 timestamp of the measurement. Defaults to now for 'measured'. Pass it explicitly when recording something measured earlier."
+                            "description": "As in memory_add."
                         },
                         "claim": {
                             "type": "string",
-                            "description": "The assertion in one or two lines — returned WHOLE, never clipped mid-word. Max 240 chars; the long reasoning belongs in 'note', which is returned on demand."
+                            "description": "As in memory_add."
                         },
                         "volatility": {
                             "type": "string",
                             "enum": ["immutable", "slow", "volatile"],
-                            "description": "How fast this stops being true. immutable: never (a function address, a commit sha). slow: rarely and visibly (a DB schema). volatile: quietly and at any moment (a value in .env, a process state). A stale fact is handed back with 'older than N days — re-check with …'. Omit when you do not know; a wrong default would be the same silent lie this field exists to prevent."
+                            "description": "As in memory_add."
                         },
                         "verify_with": {
                             "type": "string",
-                            "description": "Command that re-checks this claim. Without it a staleness note reports trouble without saying how to close it."
+                            "description": "As in memory_add."
                         },
                         "subject": {
                             "type": "string",
-                            "description": "Identity of what is being asserted, e.g. 'xhub:.env:REFUND_REQUESTS_ENABLED'. Two facts sharing a subject cannot both be true, so a second one is refused until you say how to resolve it — see 'resolution'."
+                            "description": "As in memory_add."
                         }
                     },
                     "required": ["summary", "project"]
@@ -447,7 +447,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "task_create",
-                "description": "Create a well-structured task with title, description, acceptance criteria, and priority. Auto-links to project. Supports subtask hierarchy and blocking relations. Accepts the same provenance fields as memory_add (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way — they land on the task node. resolution is not supported here: to supersede an existing fact by subject, use memory_add with resolution.",
+                "description": "Create a task (title, description, acceptance criteria, priority), auto-linked to the project; supports subtasks and blocking. Accepts memory_add's provenance fields (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way; they land on the task node. resolution is not supported: to supersede a fact by subject, use memory_add.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -486,32 +486,32 @@ pub fn tool_definitions() -> serde_json::Value {
                         "confidence": {
                             "type": "string",
                             "enum": ["measured", "inferred", "reported", "unverified"],
-                            "description": "Where this came from. REQUIRED — a false claim otherwise lands exactly like a measured one. measured: obtained by a command/query, which must be quoted verbatim in 'evidence'. inferred: derived from something measured, not itself measured. reported: told by a human or docs, unchecked. unverified: origin not named. Anything but 'measured' is marked as such on the way out."
+                            "description": "Required. Provenance field, defined in memory_add."
                         },
                         "evidence": {
                             "type": "string",
-                            "description": "The command or query VERBATIM — what produced this. Required when confidence is 'measured': a measurement without the command that made it is an inference."
+                            "description": "As in memory_add."
                         },
                         "measured_at": {
                             "type": "string",
-                            "description": "RFC 3339 timestamp of the measurement. Defaults to now for 'measured'. Pass it explicitly when recording something measured earlier."
+                            "description": "As in memory_add."
                         },
                         "claim": {
                             "type": "string",
-                            "description": "The assertion in one or two lines — returned WHOLE, never clipped mid-word. Max 240 chars; the long reasoning belongs in 'note', which is returned on demand."
+                            "description": "As in memory_add."
                         },
                         "volatility": {
                             "type": "string",
                             "enum": ["immutable", "slow", "volatile"],
-                            "description": "How fast this stops being true. immutable: never (a function address, a commit sha). slow: rarely and visibly (a DB schema). volatile: quietly and at any moment (a value in .env, a process state). A stale fact is handed back with 'older than N days — re-check with …'. Omit when you do not know; a wrong default would be the same silent lie this field exists to prevent."
+                            "description": "As in memory_add."
                         },
                         "verify_with": {
                             "type": "string",
-                            "description": "Command that re-checks this claim. Without it a staleness note reports trouble without saying how to close it."
+                            "description": "As in memory_add."
                         },
                         "subject": {
                             "type": "string",
-                            "description": "Identity of what is being asserted, e.g. 'xhub:.env:REFUND_REQUESTS_ENABLED'. Two facts sharing a subject cannot both be true, so a second one is refused until you say how to resolve it — see 'resolution'."
+                            "description": "As in memory_add."
                         },
                     },
                     "required": ["title"]
@@ -519,7 +519,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "task_update",
-                "description": "Update task status, priority, or acceptance criteria. Supports status transitions: backlog → active → done/blocked/cancelled. Transitioning to 'active' stamps activated_at and evicts any other active task in the same project back to backlog (at most one active task per project) — same rule as `au task activate`, not a separate copy of it. Transitioning to 'done' stamps closed_at and builds the resolution (how the task got solved) the same way the CLI does: commit is read from the current git HEAD unless given explicitly, files come from edits traced since activation; optional commit/pull_request/unconfirmed only refine that auto-collected resolution, they don't replace it. Also auto-tracks legacy started_at/completed_at timestamps for older readers. Accepts the same provenance fields as memory_add (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way — a task's confidence can change after a measurement, and this is how that lands on the task node. resolution is not supported here: to supersede an existing fact by subject, use memory_add with resolution.",
+                "description": "Update task status, priority or acceptance criteria (backlog → active → done/blocked/cancelled). 'active' stamps activated_at and moves any other active task of the project back to backlog (one active per project, same rule as `au task activate`). 'done' stamps closed_at and builds the resolution like the CLI: commit from git HEAD unless given, files from edits traced since activation; commit/pull_request/unconfirmed only refine it. Legacy started_at/completed_at are still tracked. Accepts memory_add's provenance fields (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way; this is how a changed confidence lands on the task. resolution is not supported: to supersede a fact by subject, use memory_add.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -565,32 +565,32 @@ pub fn tool_definitions() -> serde_json::Value {
                         "confidence": {
                             "type": "string",
                             "enum": ["measured", "inferred", "reported", "unverified"],
-                            "description": "Where this came from. REQUIRED — a false claim otherwise lands exactly like a measured one. measured: obtained by a command/query, which must be quoted verbatim in 'evidence'. inferred: derived from something measured, not itself measured. reported: told by a human or docs, unchecked. unverified: origin not named. Anything but 'measured' is marked as such on the way out."
+                            "description": "Required. Provenance field, defined in memory_add."
                         },
                         "evidence": {
                             "type": "string",
-                            "description": "The command or query VERBATIM — what produced this. Required when confidence is 'measured': a measurement without the command that made it is an inference."
+                            "description": "As in memory_add."
                         },
                         "measured_at": {
                             "type": "string",
-                            "description": "RFC 3339 timestamp of the measurement. Defaults to now for 'measured'. Pass it explicitly when recording something measured earlier."
+                            "description": "As in memory_add."
                         },
                         "claim": {
                             "type": "string",
-                            "description": "The assertion in one or two lines — returned WHOLE, never clipped mid-word. Max 240 chars; the long reasoning belongs in 'note', which is returned on demand."
+                            "description": "As in memory_add."
                         },
                         "volatility": {
                             "type": "string",
                             "enum": ["immutable", "slow", "volatile"],
-                            "description": "How fast this stops being true. immutable: never (a function address, a commit sha). slow: rarely and visibly (a DB schema). volatile: quietly and at any moment (a value in .env, a process state). A stale fact is handed back with 'older than N days — re-check with …'. Omit when you do not know; a wrong default would be the same silent lie this field exists to prevent."
+                            "description": "As in memory_add."
                         },
                         "verify_with": {
                             "type": "string",
-                            "description": "Command that re-checks this claim. Without it a staleness note reports trouble without saying how to close it."
+                            "description": "As in memory_add."
                         },
                         "subject": {
                             "type": "string",
-                            "description": "Identity of what is being asserted, e.g. 'xhub:.env:REFUND_REQUESTS_ENABLED'. Two facts sharing a subject cannot both be true, so a second one is refused until you say how to resolve it — see 'resolution'."
+                            "description": "As in memory_add."
                         }
                     },
                     "required": ["id"]
@@ -630,7 +630,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "task_log",
-                "description": "Record work done on a task. Creates a WorkLog node linked to the task. Optionally records decisions made and problems solved during the work. Logging never changes the task's status: the response includes task_status, and activation is explicit, via task_update with status=active. Accepts the same provenance fields as memory_add (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way — they land on the WorkLog node; the decisions/problems/solutions it spawns inherit confidence/evidence but never subject or claim. resolution is not supported here: to supersede an existing fact by subject, use memory_add with resolution.",
+                "description": "Record work on a task as a WorkLog node, optionally with decisions and problems solved. Never changes task status (response has task_status; activate via task_update status=active). Accepts memory_add's provenance fields (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way; they land on the WorkLog node, spawned nodes inherit confidence/evidence but never subject or claim. resolution is not supported: to supersede a fact by subject, use memory_add.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -661,32 +661,32 @@ pub fn tool_definitions() -> serde_json::Value {
                         "confidence": {
                             "type": "string",
                             "enum": ["measured", "inferred", "reported", "unverified"],
-                            "description": "Where this came from. REQUIRED — a false claim otherwise lands exactly like a measured one. measured: obtained by a command/query, which must be quoted verbatim in 'evidence'. inferred: derived from something measured, not itself measured. reported: told by a human or docs, unchecked. unverified: origin not named. Anything but 'measured' is marked as such on the way out."
+                            "description": "Required. Provenance field, defined in memory_add."
                         },
                         "evidence": {
                             "type": "string",
-                            "description": "The command or query VERBATIM — what produced this. Required when confidence is 'measured': a measurement without the command that made it is an inference."
+                            "description": "As in memory_add."
                         },
                         "measured_at": {
                             "type": "string",
-                            "description": "RFC 3339 timestamp of the measurement. Defaults to now for 'measured'. Pass it explicitly when recording something measured earlier."
+                            "description": "As in memory_add."
                         },
                         "claim": {
                             "type": "string",
-                            "description": "The assertion in one or two lines — returned WHOLE, never clipped mid-word. Max 240 chars; the long reasoning belongs in 'note', which is returned on demand."
+                            "description": "As in memory_add."
                         },
                         "volatility": {
                             "type": "string",
                             "enum": ["immutable", "slow", "volatile"],
-                            "description": "How fast this stops being true. immutable: never (a function address, a commit sha). slow: rarely and visibly (a DB schema). volatile: quietly and at any moment (a value in .env, a process state). A stale fact is handed back with 'older than N days — re-check with …'. Omit when you do not know; a wrong default would be the same silent lie this field exists to prevent."
+                            "description": "As in memory_add."
                         },
                         "verify_with": {
                             "type": "string",
-                            "description": "Command that re-checks this claim. Without it a staleness note reports trouble without saying how to close it."
+                            "description": "As in memory_add."
                         },
                         "subject": {
                             "type": "string",
-                            "description": "Identity of what is being asserted, e.g. 'xhub:.env:REFUND_REQUESTS_ENABLED'. Two facts sharing a subject cannot both be true, so a second one is refused until you say how to resolve it — see 'resolution'."
+                            "description": "As in memory_add."
                         },
                     },
                     "required": ["task", "text"]

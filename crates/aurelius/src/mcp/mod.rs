@@ -97,8 +97,39 @@ fn handle_initialize(id: Option<serde_json::Value>) -> JsonRpcResponse {
     )
 }
 
+/// Admin tools left out of `tools/list` unless `AURELIUS_MCP_ADMIN=1`;
+/// dispatch still serves them. Measured 2026-09-25: most were never called
+/// over MCP in 17 days, yet every session paid for their descriptions.
+const ADMIN_TOOLS: [&str; 10] = [
+    "db_backup",
+    "db_check",
+    "db_reindex_embeddings",
+    "memory_gc",
+    "memory_merge",
+    "memory_consolidate",
+    "memory_dump",
+    "memory_eval",
+    "memory_journal",
+    "skill_remove",
+];
+
 fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
-    JsonRpcResponse::success(id, tools::tool_definitions())
+    let admin = std::env::var("AURELIUS_MCP_ADMIN").is_ok_and(|v| v == "1");
+    JsonRpcResponse::success(id, visible_tools(admin))
+}
+
+fn visible_tools(admin: bool) -> serde_json::Value {
+    let mut defs = tools::tool_definitions();
+    if !admin {
+        if let Some(list) = defs.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            list.retain(|t| {
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .is_none_or(|n| !ADMIN_TOOLS.contains(&n))
+            });
+        }
+    }
+    defs
 }
 
 async fn handle_tools_call(
@@ -271,4 +302,29 @@ async fn write_response(stdout: &mut tokio::io::Stdout, resp: &JsonRpcResponse) 
     stdout.write_all(b"\n").await?;
     stdout.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(defs: &serde_json::Value) -> Vec<String> {
+        defs["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[test]
+    fn tools_list_hides_admin_tools_unless_admin() {
+        let plain = names(&visible_tools(false));
+        let admin = names(&visible_tools(true));
+        for t in ADMIN_TOOLS {
+            assert!(!plain.iter().any(|n| n == t), "{t} must be hidden");
+            assert!(admin.iter().any(|n| n == t), "{t} must be listed for admin");
+        }
+        assert_eq!(admin.len() - plain.len(), ADMIN_TOOLS.len());
+    }
 }
