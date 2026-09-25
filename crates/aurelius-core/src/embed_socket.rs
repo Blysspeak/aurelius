@@ -176,11 +176,29 @@ pub const DEFAULT_IDLE_SECS: u64 = 0;
 /// # Errors
 /// A value that is not a whole number of seconds.
 pub fn parse_idle_secs(raw: Option<&str>) -> Result<Option<Duration>, String> {
+    parse_secs("AURELIUS_EMBED_IDLE_SECS", DEFAULT_IDLE_SECS, raw)
+}
+
+/// How long the reranker weights stay loaded with no rerank call when
+/// `AURELIUS_RERANK_IDLE_SECS` is unset. Unlike bge-m3 it is unloaded by
+/// default: with both models resident the daemon holds about 6 GB of an 8 GB
+/// GPU, and a cold reranker load only delays one search past `RERANK_TIMEOUT`.
+pub const DEFAULT_RERANK_IDLE_SECS: u64 = 600;
+
+/// `AURELIUS_RERANK_IDLE_SECS`: whole seconds, `0` = never unload (`None`).
+///
+/// # Errors
+/// A value that is not a whole number of seconds.
+pub fn parse_rerank_idle_secs(raw: Option<&str>) -> Result<Option<Duration>, String> {
+    parse_secs("AURELIUS_RERANK_IDLE_SECS", DEFAULT_RERANK_IDLE_SECS, raw)
+}
+
+fn parse_secs(var: &str, default: u64, raw: Option<&str>) -> Result<Option<Duration>, String> {
     let secs = match raw.map(str::trim) {
-        None | Some("") => DEFAULT_IDLE_SECS,
-        Some(v) => v.parse::<u64>().map_err(|_| {
-            format!("AURELIUS_EMBED_IDLE_SECS={v}: expected whole seconds, 0 disables unloading")
-        })?,
+        None | Some("") => default,
+        Some(v) => v
+            .parse::<u64>()
+            .map_err(|_| format!("{var}={v}: expected whole seconds, 0 disables unloading"))?,
     };
     Ok(if secs == 0 {
         None
@@ -207,6 +225,15 @@ pub fn idle_from_env() -> Option<Duration> {
     parse_idle_secs(raw.as_deref()).unwrap_or_else(|reason| {
         eprintln!("embed: {reason}; using {DEFAULT_IDLE_SECS}s");
         Some(Duration::from_secs(DEFAULT_IDLE_SECS))
+    })
+}
+
+/// The reranker's idle timeout, read like `idle_from_env`.
+pub fn rerank_idle_from_env() -> Option<Duration> {
+    let raw = std::env::var("AURELIUS_RERANK_IDLE_SECS").ok();
+    parse_rerank_idle_secs(raw.as_deref()).unwrap_or_else(|reason| {
+        eprintln!("rerank: {reason}; using {DEFAULT_RERANK_IDLE_SECS}s");
+        Some(Duration::from_secs(DEFAULT_RERANK_IDLE_SECS))
     })
 }
 
@@ -323,13 +350,13 @@ pub fn shared_bge_m3(idle: Option<Duration>) -> SharedModel {
 
 /// The daemon's single lazily loaded bge-reranker-v2-m3. Process-wide rather
 /// than a `serve` argument so the daemon's call site stays as it is; created
-/// on first use with the same idle timeout as bge-m3.
+/// on first use with its own idle timeout, `AURELIUS_RERANK_IDLE_SECS`.
 fn shared_reranker() -> Arc<Lazy<TextRerank>> {
     static RERANKER: OnceLock<Arc<Lazy<TextRerank>>> = OnceLock::new();
     Arc::clone(RERANKER.get_or_init(|| {
         Arc::new(Lazy::new(
             Box::new(crate::embed::init_bge_reranker),
-            idle_from_env(),
+            rerank_idle_from_env(),
         ))
     }))
 }
@@ -569,6 +596,24 @@ mod tests {
         );
         assert_eq!(parse_idle_secs(Some("0")).unwrap(), None);
         assert!(parse_idle_secs(Some("5m")).is_err());
+    }
+
+    #[test]
+    fn rerank_idle_defaults_to_600_and_zero_disables_it() {
+        assert_eq!(DEFAULT_RERANK_IDLE_SECS, 600);
+        assert_eq!(
+            parse_rerank_idle_secs(None).unwrap(),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(
+            parse_rerank_idle_secs(Some("")).unwrap(),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(parse_rerank_idle_secs(Some("0")).unwrap(), None);
+        assert!(parse_rerank_idle_secs(Some("5m")).is_err());
+        // bge-m3 keeps its own default: resident, never unloaded.
+        assert_eq!(DEFAULT_IDLE_SECS, 0);
+        assert_eq!(parse_idle_secs(None).unwrap(), None);
     }
 
     #[tokio::test]
