@@ -183,6 +183,56 @@ pub fn check_and_record(
     })
 }
 
+/// A recorded probe result that did not pass, as read back for rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedProbe {
+    pub kind: String,
+    pub expr: String,
+    /// Unix seconds of the recorded check; `None` if the row has no time.
+    pub checked_at: Option<i64>,
+}
+
+/// Failing probes for a set of nodes, keyed by node id, newest check first.
+///
+/// One query for the whole set (ids travel as one JSON array through
+/// `json_each`, so there is no bind-parameter limit to hit). Only the latest
+/// row per `(node, kind, expr)` counts: a later passing check supersedes an
+/// earlier failure. Reads what was recorded; never re-runs a probe.
+pub fn failing_for(
+    conn: &Connection,
+    node_ids: &[&str],
+) -> Result<std::collections::HashMap<String, Vec<FailedProbe>>> {
+    let mut out: std::collections::HashMap<String, Vec<FailedProbe>> =
+        std::collections::HashMap::new();
+    if node_ids.is_empty() {
+        return Ok(out);
+    }
+    let ids = serde_json::to_string(node_ids)?;
+    let mut stmt = conn.prepare(
+        "SELECT p.node_id, p.kind, p.expr, p.checked_at FROM probes p
+         WHERE p.node_id IN (SELECT value FROM json_each(?1))
+           AND p.last_ok = 0
+           AND p.id = (SELECT MAX(q.id) FROM probes q
+                       WHERE q.node_id = p.node_id AND q.kind = p.kind AND q.expr = p.expr)
+         ORDER BY p.checked_at DESC, p.id DESC",
+    )?;
+    let rows = stmt.query_map([ids], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            FailedProbe {
+                kind: r.get(1)?,
+                expr: r.get(2)?,
+                checked_at: r.get(3)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (node_id, probe) = row?;
+        out.entry(node_id).or_default().push(probe);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +303,45 @@ mod tests {
             Path::new("."),
         );
         assert!(!missing);
+    }
+
+    fn probe_db() -> (std::path::PathBuf, Connection) {
+        let path =
+            std::env::temp_dir().join(format!("aurelius-probes-{}.db", uuid::Uuid::new_v4()));
+        let conn = crate::db::open(&path).expect("open temp db");
+        (path, conn)
+    }
+
+    fn drop_db(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        }
+    }
+
+    fn put(conn: &Connection, node: &str, expr: &str, ok: bool, at: i64) {
+        conn.execute(
+            "INSERT INTO probes (node_id, kind, expr, last_ok, checked_at) VALUES (?1, 'file_exists', ?2, ?3, ?4)",
+            rusqlite::params![node, expr, i64::from(ok), at],
+        )
+        .expect("insert probe");
+    }
+
+    #[test]
+    fn failing_for_reads_the_whole_set_and_honours_the_latest_check() {
+        let (path, conn) = probe_db();
+        put(&conn, "a", "/gone.rs", false, 100);
+        put(&conn, "b", "/here.rs", true, 100);
+        put(&conn, "c", "/fixed.rs", false, 100);
+        put(&conn, "c", "/fixed.rs", true, 200);
+        put(&conn, "d", "/gone.rs", false, 100);
+        let got = failing_for(&conn, &["a", "b", "c", "d", "missing"]).expect("query");
+        drop_db(&path);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got["a"][0].expr, "/gone.rs");
+        assert_eq!(got["a"][0].checked_at, Some(100));
+        assert!(got.contains_key("d"));
+        assert!(failing_for(&conn, &[]).expect("empty").is_empty());
     }
 }

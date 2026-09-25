@@ -7,8 +7,8 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use super::{
-    db_path, node_brief, node_detail, open_db, query_vector_for_topic, restart_needed,
-    server_started_at, sync_pull_if_enabled,
+    apply_probe_stale, db_path, node_brief, node_detail, open_db, probe_stale_notes,
+    query_vector_for_topic, restart_needed, server_started_at, sync_pull_if_enabled,
 };
 
 /// `server` block of `memory_status`: which MCP server process answered, and
@@ -184,6 +184,20 @@ fn memory_status_with_conn(
             })
             .collect();
 
+        // One probe read for every node this answer renders.
+        let rendered: Vec<&aurelius_core::models::Node> = recent_decisions
+            .iter()
+            .chain(&problems)
+            .chain(&recent_solutions)
+            .chain(&recent_sessions)
+            .collect();
+        let probe_notes = probe_stale_notes(conn, &rendered);
+        let detail = |n: &aurelius_core::models::Node| {
+            let mut v = node_detail(n);
+            apply_probe_stale(&mut v, "/provenance/stale", &probe_notes);
+            v
+        };
+
         return Ok(json!({
             "server": server_block(),
             "summary": {
@@ -199,10 +213,10 @@ fn memory_status_with_conn(
                 "uses": n.access_count,
             })).collect::<Vec<_>>(),
             "active_tasks": active_tasks_json,
-            "recent_decisions": recent_decisions.iter().map(node_detail).collect::<Vec<_>>(),
-            "open_problems": problems.iter().map(node_detail).collect::<Vec<_>>(),
-            "recent_solutions": recent_solutions.iter().map(node_detail).collect::<Vec<_>>(),
-            "recent_sessions": recent_sessions.iter().map(node_detail).collect::<Vec<_>>(),
+            "recent_decisions": recent_decisions.iter().map(detail).collect::<Vec<_>>(),
+            "open_problems": problems.iter().map(detail).collect::<Vec<_>>(),
+            "recent_solutions": recent_solutions.iter().map(detail).collect::<Vec<_>>(),
+            "recent_sessions": recent_sessions.iter().map(detail).collect::<Vec<_>>(),
         }));
     }
 
@@ -290,6 +304,21 @@ fn memory_status_with_conn(
         "how_to_see_more": "task_view with a task id returns its full notes and evidence runs; memory_search(query) finds nodes beyond the cap; `au journal --session <id>` replays a session",
     });
 
+    // One probe read for every node this answer renders.
+    let rendered: Vec<&aurelius_core::models::Node> = recent_decisions
+        .iter()
+        .take(COMPACT_LIST_CAP)
+        .chain(problems.iter().take(COMPACT_LIST_CAP))
+        .chain(recent_solutions.iter().take(COMPACT_LIST_CAP))
+        .chain(recent_sessions.iter().take(COMPACT_LIST_CAP))
+        .collect();
+    let probe_notes = probe_stale_notes(conn, &rendered);
+    let compact = |n: &aurelius_core::models::Node| {
+        let mut v = compact_node_json(n);
+        apply_probe_stale(&mut v, "/provenance/stale", &probe_notes);
+        v
+    };
+
     Ok(json!({
         "server": server_block(),
         "summary": {
@@ -309,10 +338,10 @@ fn memory_status_with_conn(
             })
         }).collect::<Vec<_>>(),
         "active_tasks": active_tasks_json,
-        "recent_decisions": recent_decisions.iter().take(COMPACT_LIST_CAP).map(compact_node_json).collect::<Vec<_>>(),
-        "open_problems": problems.iter().take(COMPACT_LIST_CAP).map(compact_node_json).collect::<Vec<_>>(),
-        "recent_solutions": recent_solutions.iter().take(COMPACT_LIST_CAP).map(compact_node_json).collect::<Vec<_>>(),
-        "recent_sessions": recent_sessions.iter().take(COMPACT_LIST_CAP).map(compact_node_json).collect::<Vec<_>>(),
+        "recent_decisions": recent_decisions.iter().take(COMPACT_LIST_CAP).map(compact).collect::<Vec<_>>(),
+        "open_problems": problems.iter().take(COMPACT_LIST_CAP).map(compact).collect::<Vec<_>>(),
+        "recent_solutions": recent_solutions.iter().take(COMPACT_LIST_CAP).map(compact).collect::<Vec<_>>(),
+        "recent_sessions": recent_sessions.iter().take(COMPACT_LIST_CAP).map(compact).collect::<Vec<_>>(),
         "truncation": truncation,
     }))
 }
@@ -832,5 +861,58 @@ mod tests {
             "compact status ballooned: {} bytes on a tiny fixture",
             serialized.len()
         );
+    }
+
+    fn seed_probe(conn: &Connection, node_id: &str, expr: &str, ok: bool, at: i64) {
+        conn.execute(
+            "INSERT INTO probes (node_id, kind, expr, last_ok, checked_at) VALUES (?1, 'file_exists', ?2, ?3, ?4)",
+            rusqlite::params![node_id, expr, i64::from(ok), at],
+        )
+        .expect("seed probe");
+    }
+
+    /// An old volatile decision, so the age-based note fires on its own.
+    fn seed_aged_decision(conn: &Connection, label: &str) -> String {
+        graph::add_node(
+            conn,
+            NodeType::Decision,
+            label,
+            None,
+            "test",
+            json!({"volatility": "volatile", "measured_at": "2026-01-01T00:00:00Z"}),
+        )
+        .expect("seed decision")
+        .id
+        .to_string()
+    }
+
+    fn stale_of(status: &serde_json::Value, id: &str) -> serde_json::Value {
+        status["recent_decisions"]
+            .as_array()
+            .expect("decisions")
+            .iter()
+            .find(|d| d["id"] == json!(id))
+            .map(|d| d["provenance"]["stale"].clone())
+            .expect("decision rendered")
+    }
+
+    #[test]
+    fn failing_probe_note_outranks_age_note_and_passing_probe_keeps_age() {
+        let (_tmp, conn) = setup();
+        let failing = seed_aged_decision(&conn, "[aurelius] leans on a gone file");
+        let passing = seed_aged_decision(&conn, "[aurelius] leans on a present file");
+        // 2026-09-20T00:00:00Z
+        seed_probe(&conn, &failing, "/gone/file.rs", false, 1_789_862_400);
+        seed_probe(&conn, &passing, "/here/file.rs", true, 1_789_862_400);
+
+        let expected = "проба не прошла 2026-09-20: file_exists /gone/file.rs — перепроверь, прежде чем опираться";
+        for full in [false, true] {
+            let status =
+                memory_status_with_conn(&conn, &json!({"full": full})).expect("memory_status");
+            assert_eq!(stale_of(&status, &failing), json!(expected), "full={full}");
+            let age = stale_of(&status, &passing);
+            let age = age.as_str().expect("age note present");
+            assert!(age.starts_with("старше "), "full={full}: {age}");
+        }
     }
 }
