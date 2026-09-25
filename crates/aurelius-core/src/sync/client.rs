@@ -230,6 +230,11 @@ fn apply_pulled_nodes(conn: &Connection, nodes: &[Node]) -> Result<()> {
                 node.sync_seq,
             ],
         )?;
+        // A tombstone must lose its vector the way `graph::delete_node` does:
+        // dense search takes the KNN top k before filtering `deleted_at`.
+        if node.deleted_at.is_some() {
+            crate::graph::drop_node_vector(conn, &node.id.to_string())?;
+        }
     }
     Ok(())
 }
@@ -328,4 +333,69 @@ pub async fn pull_project(
     apply_pull(conn, &pull)?;
     set_sync_last_seq(conn, &cfg.project_label, pull.server_seq)?;
     Ok(pull)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::NodeType;
+
+    fn vectors(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM node_embeddings", [], |r| r.get(0))
+            .expect("count vectors")
+    }
+
+    #[test]
+    fn pulled_tombstone_drops_the_node_vector() {
+        let path = std::env::temp_dir().join(format!("aurelius-pull-{}.db", uuid::Uuid::new_v4()));
+        let conn = crate::db::open(&path).expect("open");
+        let keep = crate::graph::add_node(
+            &conn,
+            NodeType::Concept,
+            "keep",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add keep");
+        let gone = crate::graph::add_node(
+            &conn,
+            NodeType::Concept,
+            "gone",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add gone");
+        let bytes: Vec<u8> = (0..1024u32)
+            .flat_map(|i| ((i % 7) as f32 + 1.0).to_le_bytes())
+            .collect();
+        for node in [&keep, &gone] {
+            conn.execute(
+                "INSERT INTO node_embeddings(rowid, embedding)
+                 SELECT rowid, vec_quantize_int8(?2, 'unit') FROM nodes WHERE id = ?1",
+                params![node.id.to_string(), bytes],
+            )
+            .expect("insert vector");
+        }
+
+        // A live row from the server keeps its vector; a tombstone loses it.
+        let mut tomb = gone.clone();
+        tomb.deleted_at = Some(chrono::Utc::now());
+        let pull = SyncPullResponse {
+            project: "p".to_owned(),
+            nodes: vec![keep.clone(), tomb],
+            edges: Vec::new(),
+            server_seq: 1,
+        };
+        apply_pull(&conn, &pull).expect("apply pull");
+
+        assert_eq!(vectors(&conn), 1);
+        assert_eq!(
+            crate::graph::purge_orphan_embeddings(&conn).expect("purge"),
+            0
+        );
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
 }

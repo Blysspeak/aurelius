@@ -487,7 +487,7 @@ pub enum DbAction {
     Migrate,
     /// Safe snapshot via SQLite VACUUM INTO — the only correct way to copy a live database
     Backup {
-        /// Destination file (default: aurelius-<UTC timestamp>.db next to the database)
+        /// Destination file (default: <data_dir>/backups/aurelius-<UTC timestamp>.db)
         #[arg(short, long, conflicts_with = "hook")]
         out: Option<String>,
         /// SessionStart-hook mode: snapshot into <data_dir>/backups, throttled
@@ -515,6 +515,37 @@ pub enum DbAction {
         /// Machine-readable plan: every candidate, not a sample
         #[arg(long)]
         json: bool,
+    },
+    /// Count vectors whose node is deleted or missing; remove them with --apply
+    PurgeOrphans {
+        /// Remove the orphan vectors
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Count stored trace payloads that secret masking would change; rewrite them with --apply
+    ScrubTrace {
+        /// Rewrite the payloads
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Count traces older than --days; remove them with --apply
+    TraceRetention {
+        /// Age in days (at least 30)
+        #[arg(long)]
+        days: u32,
+        /// Remove the old traces
+        #[arg(long)]
+        apply: bool,
+    },
+    /// List backup snapshots (next to the database and in <data_dir>/backups)
+    /// beyond the --keep newest; remove them with --apply
+    PruneBackups {
+        /// Snapshots to keep, newest first
+        #[arg(long, default_value = "7")]
+        keep: usize,
+        /// Remove the listed snapshots
+        #[arg(long)]
+        apply: bool,
     },
 }
 
