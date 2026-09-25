@@ -36,17 +36,11 @@ fn server_block() -> serde_json::Value {
     serde_json::Value::Object(fields)
 }
 
-/// Note budget for one compact item, in characters, clipped at a word
-/// boundary through `graph::clip` — the same helper `task_list` uses, so the
-/// excerpt a status shows and the excerpt a list shows of the same node can
-/// never disagree. The full text stays in the node, reachable through
-/// `task_view` / `memory_search`.
-const STATUS_NOTE_BUDGET: usize = 200;
-
-/// How many items each capped section shows in compact mode. `full=true`
-/// keeps the historical selection instead (5 sessions, 30 skills).
-const COMPACT_LIST_CAP: usize = 10;
-const COMPACT_SKILLS_CAP: usize = 20;
+/// How many items each list section shows in compact mode. `full=true`
+/// keeps the historical selection instead (5 sessions, 30 skills). Five, not
+/// ten: the SessionStart snapshot already orients the agent, and a compact
+/// status is the "a bit more" view, not the whole picture.
+const COMPACT_LIST_CAP: usize = 5;
 
 /// Compact mode fetches with this padded limit and caps in memory, so the
 /// truncation block can report the exact number of hidden items (the same
@@ -55,58 +49,34 @@ const COMPACT_SKILLS_CAP: usize = 20;
 /// then the graph itself is the problem, not the report.
 const COMPACT_FETCH_LIMIT: usize = 1000;
 
-/// Clip one optional note to [`STATUS_NOTE_BUDGET`] and say whether the
-/// budget actually cut it — the same honesty rule as `task_list`:
-/// `note_truncated` is a boolean flag, not a guess from a trailing ellipsis.
-fn clipped_note(note: Option<&str>) -> (Option<String>, bool) {
-    match note {
-        None => (None, false),
-        Some(n) => {
-            let clipped = graph::clip(n, STATUS_NOTE_BUDGET);
-            let truncated = clipped.ends_with('…');
-            (Some(clipped), truncated)
-        }
-    }
-}
-
-/// Provenance in compact form. `confidence` is always present — silence about
-/// provenance reads as measured, and that misreading is exactly what the field
-/// exists to prevent — while `subject` and the stale warning show up only when
-/// they have something to say. The verbose half (evidence command text,
-/// `verify_with`, `volatility`, `measured_at`) stays in `data` and in
-/// `full=true`: measured on the live project, `data` + full provenance were
-/// ~44k of the ~89k compact characters, nearly all of it the same facts
-/// serialized twice.
-fn compact_provenance(node: &aurelius_core::models::Node) -> serde_json::Value {
-    let p = aurelius_core::provenance::Provenance::from_data(&node.data);
-    json!({
-        "confidence": p.confidence_or_default().as_str(),
-        "subject": p.subject,
-        "stale": p.staleness(node.created_at, chrono::Utc::now()).map(|s| s.note()),
-    })
-}
-
-/// One knowledge node (decision/problem/solution/session) in compact form:
-/// claim whole, note as a budgeted excerpt, provenance down to its signal,
-/// and the fields that are boilerplate in a status view dropped — the listed
-/// `source`/`memory_kind`/`created_by`/`updated_by`, plus `data`, which on
-/// every node duplicates what `claim` and `provenance` already say (and
-/// carries `next_steps`/`key_files`/evidence texts that belong to a detail
-/// view, not an orientation one). `full=true` returns `node_detail` instead,
-/// which carries every field.
+/// One node in compact form: id, type, date, the claim when present or else
+/// the label, and provenance reduced to `confidence` (always — silence about
+/// provenance reads as measured) plus `stale` only when there is a warning.
+/// No note excerpt, no access count: the text is one line, the detail lives
+/// in `memory_search` / `task_view` / `full=true`.
 fn compact_node_json(node: &aurelius_core::models::Node) -> serde_json::Value {
-    let (note, note_truncated) = clipped_note(node.note.as_deref());
+    let p = aurelius_core::provenance::Provenance::from_data(&node.data);
+    let text = p.claim.clone().unwrap_or_else(|| node.label.clone());
     json!({
         "id": node.id.to_string(),
         "type": node.node_type,
-        "label": node.label,
-        "claim": aurelius_core::provenance::Provenance::from_data(&node.data).claim,
-        "note": note,
-        "note_truncated": note_truncated,
-        "created_at": node.created_at.to_rfc3339(),
-        "access_count": node.access_count,
-        "provenance": compact_provenance(node),
+        "date": node.created_at.format("%Y-%m-%d").to_string(),
+        "text": text,
+        "provenance": {
+            "confidence": p.confidence_or_default().as_str(),
+            "stale": p.staleness(node.created_at, chrono::Utc::now()).map(|s| s.note()),
+        },
     })
+}
+
+/// Drops `provenance.stale` when it is null. Runs after `apply_probe_stale`,
+/// which needs the slot present to write a probe note into it.
+fn drop_null_stale(item: &mut serde_json::Value) {
+    if let Some(prov) = item.get_mut("provenance").and_then(|p| p.as_object_mut()) {
+        if prov.get("stale").is_some_and(|s| s.is_null()) {
+            prov.remove("stale");
+        }
+    }
 }
 
 pub fn memory_status(params: &serde_json::Value) -> Result<serde_json::Value> {
@@ -144,7 +114,7 @@ fn memory_status_with_conn(
     // Best-effort — never fails memory_status (T022).
     sync_pull_if_enabled(conn, project_filter);
 
-    let projects = graph::search_typed(conn, "*", &NodeType::Project, 10)?;
+    let mut projects = graph::search_typed(conn, "*", &NodeType::Project, 10)?;
     let crates = graph::search_typed(conn, "*", &NodeType::Crate, 20)?;
     let mut skills = graph::get_nodes_by_type(conn, &NodeType::Skill)?;
     skills.sort_by_key(|s| std::cmp::Reverse(s.access_count));
@@ -221,9 +191,8 @@ fn memory_status_with_conn(
     }
 
     // Compact mode: same sections, padded fetches so the number of hidden
-    // items is exact, one uniform shrink rule per item (claim whole, note
-    // excerpted with `note_truncated`, no boilerplate fields, task evidence
-    // summarized), and one honest truncation block.
+    // items is exact, one uniform shrink rule per item (id, type, date,
+    // claim or label, provenance signal; task evidence summarized), and one honest truncation block.
     let (recent_decisions, problems, recent_solutions, recent_sessions, active_tasks) = (
         graph::typed_in_project(
             conn,
@@ -258,27 +227,35 @@ fn memory_status_with_conn(
     let hidden_solutions = recent_solutions.len().saturating_sub(COMPACT_LIST_CAP);
     let hidden_sessions = recent_sessions.len().saturating_sub(COMPACT_LIST_CAP);
     let hidden_tasks = active_tasks.len().saturating_sub(COMPACT_LIST_CAP);
-    let hidden_skills = skills.len().saturating_sub(COMPACT_SKILLS_CAP);
+    let hidden_skills = skills.len().saturating_sub(COMPACT_LIST_CAP);
+
+    // With a project filter, other projects are noise in the answer.
+    // Looked up by label, not filtered out of the top-10 list above: the
+    // filtered project need not be among the ten.
+    if let Some(p) = project_filter {
+        projects = graph::find_project_by_label(conn, p)?.into_iter().collect();
+    }
 
     let active_tasks_json: Vec<serde_json::Value> = active_tasks
         .iter()
         .take(COMPACT_LIST_CAP)
         .map(|t| {
-            let (note, note_truncated) = clipped_note(t.note.as_deref());
             let fields = aurelius_core::tasks::TaskFields::from_data(&t.data);
-            json!({
-                "id": t.id.to_string(),
-                "label": t.label,
-                "status": t.data.get("status"),
-                "priority": t.data.get("priority"),
-                "note": note,
-                "note_truncated": note_truncated,
-                "created_at": t.created_at.to_rfc3339(),
+            let mut v = compact_node_json(t);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("status".to_owned(), json!(t.data.get("status")));
+                obj.insert("priority".to_owned(), json!(t.data.get("priority")));
                 // The run-by-run journal stays with `task_view`; a status
                 // answer needs "is there proof and is it green", which is
                 // exactly what the summary says.
-                "evidence": aurelius_core::tasks::evidence_summary(&fields),
-            })
+                // A task without runs carries no evidence object at all.
+                let summary = aurelius_core::tasks::evidence_summary(&fields);
+                if summary.total > 0 {
+                    obj.insert("evidence".to_owned(), json!(summary));
+                }
+            }
+            drop_null_stale(&mut v);
+            v
         })
         .collect();
 
@@ -291,7 +268,7 @@ fn memory_status_with_conn(
             "recent_decisions": COMPACT_LIST_CAP,
             "recent_solutions": COMPACT_LIST_CAP,
             "recent_sessions": COMPACT_LIST_CAP,
-            "skills": COMPACT_SKILLS_CAP,
+            "skills": COMPACT_LIST_CAP,
         },
         "hidden": {
             "active_tasks": hidden_tasks,
@@ -316,6 +293,7 @@ fn memory_status_with_conn(
     let compact = |n: &aurelius_core::models::Node| {
         let mut v = compact_node_json(n);
         apply_probe_stale(&mut v, "/provenance/stale", &probe_notes);
+        drop_null_stale(&mut v);
         v
     };
 
@@ -328,15 +306,9 @@ fn memory_status_with_conn(
         "project_filter": project_filter,
         "projects": projects.iter().map(node_brief).collect::<Vec<_>>(),
         "crates": crates.iter().map(node_brief).collect::<Vec<_>>(),
-        "skills": skills.iter().take(COMPACT_SKILLS_CAP).map(|n| {
-            let (trigger, note_truncated) = clipped_note(n.note.as_deref());
-            json!({
-                "name": n.label,
-                "trigger": trigger,
-                "uses": n.access_count,
-                "note_truncated": note_truncated,
-            })
-        }).collect::<Vec<_>>(),
+        // Names only: the SessionStart hook already delivers the skill index
+        // with triggers.
+        "skills": skills.iter().take(COMPACT_LIST_CAP).map(|n| n.label.clone()).collect::<Vec<_>>(),
         "active_tasks": active_tasks_json,
         "recent_decisions": recent_decisions.iter().take(COMPACT_LIST_CAP).map(compact).collect::<Vec<_>>(),
         "open_problems": problems.iter().take(COMPACT_LIST_CAP).map(compact).collect::<Vec<_>>(),
@@ -740,30 +712,24 @@ mod tests {
 
         let status = memory_status_with_conn(&conn, &json!({})).expect("compact memory_status");
 
-        // (a) note excerpted at a word boundary near 200 chars, flagged.
+        // (a) no note excerpt, no boilerplate: the label stands in for the
+        // missing claim, provenance is reduced to its signal.
         let decision = &status["recent_decisions"][0];
-        let note = decision["note"].as_str().expect("note is a string");
-        assert!(
-            note.chars().count() <= 220,
-            "compact note must be an excerpt, got {} chars",
-            note.chars().count()
-        );
-        assert!(note.ends_with('…'), "excerpt must end with the ellipsis");
-        assert_eq!(decision["note_truncated"], json!(true));
-        // Boilerplate fields are gone from compact items, `data` included:
-        // every fact it carried is already surfaced as claim/provenance.
-        assert!(decision.get("created_by").is_none());
-        assert!(decision.get("source").is_none());
-        assert!(decision.get("memory_kind").is_none());
+        assert!(decision.get("note").is_none());
+        assert!(decision.get("note_truncated").is_none());
+        assert!(decision.get("access_count").is_none());
         assert!(decision.get("data").is_none());
+        assert_eq!(
+            decision["text"],
+            json!("[aurelius] test decision with a long note")
+        );
+        assert_eq!(decision["date"].as_str().map(str::len), Some(10));
         let prov = decision["provenance"]
             .as_object()
             .expect("provenance object");
         assert!(prov
             .keys()
-            .all(|k| ["confidence", "subject", "stale"].contains(&k.as_str())));
-        // The claim itself is never clipped.
-        assert!(decision["claim"].is_null());
+            .all(|k| ["confidence", "stale"].contains(&k.as_str())));
 
         // (b) task evidence is the summary object, not the run array.
         let task = &status["active_tasks"][0];
@@ -779,15 +745,15 @@ mod tests {
             json!("cargo test --workspace")
         );
         assert!(evidence["last_green"].get("artifact").is_none());
-        // Boilerplate gone here too, excerpt flagged.
+        // Boilerplate gone here too.
         assert!(task.get("created_by").is_none());
-        assert_eq!(task["note_truncated"], json!(true));
-        // Skills carry the same clip flag.
+        assert!(task.get("note").is_none());
+        // Skills are names only.
         assert!(status["skills"]
             .as_array()
             .expect("skills")
             .iter()
-            .all(|s| { s.get("note_truncated").is_some() }));
+            .all(|s| s.is_string()));
 
         // (d) the truncation block is present in compact mode.
         let truncation = &status["truncation"];
@@ -828,7 +794,7 @@ mod tests {
     #[test]
     fn compact_reports_the_exact_number_of_hidden_items() {
         let (_tmp, conn) = setup();
-        for i in 0..12 {
+        for i in 0..7 {
             graph::add_node(
                 &conn,
                 NodeType::Decision,
@@ -846,6 +812,63 @@ mod tests {
         assert_eq!(decisions.len(), COMPACT_LIST_CAP);
         assert_eq!(status["truncation"]["hidden"]["recent_decisions"], json!(2));
         assert_eq!(status["truncation"]["applied"], json!(true));
+    }
+
+    #[test]
+    fn compact_with_filter_lists_only_the_filtered_project() {
+        let (_tmp, conn) = setup();
+        graph::add_node(&conn, NodeType::Project, "other", None, "test", json!({}))
+            .expect("seed other project");
+
+        let status = memory_status_with_conn(&conn, &json!({"project": "aurelius"}))
+            .expect("compact memory_status");
+
+        let projects = status["projects"].as_array().expect("projects");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["label"], json!("aurelius"));
+    }
+
+    #[test]
+    fn compact_item_with_claim_has_no_note_excerpt() {
+        let (_tmp, conn) = setup();
+        graph::add_node(
+            &conn,
+            NodeType::Decision,
+            "[aurelius] decision with a claim",
+            Some("a note that must not be echoed next to the claim"),
+            "test",
+            json!({"claim": "the claim itself"}),
+        )
+        .expect("seed decision");
+
+        let status = memory_status_with_conn(&conn, &json!({})).expect("compact memory_status");
+
+        let decision = &status["recent_decisions"][0];
+        assert_eq!(decision["text"], json!("the claim itself"));
+        assert!(decision.get("note").is_none());
+        assert!(!serde_json::to_string(decision)
+            .expect("serialize")
+            .contains("must not be echoed"));
+    }
+
+    #[test]
+    fn compact_task_without_runs_has_no_evidence_object() {
+        let (_tmp, conn) = setup();
+        graph::add_node(
+            &conn,
+            NodeType::Task,
+            "[aurelius] task without evidence",
+            None,
+            "test",
+            json!({"status": "active", "project": "aurelius"}),
+        )
+        .expect("seed task");
+
+        let status = memory_status_with_conn(&conn, &json!({})).expect("compact memory_status");
+
+        let task = &status["active_tasks"][0];
+        assert_eq!(task["text"], json!("[aurelius] task without evidence"));
+        assert!(task.get("evidence").is_none());
     }
 
     #[test]

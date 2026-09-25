@@ -231,7 +231,7 @@ async fn handle_tools_call(
             serde_json::json!({
                 "content": [{
                     "type": "text",
-                    "text": serde_json::to_string_pretty(&value).unwrap_or_default()
+                    "text": serde_json::to_string(&value).unwrap_or_default()
                 }]
             }),
         ),
