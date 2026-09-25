@@ -101,7 +101,6 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     }))
 }
 
-
 /// Picks the engines for `memory_search`. Typed and untyped queries take the
 /// same hybrid path; the type filter is applied to the fused candidates. When
 /// the vector half is unavailable, the answer is FTS-only and the notice says
@@ -133,17 +132,21 @@ fn search_outcome(
     let fused = match node_type {
         Some(t) => {
             let wanted = serde_json::to_string(t).unwrap_or_default();
-            graph::hybrid_seeds_pooled(conn, query, &vector, usize::MAX, graph::FILTERED_POOL.max(limit))
-                .map(|(nodes, _)| {
-                    let mut nodes: Vec<aurelius_core::models::Node> = nodes
-                        .into_iter()
-                        .filter(|n| {
-                            serde_json::to_string(&n.node_type).unwrap_or_default() == wanted
-                        })
-                        .collect();
-                    nodes.truncate(limit);
-                    nodes
-                })
+            graph::hybrid_seeds_pooled(
+                conn,
+                query,
+                &vector,
+                usize::MAX,
+                graph::FILTERED_POOL.max(limit),
+            )
+            .map(|(nodes, _)| {
+                let mut nodes: Vec<aurelius_core::models::Node> = nodes
+                    .into_iter()
+                    .filter(|n| serde_json::to_string(&n.node_type).unwrap_or_default() == wanted)
+                    .collect();
+                nodes.truncate(limit);
+                nodes
+            })
         }
         None => graph::hybrid_seeds(conn, query, &vector, limit).map(|(nodes, _)| nodes),
     };
