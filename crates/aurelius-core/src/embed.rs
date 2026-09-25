@@ -1,4 +1,6 @@
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{
+    EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank,
+};
 use ort::execution_providers::{CPU, CUDA};
 use std::path::PathBuf;
 
@@ -143,6 +145,86 @@ pub fn init_bge_m3() -> anyhow::Result<TextEmbedding> {
             Ok(model)
         }
     }
+}
+
+/// Loads the bge-reranker-v2-m3 cross-encoder the same way `init_bge_m3`
+/// loads bge-m3: CUDA first, proven by one real run, CPU on any CUDA failure,
+/// `AURELIUS_EMBED_DEVICE=cpu` skips CUDA. Weights are fetched into
+/// `models_dir()` on the first load when absent.
+pub fn init_bge_reranker() -> anyhow::Result<TextRerank> {
+    let device = parse_device(std::env::var("AURELIUS_EMBED_DEVICE").ok().as_deref())?;
+    init_ort_runtime()?;
+    let cache_dir = models_dir();
+    let started = std::time::Instant::now();
+    let load_cpu = |cache_dir: PathBuf| {
+        let cpu_opts = RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
+            .with_show_download_progress(true)
+            .with_cache_dir(cache_dir)
+            .with_execution_providers(vec![CPU::default().build()]);
+        TextRerank::try_new(cpu_opts)
+    };
+
+    if device == Device::Cpu {
+        let model = load_cpu(cache_dir)?;
+        eprintln!(
+            "rerank: loaded on CPU in {:.1}s (AURELIUS_EMBED_DEVICE=cpu)",
+            started.elapsed().as_secs_f64()
+        );
+        return Ok(model);
+    }
+
+    let cuda_opts = RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
+        .with_show_download_progress(true)
+        .with_cache_dir(cache_dir.clone())
+        .with_execution_providers(vec![CUDA::default().build().error_on_failure()]);
+    // Same reason as in `init_bge_m3`: only a real run proves CUDA works.
+    let cuda_attempt: anyhow::Result<TextRerank> = (|| {
+        let mut model = TextRerank::try_new(cuda_opts)?;
+        model.rerank("cuda smoke test", ["cuda smoke test"], false, None)?;
+        Ok(model)
+    })();
+
+    match cuda_attempt {
+        Ok(model) => {
+            eprintln!(
+                "rerank: loaded on CUDA in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+            Ok(model)
+        }
+        Err(cuda_err) => {
+            let model = load_cpu(cache_dir)?;
+            eprintln!(
+                "rerank: loaded on CPU in {:.1}s, CUDA failed — {cuda_err}",
+                started.elapsed().as_secs_f64()
+            );
+            Ok(model)
+        }
+    }
+}
+
+/// Documents per reranker forward pass.
+const RERANK_BATCH: usize = 8;
+
+/// Cross-encoder scores for `docs` against `query`, in the order of `docs`
+/// (fastembed returns them sorted by score, with the original index).
+pub fn rerank_scores(
+    model: &mut TextRerank,
+    query: &str,
+    docs: &[String],
+) -> anyhow::Result<Vec<f32>> {
+    let docs: Vec<&str> = docs.iter().map(String::as_str).collect();
+    // fastembed's default batch (256) puts all 30 candidates of up to 512
+    // tokens into one attention pass; on the 8 GB card that ran the arena
+    // out of memory next to bge-m3. Small batches bound the peak.
+    let results = model.rerank(query, docs.as_slice(), false, Some(RERANK_BATCH))?;
+    let mut scores = vec![f32::NEG_INFINITY; docs.len()];
+    for r in results {
+        if let Some(slot) = scores.get_mut(r.index) {
+            *slot = r.score;
+        }
+    }
+    Ok(scores)
 }
 
 pub fn format_for_embedding(

@@ -1157,6 +1157,36 @@ pub fn hybrid_seeds_pooled(
     limit: usize,
     pool: usize,
 ) -> Result<(Vec<Node>, std::collections::HashMap<uuid::Uuid, f64>)> {
+    let socket = super::rerank::rerank_socket_for(conn);
+    fuse_seeds(conn, query, query_vector, limit, pool, socket.as_deref())
+}
+
+/// [`hybrid_seeds`] without the cross-encoder rerank: the RRF order alone.
+/// `au eval-search` measures it as its own row next to the reranked one.
+///
+/// # Errors
+/// Ошибка `search_ranked` или `dense_search`.
+pub fn hybrid_seeds_fused(
+    conn: &Connection,
+    query: &str,
+    query_vector: &[f32],
+    limit: usize,
+) -> Result<(Vec<Node>, std::collections::HashMap<uuid::Uuid, f64>)> {
+    fuse_seeds(conn, query, query_vector, limit, FUSION_POOL, None)
+}
+
+/// RRF fusion of both sides, then — with a `rerank_socket` — the top
+/// [`super::rerank::RERANK_TOP`] fused candidates re-ordered by the daemon's
+/// cross-encoder, then the limit. No scores (no daemon, an old one, a slow
+/// one) keeps the fused order silently.
+fn fuse_seeds(
+    conn: &Connection,
+    query: &str,
+    query_vector: &[f32],
+    limit: usize,
+    pool: usize,
+    rerank_socket: Option<&std::path::Path>,
+) -> Result<(Vec<Node>, std::collections::HashMap<uuid::Uuid, f64>)> {
     let fts_nodes = search_ranked(conn, query, pool)?.nodes;
     let dense_nodes = dense_search(conn, query_vector, pool)?;
 
@@ -1214,16 +1244,28 @@ pub fn hybrid_seeds_pooled(
     // другой — только первым в dense: у обоих 1/(k+1)). Без явного тай-брейка
     // порядок между такими узлами был бы недетерминирован между прогонами.
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    scored.truncate(limit);
+    let keep = if rerank_socket.is_some() {
+        limit.max(super::rerank::RERANK_TOP)
+    } else {
+        limit
+    };
+    scored.truncate(keep);
 
     let mut nodes = Vec::with_capacity(scored.len());
-    let mut r = std::collections::HashMap::with_capacity(scored.len());
+    let mut norms = Vec::with_capacity(scored.len());
     for (id, norm) in scored {
         if let Some(node) = by_id.remove(&id) {
-            r.insert(id, norm);
+            norms.push(norm);
             nodes.push(node);
         }
     }
+    // The reranked order keeps the fused r values by position (best r to the
+    // new first), so traversal ranks seeds the way the cross-encoder did.
+    if let Some(socket) = rerank_socket {
+        super::rerank::rerank_in_place(socket, query, &mut nodes);
+    }
+    nodes.truncate(limit);
+    let r = nodes.iter().map(|n| n.id).zip(norms).collect();
     Ok((nodes, r))
 }
 
@@ -2144,6 +2186,50 @@ mod tests {
             "лучший узел посева обязан получить максимум шкалы"
         );
 
+        cleanup(&path, conn);
+    }
+
+    /// Reranking unavailable — a daemon that answers the rerank op with an
+    /// error — leaves the fused order and r values exactly as RRF gave them.
+    #[test]
+    fn hybrid_keeps_fused_order_when_rerank_is_unavailable() {
+        use std::io::{Read, Write};
+        let (path, conn) = temp_db();
+        for i in 0..6 {
+            super::super::add_node(
+                &conn,
+                NodeType::Concept,
+                &format!("телеграм алерт {i}"),
+                Some(&"телеграм ".repeat(i + 1)),
+                "test",
+                serde_json::json!({}),
+            )
+            .expect("add node");
+        }
+        let query = vec![0.1f32; 1024];
+        let socket = std::env::temp_dir().join(format!("au-rerank-{}.sock", uuid::Uuid::new_v4()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut req = Vec::new();
+            stream.read_to_end(&mut req).expect("read");
+            stream
+                .write_all(r#"{"error":"неизвестная операция rerank"}"#.as_bytes())
+                .expect("write");
+        });
+
+        let (plain, plain_r) = hybrid_seeds_fused(&conn, "телеграм", &query, 4).expect("слияние");
+        let (tried, tried_r) =
+            fuse_seeds(&conn, "телеграм", &query, 4, FUSION_POOL, Some(&socket)).expect("слияние");
+        server.join().expect("server");
+
+        assert_eq!(plain.len(), 4);
+        assert_eq!(
+            tried.iter().map(|n| n.id).collect::<Vec<_>>(),
+            plain.iter().map(|n| n.id).collect::<Vec<_>>()
+        );
+        assert_eq!(tried_r, plain_r);
+        let _ = std::fs::remove_file(&socket);
         cleanup(&path, conn);
     }
 }
