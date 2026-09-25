@@ -4717,6 +4717,8 @@ pub async fn judge_cmd(min_age_secs: i64, hook: bool) -> Result<()> {
         }
 
         // 5. Клиринг: yield-бонусы reinforce-окон + штраф render_miss.
+        // Only windows closed in this run are credited, so a repeat Stop adds nothing.
+        let _ = ledger::credit_reinforced(&conn, &stats.reinforced_windows);
         let sessions: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT DISTINCT session_id FROM labile_window WHERE closed_at IS NOT NULL",

@@ -38,6 +38,10 @@ pub fn pathway_blocked(conn: &Connection, sig: &str, node_id: &str) -> Result<bo
     Ok(blocked == Some(1))
 }
 
+/// Placeholder session id the MCP handlers use when the caller passes none.
+/// Windows under it cannot be attributed to real actions, so none are opened.
+pub const PLACEHOLDER_SESSION: &str = "mcp";
+
 /// Зафиксировать извлечение: путь + лабильное окно (одно открытое на узел
 /// и сессию — повторный recall в той же сессии не плодит окон).
 pub fn record_recall(
@@ -47,6 +51,11 @@ pub fn record_recall(
     session_id: &str,
     content: &str,
 ) -> Result<()> {
+    // A listing call (empty or "*" query) is not a recall pathway, and the
+    // placeholder session cannot be judged: record nothing for either.
+    if session_id == PLACEHOLDER_SESSION || sig == query_sig("") || sig == query_sig("*") {
+        return Ok(());
+    }
     conn.execute(
         "INSERT INTO pathways (query_sig, node_id) VALUES (?1, ?2)
          ON CONFLICT(query_sig, node_id) DO NOTHING",
@@ -151,6 +160,24 @@ mod tests {
             )
             .expect("count");
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn placeholder_session_and_empty_query_record_nothing() {
+        let conn = test_conn();
+        let real = query_sig("вебхуки мерчанта");
+        record_recall(&conn, &real, "n1", PLACEHOLDER_SESSION, "text").expect("placeholder");
+        record_recall(&conn, &query_sig(""), "n1", "s1", "text").expect("empty");
+        record_recall(&conn, &query_sig("*"), "n1", "s1", "text").expect("star");
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .expect("count")
+        };
+        assert_eq!(count("pathways"), 0);
+        assert_eq!(count("labile_window"), 0);
+        record_recall(&conn, &real, "n1", "s1", "text").expect("real");
+        assert_eq!(count("pathways"), 1);
+        assert_eq!(count("labile_window"), 1);
     }
 
     #[test]
