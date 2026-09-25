@@ -25,10 +25,16 @@ pub const RERANK_TIMEOUT: Duration = Duration::from_millis(1500);
 /// How much of the note goes into a candidate's document text.
 const NOTE_CHARS: usize = 600;
 
-/// The text the cross-encoder reads for `node`: label, claim and the first
-/// 600 characters of the note, one per line, empty parts left out.
+/// The text the cross-encoder reads for `node`: subject (`data.subject`),
+/// label, claim and the first 600 characters of the note, one per line,
+/// empty parts left out. The subject leads because key queries name it.
 #[must_use]
 pub fn rerank_doc(node: &Node) -> String {
+    let subject = node
+        .data
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let claim = node
         .data
         .get(crate::provenance::CLAIM_KEY)
@@ -41,7 +47,7 @@ pub fn rerank_doc(node: &Node) -> String {
         .chars()
         .take(NOTE_CHARS)
         .collect();
-    [node.label.as_str(), claim, note.as_str()]
+    [subject, node.label.as_str(), claim, note.as_str()]
         .into_iter()
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>()
@@ -126,6 +132,32 @@ mod tests {
             stream.write_all(reply.as_bytes()).unwrap();
             req
         })
+    }
+
+    #[test]
+    fn rerank_doc_leads_with_the_subject() {
+        let now = chrono::Utc::now();
+        let mut node = Node {
+            id: uuid::Uuid::new_v4(),
+            node_type: crate::models::NodeType::Concept,
+            label: "label".to_owned(),
+            note: Some("note".to_owned()),
+            source: "test".to_owned(),
+            data: serde_json::json!({"subject": "aurelius:x/y", "claim": "claim"}),
+            created_at: now,
+            updated_at: now,
+            memory_kind: crate::models::MemoryKind::Semantic,
+            last_accessed_at: now,
+            access_count: 0,
+            content_hash: None,
+            created_by: None,
+            updated_by: None,
+            deleted_at: None,
+            sync_seq: None,
+        };
+        assert_eq!(rerank_doc(&node), "aurelius:x/y\nlabel\nclaim\nnote");
+        node.data = serde_json::json!({"claim": "claim"});
+        assert_eq!(rerank_doc(&node), "label\nclaim\nnote");
     }
 
     #[test]
