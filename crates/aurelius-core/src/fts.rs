@@ -24,6 +24,28 @@ pub struct Query {
     pub expr: String,
     /// Слова пользователя без операторов, кавычек и звёздочки.
     pub terms: Vec<String>,
+    /// Plain words only: no explicit operator, no prefix star, no quoted
+    /// phrase. Only such a query also goes through the stem index.
+    pub plain: bool,
+}
+
+impl Query {
+    /// OR of the quoted stems of [`Query::terms`] for `nodes_stem_fts`, or
+    /// `None` when the query is not plain and keeps the exact path.
+    #[must_use]
+    pub fn stem_expr(&self) -> Option<String> {
+        if !self.plain {
+            return None;
+        }
+        let parts: Vec<String> = self
+            .terms
+            .iter()
+            .map(|t| crate::stem::stem_term(t))
+            .filter(|s| !s.is_empty())
+            .map(|s| term_expr(&s))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" OR "))
+    }
 }
 
 /// Явные операторы FTS5, которые пользователь пишет сам.
@@ -47,12 +69,16 @@ pub fn parse(raw: &str) -> Query {
     let mut parts = Vec::new();
     let mut terms = Vec::new();
     let mut explicit = false;
+    let mut plain = true;
 
     for token in raw.split_whitespace() {
         if OPERATORS.contains(&token) {
             explicit = true;
             parts.push(token.to_owned());
             continue;
+        }
+        if token.starts_with('"') || token.ends_with('*') {
+            plain = false;
         }
         let (body, star) = match token.strip_suffix('*') {
             Some(body) => (body, "*"),
@@ -75,6 +101,7 @@ pub fn parse(raw: &str) -> Query {
         return Query {
             expr: String::new(),
             terms,
+            plain: false,
         };
     }
 
@@ -83,7 +110,11 @@ pub fn parse(raw: &str) -> Query {
     } else {
         parts.join(" OR ")
     };
-    Query { expr, terms }
+    Query {
+        expr,
+        terms,
+        plain: plain && !explicit,
+    }
 }
 
 /// Только выражение — для вызывающих, которым диагностика слов не нужна.
@@ -145,5 +176,16 @@ mod tests {
     fn the_words_themselves_are_kept_for_diagnostics() {
         let q = parse("алерт telegram*");
         assert_eq!(q.terms, vec!["алерт".to_owned(), "telegram".to_owned()]);
+    }
+
+    #[test]
+    fn only_plain_words_get_a_stem_expression() {
+        assert_eq!(
+            parse("алертов running").stem_expr().as_deref(),
+            Some("\"алерт\" OR \"run\"")
+        );
+        assert_eq!(parse("redis*").stem_expr(), None);
+        assert_eq!(parse("redis AND postgres").stem_expr(), None);
+        assert_eq!(parse("\"skills-store\"").stem_expr(), None);
     }
 }
