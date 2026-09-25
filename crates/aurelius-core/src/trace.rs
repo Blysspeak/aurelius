@@ -21,6 +21,8 @@ pub enum TraceKind {
     Commit,
     MsgSent,
     UserCorrection,
+    /// A verify run with its real exit code (`au task evidence`).
+    Verify,
 }
 
 impl TraceKind {
@@ -32,6 +34,7 @@ impl TraceKind {
             TraceKind::Commit => "commit",
             TraceKind::MsgSent => "msg_sent",
             TraceKind::UserCorrection => "user_correction",
+            TraceKind::Verify => "verify",
         }
     }
 
@@ -43,6 +46,7 @@ impl TraceKind {
             "commit" => Some(Self::Commit),
             "msg_sent" => Some(Self::MsgSent),
             "user_correction" => Some(Self::UserCorrection),
+            "verify" => Some(Self::Verify),
             _ => None,
         }
     }

@@ -215,11 +215,8 @@ async fn handle_tools_call(
         // `au::commands::trace_cmd`), so the two sources land in one place.
         // Swallowed on failure by design (doc comment on the fn below) —
         // `outcome` below is untouched either way.
-        let session_id = arguments
-            .get("session_id")
-            .and_then(|s| s.as_str())
-            .unwrap_or("mcp");
-        record_tool_call(session_id, &tool_name, outcome.is_ok());
+        let session_id = session_for(&arguments);
+        record_tool_call(&session_id, &tool_name, outcome.is_ok());
 
         outcome
     })
@@ -252,6 +249,23 @@ async fn handle_tools_call(
             error!("spawn error: {e}");
             JsonRpcResponse::error(id, INTERNAL_ERROR, format!("Internal error: {e}"))
         }
+    }
+}
+
+/// Session a tool call belongs to: the caller's `session_id` if given, else
+/// the Claude Code session registered for an ancestor process (read fresh on
+/// every call, since `/clear` changes it), else the placeholder.
+pub(crate) fn session_for(arguments: &serde_json::Value) -> String {
+    pick_session(
+        arguments.get("session_id").and_then(|s| s.as_str()),
+        aurelius_core::session_registry::resolve_session,
+    )
+}
+
+fn pick_session(explicit: Option<&str>, resolve: impl FnOnce() -> Option<String>) -> String {
+    match explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_owned(),
+        None => resolve().unwrap_or_else(|| aurelius_core::window::PLACEHOLDER_SESSION.to_owned()),
     }
 }
 
@@ -326,5 +340,16 @@ mod tests {
             assert!(admin.iter().any(|n| n == t), "{t} must be listed for admin");
         }
         assert_eq!(admin.len() - plain.len(), ADMIN_TOOLS.len());
+    }
+
+    #[test]
+    fn session_prefers_explicit_then_resolved_then_placeholder() {
+        assert_eq!(pick_session(Some("given"), || Some("reg".into())), "given");
+        assert_eq!(pick_session(None, || Some("reg".into())), "reg");
+        assert_eq!(pick_session(Some(" "), || Some("reg".into())), "reg");
+        assert_eq!(
+            pick_session(None, || None),
+            aurelius_core::window::PLACEHOLDER_SESSION
+        );
     }
 }

@@ -71,6 +71,11 @@ pub fn judge(traces: &[AttributedTrace]) -> Verdict {
                 None => {}
                 Some(_) => fail = true,
             },
+            // A verify run always carries the real exit code of the command.
+            "verify" => match t.exit_code {
+                Some(0) => ok = true,
+                _ => fail = true,
+            },
             "file_edit" | "commit" | "msg_sent" => ok = true,
             _ => {}
         }
@@ -337,5 +342,65 @@ mod tests {
             judge(&[t("error", None, "boom"), t("tool_call", None, "hook")]),
             Verdict::Erode
         );
+    }
+
+    fn verify_verdict(exit: i64) -> Verdict {
+        use crate::trace::{ingest, TraceInput, TraceKind};
+        let path =
+            std::env::temp_dir().join(format!("aurelius-differ-{}.db", uuid::Uuid::new_v4()));
+        let conn = crate::db::open(&path).unwrap();
+        let node = crate::graph::add_node_full(
+            &conn,
+            crate::models::NodeType::Concept,
+            "cargo clippy workspace gate",
+            Some("run cargo clippy before commit"),
+            "test",
+            serde_json::json!({}),
+            crate::models::MemoryKind::Semantic,
+            None,
+        )
+        .unwrap();
+        let sig = crate::window::query_sig("clippy gate");
+        crate::window::record_recall(&conn, &sig, &node.id.to_string(), "sess-v", "x").unwrap();
+        ingest(
+            &conn,
+            &TraceInput {
+                session_id: "sess-v",
+                kind: TraceKind::Verify,
+                payload: "cargo clippy --workspace",
+                exit_code: Some(exit),
+                state_hash_pre: None,
+                state_hash_post: None,
+            },
+        )
+        .unwrap();
+        let stats = close_ripe_windows(&conn, 0).unwrap();
+        assert_eq!(stats.closed, 1);
+        let v: String = conn
+            .query_row("SELECT verdict FROM labile_window", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(p));
+        }
+        match v.as_str() {
+            "reinforce" => Verdict::Reinforce,
+            "erode" => Verdict::Erode,
+            "fork" => Verdict::Fork,
+            _ => Verdict::Null,
+        }
+    }
+
+    #[test]
+    fn verify_trace_judges_by_exit_code() {
+        assert_eq!(
+            judge(&[t("verify", Some(0), "cargo test")]),
+            Verdict::Reinforce
+        );
+        assert_eq!(judge(&[t("verify", Some(1), "cargo test")]), Verdict::Erode);
+        assert_eq!(verify_verdict(1), Verdict::Erode);
+        assert_eq!(verify_verdict(0), Verdict::Reinforce);
     }
 }

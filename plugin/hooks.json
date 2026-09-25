@@ -3,6 +3,7 @@
   "hooks": {
     "SessionStart": [
       { "matcher": "", "hooks": [
+        { "type": "command", "command": "au", "args": ["session-hook", "--hook"], "timeout": 5 },
         { "type": "command", "command": "au", "args": ["skills", "--hook"], "timeout": 10 },
         { "type": "command", "command": "au", "args": ["db", "backup", "--hook"], "timeout": 30 }
       ] }

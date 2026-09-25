@@ -30,13 +30,21 @@ fn instrument_recall(
         .collect();
     for n in nodes {
         let id = n.id.to_string();
-        if window::pathway_blocked(conn, &sig, &id).unwrap_or(false) {
+        if blocking_on(std::env::var("AURELIUS_PATHWAY_BLOCKING").ok().as_deref())
+            && window::pathway_blocked(conn, &sig, &id).unwrap_or(false)
+        {
             continue;
         }
         let content = n.note.as_deref().unwrap_or(&n.label);
         let _ = window::record_recall(conn, &sig, &id, session_id, content);
     }
     corrections
+}
+
+/// Pathway blocking hides nothing until it is measured: only
+/// `AURELIUS_PATHWAY_BLOCKING=1` turns it on.
+fn blocking_on(var: Option<&str>) -> bool {
+    var == Some("1")
 }
 
 /// Сколько находок `memory_search` отдаёт без явного `limit` — столько же,
@@ -77,11 +85,8 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         }
     }
 
-    let session_id = params
-        .get("session_id")
-        .and_then(|s| s.as_str())
-        .unwrap_or("mcp");
-    let corrections = instrument_recall(&conn, query, session_id, &nodes);
+    let session_id = super::super::session_for(params);
+    let corrections = instrument_recall(&conn, query, &session_id, &nodes);
 
     Ok(json!({
         "query": query,
@@ -804,6 +809,14 @@ pub fn task_criterion(params: &serde_json::Value) -> Result<serde_json::Value> {
 mod tests {
     use super::*;
     use aurelius_core::db;
+
+    #[test]
+    fn pathway_blocking_is_off_without_the_variable() {
+        assert!(!blocking_on(None));
+        assert!(!blocking_on(Some("0")));
+        assert!(!blocking_on(Some("")));
+        assert!(blocking_on(Some("1")));
+    }
 
     struct TmpDb(std::path::PathBuf);
 
