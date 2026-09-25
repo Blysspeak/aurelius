@@ -69,7 +69,7 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     )?;
     let hint = outcome.diagnosis();
     let unmatched = outcome.unmatched_terms;
-    let mut nodes = outcome.nodes;
+    let (route, mut nodes) = route_subject(&conn, query, node_type.as_ref(), outcome.nodes, limit)?;
 
     if let Some(since_str) = since {
         if let Some(cutoff_time) = parse_since(since_str) {
@@ -85,6 +85,7 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
 
     Ok(json!({
         "query": query,
+        "route": route,
         "type": type_filter,
         "since": since,
         "corrections": corrections,
@@ -99,6 +100,60 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         "vector_notice": vector_notice,
         "results": nodes.iter().map(|n| node_hit(n, query)).collect::<Vec<_>>(),
     }))
+}
+
+/// True when the trimmed query is one token shaped like a subject key:
+/// `^[A-Za-z0-9][A-Za-z0-9._/@#-]*(:\\S+)+$`.
+fn is_subject_key(query: &str) -> bool {
+    let q = query.trim();
+    if q.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = q.split(':');
+    let head = parts.next().unwrap_or("");
+    let head_ok = head
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._/@#-".contains(c));
+    let mut tail = parts.peekable();
+    head_ok && tail.peek().is_some() && tail.all(|seg| !seg.is_empty())
+}
+
+/// Subject routing for `memory_search`: a key-shaped query puts live nodes
+/// with that exact subject first, then the newest member of each
+/// `query:`-prefixed family, then the usual hits without duplicates, within
+/// `limit`. Returns the route name and the merged list.
+fn route_subject(
+    conn: &rusqlite::Connection,
+    query: &str,
+    node_type: Option<&NodeType>,
+    hits: Vec<aurelius_core::models::Node>,
+    limit: usize,
+) -> Result<(&'static str, Vec<aurelius_core::models::Node>)> {
+    if !is_subject_key(query) {
+        return Ok(("search", hits));
+    }
+    let key = query.trim();
+    let child = format!("{key}:");
+    let mut families = graph::find_subject_families_by_prefix(conn, key)?;
+    families.retain(|f| f.subject == key || f.subject.starts_with(&child));
+    // Stable sort keeps newest-first within each group.
+    families.sort_by_key(|f| f.subject != key);
+    let mut nodes: Vec<aurelius_core::models::Node> = families
+        .into_iter()
+        .map(|f| f.newest)
+        .filter(|n| node_type.is_none_or(|t| format!("{:?}", n.node_type) == format!("{t:?}")))
+        .collect();
+    for n in hits {
+        if !nodes.iter().any(|m| m.id == n.id) {
+            nodes.push(n);
+        }
+    }
+    nodes.truncate(limit);
+    Ok(("subject", nodes))
 }
 
 /// Picks the engines for `memory_search`. Typed and untyped queries take the
@@ -750,6 +805,39 @@ mod tests {
         )
         .expect("seed node")
         .id
+    }
+
+    #[test]
+    fn subject_key_query_routes_exact_subject_first() {
+        let (_tmp, conn) = setup();
+        let exact = graph::add_node_full(
+            &conn,
+            NodeType::Decision,
+            "walrus rule",
+            None,
+            "test",
+            json!({ "subject": "zoo:walrus" }),
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("seed exact")
+        .id;
+        let other = seed(&conn, NodeType::Decision, "zoo walrus plain");
+        assert!(is_subject_key("zoo:walrus"));
+        assert!(!is_subject_key("zoo walrus"));
+        assert!(!is_subject_key("zoo:"));
+
+        let other_node = graph::get_node(&conn, &other.to_string())
+            .expect("get")
+            .expect("node");
+        let (route, nodes) =
+            route_subject(&conn, "zoo:walrus", None, vec![other_node], 5).expect("route");
+        assert_eq!(route, "subject");
+        assert_eq!(nodes.first().map(|n| n.id), Some(exact));
+        assert_eq!(nodes.len(), 2);
+
+        let (route, _) = route_subject(&conn, "walrus", None, vec![], 5).expect("route");
+        assert_eq!(route, "search");
     }
 
     #[test]
