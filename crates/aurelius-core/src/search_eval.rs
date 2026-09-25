@@ -147,4 +147,32 @@ mod tests {
             );
         }
     }
+
+    /// The held-out set: 10 cases per class, none aimed at a node the
+    /// baseline already targets, so it measures what the baseline tuned.
+    #[test]
+    fn holdout_fixture_is_balanced_disjoint_and_clean() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/eval");
+        let base = load(&dir.join("search-baseline.jsonl")).unwrap();
+        let held = load(&dir.join("search-holdout.jsonl")).unwrap();
+        assert_eq!(held.len(), 40);
+        for class in ["ru", "en", "cross", "key"] {
+            let n = held.iter().filter(|c| c.class == class).count();
+            assert_eq!(n, 10, "класс {class}");
+        }
+        let targeted: std::collections::HashSet<Uuid> =
+            base.iter().flat_map(|c| c.expect.iter().copied()).collect();
+        for c in &held {
+            assert!(
+                c.expect.iter().all(|id| !targeted.contains(id)),
+                "{} целит в узел эталона",
+                c.id
+            );
+            assert!(
+                crate::secret::scan_text_for_lookalike(&c.query).is_none(),
+                "{} похож на секрет",
+                c.id
+            );
+        }
+    }
 }

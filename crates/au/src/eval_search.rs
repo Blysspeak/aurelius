@@ -1,5 +1,6 @@
 //! `au eval-search` — recall@5, recall@10 и MRR@10 эталонного набора
-//! (`fixtures/eval/search-baseline.jsonl`) по трём движкам: FTS, dense, RRF.
+//! (`fixtures/eval/search-baseline.jsonl`) по четырём движкам: FTS, dense, RRF и RRF с
+//! перестановкой кросс-энкодером (rerank).
 //!
 //! Отдельная подкоманда, а не ещё один вид кейса `au eval`: тот меряет
 //! замороженную базу по sha256, а эталон поиска меряет базу, в которой лежат
@@ -31,6 +32,7 @@ pub async fn run(cases: Option<String>, db: Option<String>, json_out: bool) -> R
         |row| row.get(0),
     )?;
     let mut board = Board::default();
+    let mut rerank_ok = true;
     let mut skipped: Option<String> =
         (!has_vectors).then(|| "в базе нет таблицы node_embeddings".to_owned());
 
@@ -58,18 +60,36 @@ pub async fn run(cases: Option<String>, db: Option<String>, json_out: bool) -> R
             &case.class,
             search_eval::score(&ids(&dense), &case.expect),
         );
-        let (fused, _) = graph::hybrid_seeds(&conn, &case.query, &vector, DEPTH)?;
+        let (fused, _) = graph::hybrid_seeds_fused(&conn, &case.query, &vector, DEPTH)?;
         board.add(
             "rrf",
             &case.class,
             search_eval::score(&ids(&fused), &case.expect),
         );
+        // The rerank row asks the daemon beside the measured database; a
+        // daemon that cannot rerank drops the whole row, not a share of it.
+        if let Some(socket) = graph::rerank_socket_for(&conn) {
+            if rerank_ok {
+                let (mut top, _) =
+                    graph::hybrid_seeds_fused(&conn, &case.query, &vector, graph::RERANK_TOP)?;
+                rerank_ok = graph::rerank_in_place(&socket, &case.query, &mut top);
+                top.truncate(DEPTH);
+                board.add(
+                    "rerank",
+                    &case.class,
+                    search_eval::score(&ids(&top), &case.expect),
+                );
+            }
+        }
     }
     // Частичный векторный прогон несравним с полным: демон упал посреди —
     // выбрасываем обе векторные строки целиком, а не печатаем долю от части.
     if skipped.is_some() {
         board.0.remove("dense");
         board.0.remove("rrf");
+    }
+    if !rerank_ok || skipped.is_some() {
+        board.0.remove("rerank");
     }
 
     if json_out {
@@ -79,6 +99,7 @@ pub async fn run(cases: Option<String>, db: Option<String>, json_out: bool) -> R
             "depth": DEPTH,
             "board": board,
             "vector_skipped": skipped,
+            "rerank_skipped": !rerank_ok,
         });
         println!("{out}");
         return Ok(());
@@ -109,6 +130,9 @@ pub async fn run(cases: Option<String>, db: Option<String>, json_out: bool) -> R
     }
     if let Some(reason) = skipped {
         println!("dense и rrf пропущены: {reason}");
+    }
+    if !rerank_ok {
+        println!("rerank пропущен: демон рядом с базой не ответил оценками кросс-энкодера");
     }
     Ok(())
 }

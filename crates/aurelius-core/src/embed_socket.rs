@@ -13,10 +13,10 @@
 //! exactly one JSON value before the writer is done.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
-use fastembed::TextEmbedding;
+use fastembed::{TextEmbedding, TextRerank};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -49,7 +49,37 @@ struct Request {
 #[serde(untagged)]
 enum Response {
     Vector { vector: Vec<f32> },
+    Scores { scores: Vec<f32> },
     Error { error: String },
+}
+
+/// What the server accepts: today's `{"query": ...}` (no `op`) for a query
+/// vector, or `{"op": "rerank", "query": ..., "docs": [...]}` for
+/// cross-encoder scores in the order of `docs`. A daemon older than `op`
+/// ignores the unknown fields and answers the rerank request with a vector,
+/// so the rerank client accepts nothing but `{"scores": [...]}`.
+#[derive(Deserialize)]
+struct Incoming {
+    #[serde(default)]
+    op: Option<String>,
+    query: String,
+    #[serde(default)]
+    docs: Vec<String>,
+}
+
+/// A cross-encoder behind the socket; a trait so tests serve a fake one.
+pub trait Reranker: Send + 'static {
+    /// Scores of `docs` against `query`, in the order of `docs`.
+    ///
+    /// # Errors
+    /// Inference failed.
+    fn scores(&mut self, query: &str, docs: &[String]) -> anyhow::Result<Vec<f32>>;
+}
+
+impl Reranker for TextRerank {
+    fn scores(&mut self, query: &str, docs: &[String]) -> anyhow::Result<Vec<f32>> {
+        crate::embed::rerank_scores(self, query, docs)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +148,7 @@ async fn request_vector_inner(socket: &Path, query: &str) -> Result<Vec<f32>, St
     match serde_json::from_slice::<Response>(&buf) {
         Ok(Response::Vector { vector }) => Ok(vector),
         Ok(Response::Error { error }) => Err(error),
+        Ok(Response::Scores { .. }) => Err("демон ответил оценками вместо вектора".to_owned()),
         Err(e) => Err(format!("демон ответил не тем, что ожидалось: {e}")),
     }
 }
@@ -290,11 +321,48 @@ pub fn shared_bge_m3(idle: Option<Duration>) -> SharedModel {
     Arc::new(Lazy::new(Box::new(crate::embed::init_bge_m3), idle))
 }
 
+/// The daemon's single lazily loaded bge-reranker-v2-m3. Process-wide rather
+/// than a `serve` argument so the daemon's call site stays as it is; created
+/// on first use with the same idle timeout as bge-m3.
+fn shared_reranker() -> Arc<Lazy<TextRerank>> {
+    static RERANKER: OnceLock<Arc<Lazy<TextRerank>>> = OnceLock::new();
+    Arc::clone(RERANKER.get_or_init(|| {
+        Arc::new(Lazy::new(
+            Box::new(crate::embed::init_bge_reranker),
+            idle_from_env(),
+        ))
+    }))
+}
+
 /// Accepts connections on `listener` forever, each handled with the shared
 /// `model`. Runs until the daemon's caller aborts the task (on `SIGTERM`) —
 /// there is no other exit path here, by design: the socket lives exactly as
 /// long as the daemon does.
 pub async fn serve(listener: UnixListener, model: SharedModel) {
+    let reranker = shared_reranker();
+    if let Some(idle) = reranker.idle {
+        // The daemon's tick loop only unloads bge-m3; the reranker is
+        // unloaded here, checked a few times per idle period.
+        let watched = Arc::clone(&reranker);
+        let every = (idle / 4).max(Duration::from_secs(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                if let Some((model, quiet)) = watched.take_idle() {
+                    drop(model);
+                    eprintln!("rerank: unloaded after {}s idle", quiet.as_secs());
+                }
+            }
+        });
+    }
+    serve_with(listener, model, reranker).await;
+}
+
+async fn serve_with<R: Reranker>(
+    listener: UnixListener,
+    model: SharedModel,
+    reranker: Arc<Lazy<R>>,
+) {
     loop {
         let (stream, _addr) = match listener.accept().await {
             Ok(pair) => pair,
@@ -307,17 +375,43 @@ pub async fn serve(listener: UnixListener, model: SharedModel) {
             }
         };
         let model = Arc::clone(&model);
+        let reranker = Arc::clone(&reranker);
         tokio::spawn(async move {
-            let _ = handle_connection(stream, &model).await;
+            let _ = handle_connection(stream, &model, &reranker).await;
         });
     }
 }
 
-async fn handle_connection(mut stream: UnixStream, model: &SharedModel) -> anyhow::Result<()> {
+async fn handle_connection<R: Reranker>(
+    mut stream: UnixStream,
+    model: &SharedModel,
+    reranker: &Arc<Lazy<R>>,
+) -> anyhow::Result<()> {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
 
-    let response = match serde_json::from_slice::<Request>(&buf) {
+    let response = match serde_json::from_slice::<Incoming>(&buf) {
+        Ok(Incoming {
+            op: Some(op),
+            query,
+            docs,
+        }) if op == "rerank" => {
+            let reranker = Arc::clone(reranker);
+            match tokio::task::spawn_blocking(move || reranker.with(|m| m.scores(&query, &docs)))
+                .await
+            {
+                Ok(Ok(scores)) => Response::Scores { scores },
+                Ok(Err(e)) => Response::Error {
+                    error: e.to_string(),
+                },
+                Err(e) => Response::Error {
+                    error: format!("инференс упал: {e}"),
+                },
+            }
+        }
+        Ok(Incoming { op: Some(op), .. }) => Response::Error {
+            error: format!("неизвестная операция {op}"),
+        },
         Ok(request) => {
             let model = Arc::clone(model);
             match tokio::task::spawn_blocking(move || embed_locked(&model, request.query)).await {
@@ -370,7 +464,7 @@ mod tests {
         let bytes = serde_json::to_vec(&resp).expect("serialize");
         match serde_json::from_slice::<Response>(&bytes).expect("deserialize") {
             Response::Vector { vector } => assert_eq!(vector, vec![0.1, 0.2, 0.3]),
-            Response::Error { .. } => panic!("expected Vector"),
+            _ => panic!("expected Vector"),
         }
     }
 
@@ -382,7 +476,7 @@ mod tests {
         let bytes = serde_json::to_vec(&resp).expect("serialize");
         match serde_json::from_slice::<Response>(&bytes).expect("deserialize") {
             Response::Error { error } => assert_eq!(error, "boom"),
-            Response::Vector { .. } => panic!("expected Error"),
+            _ => panic!("expected Error"),
         }
     }
 
@@ -484,5 +578,45 @@ mod tests {
         let socket = dir.join("does-not-exist.sock");
         let result = request_vector(&socket, "hello", Duration::from_millis(500)).await;
         assert!(result.is_err());
+    }
+
+    /// Scores each document by its length, so the order is predictable.
+    struct FakeReranker;
+
+    impl Reranker for FakeReranker {
+        fn scores(&mut self, query: &str, docs: &[String]) -> anyhow::Result<Vec<f32>> {
+            assert_eq!(query, "q");
+            Ok(docs.iter().map(|d| d.len() as f32).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn rerank_round_trips_through_the_socket_on_a_fake_model() {
+        let socket =
+            std::env::temp_dir().join(format!("au-embed-rerank-{}.sock", uuid::Uuid::new_v4()));
+        let listener = UnixListener::bind(&socket).expect("bind");
+        let model: SharedModel = Arc::new(Lazy::new(
+            Box::new(|| Err(anyhow::anyhow!("not in this test"))),
+            None,
+        ));
+        let reranker = Arc::new(Lazy::new(Box::new(|| Ok(FakeReranker)), None));
+        let server = tokio::spawn(serve_with(listener, model, reranker));
+
+        let path = socket.clone();
+        let scores = tokio::task::spawn_blocking(move || {
+            let docs = vec!["aaa".to_owned(), "a".to_owned(), "aa".to_owned()];
+            crate::graph::rerank_scores_at(&path, "q", &docs, Duration::from_secs(5))
+        })
+        .await
+        .expect("join");
+        assert_eq!(scores, Some(vec![3.0, 1.0, 2.0]));
+
+        // Today's vector request still answers as before (here: the error
+        // of a model that cannot load), not with scores.
+        let err = request_vector(&socket, "q", Duration::from_secs(5)).await;
+        assert!(err.unwrap_err().contains("not in this test"));
+
+        server.abort();
+        let _ = std::fs::remove_file(&socket);
     }
 }
