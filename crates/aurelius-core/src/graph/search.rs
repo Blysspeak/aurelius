@@ -170,23 +170,17 @@ pub fn search_scored(
     // T015: `rank` (bm25) выходит наружу вместе с узлом — раньше он жил
     // только внутри SQL (в `ORDER BY`), в SELECT-лист не входил и наружу не
     // выходил вовсе, нормировать было нечего.
-    let mut stmt = conn.prepare(
-        "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
-                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash,
-                n.created_by, n.updated_by, n.deleted_at, n.sync_seq, rank
-         FROM nodes_fts
-         JOIN nodes n ON nodes_fts.rowid = n.rowid
-         WHERE nodes_fts MATCH ?1 AND n.deleted_at IS NULL
-         ORDER BY rank
-         LIMIT ?2",
-    )?;
-    let mut fetched = stmt
-        .query_map(params![parsed.expr, (limit * OVERFETCH) as i64], |row| {
-            let node = row_to_node(row)?;
-            let raw_rank: f64 = row.get(16)?;
-            Ok((node, raw_rank))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut fetched = fts_hits(conn, "nodes_fts", &parsed.expr, limit * OVERFETCH)?;
+    // Word forms: plain words also match by stem, best (lowest) bm25 of the
+    // two tables per node.
+    if let Some(stem_expr) = parsed.stem_expr() {
+        for (node, rank) in fts_hits(conn, "nodes_stem_fts", &stem_expr, limit * OVERFETCH)? {
+            match fetched.iter_mut().find(|(n, _)| n.id == node.id) {
+                Some(hit) => hit.1 = hit.1.min(rank),
+                None => fetched.push((node, rank)),
+            }
+        }
+    }
     fetched.retain(|(n, _)| !crate::secret::is_secret_ref(n) && !is_technical(n));
 
     // Посевы упорядочиваются нормированным bm25 и ничем иным (FR-008): ни
@@ -207,7 +201,7 @@ pub fn search_scored(
     Ok((
         SearchOutcome {
             nodes,
-            unmatched_terms: unmatched_terms(conn, &parsed.terms)?,
+            unmatched_terms: unmatched_terms(conn, &parsed.terms, parsed.plain)?,
             terms: parsed.terms,
         },
         scores,
@@ -371,24 +365,62 @@ fn rank_by_matched_terms(nodes: &mut [Node], terms: &[String]) {
 /// # Errors
 /// Ошибка подготовки или исполнения запроса к FTS-таблице.
 pub fn query_terms(conn: &Connection, query: &str) -> Result<(Vec<String>, Vec<String>)> {
-    let terms = crate::fts::parse(query).terms;
-    let unmatched = unmatched_terms(conn, &terms)?;
-    Ok((terms, unmatched))
+    let parsed = crate::fts::parse(query);
+    let unmatched = unmatched_terms(conn, &parsed.terms, parsed.plain)?;
+    Ok((parsed.terms, unmatched))
+}
+
+/// Hits of one FTS table (`nodes_fts` or `nodes_stem_fts`) with raw bm25,
+/// live nodes only, best first.
+fn fts_hits(conn: &Connection, table: &str, expr: &str, limit: usize) -> Result<Vec<(Node, f64)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT n.id, n.node_type, n.label, n.note, n.source, n.data, n.created_at, n.updated_at,
+                n.memory_kind, n.last_accessed_at, n.access_count, n.content_hash,
+                n.created_by, n.updated_by, n.deleted_at, n.sync_seq, rank
+         FROM {table}
+         JOIN nodes n ON {table}.rowid = n.rowid
+         WHERE {table} MATCH ?1 AND n.deleted_at IS NULL
+         ORDER BY rank
+         LIMIT ?2"
+    ))?;
+    let hits = stmt
+        .query_map(params![expr, limit as i64], |row| {
+            let node = row_to_node(row)?;
+            let raw_rank: f64 = row.get(16)?;
+            Ok((node, raw_rank))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(hits)
 }
 
 /// Спрашивается по одному слову: только так видно, какое именно слово увело
 /// запрос в пустоту.
-fn unmatched_terms(conn: &Connection, terms: &[String]) -> Result<Vec<String>> {
+/// With `stem` (a plain query) a word whose stem matched `nodes_stem_fts`
+/// counts as found too.
+fn unmatched_terms(conn: &Connection, terms: &[String], stem: bool) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT 1 FROM nodes_fts JOIN nodes n ON nodes_fts.rowid = n.rowid
           WHERE nodes_fts MATCH ?1 AND n.deleted_at IS NULL LIMIT 1",
     )?;
+    let mut stem_stmt = conn.prepare(
+        "SELECT 1 FROM nodes_stem_fts JOIN nodes n ON nodes_stem_fts.rowid = n.rowid
+          WHERE nodes_stem_fts MATCH ?1 AND n.deleted_at IS NULL LIMIT 1",
+    )?;
     let mut out = Vec::new();
     for term in terms {
-        let found = stmt
+        let mut found = stmt
             .query_map(params![crate::fts::term_expr(term)], |_| Ok(()))?
             .next()
             .is_some();
+        if !found && stem {
+            let stemmed = crate::stem::stem_term(term);
+            if !stemmed.is_empty() {
+                found = stem_stmt
+                    .query_map(params![crate::fts::term_expr(&stemmed)], |_| Ok(()))?
+                    .next()
+                    .is_some();
+            }
+        }
         if !found {
             out.push(term.clone());
         }
@@ -1228,6 +1260,86 @@ mod tests {
         }
     }
 
+    fn stem_hits(conn: &Connection, stem: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM nodes_stem_fts WHERE nodes_stem_fts MATCH ?1",
+            params![crate::fts::term_expr(stem)],
+            |row| row.get(0),
+        )
+        .expect("stem match")
+    }
+
+    /// Word forms: the genitive plural is found by the nominative singular,
+    /// `running` by `run`, and the word is not reported as unmatched.
+    #[test]
+    fn word_forms_are_found_through_the_stem_index() {
+        let (path, conn) = temp_db();
+        let ru = super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "очередь алертов",
+            Some("разбор старых баз"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add ru");
+        let en = super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "daemon running",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add en");
+
+        let out = search_ranked(&conn, "база", 10).expect("search ru");
+        assert!(out.nodes.iter().any(|n| n.id == ru.id));
+        assert!(out.unmatched_terms.is_empty());
+
+        let out = search_ranked(&conn, "run", 10).expect("search en");
+        assert!(out.nodes.iter().any(|n| n.id == en.id));
+        assert!(out.unmatched_terms.is_empty());
+
+        // A prefix query keeps the exact path: no stem fallback.
+        let out = search_ranked(&conn, "база*", 10).expect("search prefix");
+        assert!(out.nodes.is_empty());
+        cleanup(&path, conn);
+    }
+
+    /// The stem index follows insert, update and delete on `nodes`.
+    #[test]
+    fn stem_index_follows_insert_update_and_delete() {
+        let (path, conn) = temp_db();
+        let node = super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "алертов",
+            None,
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node");
+        let alert = crate::stem::stem_term("алерт");
+        assert_eq!(stem_hits(&conn, &alert), 1);
+
+        conn.execute(
+            "UPDATE nodes SET label = 'running jobs' WHERE id = ?1",
+            params![node.id.to_string()],
+        )
+        .expect("update");
+        assert_eq!(stem_hits(&conn, &alert), 0);
+        assert_eq!(stem_hits(&conn, "run"), 1);
+
+        conn.execute(
+            "DELETE FROM nodes WHERE id = ?1",
+            params![node.id.to_string()],
+        )
+        .expect("delete");
+        assert_eq!(stem_hits(&conn, "run"), 0);
+        cleanup(&path, conn);
+    }
+
     /// Гигиена выдачи: строка, которую читатель увидел бы дважды, уходит
     /// один раз; одна метка при разных телах — разные записи; пустая запись
     /// уступает содержательной только при ничьей, а не при более высоком
@@ -1479,10 +1591,12 @@ mod tests {
         )
         .expect("add node");
 
-        let outcome = search_ranked(&conn, "телеграм алертов", 5).expect("поиск");
+        // "алертов" is found through the stem index now; a word absent in
+        // every form is still named.
+        let outcome = search_ranked(&conn, "телеграм кластеров", 5).expect("поиск");
         assert_eq!(
             outcome.unmatched_terms,
-            vec!["алертов".to_owned()],
+            vec!["кластеров".to_owned()],
             "слово, не давшее ни одного попадания, обязано быть названо"
         );
 
@@ -1513,7 +1627,9 @@ mod tests {
         super::super::add_node(
             &conn,
             NodeType::Concept,
-            "воркеров примерно двадцать",
+            // Stems find "воркеров" by "воркеры" now, so the record holds
+            // a different spelling to keep the miss.
+            "workers примерно двадцать",
             None,
             "test",
             serde_json::json!({}),

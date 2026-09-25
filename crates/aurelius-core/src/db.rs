@@ -6,7 +6,7 @@ use std::time::Duration;
 
 // SCHEMA_VERSION must be incremented whenever the database schema changes.
 // The migration chain in `migrate()` updates older instances on connection.
-pub const SCHEMA_VERSION: i32 = 18;
+pub const SCHEMA_VERSION: i32 = 19;
 
 /// How long a connection waits for a lock another process holds. Long enough to
 /// absorb a checkpoint or a migration, short enough that a genuinely stuck lock
@@ -144,6 +144,9 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")
         .map_err(|e| classify(e, path))?;
 
+    // Before migrations: V19 and the triggers it installs call aurelius_stem.
+    register_functions(&conn)?;
+
     migrate(&conn).map_err(|e| match e {
         DbError::Sqlite(inner) => classify(inner, path),
         other => other,
@@ -204,7 +207,24 @@ pub fn open_readonly(path: &Path) -> Result<Connection> {
     init_sqlite_extensions();
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    register_functions(&conn)?;
     Ok(conn)
+}
+
+/// SQL scalar `aurelius_stem(text)`: [`crate::stem::stem_text`], used by the
+/// `nodes_stem_fts` triggers (V19). NULL in, empty string out.
+fn register_functions(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "aurelius_stem",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let text: Option<String> = ctx.get(0)?;
+            Ok(crate::stem::stem_text(text.as_deref().unwrap_or("")))
+        },
+    )?;
+    Ok(())
 }
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -687,7 +707,44 @@ fn migrate(conn: &Connection) -> Result<()> {
         set_schema_version(&tx, 18)?;
     }
 
+    if current < 19 {
+        migrate_v19(&tx)?;
+        set_schema_version(&tx, 19)?;
+    }
+
     tx.commit()?;
+    Ok(())
+}
+
+/// V19 — stemmed full-text index. `nodes_fts` has no stemming, so a Russian
+/// word in another case or number missed the record. The stems go into a
+/// separate regular FTS5 table, not a column of the external-content
+/// `nodes_fts`: a column missing from `nodes` breaks its rebuild and every
+/// read. `rowid` equals `nodes.rowid`; the triggers keep it in sync through
+/// `aurelius_stem` (registered in [`open`]), and every existing row is
+/// backfilled here.
+fn migrate_v19(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE nodes_stem_fts USING fts5(stem);
+
+        CREATE TRIGGER nodes_stem_ai AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_stem_fts(rowid, stem)
+            VALUES (new.rowid, aurelius_stem(new.label || ' ' || coalesce(new.note, '')));
+        END;
+
+        CREATE TRIGGER nodes_stem_ad AFTER DELETE ON nodes BEGIN
+            DELETE FROM nodes_stem_fts WHERE rowid = old.rowid;
+        END;
+
+        CREATE TRIGGER nodes_stem_au AFTER UPDATE ON nodes BEGIN
+            DELETE FROM nodes_stem_fts WHERE rowid = old.rowid;
+            INSERT INTO nodes_stem_fts(rowid, stem)
+            VALUES (new.rowid, aurelius_stem(new.label || ' ' || coalesce(new.note, '')));
+        END;
+
+        INSERT INTO nodes_stem_fts(rowid, stem)
+        SELECT rowid, aurelius_stem(label || ' ' || coalesce(note, '')) FROM nodes;",
+    )?;
     Ok(())
 }
 
@@ -1572,6 +1629,33 @@ mod tests {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).expect("read for hashing");
         format!("{:x}", Sha256::digest(&buf))
+    }
+
+    /// V19 on an existing database backfills the stem index for rows written
+    /// before it existed.
+    #[test]
+    fn v19_backfills_the_stem_index() {
+        let tmp = TmpDb::new("v19");
+        {
+            let conn = open(tmp.path()).expect("initial open");
+            conn.execute_batch(
+                "DROP TRIGGER nodes_stem_ai; DROP TRIGGER nodes_stem_au;
+                 DROP TRIGGER nodes_stem_ad; DROP TABLE nodes_stem_fts;
+                 DELETE FROM schema_version WHERE version = 19;",
+            )
+            .expect("roll back to v18");
+            insert_node(&conn, "n1", "очередь алертов");
+        }
+        let conn = open(tmp.path()).expect("reopen migrates");
+        assert_eq!(stored_version(&conn), SCHEMA_VERSION);
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM nodes_stem_fts WHERE nodes_stem_fts MATCH ?1",
+                params![format!("\"{}\"", crate::stem::stem_term("алерт"))],
+                |row| row.get(0),
+            )
+            .expect("stem match");
+        assert_eq!(hits, 1);
     }
 
     /// Regression guard: a fresh database reaches the current schema, and a

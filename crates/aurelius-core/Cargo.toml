@@ -21,7 +21,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["functions"] }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
@@ -36,4 +36,5 @@ zstd = { workspace = true }
 tokio = { workspace = true }
 sqlite-vec = "0.1.9"
 fastembed = { version = "6.1.0", default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls"] }
+rust-stemmers = "1.2.0"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "cuda", "std"] }

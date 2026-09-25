@@ -25,6 +25,7 @@ pub mod provenance;
 pub mod reminders;
 pub mod search_eval;
 pub mod secret;
+pub mod stem;
 pub mod sync;
 pub mod tasks;
 pub mod trace;
