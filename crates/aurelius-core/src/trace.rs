@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -85,7 +85,7 @@ pub fn ingest(conn: &Connection, t: &TraceInput<'_>) -> Result<i64> {
 }
 
 /// Rewrite already stored payloads through [`crate::secret::mask_secrets`] in
-/// one transaction; returns how many rows changed. Never wired to the CLI yet.
+/// one IMMEDIATE transaction; returns how many rows changed. Never wired to the CLI yet.
 ///
 /// `act_trace` is append-only via the `act_trace_ro` trigger, so the trigger is
 /// dropped and recreated from its own `sqlite_master` text inside the same
@@ -94,7 +94,16 @@ pub fn ingest(conn: &Connection, t: &TraceInput<'_>) -> Result<i64> {
 /// changed row gets an explicit FTS 'delete' of the old text and an insert of
 /// the new one; otherwise the old tokens would stay searchable.
 pub fn scrub_existing(conn: &Connection) -> Result<usize> {
-    let tx = conn.unchecked_transaction()?;
+    scrub_existing_with(conn, || {})
+}
+
+/// Body of [`scrub_existing`]; `after_read` runs between the read and the
+/// writes so tests can race a second connection against the scrub.
+fn scrub_existing_with(conn: &Connection, after_read: impl FnOnce()) -> Result<usize> {
+    // IMMEDIATE takes the write lock before the read: a deferred transaction
+    // that reads first fails with SQLITE_BUSY_SNAPSHOT (517) once another
+    // connection writes in between.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let changed: Vec<(i64, String, String)> = {
         let mut stmt = tx.prepare("SELECT id, payload FROM act_trace")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
@@ -108,16 +117,11 @@ pub fn scrub_existing(conn: &Connection) -> Result<usize> {
         }
         out
     };
+    after_read();
     if changed.is_empty() {
         return Ok(0);
     }
-    let trigger_sql: Option<String> = tx
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'act_trace_ro'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
+    let trigger_sql = trigger_sql(&tx, "act_trace_ro");
     tx.execute_batch("DROP TRIGGER IF EXISTS act_trace_ro")?;
     for (id, old, new) in &changed {
         tx.execute(
@@ -138,6 +142,58 @@ pub fn scrub_existing(conn: &Connection) -> Result<usize> {
     }
     tx.commit()?;
     Ok(changed.len())
+}
+
+/// Stored `CREATE TRIGGER` text of `name`, if the trigger exists.
+fn trigger_sql(conn: &Connection, name: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+        [name],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Retention capability: rows of `act_trace` with `ts` older than
+/// `cutoff_unix_seconds`. With `apply` false only counts them. With `apply`
+/// true removes them, their `act_trace_fts` entries and their
+/// `trace_attribution` rows in one IMMEDIATE transaction, lifting the
+/// `act_trace_nodel` guard and recreating it from its `sqlite_master` text.
+/// Returns the number of trace rows matched. Not wired to the CLI yet.
+pub fn prune_trace_before(
+    conn: &Connection,
+    cutoff_unix_seconds: i64,
+    apply: bool,
+) -> Result<usize> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM act_trace WHERE ts < ?1",
+        [cutoff_unix_seconds],
+        |r| r.get(0),
+    )?;
+    let count = usize::try_from(count)?;
+    if !apply || count == 0 {
+        return Ok(count);
+    }
+    let nodel_sql = trigger_sql(&tx, "act_trace_nodel");
+    tx.execute_batch("DROP TRIGGER IF EXISTS act_trace_nodel")?;
+    tx.execute(
+        "DELETE FROM trace_attribution
+         WHERE trace_id IN (SELECT id FROM act_trace WHERE ts < ?1)",
+        [cutoff_unix_seconds],
+    )?;
+    // External-content FTS5 needs the old text to drop its tokens.
+    tx.execute(
+        "INSERT INTO act_trace_fts(act_trace_fts, rowid, payload)
+         SELECT 'delete', id, payload FROM act_trace WHERE ts < ?1",
+        [cutoff_unix_seconds],
+    )?;
+    tx.execute("DELETE FROM act_trace WHERE ts < ?1", [cutoff_unix_seconds])?;
+    if let Some(sql) = nodel_sql {
+        tx.execute_batch(&sql)?;
+    }
+    tx.commit()?;
+    Ok(count)
 }
 
 /// Хэш состояния файла для пары pre/post. Отсутствующий файл — тоже состояние
@@ -469,6 +525,98 @@ mod tests {
 
         assert_eq!(scrub_existing(&conn).expect("scrub again"), 0);
         // The append-only guard is back in place.
+        assert!(conn
+            .execute("UPDATE act_trace SET payload = 'x'", [])
+            .is_err());
+    }
+
+    fn db_path() -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aurelius-trace-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        dir.join("test.db")
+    }
+
+    #[test]
+    fn scrub_survives_concurrent_insert_between_read_and_write() {
+        let path = db_path();
+        let conn = db::open(&path).expect("open");
+        conn.execute(
+            "INSERT INTO act_trace (ts, session_id, kind, payload)
+             VALUES (1, 's', 'tool_call', 'export PGPASSWORD=hunter2')",
+            [],
+        )
+        .expect("raw insert");
+        let mut writer = None;
+        let changed = scrub_existing_with(&conn, || {
+            let p = path.clone();
+            writer = Some(std::thread::spawn(move || {
+                let other = db::open(&p).expect("open second");
+                other.execute(
+                    "INSERT INTO act_trace (ts, session_id, kind, payload)
+                     VALUES (2, 's', 'tool_call', 'ls')",
+                    [],
+                )
+            }));
+            // Give the second connection time to try its write mid-scrub.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        })
+        .expect("scrub must not fail with 517");
+        assert_eq!(changed, 1);
+        let res = writer.expect("spawned").join().expect("join");
+        assert!(res.is_ok(), "concurrent insert: {res:?}");
+        assert_eq!(count_rows(&conn), 2);
+        std::fs::remove_dir_all(path.parent().expect("dir")).ok();
+    }
+
+    fn count_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM act_trace", [], |r| r.get(0))
+            .expect("count")
+    }
+
+    #[test]
+    fn prune_counts_then_removes_old_rows_index_and_attributions() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO act_trace (id, ts, session_id, kind, payload) VALUES
+                 (1, 100, 's', 'tool_call', 'oldcmd alpha'),
+                 (2, 200, 's', 'tool_call', 'oldcmd beta'),
+                 (3, 900, 's', 'tool_call', 'newcmd gamma')",
+            [],
+        )
+        .expect("raw insert");
+        conn.execute(
+            "INSERT INTO trace_attribution (window_id, trace_id, overlap_score)
+             VALUES (7, 1, 0.5), (7, 3, 0.5)",
+            [],
+        )
+        .expect("attribution");
+
+        assert_eq!(prune_trace_before(&conn, 500, false).expect("dry"), 2);
+        assert_eq!(count_rows(&conn), 3);
+        assert_eq!(fts_hits(&conn, "oldcmd"), 2);
+
+        assert_eq!(prune_trace_before(&conn, 500, true).expect("apply"), 2);
+        assert_eq!(count_rows(&conn), 1);
+        assert_eq!(fts_hits(&conn, "oldcmd"), 0);
+        assert_eq!(fts_hits(&conn, "newcmd"), 1);
+        let attr: Vec<i64> = conn
+            .prepare("SELECT trace_id FROM trace_attribution")
+            .expect("prep")
+            .query_map([], |r| r.get(0))
+            .expect("q")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        assert_eq!(attr, vec![3]);
+        let integrity = conn.execute(
+            "INSERT INTO act_trace_fts(act_trace_fts) VALUES ('integrity-check')",
+            [],
+        );
+        assert!(integrity.is_ok(), "fts index out of sync: {integrity:?}");
+        for name in ["act_trace_ro", "act_trace_nodel", "act_trace_ai"] {
+            assert!(trigger_sql(&conn, name).is_some(), "{name} missing");
+        }
+        assert!(conn.execute("DELETE FROM act_trace", []).is_err());
         assert!(conn
             .execute("UPDATE act_trace SET payload = 'x'", [])
             .is_err());
