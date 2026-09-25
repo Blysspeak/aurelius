@@ -9,8 +9,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    edge_brief, node_detail, node_hit, open_db, parse_node_type, parse_relation, parse_since,
-    query_vector_for_topic, resolve_node, resolve_task_node,
+    apply_probe_stale, edge_brief, node_detail, node_hit, open_db, parse_node_type, parse_relation,
+    parse_since, probe_stale_notes, query_vector_for_topic, resolve_node, resolve_task_node,
 };
 
 /// Бит-и-Дело, ступень 3: превратить recall в транзакцию. Отфильтровать
@@ -98,8 +98,27 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         // потребитель JSON видит деградацию, а не только человек (spec.md,
         // ограничение №2).
         "vector_notice": vector_notice,
-        "results": nodes.iter().map(|n| node_hit(n, query)).collect::<Vec<_>>(),
+        "results": search_hits(&conn, &nodes, query),
     }))
+}
+
+/// Render search hits, with one probe read for the whole list: a hit whose
+/// recorded probe failed carries the probe note in `stale`.
+fn search_hits(
+    conn: &rusqlite::Connection,
+    nodes: &[aurelius_core::models::Node],
+    query: &str,
+) -> Vec<serde_json::Value> {
+    let refs: Vec<&aurelius_core::models::Node> = nodes.iter().collect();
+    let notes = probe_stale_notes(conn, &refs);
+    nodes
+        .iter()
+        .map(|n| {
+            let mut hit = node_hit(n, query);
+            apply_probe_stale(&mut hit, "/stale", &notes);
+            hit
+        })
+        .collect()
 }
 
 /// True when the trimmed query is one token shaped like a subject key:
@@ -684,12 +703,7 @@ pub fn memory_gc() -> Result<serde_json::Value> {
         [],
     )?;
 
-    let dup_nodes = conn.execute(
-        "DELETE FROM nodes WHERE content_hash IS NOT NULL AND id NOT IN (
-            SELECT MIN(id) FROM nodes WHERE content_hash IS NOT NULL GROUP BY content_hash
-        )",
-        [],
-    )?;
+    let dup_nodes = remove_duplicate_nodes(&conn)?;
 
     // Бит-и-Дело, ступень 7: банкротство-поглощение бесполезных узлов
     // (ниже порога ценности и без подтверждённых путей) в сильнейшего соседа.
@@ -707,6 +721,24 @@ pub fn memory_gc() -> Result<serde_json::Value> {
         "bankrupt_scanned": gc.scanned,
         "bankrupt_absorbed": gc.absorbed,
     }))
+}
+
+/// Hard-delete nodes whose `content_hash` repeats, keeping the smallest id.
+/// Each node's vector goes first: the rowid is only resolvable while the row
+/// still exists, and a vector left behind steals a KNN slot from live nodes.
+fn remove_duplicate_nodes(conn: &rusqlite::Connection) -> Result<usize> {
+    const DUPLICATES: &str = "content_hash IS NOT NULL AND id NOT IN (
+            SELECT MIN(id) FROM nodes WHERE content_hash IS NOT NULL GROUP BY content_hash
+        )";
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare(&format!("SELECT id FROM nodes WHERE {DUPLICATES}"))?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for id in &ids {
+        graph::drop_node_vector(conn, id)?;
+    }
+    Ok(conn.execute(&format!("DELETE FROM nodes WHERE {DUPLICATES}"), [])?)
 }
 
 /// `task_criterion` — MCP door onto `au task criterion <id> [--met|--unmet] <criterion>`
@@ -807,6 +839,73 @@ mod tests {
         )
         .expect("seed node")
         .id
+    }
+
+    fn fail_probe(conn: &rusqlite::Connection, id: Uuid, expr: &str) {
+        conn.execute(
+            "INSERT INTO probes (node_id, kind, expr, last_ok, checked_at)
+             VALUES (?1, 'file_exists', ?2, 0, 1758800000)",
+            rusqlite::params![id.to_string(), expr],
+        )
+        .expect("insert probe");
+    }
+
+    #[test]
+    fn search_hits_carry_the_failing_probe_note() {
+        let (_tmp, conn) = setup();
+        let bad = seed(&conn, NodeType::Decision, "probe walrus bad");
+        let good = seed(&conn, NodeType::Decision, "probe walrus good");
+        fail_probe(&conn, bad, "/nowhere/walrus.rs");
+        let nodes = vec![
+            graph::get_node(&conn, &bad.to_string())
+                .expect("get")
+                .expect("bad"),
+            graph::get_node(&conn, &good.to_string())
+                .expect("get")
+                .expect("good"),
+        ];
+        let hits = search_hits(&conn, &nodes, "walrus");
+        let stale = hits[0]["stale"].as_str().expect("probe note");
+        assert!(stale.contains("проба не прошла"), "{stale}");
+        assert!(stale.contains("/nowhere/walrus.rs"), "{stale}");
+        assert!(hits[1]["stale"].is_null());
+    }
+
+    #[test]
+    fn gc_duplicate_removal_leaves_no_vector_behind() {
+        let (_tmp, conn) = setup();
+        let a = seed(&conn, NodeType::Concept, "dup one");
+        let b = seed(&conn, NodeType::Concept, "dup two");
+        let bytes: Vec<u8> = (0..1024u32)
+            .flat_map(|i| ((i % 7) as f32 + 1.0).to_le_bytes())
+            .collect();
+        for id in [a, b] {
+            conn.execute(
+                "UPDATE nodes SET content_hash = 'same' WHERE id = ?1",
+                [id.to_string()],
+            )
+            .expect("hash");
+            conn.execute(
+                "INSERT INTO node_embeddings(rowid, embedding)
+                 SELECT rowid, vec_quantize_int8(?2, 'unit') FROM nodes WHERE id = ?1",
+                rusqlite::params![id.to_string(), bytes],
+            )
+            .expect("vector");
+        }
+
+        assert_eq!(remove_duplicate_nodes(&conn).expect("gc"), 1);
+
+        let vectors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM node_embeddings", [], |r| r.get(0))
+            .expect("count");
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_embeddings WHERE rowid NOT IN (SELECT rowid FROM nodes)",
+                [],
+                |r| r.get(0),
+            )
+            .expect("orphans");
+        assert_eq!((vectors, orphans), (1, 0));
     }
 
     #[test]
