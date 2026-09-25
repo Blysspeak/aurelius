@@ -208,6 +208,42 @@ pub fn field_report(params: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     (stored, dropped)
 }
 
+/// Tells the caller its claim was shortened on write.
+///
+/// `field_report` sees only the call's params, so `claim_auto` and `claim_full`
+/// (written by `Provenance::parse` for an overlong claim) never showed up in the
+/// response. Without shortening the response is left untouched.
+pub fn report_shortened_claim(
+    prov: &aurelius_core::provenance::Provenance,
+    response: &mut serde_json::Value,
+) {
+    use aurelius_core::provenance::{CLAIM_AUTO_KEY, CLAIM_FULL_KEY};
+    if prov.claim_full.is_none() {
+        return;
+    }
+    let Some(obj) = response.as_object_mut() else {
+        return;
+    };
+    let n = prov.claim.as_deref().map_or(0, |c| c.chars().count());
+    let stored = obj
+        .entry("stored_fields")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(arr) = stored.as_array_mut() {
+        for field in [CLAIM_AUTO_KEY, CLAIM_FULL_KEY] {
+            if !arr.iter().any(|v| v.as_str() == Some(field)) {
+                arr.push(serde_json::json!(field));
+            }
+        }
+        arr.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    }
+    obj.insert(
+        "warnings".to_owned(),
+        serde_json::json!([format!(
+            "claim сокращён до {n} символов, полный текст сохранён в claim_full"
+        )]),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +346,44 @@ mod tests {
             let err = validate(tool, &json!({})).expect_err("id обязателен");
             assert!(format!("{err}").contains("id"), "{tool}: {err}");
         }
+    }
+
+    /// The memory_add response pipeline: `field_report` over the params, then
+    /// the parsed provenance reports what the write itself added.
+    fn memory_add_fields(claim: &str) -> serde_json::Value {
+        let params = json!({ "label": "l", "claim": claim });
+        let prov = aurelius_core::provenance::Provenance::parse(&params).expect("parse");
+        let (stored, _) = field_report(&params);
+        let mut response = json!({ "created": true, "stored_fields": stored });
+        report_shortened_claim(&prov, &mut response);
+        response
+    }
+
+    #[test]
+    fn a_long_claim_is_reported_as_shortened() {
+        let response = memory_add_fields(&"слово ".repeat(80));
+        let stored: Vec<&str> = response["stored_fields"]
+            .as_array()
+            .expect("stored_fields")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(stored.contains(&"claim_auto"), "{stored:?}");
+        assert!(stored.contains(&"claim_full"), "{stored:?}");
+        let warnings = response["warnings"].as_array().expect("warnings");
+        assert_eq!(warnings.len(), 1);
+        let line = warnings[0].as_str().expect("warning text");
+        assert!(
+            line.starts_with("claim сокращён до ")
+                && line.ends_with(" символов, полный текст сохранён в claim_full"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_short_claim_leaves_the_response_as_it_was() {
+        let response = memory_add_fields("короткое утверждение");
+        assert!(response.get("warnings").is_none(), "{response}");
+        assert_eq!(response["stored_fields"], json!(["claim", "label"]));
     }
 }

@@ -512,7 +512,7 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
     // выглядит переданным ровно так же, как настоящий.
     let (stored_fields, dropped_fields) = super::super::params::field_report(params);
 
-    Ok(json!({
+    let mut response = json!({
         "id": node_id,
         "label": node.label,
         "type": type_str,
@@ -529,7 +529,9 @@ pub fn memory_add(params: &serde_json::Value) -> Result<serde_json::Value> {
         "stored_fields": stored_fields,
         "dropped_fields": dropped_fields,
         "surprise": surprise,
-    }))
+    });
+    super::super::params::report_shortened_claim(&prov, &mut response);
+    Ok(response)
 }
 
 pub fn memory_relate(params: &serde_json::Value) -> Result<serde_json::Value> {

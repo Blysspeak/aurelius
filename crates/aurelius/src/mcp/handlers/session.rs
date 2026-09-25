@@ -251,7 +251,7 @@ fn memory_session_with_conn(
         dropped_fields.sort();
     }
 
-    Ok(json!({
+    let mut response = json!({
         "id": session.id.to_string(),
         "label": session.label,
         "type": "session",
@@ -267,7 +267,9 @@ fn memory_session_with_conn(
         "unresolved_tasks": unresolved_tasks,
         "active_tasks_hint": active_tasks,
         "provenance": provenance_response,
-    }))
+    });
+    super::super::params::report_shortened_claim(&response_prov, &mut response);
+    Ok(response)
 }
 
 pub fn memory_recall(params: &serde_json::Value) -> Result<serde_json::Value> {
@@ -618,5 +620,39 @@ mod tests {
         .expect("memory_session");
         assert_eq!(result["complete"], true, "{result}");
         assert_eq!(result["rejected"], json!([]));
+    }
+
+    #[test]
+    fn a_shortened_session_claim_is_named_in_the_response() {
+        let (_tmp, conn) = setup();
+        let long = "слово ".repeat(80);
+        let result = memory_session_with_conn(
+            &conn,
+            &json!({ "summary": "итог с длинным claim", "project": "proj-claim", "claim": long }),
+        )
+        .expect("memory_session");
+        let node = aurelius_core::graph::get_node(&conn, result["id"].as_str().expect("id"))
+            .expect("get")
+            .expect("node");
+        let n = aurelius_core::provenance::Provenance::from_data(&node.data)
+            .claim
+            .expect("claim")
+            .chars()
+            .count();
+        assert_eq!(
+            result["warnings"],
+            json!([format!(
+                "claim сокращён до {n} символов, полный текст сохранён в claim_full"
+            )])
+        );
+        let stored = result["stored_fields"].as_array().expect("stored_fields");
+        assert!(stored.contains(&json!("claim_auto")) && stored.contains(&json!("claim_full")));
+
+        let short = memory_session_with_conn(
+            &conn,
+            &json!({ "summary": "итог с коротким claim", "project": "proj-claim", "claim": "коротко" }),
+        )
+        .expect("memory_session");
+        assert!(short.get("warnings").is_none(), "{short}");
     }
 }
