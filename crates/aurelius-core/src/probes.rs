@@ -192,6 +192,19 @@ pub struct FailedProbe {
     pub checked_at: Option<i64>,
 }
 
+/// The `stale` note for a failed probe: one template shared by every door
+/// (MCP handlers and `au recall`), so the wording cannot drift between them.
+pub fn stale_note(probe: &FailedProbe) -> String {
+    let date = probe
+        .checked_at
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map_or_else(|| "?".to_owned(), |d| d.format("%Y-%m-%d").to_string());
+    format!(
+        "проба не прошла {date}: {} {} — перепроверь, прежде чем опираться",
+        probe.kind, probe.expr
+    )
+}
+
 /// Failing probes for a set of nodes, keyed by node id, newest check first.
 ///
 /// One query for the whole set (ids travel as one JSON array through
@@ -421,5 +434,26 @@ mod tests {
         assert_eq!(got["a"][0].checked_at, Some(100));
         assert!(got.contains_key("d"));
         assert!(failing_for(&conn, &[]).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn stale_note_keeps_the_handler_wording() {
+        let dated = FailedProbe {
+            kind: "path".to_owned(),
+            expr: "/tmp/gone.rs".to_owned(),
+            checked_at: Some(1_758_758_400), // 2025-09-25 00:00:00 UTC
+        };
+        assert_eq!(
+            stale_note(&dated),
+            "проба не прошла 2025-09-25: path /tmp/gone.rs — перепроверь, прежде чем опираться"
+        );
+        let undated = FailedProbe {
+            checked_at: None,
+            ..dated
+        };
+        assert_eq!(
+            stale_note(&undated),
+            "проба не прошла ?: path /tmp/gone.rs — перепроверь, прежде чем опираться"
+        );
     }
 }

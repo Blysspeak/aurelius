@@ -293,24 +293,17 @@ pub(crate) fn probe_stale_notes(
     match aurelius_core::probes::failing_for(conn, &refs) {
         Ok(failing) => failing
             .into_iter()
-            .filter_map(|(id, probes)| probes.first().map(|p| (id, probe_stale_note(p))))
+            .filter_map(|(id, probes)| {
+                probes
+                    .first()
+                    .map(|p| (id, aurelius_core::probes::stale_note(p)))
+            })
             .collect(),
         Err(e) => {
             tracing::warn!("could not read probe results: {e}");
             std::collections::HashMap::new()
         }
     }
-}
-
-fn probe_stale_note(p: &aurelius_core::probes::FailedProbe) -> String {
-    let date = p
-        .checked_at
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map_or_else(|| "?".to_owned(), |d| d.format("%Y-%m-%d").to_string());
-    format!(
-        "проба не прошла {date}: {} {} — перепроверь, прежде чем опираться",
-        p.kind, p.expr
-    )
 }
 
 /// Replace the `stale` value at `pointer` inside a rendered record with the

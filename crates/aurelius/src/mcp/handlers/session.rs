@@ -655,4 +655,42 @@ mod tests {
         .expect("memory_session");
         assert!(short.get("warnings").is_none(), "{short}");
     }
+
+    /// `memory_recall` items are `node_recall` records, which carry no
+    /// `stale` field: probe notes are not grafted on, and the shape stays
+    /// exactly this key set.
+    #[test]
+    fn memory_recall_item_shape_has_no_stale_field() {
+        let (_tmp, conn) = setup();
+        let node = graph::add_node(
+            &conn,
+            NodeType::Concept,
+            "recall shape",
+            Some("заметка"),
+            "test",
+            json!({}),
+        )
+        .expect("add node");
+        let record = node_recall(&node, "recall");
+        let mut keys: Vec<&str> = record
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "claim",
+                "confidence",
+                "created_at",
+                "id",
+                "label",
+                "subject",
+                "type",
+                "window"
+            ]
+        );
+    }
 }
