@@ -6,7 +6,16 @@ which au &>/dev/null || exit 0
 
 MSG=$(git log -1 --pretty=%s)
 BODY=$(git log -1 --pretty=%b)
-PROJECT=$(git rev-parse --show-toplevel 2>/dev/null | xargs basename 2>/dev/null || echo "unknown")
+# Name the main repository, not a linked worktree folder.
+COMMON=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+if [ -z "$COMMON" ]; then
+  PROJECT="unknown"
+elif [[ "$COMMON" == */.git ]]; then
+  PROJECT=$(basename "$(dirname "$COMMON")")
+else
+  PROJECT=$(basename "$COMMON" .git)
+fi
+[ -n "$PROJECT" ] || PROJECT="unknown"
 
 # Skip merge commits and bumps
 [[ "$MSG" =~ ^(Merge|chore:|bump:|release:) ]] && exit 0
