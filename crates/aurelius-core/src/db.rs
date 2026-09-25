@@ -29,7 +29,15 @@ pub enum DbError {
     )]
     Corrupt { path: String, detail: String },
 
-    #[error("database schema is v{found}, this binary supports v{supported} — upgrade `au`")]
+    #[error(
+        "database schema is v{found}, this binary supports only v{supported}: the installed \
+         `au` is older than the database. If you are an agent: do not retry in a loop, do not \
+         copy, restore or re-create the database, and do not run a freshly built binary \
+         against it (the MCP memory tools hit this same check). The fix is for the owner to \
+         install the new binary into both ~/.local/bin and ~/.cargo/bin (the service starts \
+         the first one). Until then memory is unavailable in this session: continue the task \
+         without it and say so in your report"
+    )]
     SchemaTooNew { found: i32, supported: i32 },
 
     #[error("could not switch the database to WAL journal mode (it reports '{0}')")]
@@ -497,6 +505,18 @@ pub fn backup_into(src: &Path, dest: &Path) -> Result<u64> {
     let dest_str = dest.to_string_lossy().into_owned();
     conn.execute("VACUUM INTO ?1", params![dest_str])
         .map_err(|e| classify(e, src))?;
+    // The snapshot holds everything the live file does; keep it owner-only
+    // instead of leaving it to the umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "warning: could not restrict backup {} to mode 0600: {e}",
+                dest.display()
+            );
+        }
+    }
     Ok(std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0))
 }
 
@@ -1844,5 +1864,21 @@ mod tests {
         assert_eq!(count, 200, "snapshot lost rows still in the -wal");
         let report = check(dest.path(), true).expect("check snapshot");
         assert!(report.ok, "snapshot is not clean: {:?}", report.problems);
+    }
+
+    /// A backup carries the same data as the live file, so it gets owner-only mode.
+    #[cfg(unix)]
+    #[test]
+    fn backup_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TmpDb::new("backup-mode");
+        let dest = TmpDb::new("backup-mode-dest");
+        drop(open(tmp.path()).expect("initial open"));
+        backup_into(tmp.path(), dest.path()).expect("backup");
+        let mode = std::fs::metadata(dest.path())
+            .expect("stat backup")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "backup mode is {:o}", mode & 0o777);
     }
 }
