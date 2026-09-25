@@ -820,6 +820,12 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
+    /// Record the Claude Code session id for its process (SessionStart hook)
+    SessionHook {
+        /// Read Claude Code SessionStart hook JSON from stdin
+        #[arg(long)]
+        hook: bool,
+    },
     /// Memory hint on the first edit of a file in a session (PreToolUse hook)
     Hint {
         /// Read Claude Code PreToolUse hook JSON from stdin
@@ -1155,6 +1161,12 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Secret { action } => commands::secret(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,
+        Commands::SessionHook { hook } => {
+            if hook {
+                commands::session_hook();
+            }
+            Ok(())
+        }
         Commands::Hint { hook } => {
             if hook {
                 hint::hint_hook();

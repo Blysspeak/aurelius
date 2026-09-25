@@ -1208,8 +1208,8 @@ fn recall_prefix(conn: &rusqlite::Connection, prefix: &str, as_json: bool) -> Re
 }
 
 /// Replace `provenance.stale` with the note of the newest failing probe, if
-/// any. Same wording as `probe_stale_note` in the MCP handlers (crate-private
-/// there): a failed probe outranks the age note. Best-effort, like the MCP side.
+/// any, worded by `probes::stale_note` like the MCP handlers: a failed probe
+/// outranks the age note. Best-effort, like the MCP side.
 fn apply_probe_note(conn: &rusqlite::Connection, record: &mut serde_json::Value, id: &str) {
     let failing = match aurelius_core::probes::failing_for(conn, &[id]) {
         Ok(f) => f,
@@ -1221,16 +1221,8 @@ fn apply_probe_note(conn: &rusqlite::Connection, record: &mut serde_json::Value,
     let Some(p) = failing.get(id).and_then(|v| v.first()) else {
         return;
     };
-    let date = p
-        .checked_at
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map_or_else(|| "?".to_owned(), |d| d.format("%Y-%m-%d").to_string());
-    let note = format!(
-        "проба не прошла {date}: {} {} — перепроверь, прежде чем опираться",
-        p.kind, p.expr
-    );
     if let Some(slot) = record.pointer_mut("/provenance/stale") {
-        *slot = json!(note);
+        *slot = json!(aurelius_core::probes::stale_note(p));
     }
 }
 
@@ -2359,6 +2351,25 @@ pub async fn task(action: TaskAction) -> Result<()> {
             subject,
             json: as_json,
         } => {
+            // The run's real exit code feeds the judge as a `verify` trace of
+            // the Claude session this process descends from. Recorded before
+            // task resolution, so a refused attach still leaves the outcome;
+            // nothing is written when no session resolves. Best-effort.
+            if let Some(session_id) = aurelius_core::session_registry::resolve_session() {
+                if let Err(e) = aurelius_core::trace::ingest(
+                    &conn,
+                    &aurelius_core::trace::TraceInput {
+                        session_id: &session_id,
+                        kind: aurelius_core::trace::TraceKind::Verify,
+                        payload: &command,
+                        exit_code: Some(exit),
+                        state_hash_pre: None,
+                        state_hash_post: None,
+                    },
+                ) {
+                    eprintln!("warning: verify trace not written: {e}");
+                }
+            }
             // FR-008/FR-009: без явного id улика уходит активной задаче
             // НАЗВАННОГО проекта — не угадываем проект по текущему каталогу,
             // как это делает `trace --hook`, потому что вызывающий (хук
@@ -4575,6 +4586,26 @@ fn eval_report_json(head: &EvalHeader, report: &eval::EvalReport) -> serde_json:
 /// Записать след действия (ступень 1 «Бит-и-Дело»). `--hook` — режим
 /// PostToolUse-хука Claude Code: JSON со stdin, маппинг по имени тула,
 /// любой сбой глотается (exit 0) — хук не имеет права мешать работе.
+/// SessionStart hook: record the hook's `session_id` under the parent pid
+/// (Claude Code). Never fails — a hook must not get in the way.
+pub fn session_hook() {
+    let run = || -> Result<()> {
+        let mut raw = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw)?;
+        let v: serde_json::Value = serde_json::from_str(&raw)?;
+        let id = v
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("no session_id in hook input")?;
+        aurelius_core::session_registry::record_for_parent(id)
+    };
+    if let Err(e) = run() {
+        eprintln!("au session-hook: {e}");
+    }
+}
+
 pub async fn trace_cmd(
     kind: Option<String>,
     payload: Option<String>,
