@@ -66,7 +66,9 @@ pub fn judge(traces: &[AttributedTrace]) -> Verdict {
             "error" => fail = true,
             "user_correction" if negation(&t.payload) => fail = true,
             "tool_call" => match t.exit_code {
-                Some(0) | None => ok = true,
+                Some(0) => ok = true,
+                // Hook traces carry no exit code: the outcome is unknown, not a success.
+                None => {}
                 Some(_) => fail = true,
             },
             "file_edit" | "commit" | "msg_sent" => ok = true,
@@ -125,6 +127,17 @@ pub struct JudgeStats {
     pub reinforced: usize,
     pub eroded: usize,
     pub forked: usize,
+    /// Windows closed with a reinforce verdict in THIS run: the clearing credits
+    /// exactly these, so a window is credited once by construction.
+    pub reinforced_windows: Vec<ReinforcedWindow>,
+}
+
+/// A window closed with a reinforce verdict, as handed to the clearing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReinforcedWindow {
+    pub window_id: i64,
+    pub node_id: String,
+    pub session_id: String,
 }
 
 /// Закрыть созревшие окна (старше `min_age_secs`) и применить вердикты.
@@ -136,6 +149,7 @@ pub fn close_ripe_windows(conn: &Connection, min_age_secs: i64) -> Result<JudgeS
         reinforced: 0,
         eroded: 0,
         forked: 0,
+        reinforced_windows: Vec::new(),
     };
 
     let windows: Vec<OpenWindow> = {
@@ -185,6 +199,11 @@ pub fn close_ripe_windows(conn: &Connection, min_age_secs: i64) -> Result<JudgeS
         match verdict {
             Verdict::Reinforce => {
                 stats.reinforced += 1;
+                stats.reinforced_windows.push(ReinforcedWindow {
+                    window_id: w.id,
+                    node_id: w.node_id.clone(),
+                    session_id: w.session_id.clone(),
+                });
                 append_revision(conn, &w.node_id, &note, w.id, 1)?;
             }
             Verdict::Erode => {
@@ -309,5 +328,14 @@ mod tests {
             Verdict::Fork
         );
         assert_eq!(judge(&[]), Verdict::Null);
+    }
+
+    #[test]
+    fn judge_treats_missing_exit_code_as_unknown() {
+        assert_eq!(judge(&[t("tool_call", None, "hook")]), Verdict::Null);
+        assert_eq!(
+            judge(&[t("error", None, "boom"), t("tool_call", None, "hook")]),
+            Verdict::Erode
+        );
     }
 }

@@ -10,38 +10,43 @@ use anyhow::Result;
 use chrono::Utc;
 use rusqlite::Connection;
 
+use crate::differ::ReinforcedWindow;
+
 /// Тариф бонуса за подтверждённый исход, в «битах». Обе валюты сходятся в одном
 /// счёте, чтобы ранжирование было одномерным.
 const YIELD_BONUS_BITS: i64 = 64;
 
-/// Провести клиринг сессии: yield-бонусы за reinforce-вердикты её окон и
-/// штраф render_miss за показанное-но-не-процитированное. earn по сжатию
-/// потока считается отдельно (когортно) и здесь не дублируется.
-pub fn clear_session(conn: &Connection, session_id: &str) -> Result<()> {
+/// Credit a yield bonus for each reinforce window closed in this judge run.
+/// The caller passes only windows closed now (`JudgeStats::reinforced_windows`),
+/// so a window is credited exactly once: nothing here rescans closed windows.
+pub fn credit_reinforced(conn: &Connection, windows: &[ReinforcedWindow]) -> Result<()> {
     let now = Utc::now().timestamp();
-
-    // yield_bonus: reinforce-окна сессии кредитуют свои узлы.
-    let reinforced: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT node_id FROM labile_window
-              WHERE session_id = ?1 AND verdict = 'reinforce'",
-        )?;
-        let rows = stmt.query_map([session_id], |r| r.get::<_, String>(0))?;
-        rows.filter_map(std::result::Result::ok).collect()
-    };
-    for node_id in &reinforced {
+    for w in windows {
         conn.execute(
             "INSERT INTO ledger (node_id, session_id, bits_delta, kind, at)
              VALUES (?1, ?2, ?3, 'yield_bonus', ?4)",
-            rusqlite::params![node_id, session_id, YIELD_BONUS_BITS, now],
+            rusqlite::params![w.node_id, w.session_id, YIELD_BONUS_BITS, now],
         )?;
     }
+    Ok(())
+}
+
+/// Провести клиринг сессии: штраф render_miss за показанное-но-не-процитированное.
+/// yield-бонусы кредитует `credit_reinforced`; earn по сжатию потока считается
+/// отдельно (когортно) и здесь не дублируется.
+///
+/// Once-only: only render_log rows newer than this session's last render_miss
+/// posting are charged, so a repeated clearing adds nothing.
+pub fn clear_session(conn: &Connection, session_id: &str) -> Result<()> {
+    let now = Utc::now().timestamp();
 
     // render_miss: показано в снапшоте, но не процитировано — место потрачено зря.
     let missed: Vec<(String, i64)> = {
         let mut stmt = conn.prepare(
             "SELECT node_id, bytes FROM render_log
-              WHERE session_id = ?1 AND cited = 0",
+              WHERE session_id = ?1 AND cited = 0
+                AND at > COALESCE((SELECT MAX(at) FROM ledger
+                                    WHERE session_id = ?1 AND kind = 'render_miss'), -1)",
         )?;
         let rows = stmt.query_map([session_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -167,8 +172,33 @@ mod tests {
         db::open(&dir.join("test.db")).expect("open test db")
     }
 
+    fn ledger_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM ledger", [], |r| r.get(0))
+            .expect("count")
+    }
+
     #[test]
     fn clearing_credits_reinforce_and_debits_render_miss() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO render_log (session_id, node_id, layer, bytes, cited, at)
+             VALUES ('s1', 'n2', 'semantic', 100, 0, 1)",
+            [],
+        )
+        .expect("render");
+        let closed = [ReinforcedWindow {
+            window_id: 1,
+            node_id: "n1".into(),
+            session_id: "s1".into(),
+        }];
+        credit_reinforced(&conn, &closed).expect("credit");
+        clear_session(&conn, "s1").expect("clear");
+        assert_eq!(node_value_bits(&conn, "n1").expect("v1"), YIELD_BONUS_BITS);
+        assert_eq!(node_value_bits(&conn, "n2").expect("v2"), -800);
+    }
+
+    #[test]
+    fn second_clearing_run_adds_no_ledger_rows() {
         let conn = test_conn();
         conn.execute(
             "INSERT INTO labile_window (node_id, session_id, snapshot_hash, opened_at, closed_at, verdict)
@@ -182,9 +212,17 @@ mod tests {
             [],
         )
         .expect("render");
-        clear_session(&conn, "s1").expect("clear");
-        assert_eq!(node_value_bits(&conn, "n1").expect("v1"), YIELD_BONUS_BITS);
-        assert_eq!(node_value_bits(&conn, "n2").expect("v2"), -800);
+        // Run 1: the judge closes nothing new (window was closed earlier), so the
+        // already-closed reinforce window must not be re-credited.
+        let stats = crate::differ::close_ripe_windows(&conn, 0).expect("judge 1");
+        credit_reinforced(&conn, &stats.reinforced_windows).expect("credit 1");
+        clear_session(&conn, "s1").expect("clear 1");
+        let after_first = ledger_rows(&conn);
+        assert_eq!(after_first, 1, "only the render_miss posting");
+        let stats = crate::differ::close_ripe_windows(&conn, 0).expect("judge 2");
+        credit_reinforced(&conn, &stats.reinforced_windows).expect("credit 2");
+        clear_session(&conn, "s1").expect("clear 2");
+        assert_eq!(ledger_rows(&conn), after_first);
     }
 
     #[test]
