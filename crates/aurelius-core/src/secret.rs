@@ -537,6 +537,58 @@ pub fn scan_provenance_for_lookalike(data: &serde_json::Value) -> Option<(Secret
     })
 }
 
+/// Marker that replaces a masked secret value in trace payloads.
+pub const SECRET_MASK: &str = "***";
+
+// Static literal patterns: `.expect` can only fire on a typo in this source
+// (any test calling `mask_secrets` catches it), never on runtime input.
+#[allow(clippy::expect_used)]
+fn mask_rules() -> &'static [(regex::Regex, &'static str)] {
+    static RULES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> =
+        std::sync::OnceLock::new();
+    RULES.get_or_init(|| {
+        [
+            // Password part of URL userinfo: scheme://user:PASSWORD@host.
+            (
+                r"([A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]+:)[^\s@/]+@",
+                "${1}***@",
+            ),
+            // Authorization header value and bare Bearer tokens.
+            (
+                r#"(?i)(authorization:\s*(?:bearer\s+|basic\s+|token\s+)?|\bbearer\s+)(?:"[^"]*"|'[^']*'|[^\s'"]+)"#,
+                "${1}***",
+            ),
+            // Known token prefixes (GitHub, OpenAI/Anthropic, Slack, AWS, GitLab).
+            (
+                r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:ant-)?[A-Za-z0-9_\-]{16,}|xox[bpa]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|glpat-[A-Za-z0-9_\-]{20,})",
+                "***",
+            ),
+            // key=value / key: value where the key names a secret.
+            (
+                r#"(?i)\b([A-Za-z0-9_\-]*(?:password|passwd|pwd|token|secret|api_key|apikey|access_key|private_key)[A-Za-z0-9_\-]*)(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s'"&;]+)"#,
+                "${1}${2}***",
+            ),
+        ]
+        .into_iter()
+        .map(|(re, rep)| (regex::Regex::new(re).expect("static regex"), rep))
+        .collect()
+    })
+}
+
+/// Replace high-precision secret shapes in free text (trace payloads) with
+/// [`SECRET_MASK`], leaving the rest intact. Deliberately does not use the
+/// entropy lookalike detector: it flags git SHAs, UUIDs and hashes, which
+/// traces must keep. Idempotent: masking an already masked text is a no-op.
+pub fn mask_secrets(text: &str) -> String {
+    let mut out = text.to_owned();
+    for (re, rep) in mask_rules() {
+        if re.is_match(&out) {
+            out = re.replace_all(&out, *rep).into_owned();
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,5 +1116,82 @@ mod tests {
             !is_secret_ref(&wrong_type),
             "признак 'secret_ref' на чужом типе узла не должен считаться"
         );
+    }
+
+    #[test]
+    fn mask_secrets_masks_every_shape() {
+        let cases = [
+            (
+                "git push https://ghp_abcdefghijklmnopqrstuvwxyz0123@github.com",
+                "ghp_",
+            ),
+            ("export T=gho_ABCDEFGHIJKLMNOPQRST1234", "gho_"),
+            ("x ghu_ABCDEFGHIJKLMNOPQRST1234", "ghu_"),
+            ("x ghs_ABCDEFGHIJKLMNOPQRST1234", "ghs_"),
+            ("x ghr_ABCDEFGHIJKLMNOPQRST1234", "ghr_"),
+            ("x github_pat_11ABCDEFG0123456789_abcdefXYZ", "github_pat_"),
+            ("OPENAI=sk-proj1234567890abcdefghij run", "sk-proj"),
+            ("x sk-ant-api03-abcdefghijklmnop1234", "sk-ant-api03"),
+            ("slack xoxb-1234567890-abcdefghij", "xoxb-"),
+            ("slack xoxp-1234567890-abcdefghij", "xoxp-"),
+            ("slack xoxa-1234567890-abcdefghij", "xoxa-"),
+            ("aws AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7"),
+            ("gl glpat-abcdefghij0123456789", "glpat-"),
+            (
+                "curl -H 'Authorization: Bearer abc.def.ghi' u",
+                "abc.def.ghi",
+            ),
+            (
+                "curl -H \"Authorization: Basic dXNlcjpwYXNz\" u",
+                "dXNlcjpwYXNz",
+            ),
+            ("curl -H 'X: bearer opaqueTok123' u", "opaqueTok123"),
+            ("psql --password=hunter2 db", "hunter2"),
+            ("PGPASSWORD='s3cr et' psql", "s3cr et"),
+            ("DB_PASSWD=abc123 run", "abc123"),
+            ("mysql pwd=qwerty", "qwerty"),
+            ("gh auth --token=zzz999", "zzz999"),
+            ("client_secret: mysecretvalue", "mysecretvalue"),
+            ("API_KEY=k123 APIKEY=k456", "k123"),
+            ("apikey=k456", "k456"),
+            ("aws_access_key=AKZZ12", "AKZZ12"),
+            ("private_key: \"-----BEGIN\"", "BEGIN"),
+            (
+                "psql postgres://admin:Pa55word@db.local:5432/app",
+                "Pa55word",
+            ),
+        ];
+        for (input, secret) in cases {
+            let masked = mask_secrets(input);
+            assert!(!masked.contains(secret), "{input} -> {masked}");
+            assert!(masked.contains(SECRET_MASK), "{input} -> {masked}");
+        }
+        assert_eq!(
+            mask_secrets("psql postgres://admin:Pa55word@db.local:5432/app"),
+            "psql postgres://admin:***@db.local:5432/app"
+        );
+        assert_eq!(
+            mask_secrets("psql --password=hunter2 db"),
+            "psql --password=*** db"
+        );
+    }
+
+    #[test]
+    fn mask_secrets_keeps_technical_shapes_and_is_idempotent() {
+        for input in [
+            "git show 6784399a1b2c3d4e5f60718293a4b5c6d7e8f901",
+            "au task show 20b2bd3b-4946-452b-920c-9b5f2e70190e",
+            "cat /home/u/crates/aurelius-core/src/secret.rs",
+            "cargo test --workspace -- --nocapture",
+            "sha256sum file | grep e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "git clone https://github.com/org/repo.git",
+            "task-management-service-long-name",
+        ] {
+            assert_eq!(mask_secrets(input), input);
+        }
+        let once = mask_secrets(
+            "curl -H 'Authorization: Bearer x' --password=y ghp_abcdefghijklmnopqrstuv",
+        );
+        assert_eq!(mask_secrets(&once), once);
     }
 }
