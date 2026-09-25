@@ -31,6 +31,45 @@ pub const SUBJECT_KEY: &str = "subject";
 /// только пока оно ограничено. Длинное обоснование живёт в `note`.
 pub const CLAIM_MAX_CHARS: usize = 240;
 
+/// Original claim text when [`Provenance::parse`] had to shorten it.
+pub const CLAIM_FULL_KEY: &str = "claim_full";
+/// `true` marks a claim shortened automatically; the original is in `claim_full`.
+pub const CLAIM_AUTO_KEY: &str = "claim_auto";
+
+/// Fit a claim under [`CLAIM_MAX_CHARS`]: the first sentence if it fits,
+/// otherwise the text cut at the last word boundary that fits, plus an ellipsis.
+fn shorten_claim(claim: &str) -> String {
+    let first_sentence = claim
+        .char_indices()
+        .find(|&(i, c)| {
+            matches!(c, '.' | '!' | '?')
+                && claim[i + c.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace)
+        })
+        .map(|(i, c)| claim[..i + c.len_utf8()].trim());
+    if let Some(sentence) = first_sentence {
+        if !sentence.is_empty() && sentence.chars().count() <= CLAIM_MAX_CHARS {
+            return sentence.to_owned();
+        }
+    }
+    // Room for the ellipsis.
+    let budget = CLAIM_MAX_CHARS - 1;
+    let cut: String = claim.chars().take(budget + 1).collect();
+    let head: String = cut.chars().take(budget).collect();
+    let next_is_space = cut.chars().nth(budget).is_some_and(char::is_whitespace);
+    let body = if next_is_space {
+        head.trim_end()
+    } else {
+        match head.rfind(char::is_whitespace) {
+            Some(i) if !head[..i].trim_end().is_empty() => head[..i].trim_end(),
+            _ => head.as_str(),
+        }
+    };
+    format!("{body}\u{2026}")
+}
+
 /// Чем подтверждено утверждение.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -130,6 +169,8 @@ impl Volatility {
 pub struct Provenance {
     /// Короткое утверждение, которое отдаётся целиком и никогда не режется.
     pub claim: Option<String>,
+    /// Original claim when `claim` was shortened to fit [`CLAIM_MAX_CHARS`].
+    pub claim_full: Option<String>,
     /// Команда или запрос ДОСЛОВНО — то, чем это получено.
     pub evidence: Option<String>,
     pub measured_at: Option<DateTime<Utc>>,
@@ -157,8 +198,7 @@ impl Provenance {
     /// её, поэтому проверки нельзя обойти, собрав структуру руками мимо неё.
     ///
     /// # Errors
-    /// Неизвестное значение `confidence`/`volatility`, `claim` длиннее
-    /// [`CLAIM_MAX_CHARS`], `measured_at` не по RFC 3339, а также `measured`
+    /// Неизвестное значение `confidence`/`volatility`, `measured_at` не по RFC 3339, а также `measured`
     /// без `evidence` — измеренное без команды, которой измерено, это `inferred`.
     pub fn parse(params: &serde_json::Value) -> Result<Self> {
         let text = |key: &str| non_empty(params.get(key).and_then(serde_json::Value::as_str));
@@ -194,15 +234,14 @@ impl Provenance {
             ),
         };
 
-        let claim = text(CLAIM_KEY);
+        // An overlong claim is shortened, not refused: a refusal made the
+        // caller retry or lose the record. The original stays in `claim_full`.
+        let mut claim = text(CLAIM_KEY);
+        let mut claim_full = None;
         if let Some(c) = claim.as_deref() {
-            let len = c.chars().count();
-            if len > CLAIM_MAX_CHARS {
-                bail!(
-                    "claim длиной {len} символов при потолке {CLAIM_MAX_CHARS}: \
-                     он отдаётся целиком и потому обязан быть коротким. \
-                     Длинное обоснование — в note"
-                );
+            if c.chars().count() > CLAIM_MAX_CHARS {
+                let short = shorten_claim(c);
+                claim_full = claim.replace(short);
             }
         }
 
@@ -216,6 +255,7 @@ impl Provenance {
 
         let mut provenance = Self {
             claim,
+            claim_full,
             evidence,
             measured_at,
             confidence,
@@ -242,6 +282,7 @@ impl Provenance {
         let text = |key: &str| non_empty(data.get(key).and_then(serde_json::Value::as_str));
         Self {
             claim: text(CLAIM_KEY),
+            claim_full: text(CLAIM_FULL_KEY),
             evidence: text(EVIDENCE_KEY),
             measured_at: text(MEASURED_AT_KEY)
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
@@ -267,6 +308,7 @@ impl Provenance {
             }
         };
         put(CLAIM_KEY, self.claim.clone());
+        put(CLAIM_FULL_KEY, self.claim_full.clone());
         put(EVIDENCE_KEY, self.evidence.clone());
         put(MEASURED_AT_KEY, self.measured_at.map(|d| d.to_rfc3339()));
         put(
@@ -279,6 +321,9 @@ impl Provenance {
         );
         put(VERIFY_WITH_KEY, self.verify_with.clone());
         put(SUBJECT_KEY, self.subject.clone());
+        if self.claim_full.is_some() {
+            obj.insert(CLAIM_AUTO_KEY.to_owned(), true.into());
+        }
     }
 
     /// What a node created ALONGSIDE the primary record inherits — a decision
@@ -296,6 +341,7 @@ impl Provenance {
     pub fn inherited(&self) -> Self {
         Self {
             claim: None,
+            claim_full: None,
             subject: None,
             evidence: self.evidence.clone(),
             measured_at: self.measured_at,
@@ -539,11 +585,51 @@ mod tests {
     }
 
     #[test]
-    fn an_overlong_claim_is_refused_rather_than_clipped() {
-        let long = "я".repeat(CLAIM_MAX_CHARS + 1);
-        let err = Provenance::parse(&json!({ "claim": long })).expect_err("длинный claim");
-        assert!(format!("{err}").contains("note"), "{err}");
-        assert!(Provenance::parse(&json!({ "claim": "я".repeat(CLAIM_MAX_CHARS) })).is_ok());
+    fn an_overlong_claim_keeps_its_first_sentence() {
+        let long = format!("Флаги выключены. {}", "подробность ".repeat(40));
+        let p = Provenance::parse(&json!({ "claim": long })).expect("не отказ");
+        assert_eq!(p.claim.as_deref(), Some("Флаги выключены."));
+        assert_eq!(p.claim_full.as_deref(), Some(long.trim()));
+    }
+
+    #[test]
+    fn an_overlong_sentence_is_cut_at_a_word_boundary_with_an_ellipsis() {
+        let long = "слово ".repeat(80);
+        let p = Provenance::parse(&json!({ "claim": long })).expect("не отказ");
+        let claim = p.claim.expect("claim");
+        assert!(claim.chars().count() <= CLAIM_MAX_CHARS, "{claim}");
+        assert!(claim.ends_with("слово\u{2026}"), "{claim}");
+
+        let solid = "я".repeat(CLAIM_MAX_CHARS * 2);
+        let p = Provenance::parse(&json!({ "claim": solid })).expect("не отказ");
+        let claim = p.claim.expect("claim");
+        assert_eq!(claim.chars().count(), CLAIM_MAX_CHARS);
+        assert!(claim.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn a_claim_of_exactly_the_cap_is_untouched() {
+        let exact = "я".repeat(CLAIM_MAX_CHARS);
+        let p = Provenance::parse(&json!({ "claim": exact })).expect("parse");
+        assert_eq!(p.claim.as_deref(), Some(exact.as_str()));
+        assert_eq!(p.claim_full, None);
+        let mut data = json!({});
+        p.write_into(&mut data);
+        assert!(data.get(CLAIM_FULL_KEY).is_none());
+        assert!(data.get(CLAIM_AUTO_KEY).is_none());
+    }
+
+    #[test]
+    fn a_shortened_claim_writes_claim_full_and_claim_auto() {
+        let long = "длинно ".repeat(60);
+        let p = Provenance::parse(&json!({ "claim": long })).expect("parse");
+        let mut data = json!({});
+        p.write_into(&mut data);
+        assert_eq!(data[CLAIM_FULL_KEY], json!(long.trim()));
+        assert_eq!(data[CLAIM_AUTO_KEY], json!(true));
+        let stored = data[CLAIM_KEY].as_str().expect("claim");
+        assert!(stored.chars().count() <= CLAIM_MAX_CHARS);
+        assert_eq!(Provenance::from_data(&data), p);
     }
 
     #[test]
