@@ -280,6 +280,60 @@ fn provenance_brief(node: &aurelius_core::models::Node) -> serde_json::Value {
     })
 }
 
+/// Stale notes from recorded probe failures, keyed by node id — one query for
+/// the whole set. A failed probe outranks the age note: the file or commit a
+/// record leans on is known gone, not merely old. The newest failing check is
+/// the one named. Best-effort: a read error leaves the age notes in place.
+pub(crate) fn probe_stale_notes(
+    conn: &Connection,
+    nodes: &[&aurelius_core::models::Node],
+) -> std::collections::HashMap<String, String> {
+    let ids: Vec<String> = nodes.iter().map(|n| n.id.to_string()).collect();
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    match aurelius_core::probes::failing_for(conn, &refs) {
+        Ok(failing) => failing
+            .into_iter()
+            .filter_map(|(id, probes)| probes.first().map(|p| (id, probe_stale_note(p))))
+            .collect(),
+        Err(e) => {
+            tracing::warn!("could not read probe results: {e}");
+            std::collections::HashMap::new()
+        }
+    }
+}
+
+fn probe_stale_note(p: &aurelius_core::probes::FailedProbe) -> String {
+    let date = p
+        .checked_at
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map_or_else(|| "?".to_owned(), |d| d.format("%Y-%m-%d").to_string());
+    format!(
+        "проба не прошла {date}: {} {} — перепроверь, прежде чем опираться",
+        p.kind, p.expr
+    )
+}
+
+/// Replace the `stale` value at `pointer` inside a rendered record with the
+/// probe note for its id, if there is one. The field must already exist:
+/// this never adds `stale` where the shape had none.
+pub(crate) fn apply_probe_stale(
+    record: &mut serde_json::Value,
+    pointer: &str,
+    notes: &std::collections::HashMap<String, String>,
+) {
+    let Some(note) = record
+        .get("id")
+        .and_then(|v| v.as_str())
+        .and_then(|id| notes.get(id))
+        .cloned()
+    else {
+        return;
+    };
+    if let Some(slot) = record.pointer_mut(pointer) {
+        *slot = json!(note);
+    }
+}
+
 /// `pub`, unlike its neighbours: `au recall` renders the same record the MCP
 /// door does. A second renderer in the CLI would drift from this one, and the
 /// drift would show up as two answers to one question.
