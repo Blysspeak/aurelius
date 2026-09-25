@@ -842,7 +842,7 @@ struct SearchRun {
 /// есть соседи), и без потолка добор редкого типа дорастал до k=5120 —
 /// sqlite-vec отказывает выше 4096, поиск откатывался на полнотекстовый с
 /// ложной причиной за 2.7 с (замер 25.09.2026, `--type crate`). Поэтому
-/// с фильтром пул растёт не глубже [`FILTERED_POOL`] на сторону.
+/// с фильтром пул растёт не глубже [`graph::FILTERED_POOL`] на сторону.
 async fn run_search(
     conn: &rusqlite::Connection,
     home: &std::path::Path,
@@ -855,7 +855,7 @@ async fn run_search(
     let cap = if wanted.is_empty() {
         usize::MAX
     } else {
-        FILTERED_POOL.max(limit.saturating_mul(2))
+        graph::FILTERED_POOL.max(limit.saturating_mul(2))
     };
     let mut want = limit.saturating_mul(2);
     loop {
@@ -920,9 +920,6 @@ async fn run_search(
     }
 }
 
-/// Потолок пула на сторону для `au search --type`: вчетверо глубже обычного
-/// слияния ([`graph::FUSION_POOL`]) и на порядок ниже предела k у sqlite-vec.
-const FILTERED_POOL: usize = graph::FUSION_POOL * 4;
 
 /// `db_path()`'s каталог — там же лежит `embed.sock` (тот же принцип, что и
 /// у `db_reindex_embeddings_cli` и у `daemon()`: сокет рядом с базой, которую

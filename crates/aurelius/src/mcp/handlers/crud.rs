@@ -101,10 +101,6 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     }))
 }
 
-/// Pool depth per side for a typed search: same cap as `au search --type`
-/// (`FILTERED_POOL` in `crates/au/src/commands.rs`). The dense side never runs
-/// out, so without a cap a rare type would push k past sqlite-vec's 4096 limit.
-const FILTERED_POOL: usize = graph::FUSION_POOL * 4;
 
 /// Picks the engines for `memory_search`. Typed and untyped queries take the
 /// same hybrid path; the type filter is applied to the fused candidates. When
@@ -137,7 +133,7 @@ fn search_outcome(
     let fused = match node_type {
         Some(t) => {
             let wanted = serde_json::to_string(t).unwrap_or_default();
-            graph::hybrid_seeds_pooled(conn, query, &vector, usize::MAX, FILTERED_POOL.max(limit))
+            graph::hybrid_seeds_pooled(conn, query, &vector, usize::MAX, graph::FILTERED_POOL.max(limit))
                 .map(|(nodes, _)| {
                     let mut nodes: Vec<aurelius_core::models::Node> = nodes
                         .into_iter()
