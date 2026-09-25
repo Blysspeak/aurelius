@@ -748,7 +748,7 @@ const NODE_COLS: &str = "n.id, n.node_type, n.label, n.note, n.source, n.data, n
 /// связывает `проект -> файл`. Требовать конкретный тип связи тоже нельзя —
 /// словарь отношений открыт, и промах в нём снова означал бы тихую потерю
 /// знания. Ложное срабатывание ограничено фильтром по типу узла у вызывающего.
-fn project_scope_sql(alias: &str, idx: u32) -> String {
+pub fn project_scope_sql(alias: &str, idx: u32) -> String {
     format!(
         "({alias}.label LIKE '[' || ?{idx} || ']%' \
           OR {alias}.label = ?{idx} \

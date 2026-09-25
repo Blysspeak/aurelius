@@ -1,5 +1,6 @@
 mod commands;
 mod eval_search;
+mod hint;
 mod hooks;
 mod search_json;
 mod view;
@@ -788,6 +789,12 @@ enum Commands {
         #[arg(long)]
         hook: bool,
     },
+    /// Memory hint on the first edit of a file in a session (PreToolUse hook)
+    Hint {
+        /// Read Claude Code PreToolUse hook JSON from stdin
+        #[arg(long)]
+        hook: bool,
+    },
     /// Append an action trace (Bit-i-Delo stage 1); --hook reads Claude hook JSON from stdin
     Trace {
         /// tool_call|file_edit|error|commit|msg_sent|user_correction
@@ -1117,6 +1124,12 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Secret { action } => commands::secret(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,
+        Commands::Hint { hook } => {
+            if hook {
+                hint::hint_hook();
+            }
+            Ok(())
+        }
         Commands::Trace {
             kind,
             payload,
