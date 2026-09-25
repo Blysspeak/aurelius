@@ -59,45 +59,14 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     let since = params.get("since").and_then(|s| s.as_str());
 
     let conn = open_db()?;
-    // Векторная половина — только у нефильтрованного пути: `dense_search`
-    // (как и `search_typed`) не знает типа узла, и заводить вторую, типовую
-    // KNN-выборку ради одной ручки — за пределами этой волны (спека 011:
-    // "hybrid everywhere" даёт вектор темам и запросам, а не переизобретает
-    // typed-поиск).
-    let (outcome, vector_notice) = if let Some(type_str) = type_filter {
-        let node_type = parse_node_type(type_str);
-        let (terms, unmatched) = graph::query_terms(&conn, query)?;
-        (
-            graph::SearchOutcome {
-                nodes: graph::search_typed(&conn, query, &node_type, limit)?,
-                terms,
-                unmatched_terms: unmatched,
-            },
-            None,
-        )
-    } else {
-        let outcome = graph::search_ranked(&conn, query, limit)?;
-        let (vector, notice) = query_vector_for_topic(query);
-        match vector {
-            Some(vector) => match graph::hybrid_seeds(&conn, query, &vector, limit) {
-                Ok((nodes, _scores)) => (
-                    graph::SearchOutcome {
-                        nodes,
-                        terms: outcome.terms,
-                        unmatched_terms: outcome.unmatched_terms,
-                    },
-                    None,
-                ),
-                Err(e) => (
-                    outcome,
-                    Some(format!(
-                        "гибридный поиск не выполнился, отвечаю по полнотекстовому — {e}"
-                    )),
-                ),
-            },
-            None => (outcome, notice),
-        }
-    };
+    let node_type = type_filter.map(parse_node_type);
+    let (outcome, vector_notice) = search_outcome(
+        &conn,
+        query,
+        limit,
+        node_type.as_ref(),
+        query_vector_for_topic(query),
+    )?;
     let hint = outcome.diagnosis();
     let unmatched = outcome.unmatched_terms;
     let mut nodes = outcome.nodes;
@@ -122,14 +91,82 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         "count": nodes.len(),
         "unmatched_terms": unmatched,
         "query_hint": hint,
-        // `None` — гибридный путь сработал или не потребовался (фильтр по
-        // типу). `Some` — причина, по которой ответ дан по чистому
+        // `None` — гибридный путь сработал (с фильтром по типу и без).
+        // `Some` — причина, по которой ответ дан по чистому
         // полнотекстовому индексу; поле, а не только строка в тексте — так
         // потребитель JSON видит деградацию, а не только человек (spec.md,
         // ограничение №2).
         "vector_notice": vector_notice,
         "results": nodes.iter().map(|n| node_hit(n, query)).collect::<Vec<_>>(),
     }))
+}
+
+/// Pool depth per side for a typed search: same cap as `au search --type`
+/// (`FILTERED_POOL` in `crates/au/src/commands.rs`). The dense side never runs
+/// out, so without a cap a rare type would push k past sqlite-vec's 4096 limit.
+const FILTERED_POOL: usize = graph::FUSION_POOL * 4;
+
+/// Picks the engines for `memory_search`. Typed and untyped queries take the
+/// same hybrid path; the type filter is applied to the fused candidates. When
+/// the vector half is unavailable, the answer is FTS-only and the notice says
+/// why, for both shapes of the query.
+fn search_outcome(
+    conn: &rusqlite::Connection,
+    query: &str,
+    limit: usize,
+    node_type: Option<&NodeType>,
+    (vector, notice): (Option<Vec<f32>>, Option<String>),
+) -> Result<(graph::SearchOutcome, Option<String>)> {
+    let fts = |conn: &rusqlite::Connection| -> Result<graph::SearchOutcome> {
+        match node_type {
+            Some(t) => {
+                let (terms, unmatched_terms) = graph::query_terms(conn, query)?;
+                Ok(graph::SearchOutcome {
+                    nodes: graph::search_typed(conn, query, t, limit)?,
+                    terms,
+                    unmatched_terms,
+                })
+            }
+            None => graph::search_ranked(conn, query, limit),
+        }
+    };
+    let outcome = fts(conn)?;
+    let Some(vector) = vector else {
+        return Ok((outcome, notice));
+    };
+    let fused = match node_type {
+        Some(t) => {
+            let wanted = serde_json::to_string(t).unwrap_or_default();
+            graph::hybrid_seeds_pooled(conn, query, &vector, usize::MAX, FILTERED_POOL.max(limit))
+                .map(|(nodes, _)| {
+                    let mut nodes: Vec<aurelius_core::models::Node> = nodes
+                        .into_iter()
+                        .filter(|n| {
+                            serde_json::to_string(&n.node_type).unwrap_or_default() == wanted
+                        })
+                        .collect();
+                    nodes.truncate(limit);
+                    nodes
+                })
+        }
+        None => graph::hybrid_seeds(conn, query, &vector, limit).map(|(nodes, _)| nodes),
+    };
+    Ok(match fused {
+        Ok(nodes) => (
+            graph::SearchOutcome {
+                nodes,
+                terms: outcome.terms,
+                unmatched_terms: outcome.unmatched_terms,
+            },
+            None,
+        ),
+        Err(e) => (
+            outcome,
+            Some(format!(
+                "гибридный поиск не выполнился, отвечаю по полнотекстовому — {e}"
+            )),
+        ),
+    })
 }
 
 /// Тот же хаб-узел, что и в `task_view` (см. `graph::context_from_id`): узел
@@ -698,6 +735,67 @@ mod tests {
                 p.push(suffix);
                 let _ = std::fs::remove_file(std::path::PathBuf::from(p));
             }
+        }
+    }
+
+    fn seed(conn: &rusqlite::Connection, t: NodeType, label: &str) -> Uuid {
+        graph::add_node_full(
+            conn,
+            t,
+            label,
+            None,
+            "test",
+            json!({}),
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("seed node")
+        .id
+    }
+
+    #[test]
+    fn typed_search_without_vectors_reports_notice_like_untyped() {
+        let (_tmp, conn) = setup();
+        let problem = seed(&conn, NodeType::Problem, "walrus deadlock in daemon");
+        seed(&conn, NodeType::Decision, "walrus deadlock decision");
+        let offline = || (None, Some("демон недоступен".to_owned()));
+
+        let (typed, typed_notice) =
+            search_outcome(&conn, "walrus", 5, Some(&NodeType::Problem), offline())
+                .expect("typed search");
+        let (untyped, untyped_notice) =
+            search_outcome(&conn, "walrus", 5, None, offline()).expect("untyped search");
+
+        assert_eq!(
+            typed.nodes.iter().map(|n| n.id).collect::<Vec<_>>(),
+            vec![problem]
+        );
+        assert_eq!(untyped.nodes.len(), 2);
+        assert!(typed_notice.is_some(), "typed FTS-only answer must say so");
+        assert_eq!(
+            typed_notice, untyped_notice,
+            "both shapes ran the same engines"
+        );
+    }
+
+    #[test]
+    fn typed_search_with_vector_takes_hybrid_path() {
+        let (_tmp, conn) = setup();
+        let problem = seed(&conn, NodeType::Problem, "walrus deadlock in daemon");
+        seed(&conn, NodeType::Decision, "walrus deadlock decision");
+        // A vector that fails to fuse (wrong dimension or no table) must
+        // surface as a notice, exactly as on the untyped path.
+        let v = || (Some(vec![0.0_f32; 3]), None);
+        let (typed, typed_notice) =
+            search_outcome(&conn, "walrus", 5, Some(&NodeType::Problem), v()).expect("typed");
+        let (_, untyped_notice) = search_outcome(&conn, "walrus", 5, None, v()).expect("untyped");
+        assert_eq!(typed_notice.is_some(), untyped_notice.is_some());
+        assert!(typed
+            .nodes
+            .iter()
+            .all(|n| matches!(n.node_type, NodeType::Problem)));
+        if typed_notice.is_none() {
+            assert!(typed.nodes.iter().any(|n| n.id == problem));
         }
     }
 
