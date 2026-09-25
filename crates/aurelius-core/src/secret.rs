@@ -563,6 +563,24 @@ fn mask_rules() -> &'static [(regex::Regex, &'static str)] {
                 r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|sk-(?:ant-)?[A-Za-z0-9_\-]{16,}|xox[bpa]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|glpat-[A-Za-z0-9_\-]{20,})",
                 "***",
             ),
+            // Quoted keys in JSON / dict style: "password": "x", 'token': 'y'.
+            (
+                r#"(?i)(["'][A-Za-z0-9_\-]*(?:password|passwd|pwd|token|secret|api_key|apikey|access_key|private_key)[A-Za-z0-9_\-]*["']\s*:\s*)"[^"]*""#,
+                "${1}\"***\"",
+            ),
+            (
+                r#"(?i)(["'][A-Za-z0-9_\-]*(?:password|passwd|pwd|token|secret|api_key|apikey|access_key|private_key)[A-Za-z0-9_\-]*["']\s*:\s*)'[^']*'"#,
+                "${1}'***'",
+            ),
+            (
+                r#"(?i)(["'][A-Za-z0-9_\-]*(?:password|passwd|pwd|token|secret|api_key|apikey|access_key|private_key)[A-Za-z0-9_\-]*["']\s*:\s*)[^\s"',}\]]+"#,
+                "${1}***",
+            ),
+            // Flag followed by a space: --password VALUE, --api-key VALUE.
+            (
+                r#"(?i)(--(?:password|token|secret|api-key)\s+)(?:"[^"]*"|'[^']*'|[^\s'"\-][^\s'"]*)"#,
+                "${1}***",
+            ),
             // key=value / key: value where the key names a secret.
             (
                 r#"(?i)\b([A-Za-z0-9_\-]*(?:password|passwd|pwd|token|secret|api_key|apikey|access_key|private_key)[A-Za-z0-9_\-]*)(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s'"&;]+)"#,
@@ -1160,6 +1178,14 @@ mod tests {
                 "psql postgres://admin:Pa55word@db.local:5432/app",
                 "Pa55word",
             ),
+            (r#"{"password": "jsonpw1"}"#, "jsonpw1"),
+            ("{'token': 'dicttok2'}", "dicttok2"),
+            (r#"{"api_key":"zkey3"}"#, "zkey3"),
+            (r#"{"secret": 12345}"#, "12345"),
+            ("mysql --password hunter4 db", "hunter4"),
+            ("gh --token tok5abc", "tok5abc"),
+            ("vault --secret 'sp ace6'", "sp ace6"),
+            ("cli --api-key key7xyz run", "key7xyz"),
         ];
         for (input, secret) in cases {
             let masked = mask_secrets(input);
@@ -1173,6 +1199,20 @@ mod tests {
         assert_eq!(
             mask_secrets("psql --password=hunter2 db"),
             "psql --password=*** db"
+        );
+        assert_eq!(
+            mask_secrets(r#"{"password": "x", "user": "u"}"#),
+            r#"{"password": "***", "user": "u"}"#
+        );
+        assert_eq!(mask_secrets("{'token': 'y'}"), "{'token': '***'}");
+        assert_eq!(mask_secrets(r#"{"api_key":"z"}"#), r#"{"api_key":"***"}"#);
+        assert_eq!(
+            mask_secrets("mysql --password hunter4 db"),
+            "mysql --password *** db"
+        );
+        assert_eq!(
+            mask_secrets("cli --token --verbose"),
+            "cli --token --verbose"
         );
     }
 
@@ -1190,7 +1230,8 @@ mod tests {
             assert_eq!(mask_secrets(input), input);
         }
         let once = mask_secrets(
-            "curl -H 'Authorization: Bearer x' --password=y ghp_abcdefghijklmnopqrstuv",
+            "curl -H 'Authorization: Bearer x' --password=y ghp_abcdefghijklmnopqrstuv \
+             --token t {\"secret\": \"s\", 'pwd': 'p', \"api_key\": 5}",
         );
         assert_eq!(mask_secrets(&once), once);
     }
