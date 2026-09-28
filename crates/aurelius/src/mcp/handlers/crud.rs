@@ -680,7 +680,6 @@ pub fn memory_index(params: &serde_json::Value) -> Result<serde_json::Value> {
         "project": result.project_name,
         "crates_found": result.crates_found,
         "files_indexed": result.files_indexed,
-        "dependencies_found": result.dependencies_found,
         "nodes_created": result.nodes_created,
         "nodes_updated": result.nodes_updated,
         "nodes_removed": result.nodes_removed,

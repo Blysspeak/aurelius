@@ -673,9 +673,11 @@ fn evidence_without_an_active_task_has_its_own_code() {
     );
 }
 
-/// Узел проекта есть, задачи нет — прогон цепляется к проекту ребром.
+/// Узел проекта есть, задачи нет — узел прогона всё равно не заводится
+/// (28.09.2026): прогон лежит в журнале вызывающего, а `au db prune` снимал
+/// такой узел как мусор.
 #[test]
-fn evidence_without_a_task_hangs_on_an_existing_project() {
+fn evidence_without_a_task_writes_no_run_node_even_with_a_project() {
     let home = TmpHome::dir("evidence-project");
     let (code, _) = run(
         &home,
@@ -706,18 +708,7 @@ fn evidence_without_a_task_hangs_on_an_existing_project() {
         None,
     );
     assert_eq!(code, NO_ACTIVE_TASK);
-    assert_eq!(count(&home, RUN_NODES), 1);
-    assert_eq!(
-        count(
-            &home,
-            "SELECT COUNT(*) FROM edges e
-               JOIN nodes r ON r.id = e.from_id AND r.node_type = '\"run\"'
-               JOIN nodes p ON p.id = e.to_id AND p.node_type = '\"project\"' AND p.label = 'демо'
-              WHERE e.relation = 'belongs_to' AND e.deleted_at IS NULL"
-        ),
-        1,
-        "прогон без задачи обязан висеть на проекте"
-    );
+    assert_eq!(count(&home, RUN_NODES), 0, "узел прогона не пишется");
 }
 
 /// Обратная сторона: настоящая ошибка вызова обязана остаться единицей, иначе
