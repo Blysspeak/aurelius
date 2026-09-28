@@ -329,13 +329,10 @@ echo -e "${BOLD}Registering MCP server...${RESET}"
 register_mcp_server
 echo ""
 
-# --- 9. Install git hooks (for current repo) ---
-if [ -d .git ]; then
-    echo -e "${BOLD}Installing git hooks...${RESET}"
-    /usr/bin/cp -f contrib/git-hooks/post-commit .git/hooks/post-commit 2>/dev/null || cp -f contrib/git-hooks/post-commit .git/hooks/post-commit
-    chmod +x .git/hooks/post-commit
-    echo -e "${GREEN}✓${RESET} Git post-commit hook installed"
-fi
+# --- 9. Git hooks: none by default ---
+# contrib/git-hooks/post-commit stays opt-in. Installed here until 2026-09-28,
+# it wrote every commit into memory as an unverified decision node: 86 copies
+# of `git log` that search then ranked beside real decisions.
 
 # --- 10. Index current project ---
 echo -e "${BOLD}Indexing project...${RESET}"
@@ -360,7 +357,7 @@ echo "    au search      — search the knowledge graph"
 echo "    au snapshot    — seven-layer memory slice (--json for programs)"
 echo "    au mcp         — start MCP server (auto-configured)"
 echo ""
-echo "  To install git hooks in other repos:"
+echo "  Optional: mirror commit messages into memory (off by default):"
 echo "    cp contrib/git-hooks/post-commit /path/to/repo/.git/hooks/"
 echo ""
 echo -e "  ${DIM}Restart Claude Code to activate MCP server.${RESET}"
