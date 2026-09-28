@@ -129,10 +129,27 @@ mod tests {
         assert!(score(&ids, &[ids[0]]).at5);
     }
 
+    /// Search fixtures are paraphrased from the owner's live memory and are
+    /// not tracked (`.gitignore`): without them the test is skipped, not failed.
+    fn local_fixture(name: &str) -> Option<std::path::PathBuf> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/eval")
+            .join(name);
+        if path.exists() {
+            return Some(path);
+        }
+        eprintln!(
+            "skipped: {} is absent — search fixtures are local-only, not in git",
+            path.display()
+        );
+        None
+    }
+
     #[test]
     fn frozen_fixture_is_balanced_and_clean() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/eval/search-baseline.jsonl");
+        let Some(path) = local_fixture("search-baseline.jsonl") else {
+            return;
+        };
         let cases = load(&path).unwrap();
         assert!((40..=60).contains(&cases.len()), "{}", cases.len());
         for class in ["ru", "en", "cross", "key"] {
@@ -152,9 +169,14 @@ mod tests {
     /// baseline already targets, so it measures what the baseline tuned.
     #[test]
     fn holdout_fixture_is_balanced_disjoint_and_clean() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/eval");
-        let base = load(&dir.join("search-baseline.jsonl")).unwrap();
-        let held = load(&dir.join("search-holdout.jsonl")).unwrap();
+        let (Some(base_path), Some(held_path)) = (
+            local_fixture("search-baseline.jsonl"),
+            local_fixture("search-holdout.jsonl"),
+        ) else {
+            return;
+        };
+        let base = load(&base_path).unwrap();
+        let held = load(&held_path).unwrap();
         assert_eq!(held.len(), 40);
         for class in ["ru", "en", "cross", "key"] {
             let n = held.iter().filter(|c| c.class == class).count();

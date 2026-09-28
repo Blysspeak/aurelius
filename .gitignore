@@ -29,3 +29,9 @@ CLAUDE.md
 # tracked; research.md D-1 records the fixture's sha256 so a run can prove
 # it used the same file.
 fixtures/eval/*.db.zst
+
+# Search eval fixtures for `au eval-search`: queries paraphrased from the
+# owner's live memory, so they stay local. Tests that read them skip when
+# the files are absent.
+fixtures/eval/search-baseline.jsonl
+fixtures/eval/search-holdout.jsonl
