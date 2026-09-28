@@ -1122,6 +1122,8 @@ fn f32_le_bytes(values: &[f32]) -> Vec<u8> {
 /// РОВНО тот же порядок, что и чистый bm25-порядок `search_ranked`: слияние
 /// не меняет ни состав, ни порядок посева там, где векторов нет (та же
 /// гарантия деградации, что и в `dense_search`, но уже для слияния целиком).
+/// The one exception: live nodes whose subject is the query itself lead the
+/// list ahead of the fusion (see `fuse_seeds`).
 ///
 /// Возвращает узлы вместе с их нормированным RRF-скором — мин-макс
 /// (`rank::normalize_minmax`, НЕ `rank::normalize_bm25`: медианная нормировка
@@ -1175,10 +1177,35 @@ pub fn hybrid_seeds_fused(
     fuse_seeds(conn, query, query_vector, limit, FUSION_POOL, None)
 }
 
-/// RRF fusion of both sides, then — with a `rerank_socket` — the top
+/// Live nodes whose `subject` equals the trimmed query byte for byte, newest
+/// first — the same lookup `au recall` resolves a subject with
+/// (`find_nodes_by_data_field` on [`crate::provenance::SUBJECT_KEY`]), not a
+/// second one. A prefix of a subject is not a match. The filter both engines
+/// apply holds here too: a secret coordinate or a technical node does not
+/// surface through a key any more than through words or meaning.
+fn exact_subject_nodes(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Node>> {
+    let key = query.trim();
+    if key.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut nodes =
+        super::find_nodes_by_data_field(conn, crate::provenance::SUBJECT_KEY, key, limit)?;
+    nodes.retain(|n| !crate::secret::is_secret_ref(n) && !is_technical(n));
+    Ok(nodes)
+}
+
+/// Nodes whose subject is the query itself ([`exact_subject_nodes`]) lead,
+/// newest first, with `r` = 1. The rest is the RRF fusion of both sides
+/// without them, then — with a `rerank_socket` — the top
 /// [`super::rerank::RERANK_TOP`] fused candidates re-ordered by the daemon's
 /// cross-encoder, then the limit. No scores (no daemon, an old one, a slow
 /// one) keeps the fused order silently.
+///
+/// An exact key is a deterministic match, not an opinion of two engines: fed
+/// through FTS and vectors as plain text it put the right record first in 36%
+/// of the key cases of `au eval-search` (problem f805c7e6). It is prepended
+/// rather than given an RRF bonus, so neither the fusion nor the cross-encoder
+/// can move it down, and it is left out of the pool so it is not repeated.
 fn fuse_seeds(
     conn: &Connection,
     query: &str,
@@ -1187,6 +1214,11 @@ fn fuse_seeds(
     pool: usize,
     rerank_socket: Option<&std::path::Path>,
 ) -> Result<(Vec<Node>, std::collections::HashMap<uuid::Uuid, f64>)> {
+    let exact = exact_subject_nodes(conn, query, limit)?;
+    let exact_ids: std::collections::HashSet<uuid::Uuid> = exact.iter().map(|n| n.id).collect();
+    let limit = limit.saturating_sub(exact.len());
+    let rerank_socket = rerank_socket.filter(|_| limit > 0);
+
     let fts_nodes = search_ranked(conn, query, pool)?.nodes;
     let dense_nodes = dense_search(conn, query_vector, pool)?;
 
@@ -1206,6 +1238,7 @@ fn fuse_seeds(
 
     let pool: Vec<(uuid::Uuid, f64)> = by_id
         .keys()
+        .filter(|id| !exact_ids.contains(id))
         .map(|id| {
             let blind = by_id
                 .get(id)
@@ -1265,8 +1298,12 @@ fn fuse_seeds(
         super::rerank::rerank_in_place(socket, query, &mut nodes);
     }
     nodes.truncate(limit);
-    let r = nodes.iter().map(|n| n.id).zip(norms).collect();
-    Ok((nodes, r))
+    let mut r: std::collections::HashMap<uuid::Uuid, f64> =
+        nodes.iter().map(|n| n.id).zip(norms).collect();
+    r.extend(exact_ids.iter().map(|id| (*id, 1.0)));
+    let mut seeds = exact;
+    seeds.extend(nodes);
+    Ok((seeds, r))
 }
 
 pub fn get_recent_nodes(conn: &Connection, limit: usize) -> Result<Vec<Node>> {
@@ -2229,6 +2266,172 @@ mod tests {
             plain.iter().map(|n| n.id).collect::<Vec<_>>()
         );
         assert_eq!(tried_r, plain_r);
+        let _ = std::fs::remove_file(&socket);
+        cleanup(&path, conn);
+    }
+
+    const KEY: &str = "zeta:alpha:beta";
+
+    /// A node FTS finds for the words of [`KEY`] — the competition a boosted
+    /// node has to beat.
+    fn add_word_match(conn: &Connection, label: &str) -> Node {
+        super::super::add_node(
+            conn,
+            NodeType::Concept,
+            label,
+            Some("zeta alpha beta"),
+            "test",
+            serde_json::json!({}),
+        )
+        .expect("add node")
+    }
+
+    /// A node with `subject` whose text shares no word with [`KEY`]: FTS does
+    /// not index `data`, and the test database has no vectors, so the only way
+    /// into the list is the exact-subject lookup.
+    fn add_keyed(conn: &Connection, subject: &str, created_at: &str) -> Node {
+        let node = super::super::add_node(
+            conn,
+            NodeType::Concept,
+            "unrelated record",
+            Some("nothing in common with the query"),
+            "test",
+            serde_json::json!({ "subject": subject }),
+        )
+        .expect("add node");
+        conn.execute(
+            "UPDATE nodes SET created_at = ?1 WHERE id = ?2",
+            params![created_at, node.id.to_string()],
+        )
+        .expect("set created_at");
+        node
+    }
+
+    fn ids(nodes: &[Node]) -> Vec<uuid::Uuid> {
+        nodes.iter().map(|n| n.id).collect()
+    }
+
+    #[test]
+    fn an_exact_subject_leads_the_hybrid_list() {
+        let (path, conn) = temp_db();
+        let words = add_word_match(&conn, "zeta alpha beta record");
+        let keyed = add_keyed(&conn, KEY, "2026-01-01T00:00:00+00:00");
+        let query = vec![0.1f32; 1024];
+
+        let (plain, _) = hybrid_seeds(&conn, "zeta alpha beta", &query, 5).expect("words");
+        assert_eq!(
+            ids(&plain),
+            vec![words.id],
+            "the words alone miss the keyed node"
+        );
+
+        for padded in [KEY.to_owned(), format!("  {KEY}\n")] {
+            let (fused, r) = hybrid_seeds(&conn, &padded, &query, 5).expect("key");
+            assert_eq!(fused.first().map(|n| n.id), Some(keyed.id), "{padded:?}");
+            assert_eq!(r.get(&keyed.id).copied(), Some(1.0));
+            assert_eq!(r.len(), fused.len());
+        }
+        cleanup(&path, conn);
+    }
+
+    #[test]
+    fn every_live_node_of_the_subject_leads_newest_first() {
+        let (path, conn) = temp_db();
+        add_word_match(&conn, "zeta alpha beta record");
+        let older = add_keyed(&conn, KEY, "2026-01-01T00:00:00+00:00");
+        let newer = add_keyed(&conn, KEY, "2026-02-01T00:00:00+00:00");
+        let query = vec![0.1f32; 1024];
+
+        let (fused, _) = hybrid_seeds_fused(&conn, KEY, &query, 5).expect("key");
+        assert_eq!(ids(&fused[..2]), vec![newer.id, older.id]);
+        cleanup(&path, conn);
+    }
+
+    #[test]
+    fn a_prefix_of_a_subject_gets_no_boost() {
+        let (path, conn) = temp_db();
+        let words = add_word_match(&conn, "zeta alpha beta record");
+        let longer = add_keyed(&conn, &format!("{KEY}-long"), "2026-01-01T00:00:00+00:00");
+        let query = vec![0.1f32; 1024];
+
+        let (fused, _) = hybrid_seeds_fused(&conn, KEY, &query, 5).expect("key");
+        assert_eq!(fused.first().map(|n| n.id), Some(words.id));
+        assert!(!ids(&fused).contains(&longer.id), "prefix boosted");
+        cleanup(&path, conn);
+    }
+
+    #[test]
+    fn a_deleted_node_of_the_subject_does_not_lead() {
+        let (path, conn) = temp_db();
+        let words = add_word_match(&conn, "zeta alpha beta record");
+        let gone = add_keyed(&conn, KEY, "2026-01-01T00:00:00+00:00");
+        assert!(super::super::delete_node(&conn, gone.id).expect("delete"));
+        let query = vec![0.1f32; 1024];
+
+        let (fused, _) = hybrid_seeds_fused(&conn, KEY, &query, 5).expect("key");
+        assert_eq!(fused.first().map(|n| n.id), Some(words.id));
+        assert!(!ids(&fused).contains(&gone.id), "deleted node surfaced");
+        cleanup(&path, conn);
+    }
+
+    #[test]
+    fn a_boosted_node_is_not_repeated_further_down() {
+        let (path, conn) = temp_db();
+        for i in 0..3 {
+            add_word_match(&conn, &format!("zeta alpha beta competitor {i}"));
+        }
+        // Found by the words too, so it is in the fused pool as well.
+        let keyed = super::super::add_node(
+            &conn,
+            NodeType::Concept,
+            "zeta alpha beta keyed",
+            Some("zeta alpha beta"),
+            "test",
+            serde_json::json!({ "subject": KEY }),
+        )
+        .expect("add node");
+        let query = vec![0.1f32; 1024];
+
+        let (fused, r) = hybrid_seeds_fused(&conn, KEY, &query, 10).expect("key");
+        assert_eq!(fused.first().map(|n| n.id), Some(keyed.id));
+        assert_eq!(fused.iter().filter(|n| n.id == keyed.id).count(), 1);
+        assert_eq!(fused.len(), 4, "the boost takes a slot, not an extra row");
+        assert_eq!(r.len(), 4);
+
+        let (short, _) = hybrid_seeds_fused(&conn, KEY, &query, 2).expect("key");
+        assert_eq!(short.len(), 2, "the boosted node counts toward the limit");
+        cleanup(&path, conn);
+    }
+
+    /// The cross-encoder re-orders only the fused rest: the boosted node is
+    /// not sent to it and stays first whatever the scores.
+    #[test]
+    fn a_rerank_never_moves_the_boosted_node() {
+        use std::io::{Read, Write};
+        let (path, conn) = temp_db();
+        add_word_match(&conn, "zeta alpha beta competitor 0");
+        add_word_match(&conn, "zeta alpha beta competitor 1");
+        let keyed = add_keyed(&conn, KEY, "2026-01-01T00:00:00+00:00");
+        let query = vec![0.1f32; 1024];
+        let socket = std::env::temp_dir().join(format!("au-rerank-{}.sock", uuid::Uuid::new_v4()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut req = Vec::new();
+            stream.read_to_end(&mut req).expect("read");
+            stream.write_all(br#"{"scores":[0.1,0.9]}"#).expect("write");
+            req
+        });
+
+        let (plain, _) = hybrid_seeds_fused(&conn, KEY, &query, 5).expect("fused");
+        let (reranked, _) =
+            fuse_seeds(&conn, KEY, &query, 5, FUSION_POOL, Some(&socket)).expect("reranked");
+        let req: serde_json::Value =
+            serde_json::from_slice(&server.join().expect("server")).expect("request json");
+
+        assert_eq!(req["docs"].as_array().map(Vec::len), Some(2));
+        assert_eq!(reranked.first().map(|n| n.id), Some(keyed.id));
+        assert_eq!(ids(&reranked[1..]), vec![plain[2].id, plain[1].id]);
         let _ = std::fs::remove_file(&socket);
         cleanup(&path, conn);
     }
