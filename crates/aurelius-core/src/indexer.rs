@@ -10,36 +10,9 @@ pub struct IndexResult {
     pub project_name: String,
     pub crates_found: usize,
     pub files_indexed: usize,
-    pub dependencies_found: usize,
     pub nodes_created: usize,
     pub nodes_updated: usize,
     pub nodes_removed: usize,
-}
-
-/// Auto-index the project at `path` if it hasn't been indexed yet.
-/// Returns true if indexing was performed, false if project already existed.
-pub fn ensure_indexed(conn: &rusqlite::Connection, path: &Path) -> Result<bool> {
-    let path = match path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => return Ok(false),
-    };
-    let project_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-
-    // Already indexed?
-    if graph::find_project_by_label(conn, project_name)?.is_some() {
-        return Ok(false);
-    }
-
-    // Has Cargo.toml or package.json? If not, not a project root — skip.
-    if !path.join("Cargo.toml").exists() && !path.join("package.json").exists() {
-        return Ok(false);
-    }
-
-    index_project(conn, &path)?;
-    Ok(true)
 }
 
 pub fn index_project(conn: &rusqlite::Connection, path: &Path) -> Result<IndexResult> {
@@ -56,7 +29,6 @@ pub fn index_project(conn: &rusqlite::Connection, path: &Path) -> Result<IndexRe
         project_name: project_name.clone(),
         crates_found: 0,
         files_indexed: 0,
-        dependencies_found: 0,
         nodes_created: 0,
         nodes_updated: 0,
         nodes_removed: 0,
@@ -237,7 +209,6 @@ fn index_rust_crate(
     // Parse crate dependencies
     let crate_toml = crate_path.join("Cargo.toml");
     if crate_toml.exists() {
-        index_crate_dependencies(conn, &crate_toml, crate_node.id, project, result)?;
         index_file(conn, &crate_toml, crate_node.id, result)?;
     }
 
@@ -251,101 +222,6 @@ fn index_rust_crate(
     }
 
     Ok(())
-}
-
-/// Узел зависимости — свой у каждого проекта (ключ `dep:<проект>:<имя>`) и
-/// несёт то, что делает его записью, а не заглушкой: какие манифесты его
-/// просят и с каким требованием версии (`data.manifests`), плюс ребро
-/// `belongs_to` к проекту. Раньше узел искался по одной метке среди узлов
-/// любого типа и писался голым — без claim, без тела, с пустым `data`: 117
-/// таких на 19.09.2026, и четыре одноимённых `rust-embed` занимали места в
-/// выдаче по запросу про эмбеддинги. Без изменений в манифесте повторная
-/// индексация узел не переписывает.
-fn index_crate_dependencies(
-    conn: &rusqlite::Connection,
-    toml_path: &Path,
-    crate_id: uuid::Uuid,
-    (project_name, project_id): (&str, uuid::Uuid),
-    result: &mut IndexResult,
-) -> Result<()> {
-    let content = std::fs::read_to_string(toml_path)?;
-    let parsed: toml::Value = content.parse()?;
-    let manifest = toml_path.to_string_lossy().to_string();
-
-    if let Some(deps) = parsed.get("dependencies").and_then(|d| d.as_table()) {
-        for (dep_name, spec) in deps {
-            // Skip path dependencies (workspace members)
-            if spec.as_table().is_some_and(|t| t.contains_key("path")) {
-                continue;
-            }
-            let version = version_req(spec);
-            let key = format!("dep:{project_name}:{dep_name}");
-
-            let existing = graph::find_node_by_data_field(conn, "key", &key)?;
-            let mut manifests = existing
-                .as_ref()
-                .and_then(|n| n.data.get("manifests"))
-                .and_then(|m| m.as_object())
-                .cloned()
-                .unwrap_or_default();
-            let dep_id = match existing {
-                Some(node)
-                    if manifests.get(&manifest).and_then(|v| v.as_str()) == Some(&version) =>
-                {
-                    node.id
-                }
-                _ => {
-                    manifests.insert(manifest.clone(), version.into());
-                    let mut data = serde_json::Map::new();
-                    data.insert("project".to_owned(), project_name.into());
-                    data.insert("manifests".to_owned(), manifests.into());
-                    let (node, created, _) = graph::upsert_node_by_key(
-                        conn,
-                        &key,
-                        NodeType::Dependency,
-                        Some(NodeType::Dependency),
-                        dep_name,
-                        None,
-                        "indexer",
-                        data,
-                        MemoryKind::Semantic,
-                    )?;
-                    if created {
-                        result.nodes_created += 1;
-                    } else {
-                        result.nodes_updated += 1;
-                    }
-                    node.id
-                }
-            };
-
-            // Повтор безвреден: на (from, to, relation) уникальный индекс,
-            // add_edge вставляет через OR IGNORE.
-            graph::add_edge(conn, crate_id, dep_id, Relation::DependsOn, 1.0)?;
-            graph::add_edge(conn, dep_id, project_id, Relation::BelongsTo, 1.0)?;
-            result.dependencies_found += 1;
-        }
-    }
-
-    Ok(())
-}
-
-/// Требование версии так, как его записал манифест: строка (`"1.0"`), поле
-/// `version` таблицы, `workspace` — версия в корне рабочего пространства,
-/// `git:<url>` — зависимость из репозитория; иначе пустая строка.
-fn version_req(spec: &toml::Value) -> String {
-    let Some(table) = spec.as_table() else {
-        return spec.as_str().unwrap_or_default().to_owned();
-    };
-    if let Some(version) = table.get("version").and_then(|v| v.as_str()) {
-        version.to_owned()
-    } else if table.get("workspace").and_then(|w| w.as_bool()) == Some(true) {
-        "workspace".to_owned()
-    } else if let Some(git) = table.get("git").and_then(|g| g.as_str()) {
-        format!("git:{git}")
-    } else {
-        String::new()
-    }
 }
 
 fn index_file(
@@ -507,7 +383,6 @@ mod tests {
             project_name: "переезжающий".to_owned(),
             crates_found: 0,
             files_indexed: 0,
-            dependencies_found: 0,
             nodes_created: 0,
             nodes_updated: 0,
             nodes_removed: 0,
@@ -532,70 +407,4 @@ mod tests {
         );
     }
 
-    /// Зависимость — не голая заглушка: чей манифест её просит, с каким
-    /// требованием версии, и ребро к проекту. Повторная индексация узлов не
-    /// плодит.
-    #[test]
-    fn a_dependency_carries_its_manifest_and_hangs_on_its_project() {
-        let tmp = TmpDb::new();
-        let conn = db::open(&tmp.0).expect("open temp db");
-        let dir = std::env::temp_dir()
-            .join(format!("aurelius-indexer-deps-{}", uuid::Uuid::new_v4()))
-            .join("демо-проект");
-        std::fs::create_dir_all(dir.join("src")).expect("каталог проекта");
-        std::fs::write(
-            dir.join("Cargo.toml"),
-            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
-             serde = \"1.0\"\ntokio = { version = \"1\", features = [\"rt\"] }\n\
-             shared = { workspace = true }\nlocal = { path = \"../local\" }\n",
-        )
-        .expect("манифест");
-        std::fs::write(dir.join("src/lib.rs"), "").expect("lib.rs");
-
-        index_project(&conn, &dir).expect("первая индексация");
-        let again = index_project(&conn, &dir).expect("повторная индексация");
-        assert_eq!(
-            (again.nodes_created, again.nodes_updated),
-            (0, 0),
-            "неизменный манифест не переписывает ни одного узла"
-        );
-
-        let deps = graph::get_nodes_by_type(&conn, &NodeType::Dependency).expect("зависимости");
-        assert_eq!(
-            deps.len(),
-            3,
-            "path-зависимость пропускается, повтор не плодит узлов"
-        );
-        let manifest = dir
-            .canonicalize()
-            .expect("канонический путь")
-            .join("Cargo.toml")
-            .to_string_lossy()
-            .to_string();
-        let version = |name: &str| {
-            deps.iter()
-                .find(|n| n.label == name)
-                .and_then(|n| n.data["manifests"][manifest.as_str()].as_str())
-                .map(str::to_owned)
-        };
-        assert_eq!(version("serde").as_deref(), Some("1.0"));
-        assert_eq!(version("tokio").as_deref(), Some("1"));
-        assert_eq!(version("shared").as_deref(), Some("workspace"));
-
-        let project = graph::find_project_by_label(&conn, "демо-проект")
-            .expect("поиск проекта")
-            .expect("узел проекта");
-        for dep in &deps {
-            assert!(
-                graph::find_edge(&conn, dep.id, project.id, &Relation::BelongsTo)
-                    .expect("поиск ребра")
-                    .is_some(),
-                "{} без ребра к проекту",
-                dep.label
-            );
-        }
-        if let Some(root) = dir.parent() {
-            let _ = std::fs::remove_dir_all(root);
-        }
-    }
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use aurelius_core::{graph, indexer, models::NodeType};
+use aurelius_core::{graph, models::NodeType};
 use rusqlite::Connection;
 use serde_json::json;
 
@@ -100,14 +100,6 @@ fn memory_status_with_conn(
         .get("full")
         .and_then(|f| f.as_bool())
         .unwrap_or(false);
-
-    // Auto-index current working directory if not yet indexed
-    if let Ok(cwd) = std::env::current_dir() {
-        // Opportunistic: a failed auto-index must not fail the status call.
-        if let Err(e) = indexer::ensure_indexed(conn, &cwd) {
-            tracing::warn!("could not auto-index {}: {e}", cwd.display());
-        }
-    }
 
     // US2: pull any pending sync updates for a shared project before reading
     // the graph below, so the response reflects the peer's latest work.

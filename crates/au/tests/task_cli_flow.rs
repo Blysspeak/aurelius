@@ -273,6 +273,17 @@ fn task_ripe_shows_task_and_decline_removes_it_from_the_list() {
     let evidence: serde_json::Value =
         serde_json::from_str(evidence_out.trim()).expect("JSON улики");
     assert_eq!(evidence["id"], id, "улика обязана уйти именно этой задаче");
+    // 28.09.2026: улика живёт в задаче, зеркальный узел прогона не заводится.
+    assert!(evidence.get("run_id").is_none(), "{evidence_out}");
+    let conn = aurelius_core::db::open(&home.0.join("aurelius.db")).expect("открыть базу");
+    let runs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE node_type = '\"run\"' AND deleted_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("счёт прогонов");
+    assert_eq!(runs, 0, "узел прогона не пишется");
 
     let (code, ripe_out, err) = run(&home, &["task", "ripe", "--project", project, "--json"]);
     assert_eq!(code, 0, "ripe: {ripe_out} {err}");

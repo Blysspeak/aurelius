@@ -16,36 +16,18 @@ use crate::{
 
 use aurelius_core::db::db_path;
 
-/// Open DB and auto-index current project if not yet indexed.
+/// Open DB. Nothing is indexed on the way: until 2026-09-28 this auto-indexed
+/// any cwd holding a Cargo.toml or package.json under its directory name, so
+/// every worktree and every /tmp test dir became a project with dozens of
+/// empty `file` nodes (208 of them in five days). Indexing is `au reindex`.
 fn open_and_ensure(path: &std::path::Path) -> Result<rusqlite::Connection> {
-    let conn = db::open(path)?;
-    if let Ok(cwd) = std::env::current_dir() {
-        if indexer::ensure_indexed(&conn, &cwd)? {
-            let name = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            eprintln!("✓ Auto-indexed project '{name}'");
-        }
-    }
-    Ok(conn)
+    Ok(db::open(path)?)
 }
 
 pub async fn init() -> Result<()> {
     let path = db_path();
-    let conn = db::open(&path)?;
-    // Auto-index current project
-    if let Ok(cwd) = std::env::current_dir() {
-        match indexer::ensure_indexed(&conn, &cwd) {
-            Ok(true) => {
-                let name = cwd.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                println!("✓ Aurelius initialized at {}", path.display());
-                println!("  Auto-indexed project '{name}'");
-            }
-            _ => {
-                println!("✓ Aurelius initialized at {}", path.display());
-            }
-        }
-    } else {
-        println!("✓ Aurelius initialized at {}", path.display());
-    }
+    db::open(&path)?;
+    println!("✓ Aurelius initialized at {}", path.display());
     println!("  Run 'au mcp' to start the MCP server for Claude Code.");
     Ok(())
 }
@@ -1342,11 +1324,10 @@ pub async fn reindex(path: Option<String>) -> Result<()> {
     let result = indexer::index_project(&conn, &project_root)?;
 
     println!(
-        "✓ Indexed '{}': {} crates, {} files, {} deps ({} created, {} updated, {} removed)",
+        "✓ Indexed '{}': {} crates, {} files ({} created, {} updated, {} removed)",
         result.project_name,
         result.crates_found,
         result.files_indexed,
-        result.dependencies_found,
         result.nodes_created,
         result.nodes_updated,
         result.nodes_removed
@@ -2348,7 +2329,9 @@ pub async fn task(action: TaskAction) -> Result<()> {
             command,
             exit,
             artifact,
-            subject,
+            // Still accepted from the ulika hook, no longer used: it only
+            // keyed the run node, which is not written since 28.09.2026.
+            subject: _,
             json: as_json,
         } => {
             // The run's real exit code feeds the judge as a `verify` trace of
@@ -2383,27 +2366,12 @@ pub async fn task(action: TaskAction) -> Result<()> {
                         graph::get_tasks_filtered(&conn, Some(project), Some("active"), None, 1)?;
                     match active.pop() {
                         Some(task) => task,
-                        // Отказ, но не потеря. Прогон состоялся, и его улика —
-                        // единственное, чего нельзя восстановить: артефакт
-                        // сотрут, код возврата не воспроизведёшь. Раньше здесь
-                        // стоял голый bail, и улика исчезала вместе с ним, а
-                        // вызывающий об этом не узнавал: `record-verify.mjs`
-                        // выбрасывает результат. Узел цепляется к проекту, если
-                        // узел проекта есть; иначе не пишется — прогон уже в
-                        // журнале вызывающего. Потом отказываем.
+                        // Отказ, но не потеря: прогон уже в журнале вызывающего.
+                        // Узел прогона не заводится (28.09.2026) — `au db prune`
+                        // всё равно снимал его как зеркало улики.
                         None => {
-                            let run = graph::link_evidence_run(
-                                &conn,
-                                None,
-                                Some(project),
-                                subject.as_deref(),
-                                &command,
-                                exit,
-                                artifact.as_deref(),
-                            )?;
                             return Err(graph::NoActiveTask {
                                 project: project.clone(),
-                                run,
                             }
                             .into());
                         }
@@ -2428,24 +2396,14 @@ pub async fn task(action: TaskAction) -> Result<()> {
             });
             let data = fields.merge_into(&task.data);
             graph::update_node(&conn, task.id, None, Some(data))?;
-            // Проект берётся из аргумента, а при вызове по id — из метки
-            // задачи (`[project] …`), чтобы поле стояло на КАЖДОЙ улике, а не
-            // только на тех, что пришли от хука с `--project`.
-            let run_project = project.clone().or_else(|| project_of_task(&task));
-            let run_id = graph::link_evidence_run(
-                &conn,
-                Some(task.id),
-                run_project.as_deref(),
-                subject.as_deref(),
-                &command,
-                exit,
-                artifact.as_deref(),
-            )?;
+            // Улика живёт в `data.evidence` задачи. Узел прогона с ребром
+            // `verified_by` больше не заводится (28.09.2026): это было её
+            // зеркало, и `au db prune` (TechnicalJunk) снимал его как мусор —
+            // писатель и уборщик спорили, база росла на ~60 узлов в день.
 
             if as_json {
                 let out = json!({
                     "id": task.id.to_string(),
-                    "run_id": run_id.map(|id| id.to_string()),
                     "command": command,
                     "exit_code": exit,
                 });

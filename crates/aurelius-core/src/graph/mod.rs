@@ -28,7 +28,7 @@ pub use session::*;
 pub use snapshot::*;
 pub use traverse::*;
 
-use crate::models::{Edge, MemoryKind, Node, NodeType, Relation};
+use crate::models::{Edge, MemoryKind, Node, NodeType};
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -43,131 +43,12 @@ use uuid::Uuid;
 /// по которому разведены [`LeaseError::NoTasksAvailable`] (10) и
 /// [`LeaseError::Busy`] (11).
 ///
-/// `run: None` — узла прогона нет вовсе: не было и узла проекта, к которому
-/// его прицепить (см. [`link_evidence_run`]).
+/// Узла прогона нет ни в каком случае: прогон уже лежит в журнале вызывающего
+/// (ulika), а с задачей — ещё и в её `data.evidence`.
 #[derive(Debug, thiserror::Error)]
-#[error("в проекте '{project}' нет активной задачи — {}", run_fate(.run))]
+#[error("в проекте '{project}' нет активной задачи — прогон остался в журнале вызывающего")]
 pub struct NoActiveTask {
     pub project: String,
-    pub run: Option<uuid::Uuid>,
-}
-
-fn run_fate(run: &Option<uuid::Uuid>) -> String {
-    match run {
-        Some(run) => format!("улика привязана к проекту без задачи: {run}"),
-        None => "узла проекта нет, узел улики не заведён; прогон остался в журнале вызывающего"
-            .to_owned(),
-    }
-}
-
-/// Заводит узел прогона и связывает его с задачей ребром `verified_by`
-/// (спека 007, T013/T014, data-model.md «Ребро»). Улика внутри `data.evidence`
-/// задачи — для быстрого чтения без обхода графа; этот узел и ребро — для
-/// обратного пути: от прогона к задаче, которую он подтвердил.
-///
-/// `task_id: None` — в проекте нет активной задачи. Тогда узел цепляется
-/// ребром `belongs_to` к УЖЕ существующему узлу проекта, а если такого нет
-/// (или проект не назван) — не пишется вовсе, `Ok(None)`. Раньше он писался
-/// без единого ребра: 19.09.2026 таких сирот было 81 из 401, ни одна
-/// выборка через граф их не находила. Сам прогон при этом не теряется —
-/// команда, код возврата, артефакт и `subject` уже лежат в журнале
-/// вызывающего (ulika). Узел проекта здесь не заводится: пустая заглушка
-/// проекта — тот же мусор, только другого типа.
-///
-/// Пишется через `upsert_node_by_key` (`crud.rs:128`), а не голым `add_node`:
-/// без ключа один и тот же прогон, повторённый N раз, заводил бы N узлов
-/// (измерено 16.09.2026: 4119 таких узлов из 25707, 2916 — дубликаты по
-/// метке). Ключ — обязательно с префиксом `run:`: `upsert_node_by_key` ищет
-/// совпадение только по значению `key` (`find_node_by_data_field`,
-/// `crud.rs:504`), без фильтра по типу или источнику — `expected_type:
-/// Some(NodeType::Run)` здесь ровно затем, чтобы совпадение по ключу с узлом
-/// чужого типа было отказом, а не тихой перезаписью чужой записи узлом
-/// прогона. Ключ без своего пространства имён мог бы случайно совпасть с
-/// чужим. `subject` — уже нормализованный хуком адрес прогона
-/// (`<project>:verify:<key>`); без него (вызов не от хука) в ключ идут
-/// проект и команда — обе формы всё равно живут под одним префиксом.
-pub fn link_evidence_run(
-    conn: &rusqlite::Connection,
-    task_id: Option<Uuid>,
-    project: Option<&str>,
-    subject: Option<&str>,
-    command: &str,
-    exit_code: i64,
-    artifact: Option<&str>,
-) -> anyhow::Result<Option<Uuid>> {
-    let project_node = match (task_id, project) {
-        (Some(_), _) => None,
-        (None, Some(project)) => match crud::find_project_by_label(conn, project)? {
-            Some(node) => Some(node.id),
-            None => return Ok(None),
-        },
-        (None, None) => return Ok(None),
-    };
-    let label = format!("прогон: {command}");
-    let key = match subject {
-        Some(subject) => format!("run:{subject}"),
-        None => format!("run:{}:{command}", project.unwrap_or("")),
-    };
-    let now = Utc::now();
-
-    // `upsert_node_by_key` заменяет `data` целиком — счётчик и первая метка
-    // времени читаются из старой записи ДО вызова и переносятся руками,
-    // иначе повтор сбрасывал бы счётчик на единицу и весь смысл схлопывания
-    // терялся.
-    let existing = crud::find_node_by_data_field(conn, "key", &key)?;
-    let run_count = existing
-        .as_ref()
-        .and_then(|n| n.data.get("run_count"))
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0)
-        + 1;
-    let first_seen_at = existing
-        .as_ref()
-        .and_then(|n| n.data.get("first_seen_at"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| now.to_rfc3339());
-
-    let mut data = serde_json::Map::new();
-    // Командой служит сама команда — улика, а не её адрес: `subject` лишь
-    // указывает, куда положить узел, и не подменяет собой то, что реально
-    // выполнялось.
-    data.insert("command".to_owned(), serde_json::json!(command));
-    data.insert("artifact".to_owned(), serde_json::json!(artifact));
-    data.insert("project".to_owned(), serde_json::json!(project));
-    data.insert("subject".to_owned(), serde_json::json!(subject));
-    // Провенанс прогона не спрашивается у вызывающего, а выводится: раз
-    // улика существует, прогон состоялся, командой служит он сам. Просить
-    // хук передать `--confidence measured` значило бы просить его ввести
-    // то, что уже известно отсюда.
-    data.insert("confidence".to_owned(), serde_json::json!("measured"));
-    data.insert("evidence".to_owned(), serde_json::json!(command));
-    data.insert("run_count".to_owned(), serde_json::json!(run_count));
-    data.insert("first_seen_at".to_owned(), serde_json::json!(first_seen_at));
-    data.insert(
-        "last_seen_at".to_owned(),
-        serde_json::json!(now.to_rfc3339()),
-    );
-    data.insert("last_exit_code".to_owned(), serde_json::json!(exit_code));
-
-    let (run, _created, _replaced) = crud::upsert_node_by_key(
-        conn,
-        &key,
-        NodeType::Run,
-        Some(NodeType::Run),
-        &label,
-        None,
-        "au-task-evidence",
-        data,
-        MemoryKind::Semantic,
-    )?;
-    if let Some(task_id) = task_id {
-        crud::add_edge(conn, task_id, run.id, Relation::VerifiedBy, 1.0)?;
-    }
-    if let Some(project_id) = project_node {
-        crud::add_edge(conn, run.id, project_id, Relation::BelongsTo, 1.0)?;
-    }
-    Ok(Some(run.id))
 }
 
 /// Заводит координату секрета — узел `Config` с признаком `kind: "secret_ref"`
