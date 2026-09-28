@@ -9,8 +9,9 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::{
-    apply_probe_stale, edge_brief, node_detail, node_hit, open_db, parse_node_type, parse_relation,
-    parse_since, probe_stale_notes, query_vector_for_topic, resolve_node, resolve_task_node,
+    apply_probe_stale, drop_empty_fields, edge_brief, node_detail, node_hit, open_db,
+    parse_node_type, parse_relation, parse_since, probe_stale_notes, query_vector_for_topic,
+    resolve_node, resolve_task_node,
 };
 
 /// Бит-и-Дело, ступень 3: превратить recall в транзакцию. Отфильтровать
@@ -55,6 +56,24 @@ fn blocking_on(var: Option<&str>) -> bool {
 const SEARCH_DEFAULT_LIMIT: u64 = 5;
 
 pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
+    let conn = open_db()?;
+    memory_search_with_conn(&conn, params)
+}
+
+/// Тело `memory_search` с явным соединением — тот же приём тестируемости,
+/// что и у `memory_context_with_conn`.
+fn memory_search_with_conn(
+    conn: &rusqlite::Connection,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    // `id` — отдельная дверь, не второй параметр поиска: задача 05875738.
+    // Проверяется ПЕРВЫМ, до `query`, ровно затем, чтобы `query` не был
+    // обязателен при вызове с `id` (схема в tools.rs это отражает — `query`
+    // ушёл из `required`).
+    if let Some(id) = params.get("id").and_then(|v| v.as_str()) {
+        return memory_search_by_id(conn, id);
+    }
+
     let query = params
         .get("query")
         .and_then(|q| q.as_str())
@@ -66,10 +85,9 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     let type_filter = params.get("type").and_then(|t| t.as_str());
     let since = params.get("since").and_then(|s| s.as_str());
 
-    let conn = open_db()?;
     let node_type = type_filter.map(parse_node_type);
     let (outcome, vector_notice) = search_outcome(
-        &conn,
+        conn,
         query,
         limit,
         node_type.as_ref(),
@@ -77,7 +95,7 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     )?;
     let hint = outcome.diagnosis();
     let unmatched = outcome.unmatched_terms;
-    let (route, mut nodes) = route_subject(&conn, query, node_type.as_ref(), outcome.nodes, limit)?;
+    let (route, mut nodes) = route_subject(conn, query, node_type.as_ref(), outcome.nodes, limit)?;
 
     if let Some(since_str) = since {
         if let Some(cutoff_time) = parse_since(since_str) {
@@ -86,9 +104,9 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
     }
 
     let session_id = super::super::session_for(params);
-    let corrections = instrument_recall(&conn, query, &session_id, &nodes);
+    let corrections = instrument_recall(conn, query, &session_id, &nodes);
 
-    Ok(json!({
+    let mut envelope = json!({
         "query": query,
         "route": route,
         "type": type_filter,
@@ -103,8 +121,43 @@ pub fn memory_search(params: &serde_json::Value) -> Result<serde_json::Value> {
         // потребитель JSON видит деградацию, а не только человек (spec.md,
         // ограничение №2).
         "vector_notice": vector_notice,
-        "results": search_hits(&conn, &nodes, query),
-    }))
+        "results": search_hits(conn, &nodes, query),
+    });
+    // `count` уже говорит "находок нет" числом — снятие `results: []` рядом с
+    // ним не теряет информацию. То же снятие, что и на каждой находке внутри
+    // (`node_hit`), один и тот же смысл: пустое поле не стоит символов.
+    drop_empty_fields(&mut envelope);
+    Ok(envelope)
+}
+
+/// `memory_search(id=...)` — вся запись целиком по точному id или subject,
+/// не через шелл к `au recall`. Задача 05875738: у MCP не было двери,
+/// которая по id отдаёт `node_detail` одной записи — `memory_recall`/
+/// `memory_context` идут через обход и FTS, id там не индексирован.
+///
+/// Тот же поиск, что и в `au recall` (`crates/au/src/commands.rs::recall`),
+/// не вторая копия: UUID — напрямую в `graph::get_node`, что угодно ещё —
+/// точное совпадение по `subject` через `graph::find_nodes_by_data_field`
+/// (лимит 1: та же сортировка `created_at DESC`, что и в CLI, так что
+/// «первый» там и «единственный» здесь — одна и та же запись). Никакого
+/// нечёткого совпадения, в отличие от `resolve_node` — промах есть промах.
+fn memory_search_by_id(conn: &rusqlite::Connection, id: &str) -> Result<serde_json::Value> {
+    let node = if let Ok(uuid) = id.parse::<Uuid>() {
+        graph::get_node(conn, &uuid.to_string())?
+    } else {
+        graph::find_nodes_by_data_field(conn, provenance::SUBJECT_KEY, id, 1)?
+            .into_iter()
+            .next()
+    };
+    let node = node.ok_or_else(|| anyhow::anyhow!("no node with id or subject '{id}'"))?;
+
+    let mut record = node_detail(&node);
+    apply_probe_stale(
+        &mut record,
+        "/provenance/stale",
+        &probe_stale_notes(conn, &[&node]),
+    );
+    Ok(record)
 }
 
 /// Render search hits, with one probe read for the whole list: a hit whose
@@ -121,6 +174,9 @@ fn search_hits(
         .map(|n| {
             let mut hit = node_hit(n, query);
             apply_probe_stale(&mut hit, "/stale", &notes);
+            // Last step, on purpose: `apply_probe_stale` still needed the
+            // `/stale` slot to exist (even as `null`) to overwrite it above.
+            drop_empty_fields(&mut hit);
             hit
         })
         .collect()
@@ -1147,5 +1203,154 @@ mod tests {
             !result["truncation"]["how_to_see_more"].is_null(),
             "обязан быть указан способ достать скрытое: {result:?}"
         );
+    }
+
+    // -- memory_search: no null/empty keys, `id` reads the whole record -----
+
+    /// (a) Ни на находке, ни на конверте `memory_search` не остаётся ключа
+    /// со значением `null`, `[]` или `{}`. Общая гарантия, а не список
+    /// поимённо: измерение 28.09.2026 (`aletix sieve`, 5 находок) — 2366
+    /// символов при `corrections: []`, `query_hint: null`, `claim: null` на
+    /// каждой находке без своего `claim`.
+    #[test]
+    fn search_hits_carry_no_null_or_empty_key() {
+        let (_tmp, conn) = setup();
+        // Ни claim, ни subject, ни evidence — ровно тот узел, что раньше
+        // отдавал больше всего пустых ключей.
+        let bare = seed(&conn, NodeType::Concept, "лебедь без provenance");
+        let node = graph::get_node(&conn, &bare.to_string())
+            .expect("get")
+            .expect("node");
+        let hits = search_hits(&conn, &[node], "лебедь");
+        let hit = &hits[0];
+        for (key, value) in hit.as_object().expect("hit — объект") {
+            let empty = value.is_null()
+                || matches!(value, serde_json::Value::Array(a) if a.is_empty())
+                || matches!(value, serde_json::Value::Object(o) if o.is_empty());
+            assert!(!empty, "пустой ключ {key} не должен присутствовать: {hit}");
+        }
+    }
+
+    #[test]
+    fn memory_search_envelope_carries_no_null_or_empty_key() {
+        let (_tmp, conn) = setup();
+        seed(&conn, NodeType::Concept, "гагара без типа и без since");
+        // Без `type`/`since` в вызове — оба поля пусты в ответе, и оба
+        // обязаны исчезнуть вместе со всем остальным пустым.
+        let result =
+            memory_search_with_conn(&conn, &json!({"query": "гагара"})).expect("memory_search");
+        for (key, value) in result.as_object().expect("envelope — объект") {
+            let empty = value.is_null()
+                || matches!(value, serde_json::Value::Array(a) if a.is_empty())
+                || matches!(value, serde_json::Value::Object(o) if o.is_empty());
+            assert!(!empty, "пустой ключ {key} не должен присутствовать: {result}");
+        }
+        assert_eq!(result["count"], json!(1), "count остаётся, даже будучи 0 — это не 'пусто'");
+    }
+
+    /// (b) `id` — точный UUID — отдаёт всю запись: note, data, provenance
+    /// (внутри которого confidence и subject), created_at. Ровно то, что
+    /// возвращает `node_detail` — тот же рендерер, что и у `au recall`.
+    #[test]
+    fn memory_search_by_uuid_returns_the_whole_record() {
+        let (_tmp, conn) = setup();
+        let node = graph::add_node_full(
+            &conn,
+            NodeType::Decision,
+            "решение про морж",
+            Some("длинная заметка про морж, которую находка бы обрезала"),
+            "test",
+            json!({
+                "claim": "морж живёт на льдине",
+                "confidence": "measured",
+                "evidence": "cargo test",
+                "subject": "zoo:walrus:habitat",
+            }),
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("add node");
+
+        let result = memory_search_with_conn(&conn, &json!({"id": node.id.to_string()}))
+            .expect("memory_search by id");
+
+        assert_eq!(result["id"], json!(node.id.to_string()));
+        assert_eq!(
+            result["note"],
+            json!("длинная заметка про морж, которую находка бы обрезала")
+        );
+        assert_eq!(result["data"]["claim"], json!("морж живёт на льдине"));
+        assert_eq!(result["provenance"]["confidence"], json!("measured"));
+        assert_eq!(result["provenance"]["subject"], json!("zoo:walrus:habitat"));
+        assert!(result["created_at"].as_str().is_some());
+    }
+
+    /// (c) `id` — точный `subject`, не UUID — тот же путь у `au recall`:
+    /// `graph::find_nodes_by_data_field` по `subject`, не полнотекстовый
+    /// поиск.
+    #[test]
+    fn memory_search_by_exact_subject_returns_it() {
+        let (_tmp, conn) = setup();
+        let node = graph::add_node_full(
+            &conn,
+            NodeType::Decision,
+            "решение про нарвал",
+            None,
+            "test",
+            json!({"subject": "zoo:narwhal:tusk", "confidence": "reported"}),
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("add node");
+
+        let result = memory_search_with_conn(&conn, &json!({"id": "zoo:narwhal:tusk"}))
+            .expect("memory_search by subject");
+
+        assert_eq!(result["id"], json!(node.id.to_string()));
+        assert_eq!(result["provenance"]["subject"], json!("zoo:narwhal:tusk"));
+    }
+
+    /// (d) Промах по `id` — явная ошибка вызова, не сосед по смыслу: ни
+    /// `resolve_node`, ни полнотекстовый посев здесь не участвуют.
+    #[test]
+    fn memory_search_by_unknown_id_is_a_clear_miss() {
+        let (_tmp, conn) = setup();
+        seed(&conn, NodeType::Decision, "морж не тот, кого ищут");
+
+        let err = memory_search_with_conn(
+            &conn,
+            &json!({"id": "zoo:no-such-subject", "query": "морж"}),
+        )
+        .expect_err("неизвестный id обязан быть ошибкой, не находкой по query");
+        assert!(
+            err.to_string().contains("zoo:no-such-subject"),
+            "{err}"
+        );
+    }
+
+    /// `id` игнорирует `query`: даже если `query` указывает на другой узел,
+    /// ответ — ровно тот узел, что назван `id`.
+    #[test]
+    fn memory_search_by_id_ignores_query() {
+        let (_tmp, conn) = setup();
+        let target = graph::add_node_full(
+            &conn,
+            NodeType::Decision,
+            "цель по id",
+            None,
+            "test",
+            json!({"subject": "zoo:target"}),
+            MemoryKind::Semantic,
+            None,
+        )
+        .expect("target");
+        seed(&conn, NodeType::Decision, "морж — то, что искал бы query");
+
+        let result = memory_search_with_conn(
+            &conn,
+            &json!({"id": "zoo:target", "query": "морж"}),
+        )
+        .expect("memory_search by id ignoring query");
+        assert_eq!(result["id"], json!(target.id.to_string()));
     }
 }

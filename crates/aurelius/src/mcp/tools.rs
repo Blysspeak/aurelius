@@ -74,13 +74,17 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "memory_search",
-                "description": "Full-text search across the knowledge graph using FTS5. Use empty string or '*' to list recent nodes. Supports optional type filtering. Each hit is a summary, not the record: id, type, label (dropped when it only repeats the claim), claim, created_at as a date, confidence, subject, stale, and a window around the match when the claim is empty. The whole record (note, data, provenance) is read by id: `au recall <id>`.",
+                "description": "Full-text search across the knowledge graph using FTS5. Use empty string or '*' to list recent nodes. Supports optional type filtering. Each hit is a summary, not the record: id, type, label (dropped when it only repeats the claim), claim, created_at as a date, confidence, subject, stale, and a window around the match when the claim is empty — any of these that would be null or empty is left out entirely, on the hit and on the envelope alike. Pass `id` (a node UUID, or the exact `subject` a fact was written with) to read one whole record instead — note, data, provenance, created_at, confidence, subject, all of it: `query` is then ignored, and an unknown id is a clear miss, never a fuzzy neighbour. That is now how the whole record is read — not with `au recall`, which stays a CLI-only tool.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "FTS5 search query. Use empty string or '*' to list most recent nodes."
+                            "description": "FTS5 search query. Use empty string or '*' to list most recent nodes. Ignored when 'id' is given."
+                        },
+                        "id": {
+                            "type": "string",
+                            "description": "Node UUID, or the exact subject a fact was written with. When set, returns that one whole record (note, data, provenance, created_at, confidence, subject) and ignores 'query'; an unknown id or subject is a clear miss, never a fuzzy match."
                         },
                         "type": {
                             "type": "string",
@@ -100,7 +104,7 @@ pub fn tool_definitions() -> serde_json::Value {
                             "description": "Calling session's identity, used for query-correction telemetry (which pathways this session's recalls take). Defaults to a placeholder when omitted."
                         }
                     },
-                    "required": ["query"]
+                    "required": []
                 }
             },
             {
@@ -598,7 +602,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "task_list",
-                "description": "List tasks with filters by project, status, and priority. Sorted by priority (critical first), then by creation date. Shows work log count per task, plus each task's activated_at/closed_at timestamps, resolution (how it was solved: commit, PR, files, confirmed), an evidence summary (total runs recorded, how many passed, and the latest passing one — the full run-by-run array with commands, timestamps and artifact paths is only in task_view), and the derived 'ripe' flag — true when an active task has passing evidence newer than its last edit and is ready to present for closing. full_notes=true returns each note in full instead of truncated to the usual budget.",
+                "description": "List tasks with filters by project, status, and priority. Sorted by priority (critical first), then by creation date. Compact by default: id, label, status, priority, a short date, a tightly-clipped note, work_logs, ripe, and evidence only when there is any — any field that would be null or empty (activated_at, closed_at, resolution, evidence) is left out entirely. Pass full=true for the historical shape instead: authors, full RFC3339 timestamps, a wider note budget, and every field present even when null. full_notes=true (works with either mode) returns each note in full instead of truncated to the usual budget. The derived 'ripe' flag is true when an active task has passing evidence newer than its last edit and is ready to present for closing; evidence is a summary (total runs, how many passed, the latest passing one) — the full run-by-run array with commands, timestamps and artifact paths is only in task_view.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -618,6 +622,11 @@ pub fn tool_definitions() -> serde_json::Value {
                             "type": "integer",
                             "description": "Max results (default: 20)",
                             "default": 20
+                        },
+                        "full": {
+                            "type": "boolean",
+                            "description": "Return the historical per-task shape (authors, full RFC3339 timestamps, a wider note budget, every field present even when null) instead of the compact default.",
+                            "default": false
                         },
                         "full_notes": {
                             "type": "boolean",
