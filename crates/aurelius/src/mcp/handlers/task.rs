@@ -7,8 +7,8 @@ use aurelius_core::{
 use serde_json::json;
 
 use super::{
-    apply_probe_stale, node_compact, node_detail, open_db, probe_stale_notes, resolve_task_node,
-    truncate,
+    apply_probe_stale, drop_empty_fields, node_compact, node_detail, open_db, probe_stale_notes,
+    resolve_task_node, truncate,
 };
 
 pub fn task_create(params: &serde_json::Value) -> Result<serde_json::Value> {
@@ -316,6 +316,23 @@ fn task_update_with_conn(
 /// (`TASK_VIEW_NOTE_BUDGET`), тем же способом.
 const TASK_LIST_NOTE_BUDGET: usize = 200;
 
+/// Бюджет `note` в КОМПАКТНОМ (дефолтном) режиме `task_list` — туже, чем
+/// `TASK_LIST_NOTE_BUDGET`, потому что компакт снимает не только это: та же
+/// логика, что у `memory_status` (`status.rs`, `compact_node_json` против
+/// `full=true`) — компакт стал дефолтом там, где полная форма уже не
+/// помещалась в ответ, который кто-то читает целиком. Измерено 28.09.2026,
+/// `au mcp` по живому графу: `task_list` без `full` весил 15788 символов на
+/// проекте aurelius, 15675 на xhub, 14480 на boostix при дефолтном
+/// `limit=20` — на порядок выше того самого 6K-порога из задачи.
+///
+/// На тех же трёх проектах компакт (этот бюджет плюс снятие авторов/`null`,
+/// короткая дата, `evidence` без `artifact`) даёт 7598/7811/6788 —
+/// заметное сокращение (~50%), но НЕ ниже 6K на aurelius и xhub: самое
+/// тяжёлое поле строки там не note, а метка задачи (~94 символа в среднем на
+/// живом графе), и метку компакт намеренно не режет — это единственный
+/// способ узнать со стороны, какая это задача, без похода в `task_view`.
+const TASK_LIST_COMPACT_NOTE_BUDGET: usize = 40;
+
 pub fn task_list(params: &serde_json::Value) -> Result<serde_json::Value> {
     let conn = open_db()?;
     task_list_with_conn(&conn, params)
@@ -333,11 +350,19 @@ fn task_list_with_conn(
     let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
     // Опция для того самого маленького аудитора, которому 17 вызовов
     // `task_view` подряд не по карману: заметки целиком прямо в списке,
-    // без похода за каждой отдельно. По умолчанию — прежнее поведение.
+    // без похода за каждой отдельно. Значение только внутри полной формы
+    // (`full=true`) — компакт режет note своим, более тугим бюджетом
+    // независимо от этого флага.
     let full_notes = params
         .get("full_notes")
         .and_then(|f| f.as_bool())
         .unwrap_or(false);
+    // Компакт — дефолт, та же причина, что и у `memory_status`: историческая
+    // форма (авторы, полные метки времени, `null` на каждом незаполненном
+    // поле) на живом графе стоила на порядок больше бюджета одного чтения
+    // (см. `TASK_LIST_COMPACT_NOTE_BUDGET`). `full=true` сохраняет ту форму
+    // побайтово — ничего в её полях не переименовано и не убрано.
+    let full = params.get("full").and_then(|f| f.as_bool()).unwrap_or(false);
 
     let tasks = graph::get_tasks_filtered(conn, project, status, priority, limit)?;
 
@@ -366,39 +391,11 @@ fn task_list_with_conn(
             let fields = aurelius_core::tasks::TaskFields::from_data(&t.data);
             let ripe = aurelius_core::tasks::is_ripe(&fields, status);
 
-            // full_notes=true — note целиком, без урезания и без пометки
-            // усечения; иначе поведение то же, что было всегда.
-            let note = if full_notes {
-                t.note.clone()
+            if full {
+                task_item_full(t, &fields, status, ripe, log_count, full_notes)
             } else {
-                t.note
-                    .as_deref()
-                    .map(|n| graph::clip(n, TASK_LIST_NOTE_BUDGET))
-            };
-            let note_truncated = !full_notes && note.as_deref().is_some_and(|n| n.ends_with('…'));
-
-            // Сводка, не журнал прогонов целиком: полный массив с командами,
-            // временами и путями к артефактам остаётся только у `task_view`
-            // (см. `evidence_summary` в aurelius-core).
-            let evidence = aurelius_core::tasks::evidence_summary(&fields);
-
-            json!({
-                "id": t.id.to_string(),
-                "label": t.label,
-                "status": status,
-                "priority": t.data.get("priority").and_then(|p| p.as_str()).unwrap_or("medium"),
-                "work_logs": log_count,
-                "created_at": t.created_at.to_rfc3339(),
-                "note": note,
-                "note_truncated": note_truncated,
-                "created_by": t.created_by,
-                "updated_by": t.updated_by,
-                "activated_at": fields.activated_at.map(|d| d.to_rfc3339()),
-                "closed_at": fields.closed_at.map(|d| d.to_rfc3339()),
-                "resolution": fields.resolution,
-                "evidence": evidence,
-                "ripe": ripe,
-            })
+                task_item_compact(t, &fields, status, ripe, log_count, full_notes)
+            }
         })
         .collect();
 
@@ -413,9 +410,115 @@ fn task_list_with_conn(
         // Честный отчёт об урезании note — тот же принцип, что и в task_view:
         // молчаливая обрезка неотличима от короткого текста, значит нужно
         // сказать вслух бюджет и куда идти за полным текстом.
-        "note_char_budget": TASK_LIST_NOTE_BUDGET,
-        "how_to_see_full_note": "task_view с id этой задачи возвращает note целиком, без урезания; либо этот же вызов с full_notes=true отдаёт note целиком сразу для всех задач списка",
+        "note_char_budget": if full { TASK_LIST_NOTE_BUDGET } else { TASK_LIST_COMPACT_NOTE_BUDGET },
+        "how_to_see_full_note": "task_view with a task id returns its full notes and evidence runs; task_list(full=true) keeps the historical per-task shape (authors, full timestamps, full note budget), full_notes=true on top of that returns each note whole",
     }))
+}
+
+/// Историческая форма одной задачи в `task_list` — побайтово то же, что было
+/// до компактного режима: полные временные метки, авторы, `null` там, где
+/// поле не заполнено. Живёт только под `full=true`.
+fn task_item_full(
+    t: &aurelius_core::models::Node,
+    fields: &aurelius_core::tasks::TaskFields,
+    status: &str,
+    ripe: bool,
+    log_count: i64,
+    full_notes: bool,
+) -> serde_json::Value {
+    // full_notes=true — note целиком, без урезания и без пометки усечения;
+    // иначе поведение то же, что было всегда.
+    let note = if full_notes {
+        t.note.clone()
+    } else {
+        t.note
+            .as_deref()
+            .map(|n| graph::clip(n, TASK_LIST_NOTE_BUDGET))
+    };
+    let note_truncated = !full_notes && note.as_deref().is_some_and(|n| n.ends_with('…'));
+
+    // Сводка, не журнал прогонов целиком: полный массив с командами,
+    // временами и путями к артефактам остаётся только у `task_view`
+    // (см. `evidence_summary` в aurelius-core).
+    let evidence = aurelius_core::tasks::evidence_summary(fields);
+
+    json!({
+        "id": t.id.to_string(),
+        "label": t.label,
+        "status": status,
+        "priority": t.data.get("priority").and_then(|p| p.as_str()).unwrap_or("medium"),
+        "work_logs": log_count,
+        "created_at": t.created_at.to_rfc3339(),
+        "note": note,
+        "note_truncated": note_truncated,
+        "created_by": t.created_by,
+        "updated_by": t.updated_by,
+        "activated_at": fields.activated_at.map(|d| d.to_rfc3339()),
+        "closed_at": fields.closed_at.map(|d| d.to_rfc3339()),
+        "resolution": fields.resolution,
+        "evidence": evidence,
+        "ripe": ripe,
+    })
+}
+
+/// Компактная (дефолтная) форма одной задачи: та же тримка, что
+/// `compact_node_json` в `status.rs` применяет к узлу — короткая дата вместо
+/// RFC3339, без авторов, `evidence` только когда в ней вообще что-то есть, а
+/// пустые/`null` поля (`activated_at`, `closed_at`, `resolution`, когда их
+/// нет) снимаются целиком через [`drop_empty_fields`], а не остаются как
+/// `null`. `full_notes=true` работает и здесь, независимо от `full`: note
+/// целиком, но остальные поля — всё так же в компактной форме.
+fn task_item_compact(
+    t: &aurelius_core::models::Node,
+    fields: &aurelius_core::tasks::TaskFields,
+    status: &str,
+    ripe: bool,
+    log_count: i64,
+    full_notes: bool,
+) -> serde_json::Value {
+    let note = if full_notes {
+        t.note.clone()
+    } else {
+        t.note
+            .as_deref()
+            .map(|n| graph::clip(n, TASK_LIST_COMPACT_NOTE_BUDGET))
+    };
+    let note_truncated = !full_notes && note.as_deref().is_some_and(|n| n.ends_with('…'));
+
+    let mut v = json!({
+        "id": t.id.to_string(),
+        "label": t.label,
+        "status": status,
+        "priority": t.data.get("priority").and_then(|p| p.as_str()).unwrap_or("medium"),
+        "date": t.created_at.format("%Y-%m-%d").to_string(),
+        "work_logs": log_count,
+        "note": note,
+        "note_truncated": note_truncated,
+        "activated_at": fields.activated_at.map(|d| d.to_rfc3339()),
+        "closed_at": fields.closed_at.map(|d| d.to_rfc3339()),
+        "resolution": fields.resolution,
+        "ripe": ripe,
+    });
+    let summary = aurelius_core::tasks::evidence_summary(fields);
+    if summary.total > 0 {
+        let mut evidence = json!(summary);
+        // `artifact`/`artifact_present` name a log FILE on disk — real
+        // value for `task_view` deciding whether to open it, dead weight in
+        // an overview of 20 tasks (a live "done" task with a green run
+        // carried both, ~110 bytes, in the 28.09.2026 measurement below).
+        // `command`/`exit_code`/`at` stay: that's the actual signal, "was it
+        // green and when".
+        if let Some(last_green) = evidence
+            .get_mut("last_green")
+            .and_then(|v| v.as_object_mut())
+        {
+            last_green.remove("artifact");
+            last_green.remove("artifact_present");
+        }
+        v["evidence"] = evidence;
+    }
+    drop_empty_fields(&mut v);
+    v
 }
 
 /// Созревшие задачи проекта — тот же выбор, что и `au task ripe`, доступный
@@ -1674,7 +1777,9 @@ mod tests {
 
     /// Длинная note обрезается по границе слова (через `graph::clip`, как и
     /// в `task_view`) и честно помечена: и по хвосту «…», и отдельным
-    /// булевым флагом, чтобы не гадать по внешнему виду строки.
+    /// булевым флагом, чтобы не гадать по внешнему виду строки. `full: true`
+    /// — историческая форма, та же, что тестировалась до компактного
+    /// дефолта; компактный дефолт покрыт отдельными тестами ниже.
     #[test]
     fn task_list_clips_long_note_at_word_boundary_and_reports_it() {
         let (_tmp, conn) = setup();
@@ -1682,8 +1787,8 @@ mod tests {
         let note = words.join(" ");
         seed_task_with_note(&conn, "proj-list-long", &note);
 
-        let result =
-            task_list_with_conn(&conn, &json!({"project": "proj-list-long"})).expect("task_list");
+        let result = task_list_with_conn(&conn, &json!({"project": "proj-list-long", "full": true}))
+            .expect("task_list");
 
         let task = &result["tasks"][0];
         let shown = task["note"].as_str().expect("note");
@@ -1712,7 +1817,8 @@ mod tests {
     }
 
     /// Асимметрия предыдущего теста: короткая note НЕ обрезается — ни хвоста
-    /// «…», ни `note_truncated: true` быть не должно.
+    /// «…», ни `note_truncated: true` быть не должно. Компактным дефолтом,
+    /// не `full`: короткая note короче ОБОИХ бюджетов, поведение то же.
     #[test]
     fn task_list_keeps_short_note_whole_and_unmarked() {
         let (_tmp, conn) = setup();
@@ -1764,36 +1870,63 @@ mod tests {
         assert_eq!(evidence["last_green"]["at"], json!("2026-08-30T10:00:00Z"));
     }
 
-    /// `full_notes=true` отдаёт note целиком прямо в списке: по умолчанию
-    /// поведение не меняется, обрезка та же, что и раньше.
+    /// `full_notes=true` отдаёт note целиком прямо в списке — что в
+    /// компактной форме (дефолт), что под `full=true`, только сам бюджет
+    /// обрезки без `full_notes` у них разный: компактный туже полного.
     #[test]
     fn task_list_full_notes_returns_note_whole() {
         let (_tmp, conn) = setup();
         let note = "a".repeat(400);
         seed_task_with_note(&conn, "proj-full-notes", &note);
 
-        let truncated = task_list_with_conn(&conn, &json!({"project": "proj-full-notes"}))
-            .expect("task_list default");
-        let truncated_task = &truncated["tasks"][0];
-        assert_eq!(truncated_task["note_truncated"], json!(true));
+        let compact_truncated = task_list_with_conn(&conn, &json!({"project": "proj-full-notes"}))
+            .expect("task_list default (compact)");
+        let compact_task = &compact_truncated["tasks"][0];
+        assert_eq!(compact_task["note_truncated"], json!(true));
+        let compact_len = compact_task["note"]
+            .as_str()
+            .expect("note")
+            .chars()
+            .count();
         assert!(
-            truncated_task["note"]
-                .as_str()
-                .expect("note")
-                .chars()
-                .count()
-                <= TASK_LIST_NOTE_BUDGET,
-            "по умолчанию note обязана резаться бюджетом"
+            compact_len <= TASK_LIST_COMPACT_NOTE_BUDGET,
+            "по умолчанию (компакт) note обязана резаться компактным бюджетом"
+        );
+
+        let full_truncated = task_list_with_conn(
+            &conn,
+            &json!({"project": "proj-full-notes", "full": true}),
+        )
+        .expect("task_list full");
+        let full_task = &full_truncated["tasks"][0];
+        assert_eq!(full_task["note_truncated"], json!(true));
+        let full_len = full_task["note"].as_str().expect("note").chars().count();
+        assert!(
+            full_len <= TASK_LIST_NOTE_BUDGET,
+            "full=true обязана резать полным бюджетом"
+        );
+        assert!(
+            full_len > compact_len,
+            "полный бюджет обязан быть шире компактного: {full_len} <= {compact_len}"
         );
 
         let whole = task_list_with_conn(
             &conn,
             &json!({"project": "proj-full-notes", "full_notes": true}),
         )
-        .expect("task_list full_notes");
+        .expect("task_list full_notes (компактная форма поля)");
         let whole_task = &whole["tasks"][0];
         assert_eq!(whole_task["note_truncated"], json!(false));
         assert_eq!(whole_task["note"], json!(note));
+
+        let whole_full = task_list_with_conn(
+            &conn,
+            &json!({"project": "proj-full-notes", "full": true, "full_notes": true}),
+        )
+        .expect("task_list full + full_notes");
+        let whole_full_task = &whole_full["tasks"][0];
+        assert_eq!(whole_full_task["note_truncated"], json!(false));
+        assert_eq!(whole_full_task["note"], json!(note));
     }
 
     /// ripe не теряется при сокращении evidence до сводки — то же
@@ -1822,6 +1955,110 @@ mod tests {
             task_list_with_conn(&conn, &json!({"project": "proj-list-ripe"})).expect("task_list");
 
         assert_eq!(result["tasks"][0]["ripe"], json!(true));
+    }
+
+    // -- task_list: компактный дефолт (задача 3, тот же приём, что и у
+    //    memory_status в status.rs) ------------------------------------------
+
+    /// Компакт снимает авторов и `null`-поля целиком, а не оставляет их
+    /// `null`; полная временная метка уступает короткой дате. `full=true`
+    /// возвращает эти же поля как раньше (пусть и `null`, где им и положено
+    /// быть) — историческая форма никуда не делась, просто больше не дефолт.
+    #[test]
+    fn compact_task_list_drops_author_and_null_fields_uses_short_date() {
+        let (_tmp, conn) = setup();
+        seed_task_with_note(&conn, "proj-list-compact", "короткая note");
+
+        let compact = task_list_with_conn(&conn, &json!({"project": "proj-list-compact"}))
+            .expect("task_list compact");
+        let item = &compact["tasks"][0];
+        for key in [
+            "created_by",
+            "updated_by",
+            "activated_at",
+            "closed_at",
+            "resolution",
+            "evidence",
+            "created_at",
+        ] {
+            assert!(item.get(key).is_none(), "компакт обязан снять {key}: {item}");
+        }
+        let date = item["date"].as_str().expect("date строкой");
+        assert_eq!(date.len(), 10, "date обязана быть YYYY-MM-DD: {date}");
+
+        let full = task_list_with_conn(
+            &conn,
+            &json!({"project": "proj-list-compact", "full": true}),
+        )
+        .expect("task_list full");
+        let full_item = &full["tasks"][0];
+        for key in [
+            "created_by",
+            "updated_by",
+            "activated_at",
+            "closed_at",
+            "resolution",
+            "evidence",
+            "created_at",
+        ] {
+            assert!(
+                full_item.get(key).is_some(),
+                "full=true обязан вернуть ключ {key} (пусть и null): {full_item}"
+            );
+        }
+        assert!(full_item.get("date").is_none(), "full не заводит 'date': {full_item}");
+    }
+
+    /// Регрессия на измерение задачи 3 (28.09.2026, `au mcp` по живому графу,
+    /// проекты aurelius/xhub/boostix): дефолтный (сегодня — `full=true`)
+    /// `task_list` весил 14.5–15.8K символов на 20 задачах. На реалистичных
+    /// по длине метках (там метка — самое тяжёлое поле строки, ~94 символа в
+    /// среднем на живом графе, и компакт её НЕ режет — это единственный
+    /// способ узнать, какая это задача) числа не «меньше N символов»
+    /// (недостижимо без порчи метки), а «компакт заметно легче полной формы
+    /// на тех же данных» — то же соотношение, что и было измерено живьём.
+    #[test]
+    fn compact_task_list_is_smaller_than_full_on_realistic_labels() {
+        let (_tmp, conn) = setup();
+        let label_words: Vec<String> = (0..12).map(|i| format!("словодлиннойметки{i}")).collect();
+        let label_tail = label_words.join(" ");
+        let note_words: Vec<String> = (0..80).map(|i| format!("слово{i}")).collect();
+        let note = note_words.join(" ");
+        for i in 0..20 {
+            graph::add_node_full(
+                &conn,
+                NodeType::Task,
+                &format!("[proj-realistic] {label_tail} {i}"),
+                Some(&note),
+                "test",
+                json!({"status": "backlog", "priority": "medium", "project": "proj-realistic"}),
+                MemoryKind::Semantic,
+                None,
+            )
+            .expect("insert task");
+        }
+
+        let compact = task_list_with_conn(&conn, &json!({"project": "proj-realistic", "limit": 20}))
+            .expect("task_list compact");
+        let full = task_list_with_conn(
+            &conn,
+            &json!({"project": "proj-realistic", "limit": 20, "full": true}),
+        )
+        .expect("task_list full");
+        assert_eq!(compact["tasks"].as_array().expect("tasks").len(), 20);
+        assert_eq!(full["tasks"].as_array().expect("tasks").len(), 20);
+
+        let compact_len = serde_json::to_string(&compact).expect("serialize compact").len();
+        let full_len = serde_json::to_string(&full).expect("serialize full").len();
+        assert!(
+            compact_len < full_len,
+            "компакт обязан быть легче полной формы: compact={compact_len} full={full_len}"
+        );
+        assert!(
+            (compact_len as f64) <= (full_len as f64) * 0.85,
+            "компакт обязан давать заметную экономию, не косметическую: \
+             compact={compact_len} full={full_len}"
+        );
     }
 
     // -- task_ripe: та же выборка, что и `au task ripe` ----------------------

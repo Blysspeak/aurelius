@@ -398,7 +398,13 @@ pub(crate) fn node_recall(node: &aurelius_core::models::Node, query: &str) -> se
 /// 19.09.2026 двадцать находок на «embed socket bge-m3» стоили 38 754 байта
 /// против 3 110 у `au search` на том же запросе. `stale` оставлен: это
 /// единственное из происхождения, по чему действуют, не открывая запись. За
-/// телом идут по `id` — `au recall <id>`.
+/// телом целиком идут по `id` через `memory_search(id=...)` (закрывает задачу
+/// 05875738 — раньше телом делился только `au recall`, у MCP не было двери).
+///
+/// Ключи здесь МОГУТ быть `null` — снятие пустых ключей происходит на
+/// уровне вызывающего (`search_hits` в `crud.rs`, [`drop_empty_fields`]),
+/// уже ПОСЛЕ того как `apply_probe_stale` мог переписать `stale` найденной
+/// проваленной пробой: сними ключ здесь — переписывать было бы нечего.
 pub(crate) fn node_hit(node: &aurelius_core::models::Node, query: &str) -> serde_json::Value {
     let stale = aurelius_core::provenance::Provenance::from_data(&node.data)
         .staleness(node.created_at, chrono::Utc::now())
@@ -408,6 +414,27 @@ pub(crate) fn node_hit(node: &aurelius_core::models::Node, query: &str) -> serde
         fields.insert("stale".to_owned(), json!(stale));
     }
     hit
+}
+
+/// Drops every top-level key of a JSON object whose value is `null`, an
+/// empty array, or an empty object. A dropped key means "nothing here" —
+/// exactly what `null`/`[]`/`{}` already meant, just without spending
+/// characters to say so. Leaves scalars (including `false` and `0`, neither
+/// of which is "empty") and non-empty containers untouched. Applied as the
+/// LAST step, after anything that still needs to see a real (possibly
+/// `null`) key to overwrite — `apply_probe_stale` is the one caller that
+/// depends on this ordering. No-op on anything that is not a JSON object
+/// (an array of hits is handled by mapping this over each element, not by
+/// recursing here).
+pub(crate) fn drop_empty_fields(value: &mut serde_json::Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    obj.retain(|_, v| {
+        !matches!(v, serde_json::Value::Null)
+            && !matches!(v, serde_json::Value::Array(a) if a.is_empty())
+            && !matches!(v, serde_json::Value::Object(o) if o.is_empty())
+    });
 }
 
 /// Кусок текста вокруг первого совпадения любого слова запроса, по границе
@@ -722,7 +749,12 @@ mod recall_shape_tests {
     }
 
     /// Находка поиска — не карточка записи: ни `data`, ни полного `note`, ни
-    /// авторов с происхождением; `stale` есть всегда, окно — только без claim.
+    /// авторов с происхождением; `stale` есть всегда (здесь, на уровне
+    /// `node_hit` — снятие пустых ключей происходит выше, в `search_hits`,
+    /// после того как `apply_probe_stale` мог его переписать: см.
+    /// `search_hits_carry_the_failing_probe_note` и
+    /// `search_hits_carry_no_null_or_empty_key` в `crud.rs`). Окно — только
+    /// без claim.
     #[test]
     fn search_hit_is_a_summary_not_a_record_dump() {
         use super::node_hit;
@@ -768,11 +800,43 @@ mod recall_shape_tests {
             let date = hit["created_at"].as_str().expect("created_at строкой");
             assert_eq!(date.len(), 10, "created_at обязан быть датой: {date}");
         }
+        assert_eq!(node_hit(&claimed, "сокет")["subject"], "demo:embed:resident");
+        assert_eq!(
+            node_hit(&claimed, "сокет")["claim"],
+            "Модель висит резидентно"
+        );
 
         let bare_hit = node_hit(&bare, "сокет");
         let window = bare_hit["window"].as_str().expect("окно при пустом claim");
         assert!(window.contains("сокет"), "окно не на совпадении: {window}");
         assert!(window.chars().count() < body.chars().count());
         assert!(node_hit(&claimed, "сокет")["window"].is_null());
+    }
+
+    /// [`drop_empty_fields`] — механика сама по себе: снимает `null`, `[]` и
+    /// `{}`, оставляет скаляры (в том числе `false`/`0`) и непустые
+    /// контейнеры. Используется и на находке `memory_search` (`search_hits`
+    /// в `crud.rs`), и на конверте (`memory_search_with_conn`, там же).
+    #[test]
+    fn drop_empty_fields_removes_null_and_empty_only() {
+        use super::drop_empty_fields;
+        let mut value = serde_json::json!({
+            "kept_string": "x",
+            "kept_false": false,
+            "kept_zero": 0,
+            "kept_array": [1],
+            "kept_object": {"a": 1},
+            "null_field": serde_json::Value::Null,
+            "empty_array": serde_json::Value::Array(vec![]),
+            "empty_object": serde_json::Value::Object(serde_json::Map::new()),
+        });
+        drop_empty_fields(&mut value);
+        let obj = value.as_object().expect("объект");
+        for kept in ["kept_string", "kept_false", "kept_zero", "kept_array", "kept_object"] {
+            assert!(obj.contains_key(kept), "должно остаться: {kept}");
+        }
+        for dropped in ["null_field", "empty_array", "empty_object"] {
+            assert!(!obj.contains_key(dropped), "должно исчезнуть: {dropped}");
+        }
     }
 }
