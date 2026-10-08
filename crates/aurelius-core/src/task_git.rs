@@ -63,11 +63,7 @@ pub fn at_activation(conn: &rusqlite::Connection, project: &str) -> Option<GitBi
 /// заводят ветку. Два случая она не трогает: названную явно и перенос с
 /// рабочей ветки на основную — после слияния сессия возвращается на main, и
 /// правка там стёрла бы единственный след того, где задача делалась.
-pub fn follow_edit(
-    current: Option<&GitBinding>,
-    project: &str,
-    file: &Path,
-) -> Option<GitBinding> {
+pub fn follow_edit(current: Option<&GitBinding>, project: &str, file: &Path) -> Option<GitBinding> {
     if current.is_some_and(|b| b.explicit) {
         return None;
     }
@@ -86,7 +82,12 @@ pub fn follow_edit(
 fn default_branch(root: &Path) -> String {
     git::git(
         root,
-        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
     )
     .and_then(text)
     .and_then(|s| s.strip_prefix("origin/").map(str::to_owned))
@@ -221,7 +222,14 @@ mod tests {
         let wt = root.parent().expect("parent").join("wt");
         run(
             &root,
-            &["worktree", "add", "-q", "-b", "feat/wt", &wt.to_string_lossy()],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/wt",
+                &wt.to_string_lossy(),
+            ],
         );
         let on_main = detect(&root).expect("main").1;
         let moved = follow_edit(Some(&on_main), "demo", &wt.join("a.txt")).expect("перенос");
@@ -259,7 +267,10 @@ mod tests {
         let root = repo();
         let origin = root.parent().expect("parent").join("origin.git");
         run(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]);
-        run(&root, &["remote", "add", "origin", &origin.to_string_lossy()]);
+        run(
+            &root,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
         run(&root, &["checkout", "-q", "-b", "feat/x"]);
         assert_eq!(branch_state(&root, "feat/x").as_deref(), Some("not pushed"));
 
