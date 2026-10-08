@@ -1,8 +1,9 @@
 use fastembed::{
-    EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank,
+    EmbeddingModel, InitOptions, RerankInitOptions, RerankInitOptionsUserDefined, RerankerModel,
+    TextEmbedding, TextRerank, TokenizerFiles, UserDefinedRerankingModel,
 };
-use ort::execution_providers::{CPU, CUDA};
-use std::path::PathBuf;
+use ort::execution_providers::{ExecutionProviderDispatch, CPU, CUDA};
+use std::path::{Path, PathBuf};
 
 fn models_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("AURELIUS_MODELS_DIR") {
@@ -160,8 +161,10 @@ pub enum RerankPolicy {
     Cpu(Device),
 }
 
-/// `AURELIUS_RERANK` = `auto` (default), `cpu` or `off`. `auto` with
-/// `AURELIUS_EMBED_DEVICE=cpu` is `Off` without touching CUDA.
+/// `AURELIUS_RERANK` = `auto` (default), `cuda`, `cpu` or `off`. `auto` with
+/// `AURELIUS_EMBED_DEVICE=cpu` is `Off` without touching CUDA. `cuda` is
+/// `CudaOnly` whatever the embed device: bge-m3 on the CPU, where a query
+/// costs tens of milliseconds, and the reranker alone on the card.
 ///
 /// # Errors
 /// Any other value, or an invalid `AURELIUS_EMBED_DEVICE`.
@@ -173,9 +176,10 @@ pub fn parse_rerank_policy(
     match rerank.map(str::trim) {
         None | Some("") => Ok(auto_policy(device)),
         Some(v) if v.eq_ignore_ascii_case("auto") => Ok(auto_policy(device)),
+        Some(v) if v.eq_ignore_ascii_case("cuda") => Ok(RerankPolicy::CudaOnly),
         Some(v) if v.eq_ignore_ascii_case("cpu") => Ok(RerankPolicy::Cpu(device)),
         Some(v) if v.eq_ignore_ascii_case("off") => Ok(RerankPolicy::Off),
-        Some(other) => anyhow::bail!("AURELIUS_RERANK={other}: expected auto, cpu or off"),
+        Some(other) => anyhow::bail!("AURELIUS_RERANK={other}: expected auto, cuda, cpu or off"),
     }
 }
 
@@ -197,10 +201,45 @@ pub fn rerank_policy_from_env() -> anyhow::Result<RerankPolicy> {
     )
 }
 
-/// Loads the bge-reranker-v2-m3 cross-encoder the same way `init_bge_m3`
-/// loads bge-m3: CUDA first, proven by one real run. Falls back to CPU only
-/// under `RerankPolicy::Cpu`; `Cpu(Device::Cpu)` skips CUDA. Weights are
-/// fetched into `models_dir()` on the first load when absent.
+/// The directory `AURELIUS_RERANK_MODEL` names, when it names one. Unset or
+/// empty is the built-in bge-reranker-v2-m3 in FP32, which alone holds about
+/// 3.5 GiB of the card. The same weights in FP16 with the vocabulary cut to
+/// English and Russian score the control queries the same and hold 1.3 GiB.
+fn rerank_model_dir(raw: Option<&str>) -> Option<PathBuf> {
+    raw.map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The cross-encoder in `dir`: `model.onnx` and, beside it, `tokenizer.json`,
+/// `config.json`, `special_tokens_map.json` and `tokenizer_config.json`.
+///
+/// # Errors
+/// A file of the five that is missing or unreadable, by its path.
+fn read_rerank_model(dir: &Path) -> anyhow::Result<UserDefinedRerankingModel> {
+    let onnx = dir.join("model.onnx");
+    if !onnx.is_file() {
+        anyhow::bail!("AURELIUS_RERANK_MODEL: {} not found", onnx.display());
+    }
+    let read = |name: &str| {
+        let path = dir.join(name);
+        std::fs::read(&path)
+            .map_err(|e| anyhow::anyhow!("AURELIUS_RERANK_MODEL: {} — {e}", path.display()))
+    };
+    let files = TokenizerFiles {
+        tokenizer_file: read("tokenizer.json")?,
+        config_file: read("config.json")?,
+        special_tokens_map_file: read("special_tokens_map.json")?,
+        tokenizer_config_file: read("tokenizer_config.json")?,
+    };
+    Ok(UserDefinedRerankingModel::new(onnx, files))
+}
+
+/// Loads the reranker the same way `init_bge_m3` loads bge-m3: CUDA first,
+/// proven by one real run. Falls back to CPU only under `RerankPolicy::Cpu`;
+/// `Cpu(Device::Cpu)` skips CUDA. The model is the cross-encoder in
+/// `AURELIUS_RERANK_MODEL` when that names a directory, else the built-in
+/// bge-reranker-v2-m3, fetched into `models_dir()` on the first load.
 ///
 /// # Errors
 /// `RerankPolicy::Off`, a CUDA failure under `CudaOnly`, or a failed load.
@@ -211,32 +250,40 @@ pub fn init_bge_reranker(policy: RerankPolicy) -> anyhow::Result<TextRerank> {
         RerankPolicy::Cpu(device) => (device, true),
     };
     init_ort_runtime()?;
+    let dir = rerank_model_dir(std::env::var("AURELIUS_RERANK_MODEL").ok().as_deref());
+    let own = dir.as_deref().map(read_rerank_model).transpose()?;
+    let named = dir
+        .map(|d| format!(" (AURELIUS_RERANK_MODEL={})", d.display()))
+        .unwrap_or_default();
     let cache_dir = models_dir();
     let started = std::time::Instant::now();
-    let load_cpu = |cache_dir: PathBuf| {
-        let cpu_opts = RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
-            .with_show_download_progress(true)
-            .with_cache_dir(cache_dir)
-            .with_execution_providers(vec![CPU::default().build()]);
-        TextRerank::try_new(cpu_opts)
+    let load = |cache_dir: PathBuf, providers: Vec<ExecutionProviderDispatch>| match own.clone() {
+        Some(model) => TextRerank::try_new_from_user_defined(
+            model,
+            RerankInitOptionsUserDefined::new().with_execution_providers(providers),
+        ),
+        None => TextRerank::try_new(
+            RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
+                .with_show_download_progress(true)
+                .with_cache_dir(cache_dir)
+                .with_execution_providers(providers),
+        ),
     };
+    let load_cpu = |cache_dir: PathBuf| load(cache_dir, vec![CPU::default().build()]);
 
     if device == Device::Cpu {
         let model = load_cpu(cache_dir)?;
         eprintln!(
-            "rerank: loaded on CPU in {:.1}s (AURELIUS_RERANK=cpu, AURELIUS_EMBED_DEVICE=cpu)",
+            "rerank: loaded on CPU in {:.1}s (AURELIUS_RERANK=cpu, AURELIUS_EMBED_DEVICE=cpu){named}",
             started.elapsed().as_secs_f64()
         );
         return Ok(model);
     }
 
-    let cuda_opts = RerankInitOptions::new(RerankerModel::BGERerankerV2M3)
-        .with_show_download_progress(true)
-        .with_cache_dir(cache_dir.clone())
-        .with_execution_providers(vec![CUDA::default().build().error_on_failure()]);
     // Same reason as in `init_bge_m3`: only a real run proves CUDA works.
     let cuda_attempt: anyhow::Result<TextRerank> = (|| {
-        let mut model = TextRerank::try_new(cuda_opts)?;
+        let cuda = vec![CUDA::default().build().error_on_failure()];
+        let mut model = load(cache_dir.clone(), cuda)?;
         model.rerank("cuda smoke test", ["cuda smoke test"], false, None)?;
         Ok(model)
     })();
@@ -244,7 +291,7 @@ pub fn init_bge_reranker(policy: RerankPolicy) -> anyhow::Result<TextRerank> {
     match cuda_attempt {
         Ok(model) => {
             eprintln!(
-                "rerank: loaded on CUDA in {:.1}s",
+                "rerank: loaded on CUDA in {:.1}s{named}",
                 started.elapsed().as_secs_f64()
             );
             Ok(model)
@@ -255,7 +302,7 @@ pub fn init_bge_reranker(policy: RerankPolicy) -> anyhow::Result<TextRerank> {
         Err(cuda_err) => {
             let model = load_cpu(cache_dir)?;
             eprintln!(
-                "rerank: loaded on CPU in {:.1}s, CUDA failed — {cuda_err}",
+                "rerank: loaded on CPU in {:.1}s, CUDA failed — {cuda_err}{named}",
                 started.elapsed().as_secs_f64()
             );
             Ok(model)
@@ -350,6 +397,39 @@ mod tests {
             parse_rerank_policy(Some("AUTO"), Some("auto")).unwrap(),
             RerankPolicy::CudaOnly
         );
+    }
+
+    #[test]
+    fn rerank_cuda_is_cuda_only_whatever_the_embed_device() {
+        for embed_device in [None, Some("auto"), Some("cpu")] {
+            assert_eq!(
+                parse_rerank_policy(Some(" CUDA "), embed_device).unwrap(),
+                RerankPolicy::CudaOnly
+            );
+        }
+    }
+
+    #[test]
+    fn rerank_model_dir_is_unset_empty_or_a_path() {
+        assert_eq!(rerank_model_dir(None), None);
+        assert_eq!(rerank_model_dir(Some("  ")), None);
+        assert_eq!(
+            rerank_model_dir(Some(" /models/reranker ")),
+            Some(PathBuf::from("/models/reranker"))
+        );
+    }
+
+    #[test]
+    fn a_rerank_model_dir_without_its_files_is_an_error_naming_the_file() {
+        let dir = std::env::temp_dir().join(format!("au-rerank-model-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = read_rerank_model(&dir).unwrap_err().to_string();
+        assert!(err.contains("AURELIUS_RERANK_MODEL"), "{err}");
+        assert!(err.contains("model.onnx"), "{err}");
+        std::fs::write(dir.join("model.onnx"), b"").unwrap();
+        let err = read_rerank_model(&dir).unwrap_err().to_string();
+        assert!(err.contains("tokenizer.json"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

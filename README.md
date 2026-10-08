@@ -344,7 +344,8 @@ What the daemon needs on disk (nothing here is downloaded by `install.sh`):
 | `AURELIUS_EMBED_DEVICE` | `auto` | `auto`: CUDA first, proven by one real run, CPU when CUDA can't run a kernel. `cpu`: skip CUDA |
 | `AURELIUS_EMBED_PRELOAD` | on | load BGE-M3 right after the daemon starts; `0` loads it on the first request |
 | `AURELIUS_EMBED_IDLE_SECS` | `0` | unload BGE-M3 after this many idle seconds; `0` keeps it resident |
-| `AURELIUS_RERANK` | `auto` | `auto`: rerank on CUDA only, and not at all when `AURELIUS_EMBED_DEVICE=cpu`. `cpu`: allow CPU (one rerank of 30 documents takes seconds there). `off`: never |
+| `AURELIUS_RERANK` | `auto` | `auto`: rerank on CUDA only, and not at all when `AURELIUS_EMBED_DEVICE=cpu`. `cuda`: rerank on CUDA whatever the embed device — bge-m3 on the CPU, the reranker alone on the card. `cpu`: allow CPU (one rerank of 30 documents takes seconds there). `off`: never |
+| `AURELIUS_RERANK_MODEL` | unset | directory with a reranker to load instead of the built-in bge-reranker-v2-m3 (`model.onnx`, `tokenizer.json`, `config.json`, `special_tokens_map.json`, `tokenizer_config.json`). `scripts/export-reranker-en-ru.py` builds the FP16 English+Russian variant: 1.3 GiB of the card instead of 3.5 |
 | `AURELIUS_RERANK_IDLE_SECS` | `600` | unload the reranker after this many idle seconds; `0` keeps it resident |
 | `AURELIUS_MODELS_DIR` | `<data-dir>/models` | where model weights live |
 
