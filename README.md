@@ -13,12 +13,13 @@
   <img src="https://img.shields.io/badge/v3.4.4-stable-a6e3a1?style=flat-square" alt="v3.4.4">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
-  <img src="https://img.shields.io/badge/MCP-38_tools-a6e3a1?style=flat-square" alt="MCP">
+  <img src="https://img.shields.io/badge/MCP-35_tools-a6e3a1?style=flat-square" alt="MCP">
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#mcp-tools-38">MCP Tools</a> ·
+  <a href="#mcp-tools-35">MCP Tools</a> ·
+  <a href="#search">Search</a> ·
   <a href="#memory-snapshot">Snapshot</a> ·
   <a href="#task-management">Tasks</a> ·
   <a href="#project-sync">Sync</a> ·
@@ -38,7 +39,7 @@ Every AI session starts from zero. You re-explain your projects, your past decis
 
 ## Quick Start
 
-Aurelius ships as a [Claude Code plugin](plugin/hooks.json): six session hooks, skill cards and
+Aurelius ships as a [Claude Code plugin](plugin/hooks.json): seven `au` hook commands, skill cards and
 the `/pickup` command, installed with two `claude plugin` commands instead of hand-edited
 `settings.json`. The MCP server is registered separately, user-scope, by `install.sh` (`claude mcp
 add -s user aurelius au mcp`) — a plugin-bundled server would rename every tool to
@@ -56,8 +57,8 @@ claude plugin marketplace add Blysspeak/aurelius      # or a local clone path: c
 claude plugin install aurelius@blysspeak -s user
 ```
 
-Restart Claude Code. `claude plugin list` shows `aurelius@blysspeak`, and a fresh session gets a
-memory snapshot and skill index at start.
+Restart Claude Code. `claude plugin list` shows `aurelius@blysspeak`, and a fresh session gets the
+skill index at start.
 
 **Existing machine (stood up by hand or by an older `install.sh`)**
 
@@ -96,50 +97,60 @@ only an entry pointing at the old wrapper script is stale — replace it with
 
 ```
 $ au --version
-au 3.4.4
+au 3.5.0 (0123456789ab)
 $ aurelius --version        # the MCP binary answers too, instead of holding stdin open
-aurelius 3.4.4
+aurelius 3.5.0 (0123456789ab)
 ```
+
+The parenthesis is the 12-character commit the binary was built from, with `-dirty` appended
+when the tree had uncommitted changes and `unknown` for a build outside git — so an installed
+binary can be traced back to its source.
+
+Nothing is indexed behind your back: no `au` command and no `memory_status` call turns the
+current directory into a project. A repository enters the graph only through an explicit
+`au reindex` (or MCP `memory_index`); `install.sh` runs it once, for the aurelius checkout itself.
 
 ---
 
-## MCP Tools (38)
+## MCP Tools (35)
 
 Aurelius runs as an MCP server over stdio. `install.sh` registers it user-scope with
 `claude mcp add -s user aurelius au mcp`, and the same command adds it by hand.
+
+`tools/list` shows 35 tools. Ten more maintenance tools (see [Admin tools](#admin-tools)) are
+left out of the list unless the server runs with `AURELIUS_MCP_ADMIN=1` — every session pays for
+the descriptions it is shown, and these are rarely called. A call by name is served either way.
 
 ### Knowledge Graph
 
 | Tool | Description |
 |------|-------------|
-| `memory_status` | Session start — project snapshot with active tasks and a `server` block (running MCP server version, `started_at`, and `restart_needed` when the binary on disk is newer than this running process — installing a new build over the old one doesn't kill an already-running MCP server). Optional `project` filter. **Compact by default:** notes come back as word-boundary excerpts flagged `note_truncated`, task evidence is summarized to total/green/last_green, and a `truncation` block counts what was hidden past the per-section cap — so the first call of a session cannot blow the context on a large graph. `full=true` returns the legacy complete shape. |
+| `memory_status` | Session start — project snapshot with active tasks and a `server` block (running MCP server version, `started_at`, and `restart_needed` when the binary on disk is newer than this running process — installing a new build over the old one doesn't kill an already-running MCP server). Optional `project` filter. Reads only: it never indexes the current directory. **Compact by default:** each item is one line — id, type, date, the claim (or the label when there is none) and `confidence`, plus `stale` only when there is a warning; no note excerpts. Five items per section, task evidence summarized to total/green/last_green and left out when a task has no runs, and a `truncation` block counts what was hidden past the cap — so the first call of a session cannot blow the context on a large graph. `full=true` returns the legacy complete shape. |
 | `memory_session` | Session end — save decisions, problems/solutions, next steps. Links to tasks. Returns active tasks hint. SHA-256 dedup. Accepts the same provenance fields as `memory_add` (`confidence`, `evidence`, `subject`, `volatility`, `claim`, `measured_at`, `verify_with`); spawned decisions/problems/solutions inherit confidence/evidence but never subject/claim. |
-| `memory_recall` | Smart topic recall — FTS + BFS, grouped by type (incl. tasks), skips structural noise. Ordered by the rank score, not by node degree: a hub node no longer wins a topic just for having many edges. |
-| `memory_search` | Full-text search with `type`, `since`, and `limit` filters. `*` for recent. Words are OR-ed and ranked by how many of them matched, so one bad word form spoils the order rather than the result; `unmatched_terms` names the words that matched nothing, telling "no such knowledge" apart from "the query didn't work". |
+| `memory_recall` | Smart topic recall — hybrid seeds (see [Search](#search)) + BFS, grouped by type (incl. tasks), skips structural noise. Ordered by the rank score, not by node degree: a hub node no longer wins a topic just for having many edges. |
+| `memory_search` | Hybrid search (full-text + vectors, see [Search](#search)) with `type`, `since`, and `limit` (default 5) filters. `*` for recent. A query shaped like a subject key (`project:area:thing`) puts the node with exactly that subject first, then the newest member of each `query:…` family. Each hit is a summary — id, type, label, claim, date, confidence, subject, stale — and any field that would be null or empty is left out, on the hit and on the envelope. Pass `id` (a UUID, or the exact `subject` a fact was written with) to read one **whole** record instead — note, data, provenance; an unknown id is a clear miss, never a fuzzy neighbour. `unmatched_terms` names the words that matched nothing, telling "no such knowledge" apart from "the query didn't work"; `vector_notice` says why an answer came from full-text alone. |
 | `memory_context` | Raw BFS graph traversal from FTS seed nodes. Capped at 200 nodes and depth 3, and the cut is reported in a `truncation` block — an explicit `depth=2` through a hub node used to expand the answer into megabytes. The same cap applies to `memory_recall`. |
 | `memory_path` | Directed step ladder over `next_step`/`prerequisite` edges: shortest path between two nodes, or every node that transitively leads to one target. Same computation as `au path`. |
-| `memory_snapshot` | The seven-layer frozen slice as Markdown, under a hard budget. |
-| `memory_consolidate` | Rebuild a project's distillate — open next steps plus unsolved problems. Idempotent. |
+| `memory_snapshot` | The layered frozen slice as Markdown, under a hard budget. |
+| `memory_pickup` | Bounded, ranked payload to rebuild working state after a context wipe — same computation as `au pickup`. |
 | `memory_add` | Create node with label, type, note, data (JSON), memory_kind. Pass `project` to link it; without a link the response says so instead of reporting a silent success. |
 | `memory_update` | Update existing node's note/data by UUID or label. |
 | `memory_relate` | Create typed edge. INSERT OR IGNORE for dedup. |
-| `memory_forget` | Delete node by UUID (cascades to edges). |
-| `memory_gc` | Garbage collection — duplicate edges/nodes, orphans. |
-| `memory_merge` | Merge two near-duplicate nodes — rewires edges, merges notes, deletes source. |
-| `memory_dump` | Paginated graph export (offset/limit). |
-| `memory_index` | Index project structure from Cargo.toml. |
+| `memory_forget` | Delete node by UUID (cascades to edges, its vector and its embedding-queue row). |
+| `memory_index` | Index a project directory on request — crates and files from `Cargo.toml`, key files for anything else. The only MCP path that indexes; nothing else does it implicitly. |
 
 ### Task Management
 
 | Tool | Description |
 |------|-------------|
 | `task_create` | Create structured task — title, description, acceptance criteria, priority, subtask/blocking relations. Accepts the same provenance fields as `memory_add` (`confidence`, `evidence`, `subject`, `volatility`, `claim`, `measured_at`, `verify_with`). |
-| `task_update` | Update status, priority, criteria. Auto-tracks `started_at`/`completed_at`. Accepts the same provenance fields as `memory_add` — a task's confidence can change after a measurement. |
-| `task_list` | Filter by project, status, priority. Sorted by priority, shows work log count. Evidence is an `EvidenceSummary` (total/green/last_green), not the full run array — that stays in `task_view`. `full_notes=true` returns each note whole instead of truncated. |
+| `task_update` | Update status, priority, criteria. Auto-tracks `started_at`/`completed_at`; `branch`/`worktree` bind the task to a git branch. Accepts the same provenance fields as `memory_add` — a task's confidence can change after a measurement. |
+| `task_list` | Filter by project, status, priority. Sorted by priority, shows work log count. **Compact by default:** id, label, status, priority, a short date, a tightly clipped note, work log count, `ripe`, and evidence only when there is any — null or empty fields are left out. `full=true` returns the historical shape (authors, RFC3339 timestamps, wider note budget, every field present). Evidence is an `EvidenceSummary` (total/green/last_green), not the full run array — that stays in `task_view`. `full_notes=true` returns each note whole instead of truncated. |
 | `task_log` | Record work done — creates WorkLog + optional Decision/Problem/Solution nodes. Never changes the task's status; the response includes `task_status`, activation is explicit via `task_update status=active`. Accepts the same provenance fields as `memory_add`; spawned decisions/problems/solutions inherit confidence/evidence but never subject/claim. |
 | `task_view` | Full task branch — timeline of work logs, decisions, problems, solutions, subtasks. |
 | `task_stats` | Task analytics — counts by status/priority, completion rate, avg/median duration, blocked count, oldest active. |
 | `task_ripe` | Tasks ready to close — active, with a passing evidence run newer than the last edit, plus the basis (which run, when, files touched). Same computation as `au task ripe`; closing itself is still `task_update`. |
+| `task_criterion` | Mark one acceptance criterion met or unmet by its short handle; with neither flag, list the criteria and their handles. Same as `au task criterion`. A record of progress, not a closing condition. |
 
 ### Reminders
 
@@ -164,7 +175,6 @@ Reusable procedural "how-to" cards with progressive disclosure — the trigger i
 | `skill_save` | Create/update a skill (upsert by name). Trigger → indexed note; body + tags → data. |
 | `skill_list` | Cheap index (name + trigger + tags + uses), ranked by usage. Optional FTS `query`/`tag`. |
 | `skill_get` | Full markdown body by name, with fuzzy FTS fallback + disambiguation. Bumps usage. |
-| `skill_remove` | Delete a skill by name. |
 
 ### Web Search
 
@@ -195,39 +205,65 @@ through MCP: it never appears in `memory_snapshot` or any other automatic dump.
 |------|-------------|
 | `secret_list` | Name, purpose, and location of every recorded secret coordinate — never the value. |
 
+### Admin tools
+
+Hidden from `tools/list` unless `AURELIUS_MCP_ADMIN=1`; still served when called by name.
+
+| Tool | Description |
+|------|-------------|
+| `memory_consolidate` | Rebuild a project's distillate — open next steps plus unsolved problems. Idempotent. |
+| `memory_gc` | Garbage collection — duplicate edges/nodes, orphans; leaves no vector behind. |
+| `memory_merge` | Merge two near-duplicate nodes — rewires edges, merges notes, deletes source. |
+| `memory_dump` | Paginated graph export (offset/limit). |
+| `memory_journal` | What a given run wrote — same as `au journal`. |
+| `memory_eval` | Score recall against a frozen fixture — same as `au eval`. |
+| `skill_remove` | Delete a skill by name. |
+| `db_check` | Integrity check, read-only — same as `au db check`. |
+| `db_backup` | Safe `VACUUM INTO` snapshot — same as `au db backup`. |
+| `db_reindex_embeddings` | Queue nodes missing a vector for the daemon to embed; returns at once, computes nothing itself. |
+
 ---
 
 ## Memory Snapshot
 
-The snapshot is how the graph reaches a session. It is a small curated slice injected
-**once** at session start — frozen for the session, so it does not break the prefix
-cache — rather than a large JSON blob fetched on demand.
+The snapshot is a small curated slice of the graph, meant to be injected **once** at
+session start (`au snapshot --hook`) — frozen for the session, so it does not break the
+prefix cache — rather than a large JSON blob fetched on demand. The plugin does not
+register that hook (see [Hooks](#hooks-auto-capture)); a hand-written `settings.json` can.
 
 ```
-1 · Owner                       what is known about you
-2 · In progress                 open tasks and unsolved problems
-3 · Pressure                    obligations taken on and not yet settled
-4 · Recent sessions             what the last sessions concluded
-5 · Decisions and knowledge     decisions, then concepts
-6 · Practices                   skills
-7 · Archive                     node/edge counts and where to dig deeper
-8 · Distillate                  the structural residue of the layers above
+Repository                  where the session stands: branch, changed paths, last commits
+Owner                       what is known about you
+In progress                 open tasks and unsolved problems
+Pressure                    obligations taken on and not yet settled
+Recent sessions             what the latest session concluded
+Decisions and knowledge     decisions, then concepts
+Distillate                  the latest session's next steps plus unsolved problems, until something newer is recorded
 ```
 
-Every layer has a hard character budget (~4.5K in total, on the order of 1.5K tokens),
-and empty layers are omitted entirely.
+Every layer has a hard budget in **bytes**, not characters — the snapshot is paid for on every
+request of the session, and Cyrillic costs twice as much as Latin — and the whole slice stays
+under 3850 bytes. An empty layer is not printed at all; layers are numbered among the printed
+ones. Past the total budget whole layers are dropped, least needed first: Distillate, Pressure,
+Decisions and knowledge, Recent sessions. Repository, Owner and In progress are never dropped.
+The Repository layer reads local git only (`rev-parse`, `status`, `log`, each under a 1.5 s
+timeout, no fetch), and only for a repository named like the project. Without a project the
+slice covers all of memory and says so under its heading. Skills are not a layer: the plugin's
+SessionStart hook prints the skill index on its own.
 
 **Active tasks are the one exception.** A task actually in progress — status `active` —
-is pulled out of layer 2 before the budget is applied and rendered in full, uncut by the
-per-layer character limit that trims everything else. There is still a hard ceiling (20
+is pulled out of "In progress" before the budget is applied and rendered in full, uncut by the
+per-layer limit that trims everything else. There is still a hard ceiling (20
 active tasks per project) purely against unbounded growth; past it the snapshot says how
 many did not fit rather than dropping them silently. Whatever an active task's own
-rendering costs beyond the layer's normal budget is taken from **layer 5 (Decisions and
-knowledge)**, not from the active tasks themselves and not from the layers in between —
-the layer immediately below "In progress" in priority pays for it.
+rendering costs beyond the layer's normal budget is taken from **Decisions and knowledge**,
+not from the active tasks themselves — the layer below "In progress" in priority pays for it.
+In a slice without a project, where every project contributes its own active task, they go
+under the ordinary layer budget and the rest are counted.
 
 ```bash
 au snapshot --project myapp          # Markdown, for humans and for context
+au snapshot                          # project = current folder name
 au snapshot --project myapp --json   # fixed shape, for programs
 au snapshot --hook                   # Claude Code SessionStart envelope — the flag stays,
                                      # but the plugin no longer registers it (see Hooks)
@@ -268,6 +304,54 @@ Both are checked by a single predicate. Only the first used to be, which made ev
 written through `memory_add` + `memory_relate` invisible to project-scoped queries —
 including the snapshot itself. If you are upgrading from ≤ 1.10.0, that knowledge becomes
 visible again with no re-import.
+
+---
+
+## Search
+
+`memory_search`, `memory_recall`, `memory_context`, `au search` and `au context` share one
+retrieval path with two halves:
+
+- **Full-text** — SQLite FTS5 over label + note, plus a stemmed index (`nodes_stem_fts`,
+  Snowball: Russian for Cyrillic words, English otherwise), so another case or number of the
+  same word still matches.
+- **Dense** — BGE-M3 vectors (1024-d, stored as int8 in `node_embeddings`).
+
+The two ranked lists are fused with Reciprocal Rank Fusion (k = 12). A node whose `subject`
+equals the query byte for byte comes first. When a reranker is available, the top 30 fused
+candidates are re-ordered by the `bge-reranker-v2-m3` cross-encoder; a search waits at most
+1.5 s for its scores and otherwise keeps the fused order.
+
+**The daemon owns the models.** `au daemon` (the same process that owns the reminder clock, see
+[Reminder Commands](#reminder-commands)) is the only process that loads BGE-M3 and the reranker.
+It serves query vectors and rerank scores over a Unix socket, `embed.sock`, next to the database.
+Writing a node only queues it in `embedding_queue`; the daemon embeds queued nodes in batches on
+its ticks. `au db reindex-embeddings` queues every live node that still lacks a vector.
+
+Without the daemon, search does not fail: it answers from full-text alone, and the JSON answer
+carries a `vector_notice` saying why.
+
+What the daemon needs on disk (nothing here is downloaded by `install.sh`):
+
+- ONNX Runtime: `libonnxruntime.so` under `<data-dir>/onnxruntime/`, or the path in `ORT_DYLIB_PATH`.
+- BGE-M3 weights: a `models--BAAI--bge-m3` directory under `<data-dir>/models/`, or under
+  `AURELIUS_MODELS_DIR`. The reranker weights are fetched into the same directory on first load.
+
+`<data-dir>` is the directory holding `aurelius.db` (`au home current`).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AURELIUS_EMBED_DEVICE` | `auto` | `auto`: CUDA first, proven by one real run, CPU when CUDA can't run a kernel. `cpu`: skip CUDA |
+| `AURELIUS_EMBED_PRELOAD` | on | load BGE-M3 right after the daemon starts; `0` loads it on the first request |
+| `AURELIUS_EMBED_IDLE_SECS` | `0` | unload BGE-M3 after this many idle seconds; `0` keeps it resident |
+| `AURELIUS_RERANK` | `auto` | `auto`: rerank on CUDA only, and not at all when `AURELIUS_EMBED_DEVICE=cpu`. `cpu`: allow CPU (one rerank of 30 documents takes seconds there). `off`: never |
+| `AURELIUS_RERANK_IDLE_SECS` | `600` | unload the reranker after this many idle seconds; `0` keeps it resident |
+| `AURELIUS_MODELS_DIR` | `<data-dir>/models` | where model weights live |
+
+`au eval-search` measures the path: recall@5, recall@10 and MRR@10 over a reference query set
+(`fixtures/eval/search-baseline.jsonl`), split by query class (ru, en, cross-language, key), for
+FTS, dense, RRF and RRF + rerank. Read-only; without the daemon only the FTS row is measured,
+the others are skipped with the reason rather than failed.
 
 ---
 
@@ -316,6 +400,25 @@ and `task_view` print all three, an unfilled one as an explicit dash (`—`), ne
 Reopening a closed task never erases these, or the resolution recorded at close time; they
 become history the task carries forward.
 
+### Branch and Worktree
+
+A task taken into work remembers the git branch and worktree it is worked on. Activation reads
+them from the repository of the current directory (only when that repository carries the task's
+project name), and the edit hook then moves the binding to wherever files are actually edited —
+a task is usually activated before its branch exists. Two things it never does: move a branch
+you named yourself, and move from a feature branch back to the default one.
+
+```bash
+au task activate <id>                                  # branch read from HEAD
+au task activate <id> --branch feat/x --worktree ~/wt  # named: the hook leaves it alone
+```
+
+`au task show` and `task_view` print the branch state against its upstream (`not pushed`,
+`pushed, in sync`, `pushed, ahead 2`, `upstream gone`) and the branch's pull request as `gh`
+reports it (`OPEN`, `MERGED`, `CLOSED`). `au task list` and `task_list` show the branch and its
+local state only — no network. "Merged" comes from the pull request, never from commit
+ancestry: a squash merge leaves the branch's commits outside the default branch.
+
 ### Evidence and Ripening
 
 A verify run (`ulika`'s gate, e.g. `node scripts/verify-run.mjs …`) reports its outcome back
@@ -323,6 +426,12 @@ to Aurelius with `au task evidence` — command, exit code, and artifact path, a
 project's active task. **This is not a command you run by hand**: the ulika hook
 (`record-verify.mjs`) calls it after every gate run, because it is the one thing that knows a
 run just happened. You will see it in scripts and hook logs, not type it yourself.
+
+The run is stored in the task itself (`data.evidence`: command, exit code, time, artifact path
+and whether the artifact still exists) — no separate run node and no `verified_by` edge is
+written; `au task show` and `task_view` list the runs. When the command runs inside a Claude
+Code session that the plugin's SessionStart hook registered, the real exit code is also
+recorded as a `verify` trace of that session for the judge.
 
 A task **ripens** once it has at least one code edit *and* a green (exit-0) evidence run newer
 than that edit — discussing a task without touching code never ripens it, and a later edit
@@ -339,11 +448,18 @@ without anyone having to ask — closing itself still requires a human decision 
 rather than asked of the human:
 
 ```bash
-au task done <id>                          # commit auto-detected via `git rev-parse --short HEAD`
+au task done <id>                          # commit auto-detected via `git rev-parse --short HEAD` in the project's repo
 au task done <id> --commit abc1234         # override the detected commit
 au task done <id> --pr https://github.com/…/pull/42
 au task done <id> --unconfirmed            # force "closed without confirmation", even if a commit was detected
 ```
+
+The auto-detected commit is recorded together with its branch, and `au task done` prints a
+notice on stderr naming both — close again with `--commit` if it is the wrong one. The project's repository is the path recorded on its
+project node by `au reindex`; without one, the repository of the current directory, but only if
+it is named like the project (a worktree counts under its main repository's name). A repository
+of another name is never used, so a session sitting in one project cannot stamp another
+project's task with its HEAD.
 
 If nothing about the resolution can be determined and `--unconfirmed` isn't passed, the task
 still closes — just marked **closed without confirmation**, so the history never silently
@@ -472,7 +588,7 @@ to self-host a sync server.
 ## CLI
 
 ```bash
-au init                            # initialize database
+au init                            # initialize database (indexes nothing)
 au note "chose X over Y" -p app   # capture a decision → project
 au note --stdin --kind episodic \
   --key precompact:$SESSION --json  # a moment, not a lasting fact: ages out, upserts, reports its id
@@ -485,30 +601,34 @@ au note "flag is on" --confidence measured \
   --evidence "cat app/.env" \
   --claim "REFUND_REQUESTS_ENABLED=true" \
   --volatility volatile --verify-with "cat app/.env" \
-  --subject xhub:.env:REFUND_REQUESTS_ENABLED  # where it came from, how fast it rots, what it is about
+  --subject myapp:.env:REFUND_REQUESTS_ENABLED  # where it came from, how fast it rots, what it is about
 au journal --session $SESSION_ID    # everything that run wrote — the selection a session-end hook needs
 au context beacon                  # graph around a topic
-au search "redis"                  # full-text search
-au reindex                         # index current project
+au search "redis"                  # hybrid search, 5 hits by default (--limit N)
+au search "redis" --json --type decision,problem   # one JSON object; `origin` says which half found each hit
+au reindex [--path DIR]            # index a project explicitly — the only way a repository enters the graph
 au view                            # open web graph UI
-au touch path/to/file              # track file access
+au touch path/to/file              # bump access_count of an already indexed file node (creates none)
 au export                          # export full graph as JSON
 au mcp                             # start MCP server
 au skills                          # print the skill index
-au snapshot -p myapp [--json]      # seven-layer slice: Markdown, or a fixed JSON shape
+au snapshot -p myapp [--json]      # layered slice: Markdown, or a fixed JSON shape
 au pickup -p myapp [--json]        # bounded ranked payload to rebuild working state after a context wipe
-au recall <uuid-or-subject>        # read one record back by its exact subject, not by search
-au recall --prefix xhub:refunds    # every live node whose subject starts with this facet
+au recall <uuid-or-subject>        # read one record back by its exact subject, not by search (MCP: memory_search id=…)
+au recall --prefix myapp:refunds    # every live node whose subject starts with this facet
 au path <from> <to> [--json]       # step ladder over next_step/prerequisite edges; --before <id> for everything leading in
 au graph import graph.json         # bulk-import an external documentation graph (spec 008)
 au graph export --format mermaid   # the same graph back out
 au merge <source> <target>         # fold a near-duplicate node into the one that stays
 au home current                    # which data/config directory au and aurelius read (`use`, `reset`)
 au eval [cases.jsonl] [--json]     # score recall against a frozen fixture — the argument gets a number
+au eval-search [--json]            # search quality by query class for FTS, dense, RRF, rerank (see Search)
 au trace -m "what just happened"   # append to the action journal (or --hook on PostToolUse)
 au judge                           # settle the session: reinforce, erode, fork or null
+au daemon                          # reminder clock + embedding model owner (systemd user unit)
 au db check [PATH]                 # verify integrity (read-only); PATH verifies a snapshot
 au db backup                       # safe snapshot via VACUUM INTO
+au db reindex-embeddings           # queue nodes without a vector for the daemon
 au doc convert report.docx         # document → Markdown on stdout
 au doc convert ./contracts -r      # convert a whole tree, cached by content hash
 au doc recall "termination"        # search everything ever converted
@@ -538,8 +658,9 @@ fixed by calling differently, the second by hand — retrying it is pointless.
 | `2` | storage unreachable — no database, damaged image, locked SQLite |
 | `10` | `au task claim`/`renew`/`release`/`give-up`: the pool is empty, or the lease expired and was reissued to someone else. A shift counts consecutive `10`s to know the queue is exhausted |
 | `11` | the same commands: the database is held by another writer. Distinct from `10` on purpose — otherwise the owner's own hand-run session reads as an empty queue and the shift exits reporting success |
-| `12` | `au task evidence`: nothing to attach the run to — the project has no active task. The evidence **is stored**, as a node without an edge; the code says "not attached", not "not written" |
+| `12` | `au task evidence`: nothing to attach the run to — the project has no active task. Nothing is written to the graph: the run stays in the caller's own journal (and in the session's `verify` trace, when a session resolves) |
 | `14` | `au eval`: no run, no numbers — the fixture's sha256 did not match `meta.fixture_sha256`, `meta.version` is unknown, or the run needed to write. A failing *case* is not this code: an incomparable number is worse than a missing one |
+| `15` | `au daemon`: another daemon is alive and holds the lock. Distinct so a supervisor (systemd `Restart=on-failure`) does not treat a correctly refused second start as a crash |
 
 Codes above `2` are neither: the call was right and the database is intact. Each names a state
 the caller has to branch on, and each exists because collapsing it into `1` made some script
@@ -560,10 +681,10 @@ back as truth six weeks later.
 | `confidence` | `measured` \| `inferred` \| `reported` \| `unverified`. **Required** on `memory_add`. Absent reads as `unverified`, never as "probably measured". `measured` without `evidence` is refused — that is `inferred`. |
 | `evidence` | The command or query **verbatim** that produced the fact |
 | `measured_at` | When it was measured; defaults to now for `measured` |
-| `claim` | The assertion in one or two lines (≤240 chars). Returned **whole** — recall clips the long note, never the claim |
+| `claim` | The assertion in one or two lines (≤240 chars). A longer one is shortened at write time — its first sentence if that fits, else cut at a word — and the original is kept in `claim_full`; the write response says so. Returned **whole** — recall clips the long note, never the claim |
 | `volatility` | `immutable` \| `slow` (30 d) \| `volatile` (1 d). Past that age the fact comes back marked "старше N дн — перепроверь" |
 | `verify_with` | The command that re-checks it |
-| `subject` | What is being asserted, e.g. `xhub:.env:REFUND_REQUESTS_ENABLED`. A second fact about the same subject is **refused** until `resolution` says `supersede` \| `refine` \| `coexist` — and the resolution becomes an edge, not a memory of one |
+| `subject` | What is being asserted, e.g. `myapp:.env:REFUND_REQUESTS_ENABLED`. A second fact about the same subject is **refused** until `resolution` says `supersede` \| `refine` \| `coexist` — and the resolution becomes an edge, not a memory of one |
 
 A failed probe (`probe_warnings`) does **not** downgrade `confidence`. Probes extract
 path-like tokens from prose and check them on disk — weak evidence by construction: an
@@ -638,7 +759,9 @@ instead of being marked and lost. `--interval` (default `60s`) sets the pause be
 systemd timer could stand in for the long-lived service). A file lock next to the database, not
 the unit being started once, is what keeps the daemon a singleton: a second `au daemon` — a stray
 manual start over an already-enabled unit, a double `enable` after copying the file twice — finds
-a live PID in the lock, refuses with its own exit code, and leaves the database untouched.
+a live PID in the lock, refuses with its own exit code (`15`), and leaves the database untouched.
+Outside `--once`, the same daemon also owns the embedding models and serves `embed.sock` — see
+[Search](#search).
 
 ```bash
 au remind add "check the deploy" --in 2h --for ai          # --for: me | ai | both (default both)
@@ -667,9 +790,8 @@ to run a timer of their own (see [Reminders](#reminders)).
 
 ### Secrets
 
-Aurelius stores where a secret lives, never the value. `--where` is checked for strings that
-look like the value itself (a key, a token, a connection string with credentials embedded) and
-the write is refused, with an explanation, when it matches.
+Aurelius stores where a secret lives, never the value: `--where` names an environment variable,
+a file path or a password-manager entry, not the secret itself.
 
 ```bash
 au secret add --name STRIPE_SECRET_KEY --where "env:STRIPE_SECRET_KEY" \
@@ -687,12 +809,12 @@ other automatic dump.
 au db check          # quick integrity report; exits non-zero when damaged
 au db check --full   # exhaustive check, every table
 au db check FILE     # verify a snapshot — a snapshot is an ordinary database
-au db backup         # snapshot → aurelius-<UTC timestamp>.db next to the database
+au db backup         # snapshot → aurelius-<UTC timestamp>.db next to the database, mode 0600
 ```
 
-Snapshots are taken automatically: `install.sh` registers a SessionStart hook that keeps
-a rolling set in `<data-dir>/aurelius/backups/`. Cadence follows activity rather than the
-clock — the graph only changes when Claude Code, the CLI or the git hooks touch it, so an
+Snapshots are taken automatically: the plugin's SessionStart hook (`au db backup --hook`) keeps
+a rolling set in `backups/` next to the database. Cadence follows activity rather than the
+clock — the graph only changes when Claude Code or the CLI touch it, so an
 idle machine does not accumulate identical copies. Several sessions in a day cost one
 snapshot; ~50 ms for an 8 MB graph. Each snapshot is verified with `au db check` right
 after it is written — one that fails is renamed to `.FAILED-CHECK` so it can never be
@@ -710,6 +832,28 @@ mistaken for a good backup, and kept, because a bad snapshot is evidence worth r
 > into the new file — producing a database whose header describes 181 pages while its body
 > holds 1781. `au db backup` uses SQLite's own `VACUUM INTO` and is the only safe way to
 > copy a live database.
+
+### Maintenance
+
+Every command here is a dry run that only counts or lists, until `--apply` is given.
+
+```bash
+au db prune [--json]                  # junk nodes by rule; nothing with a claim goes, run nodes aside
+au db purge-orphans                   # vectors whose node is deleted or missing
+au db scrub-trace                     # stored trace payloads that secret masking would change
+au db trace-retention --days 90       # traces older than N days (at least 30)
+au db prune-backups --keep 7          # snapshots beyond the N newest, next to the database and in backups/
+```
+
+`au db prune` has four rules: `technical_orphan` (a run or dependency node without edges, claim
+or body), `technical_junk` (any run node, and any dependency node without claim or body, even
+with edges — task evidence lives in the task, dependencies in the manifest), `stale_digest` (a
+project distillate that is not the newest) and `empty_project` (a project node with no edges,
+content or records naming it). Removal is a soft delete in one transaction. Nothing writes run or dependency nodes any more; the
+rules clear what older versions left behind.
+
+New trace payloads are masked for secrets before they are written; `scrub-trace` rewrites the ones
+stored before that.
 
 To restore a snapshot: stop everything that touches the database (every `au mcp`, `au view`,
 any editor with hooks), move the current database and its `-wal`/`-shm` aside, copy the
@@ -753,17 +897,23 @@ Session end    →  memory_session(summary, decisions, problems_solved, tasks)
 ```
 crates/
   aurelius-core/
-    src/graph/       — crud.rs, search.rs, traverse.rs, snapshot.rs (layers + distillate),
-                       rank.rs (the score recall orders by), render.rs (one node → one prose line),
-                       lease.rs, path.rs, pickup.rs, import.rs, export.rs
-    src/db.rs        — SQLite setup, migrations V1-V15
+    src/graph/       — crud.rs, search.rs (FTS + hybrid), traverse.rs, snapshot.rs (layers + distillate),
+                       rank.rs (the score recall orders by, RRF), fusion.rs, rerank.rs (cross-encoder client),
+                       render.rs (one node → one prose line), lease.rs, path.rs, pickup.rs, import.rs, export.rs
+    src/db.rs        — SQLite setup, migrations V1-V19
+    src/fts.rs, stem.rs — full-text query building, Snowball stemming for nodes_stem_fts
+    src/embed.rs     — BGE-M3 and bge-reranker-v2-m3 loading (ONNX Runtime, CUDA or CPU)
+    src/embed_socket.rs — embed.sock protocol: query vectors and rerank scores from the daemon
+    src/git.rs       — repository state for the snapshot's Repository layer
     src/models.rs    — Node, Edge, NodeType, Relation, MemoryKind
     src/provenance.rs — confidence/evidence/subject/volatility, parsed once for both doors
-    src/secret.rs    — the guard: refuses a field that reads like the secret's value
+    src/secret.rs    — secret detection: masks secrets in trace payloads, classifies coordinates
     src/eval.rs      — recall scored against a frozen fixture, read-only
+    src/search_eval.rs — search baseline for au eval-search
     src/tasks.rs     — task lifecycle, leasing, ripeness
     src/reminders.rs — reminders/reminder_events: state, owner, journal of postponements
-    src/indexer.rs   — Cargo.toml project indexer
+    src/indexer.rs   — project indexer behind au reindex / memory_index: crates and files, no dependency nodes
+    src/session_registry.rs — Claude Code session id per process, for traces written outside MCP
     src/identity.rs  — local identity config (~/.config/aurelius/identity.toml)
     src/sync/        — push/pull types, upsert + last-writer-wins merge logic
     src/trace.rs     — append-only journal of what the agent actually did
@@ -783,11 +933,12 @@ crates/
       brave.rs       — Brave Search API client
       perplexity.rs  — Perplexity Search API client
       cache.rs       — SQLite search cache with FTS5, scoped per provider
-  au/                — CLI + web UI server (+ `identity`/`share` sync commands)
+  au/                — CLI + web UI server (+ `identity`/`share` sync commands, plugin hook modes, `au daemon`)
 ui/                  — React + TypeScript + Tailwind (graph visualization)
 contrib/
-  claude-code/       — session hooks (reindex, track edits)
-  git-hooks/         — post-commit (captures decisions)
+  claude-code/       — deprecated bash hook wrappers (superseded by plugin/)
+  git-hooks/         — post-commit (mirrors commit messages as decisions; opt-in)
+  systemd/           — user unit for au daemon
 deploy/
   aurelius-sync-server/ — Dockerfile + docker-compose for self-hosting the sync server
 ```
@@ -795,15 +946,16 @@ deploy/
 ### Key Design
 
 - **SQLite + WAL** — concurrent reads, single writer, local-first. Every connection sets a busy timeout, verifies that WAL mode actually took effect, and checks the file header against the file size before use
-- **FTS5** — indexes label + note (not raw JSON), kept in sync via triggers
-- **15 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache, V6 sync attribution/tombstones, V7-V8 documents and skills, V9 the action journal (`act_trace`, `probes`, `pathways`, `labile_window`, `corrections`), V10 `codec`/`delta`/`node_version`, V11 obligations, V12 readable obligation objects, V13 the run that wrote a record, V14 the subject a fact asserts about, V15 `reminders`/`reminder_events`. Applied atomically in a single `BEGIN IMMEDIATE` transaction
+- **FTS5** — indexes label + note (not raw JSON), kept in sync via triggers, plus a stemmed twin (`nodes_stem_fts`)
+- **Vectors** — BGE-M3 embeddings in a `sqlite-vec` table, computed by the daemon from a queue; see [Search](#search)
+- **19 schema migrations** — V1 core, V2 access tracking, V3 indexes + edge dedup, V4 clean FTS, V5 search cache, V6 sync attribution/tombstones, V7-V8 documents and skills, V9 the action journal (`act_trace`, `probes`, `pathways`, `labile_window`, `corrections`), V10 `codec`/`delta`/`node_version`, V11 obligations, V12 readable obligation objects, V13 the run that wrote a record, V14 the subject a fact asserts about, V15 `reminders`/`reminder_events`, V16 `node_embeddings`, V17 run nodes retyped, V18 `embedding_queue`, V19 `nodes_stem_fts`. Applied atomically in a single `BEGIN IMMEDIATE` transaction. A database newer than the binary is refused with instructions instead of being opened
 - **Sync attribution** — `created_by`/`updated_by` stamped from the local identity config; deletes are soft (`deleted_at`) so they propagate as tombstones instead of resurrecting on the next sync
 - **Batch BFS** — `WHERE id IN (...)` per level, not N+1 per node
 - **Session dedup** — SHA-256 content hash on (project, summary)
 - **Edge dedup** — UNIQUE constraint on (from_id, to_id, relation)
 - **Task hub nodes** — tasks collect work logs, decisions, problems, solutions via `contains` edges
 - **Problem lifecycle** — unsolved = no Solution node with `solves` edge
-- **Relevance ranking** — recall orders by one score in `graph/rank.rs`: normalised bm25, provenance, freshness measured from `measured_at`, access count and node type. `memory_search` still ranks plainly, by how many query words matched
+- **Relevance ranking** — recall orders by one score in `graph/rank.rs`: normalised bm25, provenance, freshness measured from `measured_at`, access count and node type. Full-text and dense lists are fused by RRF (k = 12), then optionally reranked by a cross-encoder
 - **Project hub nodes** — auto-created by `memory_session`, `task_create` and `memory_add(project=…)`, all children linked via `belongs_to`
 - **Project scoping** — membership is the label prefix `[project-name]` **or** an edge to the project node, in either direction and under any relation. Checking only the label made everything written via `memory_add` + `memory_relate` invisible to project queries
 - **Label convention** — child nodes prefixed `[project-name] description`, project nodes use plain names
@@ -826,43 +978,57 @@ hand-edited into `settings.json`. Every hook calls the `au` binary directly — 
 
 | Event | Matcher | `au` command | Timeout |
 |-------|---------|-----|---------|
+| SessionStart | `""` | `au session-hook --hook` | 5s |
 | SessionStart | `""` | `au skills --hook` | 10s |
 | SessionStart | `""` | `au db backup --hook` | 30s |
 | UserPromptSubmit | `""` | `au remind --hook` | 5s |
-| PostToolUse | `Edit\|Write` | `au touch --hook` | 5s |
+| PreToolUse | `Edit\|Write\|MultiEdit\|NotebookEdit` | `au hint --hook` | 5s |
 | PostToolUse | `Bash\|PowerShell\|Edit\|Write\|NotebookEdit` | `au trace --hook` | 5s |
-| Stop | `""` | `au reindex --hook` | 15s |
 | Stop | `""` | `au judge --hook` | 20s |
 | Stop | `""` | `au remind --hook` | 5s |
 
-`skills` injects the skill index, `db backup` a throttled rolling database snapshot, `touch`
-increments access_count on edited files, `trace` appends to the action journal, `reindex`
-re-indexes the project and pushes sync-enabled projects, `judge` settles the session
-(reinforce/erode/fork/null). A failing hook is always swallowed: memory has no right to break
-the start — or the end — of a session. `remind` is wired to **both** `UserPromptSubmit` and
-`Stop` on purpose, not by oversight: `Stop` delivers at the end of a turn, `UserPromptSubmit`
-the moment the owner next types, and whichever fires first wins the conditional `UPDATE` inside
-`reminders::mark_delivered` — the other finds the row already taken and says nothing. Registering
-both costs nothing extra and halves the wait for a reminder that matures mid-turn.
+`session-hook` records the Claude Code session id under the Claude process's pid, so anything
+that process spawns (the MCP server, `au task evidence` run by a verify hook) can tell which
+session it belongs to. `skills` injects the skill index, `db backup` a throttled rolling database
+snapshot, `trace` appends to the action journal (secrets masked before the write), `judge`
+settles the session (reinforce/erode/fork/null). A failing hook is always swallowed: memory has
+no right to break the start — or the end — of a session. `remind` is wired to **both**
+`UserPromptSubmit` and `Stop` on purpose, not by oversight: `Stop` delivers at the end of a turn,
+`UserPromptSubmit` the moment the owner next types, and whichever fires first wins the
+conditional `UPDATE` inside `reminders::mark_delivered` — the other finds the row already taken
+and says nothing. Registering both costs nothing extra and halves the wait for a reminder that
+matures mid-turn.
 
-A seventh hook, `au snapshot --hook`, used to inject the memory slice at session start and was
-removed from the manifest: the slice surfaces the *freshest* nodes, which is not the same as the
-*needed* ones. The `--hook` flag itself stays on the CLI, so a hand-written `settings.json` can
-still call it. Spec
-[010 `waking-memory`](specs/010-waking-memory/) replaces it with a `UserPromptSubmit` hook that
-recalls against what was actually typed, rather than against the clock. Until that lands, pull
-memory in deliberately — `memory_status` at session start, `au pickup` after a context wipe.
+`hint` brings memory in on an event rather than on every turn: on the **first** edit of a file in
+a session it looks up at most three live decisions, problems and solutions that mention the
+file's repository-relative path and hands them to the model as additional context. Later edits of
+the same file in that session stay silent, files under `target/`, `node_modules/` and `.git/` are
+skipped, and the edit is never blocked — any failure prints nothing.
+
+The plugin no longer registers `au touch --hook` or `au reindex --hook`: nothing indexes a
+repository behind your back any more (see [Quick Start](#quick-start)). Both commands and their
+`--hook` flags stay on the CLI. Sync push at the end of a session is `memory_session`'s job.
+
+`au snapshot --hook`, which used to inject the memory slice at session start, was removed from the
+manifest as well: the slice surfaces the *freshest* nodes, which is not the same as the *needed*
+ones. The flag stays on the CLI, so a hand-written `settings.json` can still call it. Otherwise
+pull memory in deliberately — `memory_status` at session start, `au pickup` after a context wipe.
 
 `au remind --hook` prints reminders addressed to `ai`/`both` as plain stdout on `UserPromptSubmit`
 and as `{"systemMessage": …}` on `Stop` — see [Reminder Commands](#reminder-commands) for the full
-behavior and why no timer is involved anywhere in the delivery path. Same escape hatch as the
-removed seventh hook above: `--hook` stays a plain CLI flag, so a hand-written `settings.json` can
-still call it without the plugin.
+behavior and why no timer is involved anywhere in the delivery path. Like every hook mode here,
+`--hook` is a plain CLI flag, so a hand-written `settings.json` can call it without the plugin.
 
 The bash wrappers in `contrib/claude-code/*.sh` and its own `install.sh` are **deprecated since
 3.4.0** — kept only for hand installs that never adopt the plugin, and removed in the next major
 release. The `post-commit` git hook (`contrib/git-hooks/`) is a separate mechanism, unrelated to
-the Claude Code plugin, and is still installed by `install.sh` for the current repo.
+the Claude Code plugin, and opt-in: `install.sh` does not install it. It records every commit
+message as an unverified decision node, which search then ranks beside real decisions — install it
+in a repository only if you want that mirror:
+
+```bash
+cd /path/to/repo && /path/to/aurelius/contrib/git-hooks/install.sh
+```
 
 ---
 
@@ -893,7 +1059,7 @@ the Claude Code plugin, and is still installed by `install.sh` for the current r
 - [x] v3.2 — Provenance fields on every write handle; `memory_status` reports a stale server; task list stopped retelling the run journal
 - [x] v3.3 — Tasks addressable by an id prefix; the fitness gate reads volume stated as a number
 - [x] v3.4 — Claude Code plugin (`plugin/`), `--hook` mode inside `au` itself — no bash, no python3 — and an installer that updates instead of skipping
-- [ ] Next — spec [010 `waking-memory`](specs/010-waking-memory/): recall ranked and *measured* against a frozen fixture (`au eval`), and a `UserPromptSubmit` hook that brings memory in unasked, against what was typed rather than against the clock
+- [x] v3.5 — Dense retrieval: BGE-M3 vectors, RRF fusion with a stemmed full-text index, cross-encoder rerank, one daemon owning the models (spec [011](specs/011-dense-retrieval/)); reminders with a daemon-owned clock; `au hint --hook` brings memory in on the first edit of a file; `memory_search` reads a whole record by id and answers compactly; `au db prune` and the other dry-run-first maintenance commands; nothing is indexed or written implicitly any more — no auto-indexing, no run or dependency nodes, no default post-commit hook
 
 A release bumps `plugin/.claude-plugin/plugin.json` together with `Cargo.toml` — `crates/au/tests/plugin_manifest.rs`
 asserts the two versions are equal, so `cargo test` stays red until both are updated.
