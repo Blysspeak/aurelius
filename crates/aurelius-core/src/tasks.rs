@@ -171,7 +171,10 @@ fn readable_evidence(data: &Value) -> Vec<EvidenceEntry> {
 /// имени оставляет чужой проект за дверью. `None` значит «каталог этой
 /// задачи неизвестен».
 pub fn project_root(conn: &rusqlite::Connection, project: &str) -> Option<PathBuf> {
-    if let Some(path) = crate::graph::find_project_path(conn, project).ok().flatten() {
+    if let Some(path) = crate::graph::find_project_path(conn, project)
+        .ok()
+        .flatten()
+    {
         return Some(PathBuf::from(path));
     }
     // Путь проекта раньше записывала автоиндексация любого cwd; с 28.09.2026
@@ -1443,7 +1446,8 @@ mod tests {
         seed_project_with_path(&conn, "proj-branch", &repo.to_string_lossy());
         let since = "2020-01-01T00:00:00Z".parse().expect("rfc3339");
 
-        let resolution = build_resolution(&conn, Some(since), Some("proj-branch"), None, None, false);
+        let resolution =
+            build_resolution(&conn, Some(since), Some("proj-branch"), None, None, false);
 
         assert_eq!(resolution.branch.as_deref(), Some("feat/auto-probe"));
         assert_eq!(resolution.commit.as_deref(), Some(expected_sha.as_str()));
@@ -1459,8 +1463,8 @@ mod tests {
     fn build_resolution_keeps_explicit_commit_branchless() {
         let (_tmp, conn) = setup();
 
-        let repo = std::env::temp_dir()
-            .join(format!("aurelius-tasks-explicit-{}", uuid::Uuid::new_v4()));
+        let repo =
+            std::env::temp_dir().join(format!("aurelius-tasks-explicit-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&repo).expect("mkdir repo");
         let run_git = |args: &[&str]| {
             std::process::Command::new("git")

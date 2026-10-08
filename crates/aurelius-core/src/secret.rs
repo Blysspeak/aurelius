@@ -396,9 +396,8 @@ fn looks_like_git_range(s: &str) -> bool {
     let Some((left, right)) = s.split_once("..") else {
         return false;
     };
-    let sha = |part: &str| {
-        (7..=40).contains(&part.chars().count()) && part.chars().all(is_lower_hex)
-    };
+    let sha =
+        |part: &str| (7..=40).contains(&part.chars().count()) && part.chars().all(is_lower_hex);
     sha(left) && sha(right)
 }
 

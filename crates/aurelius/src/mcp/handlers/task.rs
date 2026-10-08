@@ -383,7 +383,10 @@ fn task_list_with_conn(
     // поле) на живом графе стоила на порядок больше бюджета одного чтения
     // (см. `TASK_LIST_COMPACT_NOTE_BUDGET`). `full=true` сохраняет ту форму
     // побайтово — ничего в её полях не переименовано и не убрано.
-    let full = params.get("full").and_then(|f| f.as_bool()).unwrap_or(false);
+    let full = params
+        .get("full")
+        .and_then(|f| f.as_bool())
+        .unwrap_or(false);
 
     let tasks = graph::get_tasks_filtered(conn, project, status, priority, limit)?;
 
@@ -962,10 +965,15 @@ fn task_view_with_conn(
         let mut v = json!(binding);
         let project = task.data.get("project").and_then(|p| p.as_str());
         if let Some(root) = aurelius_core::task_git::root_for(conn, project, binding) {
-            v["state"] = json!(aurelius_core::task_git::branch_state(&root, &binding.branch));
+            v["state"] = json!(aurelius_core::task_git::branch_state(
+                &root,
+                &binding.branch
+            ));
             if !matches!(status_str, "done" | "cancelled") {
-                v["pull_request"] =
-                    json!(aurelius_core::task_git::pull_request(&root, &binding.branch));
+                v["pull_request"] = json!(aurelius_core::task_git::pull_request(
+                    &root,
+                    &binding.branch
+                ));
             }
         }
         v
@@ -1878,8 +1886,9 @@ mod tests {
         let note = words.join(" ");
         seed_task_with_note(&conn, "proj-list-long", &note);
 
-        let result = task_list_with_conn(&conn, &json!({"project": "proj-list-long", "full": true}))
-            .expect("task_list");
+        let result =
+            task_list_with_conn(&conn, &json!({"project": "proj-list-long", "full": true}))
+                .expect("task_list");
 
         let task = &result["tasks"][0];
         let shown = task["note"].as_str().expect("note");
@@ -1974,21 +1983,15 @@ mod tests {
             .expect("task_list default (compact)");
         let compact_task = &compact_truncated["tasks"][0];
         assert_eq!(compact_task["note_truncated"], json!(true));
-        let compact_len = compact_task["note"]
-            .as_str()
-            .expect("note")
-            .chars()
-            .count();
+        let compact_len = compact_task["note"].as_str().expect("note").chars().count();
         assert!(
             compact_len <= TASK_LIST_COMPACT_NOTE_BUDGET,
             "по умолчанию (компакт) note обязана резаться компактным бюджетом"
         );
 
-        let full_truncated = task_list_with_conn(
-            &conn,
-            &json!({"project": "proj-full-notes", "full": true}),
-        )
-        .expect("task_list full");
+        let full_truncated =
+            task_list_with_conn(&conn, &json!({"project": "proj-full-notes", "full": true}))
+                .expect("task_list full");
         let full_task = &full_truncated["tasks"][0];
         assert_eq!(full_task["note_truncated"], json!(true));
         let full_len = full_task["note"].as_str().expect("note").chars().count();
@@ -2072,7 +2075,10 @@ mod tests {
             "evidence",
             "created_at",
         ] {
-            assert!(item.get(key).is_none(), "компакт обязан снять {key}: {item}");
+            assert!(
+                item.get(key).is_none(),
+                "компакт обязан снять {key}: {item}"
+            );
         }
         let date = item["date"].as_str().expect("date строкой");
         assert_eq!(date.len(), 10, "date обязана быть YYYY-MM-DD: {date}");
@@ -2097,7 +2103,10 @@ mod tests {
                 "full=true обязан вернуть ключ {key} (пусть и null): {full_item}"
             );
         }
-        assert!(full_item.get("date").is_none(), "full не заводит 'date': {full_item}");
+        assert!(
+            full_item.get("date").is_none(),
+            "full не заводит 'date': {full_item}"
+        );
     }
 
     /// Регрессия на измерение задачи 3 (28.09.2026, `au mcp` по живому графу,
@@ -2129,8 +2138,9 @@ mod tests {
             .expect("insert task");
         }
 
-        let compact = task_list_with_conn(&conn, &json!({"project": "proj-realistic", "limit": 20}))
-            .expect("task_list compact");
+        let compact =
+            task_list_with_conn(&conn, &json!({"project": "proj-realistic", "limit": 20}))
+                .expect("task_list compact");
         let full = task_list_with_conn(
             &conn,
             &json!({"project": "proj-realistic", "limit": 20, "full": true}),
@@ -2139,7 +2149,9 @@ mod tests {
         assert_eq!(compact["tasks"].as_array().expect("tasks").len(), 20);
         assert_eq!(full["tasks"].as_array().expect("tasks").len(), 20);
 
-        let compact_len = serde_json::to_string(&compact).expect("serialize compact").len();
+        let compact_len = serde_json::to_string(&compact)
+            .expect("serialize compact")
+            .len();
         let full_len = serde_json::to_string(&full).expect("serialize full").len();
         assert!(
             compact_len < full_len,

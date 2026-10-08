@@ -75,11 +75,7 @@ fn run_in(home: &TmpHome, cwd: &std::path::Path, args: &[&str]) -> (i32, String)
 /// То же, что `run_in`, но и stderr возвращается: нужно там, где команда
 /// обязана что-то СКАЗАТЬ в stderr (`au task done` без `--commit`), не
 /// смешивая это с результатом в stdout.
-fn run_in_full(
-    home: &TmpHome,
-    cwd: &std::path::Path,
-    args: &[&str],
-) -> (i32, String, String) {
+fn run_in_full(home: &TmpHome, cwd: &std::path::Path, args: &[&str]) -> (i32, String, String) {
     let out = au(home, args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -645,10 +641,9 @@ fn temp_git_repo(tag: &str) -> (std::path::PathBuf, String) {
     std::fs::write(repo.join("src/lib.rs"), "").expect("write lib.rs");
     assert!(run_git(&["add", "."]).status.success());
     assert!(run_git(&["commit", "-q", "-m", "init"]).status.success());
-    let expected_sha =
-        String::from_utf8_lossy(&run_git(&["rev-parse", "--short", "HEAD"]).stdout)
-            .trim()
-            .to_owned();
+    let expected_sha = String::from_utf8_lossy(&run_git(&["rev-parse", "--short", "HEAD"]).stdout)
+        .trim()
+        .to_owned();
     assert!(run_git(&["checkout", "-q", "-b", "feat/cli-probe"])
         .status
         .success());
@@ -664,10 +659,16 @@ fn temp_git_repo(tag: &str) -> (std::path::PathBuf, String) {
 fn task_done_without_commit_prints_notice_and_stores_branch() {
     let home = TmpHome::dir("done-notice");
     let (repo, expected_sha) = temp_git_repo("notice");
-    let project = repo.file_name().and_then(|n| n.to_str()).expect("имя каталога");
+    let project = repo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("имя каталога");
 
-    let (code, out, err) =
-        run_in_full(&home, &repo, &["task", "new", "probe auto detection", "--project", project]);
+    let (code, out, err) = run_in_full(
+        &home,
+        &repo,
+        &["task", "new", "probe auto detection", "--project", project],
+    );
     assert_eq!(code, 0, "создание задачи: stdout={out} stderr={err}");
     let id = created_task_id(&out);
 
@@ -710,10 +711,16 @@ fn task_done_without_commit_prints_notice_and_stores_branch() {
 fn task_done_with_explicit_commit_prints_no_notice() {
     let home = TmpHome::dir("done-explicit");
     let (repo, _expected_sha) = temp_git_repo("explicit");
-    let project = repo.file_name().and_then(|n| n.to_str()).expect("имя каталога");
+    let project = repo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("имя каталога");
 
-    let (code, out, err) =
-        run_in_full(&home, &repo, &["task", "new", "probe auto detection", "--project", project]);
+    let (code, out, err) = run_in_full(
+        &home,
+        &repo,
+        &["task", "new", "probe auto detection", "--project", project],
+    );
     assert_eq!(code, 0, "создание задачи: stdout={out} stderr={err}");
     let id = created_task_id(&out);
 

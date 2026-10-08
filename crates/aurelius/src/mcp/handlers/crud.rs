@@ -1242,9 +1242,16 @@ mod tests {
             let empty = value.is_null()
                 || matches!(value, serde_json::Value::Array(a) if a.is_empty())
                 || matches!(value, serde_json::Value::Object(o) if o.is_empty());
-            assert!(!empty, "пустой ключ {key} не должен присутствовать: {result}");
+            assert!(
+                !empty,
+                "пустой ключ {key} не должен присутствовать: {result}"
+            );
         }
-        assert_eq!(result["count"], json!(1), "count остаётся, даже будучи 0 — это не 'пусто'");
+        assert_eq!(
+            result["count"],
+            json!(1),
+            "count остаётся, даже будучи 0 — это не 'пусто'"
+        );
     }
 
     /// (b) `id` — точный UUID — отдаёт всю запись: note, data, provenance
@@ -1321,10 +1328,7 @@ mod tests {
             &json!({"id": "zoo:no-such-subject", "query": "морж"}),
         )
         .expect_err("неизвестный id обязан быть ошибкой, не находкой по query");
-        assert!(
-            err.to_string().contains("zoo:no-such-subject"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("zoo:no-such-subject"), "{err}");
     }
 
     /// `id` игнорирует `query`: даже если `query` указывает на другой узел,
@@ -1345,11 +1349,8 @@ mod tests {
         .expect("target");
         seed(&conn, NodeType::Decision, "морж — то, что искал бы query");
 
-        let result = memory_search_with_conn(
-            &conn,
-            &json!({"id": "zoo:target", "query": "морж"}),
-        )
-        .expect("memory_search by id ignoring query");
+        let result = memory_search_with_conn(&conn, &json!({"id": "zoo:target", "query": "морж"}))
+            .expect("memory_search by id ignoring query");
         assert_eq!(result["id"], json!(target.id.to_string()));
     }
 }

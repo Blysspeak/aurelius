@@ -800,7 +800,10 @@ mod recall_shape_tests {
             let date = hit["created_at"].as_str().expect("created_at строкой");
             assert_eq!(date.len(), 10, "created_at обязан быть датой: {date}");
         }
-        assert_eq!(node_hit(&claimed, "сокет")["subject"], "demo:embed:resident");
+        assert_eq!(
+            node_hit(&claimed, "сокет")["subject"],
+            "demo:embed:resident"
+        );
         assert_eq!(
             node_hit(&claimed, "сокет")["claim"],
             "Модель висит резидентно"
@@ -832,7 +835,13 @@ mod recall_shape_tests {
         });
         drop_empty_fields(&mut value);
         let obj = value.as_object().expect("объект");
-        for kept in ["kept_string", "kept_false", "kept_zero", "kept_array", "kept_object"] {
+        for kept in [
+            "kept_string",
+            "kept_false",
+            "kept_zero",
+            "kept_array",
+            "kept_object",
+        ] {
             assert!(obj.contains_key(kept), "должно остаться: {kept}");
         }
         for dropped in ["null_field", "empty_array", "empty_object"] {
