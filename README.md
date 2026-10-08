@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/v3.4.4-stable-a6e3a1?style=flat-square" alt="v3.4.4">
+  <img src="https://img.shields.io/badge/v3.5.0-stable-a6e3a1?style=flat-square" alt="v3.5.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
   <img src="https://img.shields.io/badge/MCP-35_tools-a6e3a1?style=flat-square" alt="MCP">
