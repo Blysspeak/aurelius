@@ -77,14 +77,21 @@ pub struct RepoState {
 /// Одна команда git в `dir` под [`GIT_TIMEOUT`]. `None` на любом отказе:
 /// git не найден, ненулевой код, таймаут. Процесс по таймауту убивается, а не
 /// бросается висеть.
-fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let mut child = Command::new("git")
-        // Статус не имеет права брать замок индекса: хук идёт параллельно с
-        // git владельца, и чужой `index.lock` сломал бы его команду.
-        .arg("--no-optional-locks")
+pub(crate) fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let mut cmd = Command::new("git");
+    // Статус не имеет права брать замок индекса: хук идёт параллельно с
+    // git владельца, и чужой `index.lock` сломал бы его команду.
+    cmd.arg("--no-optional-locks")
         .args(args)
         .current_dir(dir)
-        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    run(cmd, GIT_TIMEOUT)
+}
+
+/// Вывод команды под таймаутом — общий для git и `gh` (`task_git`). `None`
+/// на любом отказе: программа не найдена, ненулевой код, таймаут.
+pub(crate) fn run(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -97,7 +104,7 @@ fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
         stdout.read_to_end(&mut buf).map(|_| buf)
     });
-    let deadline = Instant::now() + GIT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -117,7 +124,7 @@ fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
 }
 
 /// Корень и каноническое имя репозитория, в котором лежит `dir`.
-fn toplevel(dir: &Path) -> Option<Repo> {
+pub(crate) fn toplevel(dir: &Path) -> Option<Repo> {
     let out = git(
         dir,
         &[

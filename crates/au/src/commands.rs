@@ -1578,9 +1578,14 @@ fn path_before(
 /// Находка 4 (адверсариальный разбор спеки 007): `activated_at` ставится
 /// ОДИН РАЗ, на переход в active — не на каждый вызов `au task activate` на
 /// уже активной задаче. Симметрия с MCP `task_update` (`handlers/task.rs`).
+///
+/// `named` — ветка, названная в `--branch`: пишется всегда. Без неё привязка
+/// читается с HEAD, и только пустая — переоткрытие не переписывает то, где
+/// задача уже велась.
 fn activate_task(
     conn: &rusqlite::Connection,
     task: &aurelius_core::models::Node,
+    named: Option<aurelius_core::task_git::GitBinding>,
 ) -> Result<Option<graph::EvictedTask>> {
     let project = task
         .data
@@ -1598,11 +1603,17 @@ fn activate_task(
     }
     data.as_object_mut().map(|o| o.remove("blocked_by"));
 
+    let mut fields = task_fields::TaskFields::from_data(&data);
     if !was_active {
-        let mut fields = task_fields::TaskFields::from_data(&data);
         fields.activated_at = Some(chrono::Utc::now());
-        data = fields.merge_into(&data);
+        if fields.git.is_none() {
+            fields.git = aurelius_core::task_git::at_activation(conn, &project);
+        }
     }
+    if named.is_some() {
+        fields.git = named;
+    }
+    data = fields.merge_into(&data);
 
     graph::update_node(conn, task.id, None, Some(data))?;
     Ok(evicted)
@@ -1970,6 +1981,19 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 };
                 println!("  {icon} [{pri}] {} — {st}{ripe_mark}", t.label);
                 println!("    id: {}", t.id);
+                if let Some(binding) = &fields.git {
+                    use aurelius_core::task_git;
+                    let project = t.data.get("project").and_then(|p| p.as_str());
+                    // Закрытой задаче состояние ветки уже не нужно.
+                    let state = (!matches!(st, "done" | "cancelled"))
+                        .then(|| task_git::root_for(&conn, project, binding))
+                        .flatten()
+                        .and_then(|root| task_git::branch_state(&root, &binding.branch));
+                    match state {
+                        Some(state) => println!("    ветка: {} — {state}", binding.branch),
+                        None => println!("    ветка: {}", binding.branch),
+                    }
+                }
                 if let Some(created_by) = &t.created_by {
                     print!("    by: {created_by}");
                     match &t.updated_by {
@@ -2135,6 +2159,33 @@ pub async fn task(action: TaskAction) -> Result<()> {
             }
             if let Some(note) = &task.note {
                 println!("  Note:     {note}");
+            }
+
+            if let Some(binding) = &fields.git {
+                use aurelius_core::task_git;
+                println!("\n  Ветка:    {}", binding.branch);
+                if let Some(worktree) = &binding.worktree {
+                    println!("    дерево: {worktree}");
+                }
+                let project = task.data.get("project").and_then(|p| p.as_str());
+                if let Some(root) = task_git::root_for(&conn, project, binding) {
+                    if let Some(state) = task_git::branch_state(&root, &binding.branch) {
+                        println!("    состояние: {state}");
+                    }
+                    // Сеть (`gh`) — закрытой задаче PR уже не спрашиваем.
+                    if !matches!(st, "done" | "cancelled") {
+                        match task_git::pull_request(&root, &binding.branch) {
+                            Some(pr) => println!(
+                                "    PR: #{} {}{} {}",
+                                pr.number,
+                                pr.state,
+                                if pr.draft { " (draft)" } else { "" },
+                                pr.url
+                            ),
+                            None => println!("    PR: —"),
+                        }
+                    }
+                }
             }
 
             if let Some(resolution) = &fields.resolution {
@@ -2335,10 +2386,24 @@ pub async fn task(action: TaskAction) -> Result<()> {
             println!("⛔ Task blocked: {} — {}", task.label, reason);
         }
 
-        TaskAction::Activate { id } => {
+        TaskAction::Activate {
+            id,
+            branch,
+            worktree,
+        } => {
             let task = find_task(&conn, &id)?;
-            let evicted = activate_task(&conn, &task)?;
+            let named = branch.map(|branch| aurelius_core::task_git::GitBinding {
+                branch,
+                worktree,
+                explicit: true,
+            });
+            let evicted = activate_task(&conn, &task, named)?;
             println!("▶ Task activated: {}", task.label);
+            let bound = graph::get_node(&conn, &task.id.to_string())?
+                .and_then(|n| task_fields::TaskFields::from_data(&n.data).git);
+            if let Some(binding) = bound {
+                println!("  ветка: {}", binding.branch);
+            }
             // T009: молчаливое вытеснение выглядит как потеря задачи.
             if let Some(evicted) = evicted {
                 println!(
@@ -4659,6 +4724,15 @@ pub async fn trace_cmd(
                         if let Some(task) = active.pop() {
                             let mut fields = task_fields::TaskFields::from_data(&task.data);
                             fields.last_edit_at = Some(chrono::Utc::now());
+                            // Привязка идёт за правкой: задачу берут в
+                            // работу раньше, чем заводят ветку.
+                            if let Some(moved) = aurelius_core::task_git::follow_edit(
+                                fields.git.as_ref(),
+                                &project,
+                                std::path::Path::new(&payload),
+                            ) {
+                                fields.git = Some(moved);
+                            }
                             let data = fields.merge_into(&task.data);
                             let _ = graph::update_node(&conn, task.id, None, Some(data));
                         }
@@ -6097,7 +6171,7 @@ mod tests {
             .expect("get_node")
             .expect("node exists");
 
-        activate_task(&conn, &task).expect("activate_task");
+        activate_task(&conn, &task, None).expect("activate_task");
 
         let after = graph::get_node(&conn, &id.to_string())
             .expect("get_node")
@@ -6125,7 +6199,7 @@ mod tests {
             .expect("get_node")
             .expect("node exists");
 
-        activate_task(&conn, &task).expect("activate_task");
+        activate_task(&conn, &task, None).expect("activate_task");
 
         let after = graph::get_node(&conn, &id.to_string())
             .expect("get_node")

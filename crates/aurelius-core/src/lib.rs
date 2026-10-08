@@ -28,6 +28,7 @@ pub mod secret;
 pub mod session_registry;
 pub mod stem;
 pub mod sync;
+pub mod task_git;
 pub mod tasks;
 pub mod trace;
 pub mod window;

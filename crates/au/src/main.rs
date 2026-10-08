@@ -146,6 +146,14 @@ pub enum TaskAction {
     Activate {
         /// Task UUID or label
         id: String,
+        /// Git branch the task is worked on. Without it the branch is read
+        /// from the repository of the current directory and then follows
+        /// file edits; a branch named here is never moved automatically
+        #[arg(long)]
+        branch: Option<String>,
+        /// Path of the git worktree that `--branch` is checked out in
+        #[arg(long, requires = "branch")]
+        worktree: Option<String>,
     },
     /// Attach evidence of a run to a task. Called by the ulika hook
     /// (`record-verify.mjs`), not by a person. The hook knows which project

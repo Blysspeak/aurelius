@@ -202,6 +202,11 @@ fn task_update_with_conn(
             if !was_active {
                 let mut fields = aurelius_core::tasks::TaskFields::from_data(&data);
                 fields.activated_at = Some(now);
+                // Привязка к ветке — только пустой: переоткрытие не
+                // переписывает то, где задача уже велась.
+                if fields.git.is_none() {
+                    fields.git = aurelius_core::task_git::at_activation(conn, &project);
+                }
                 data = fields.merge_into(&data);
             }
         }
@@ -268,6 +273,21 @@ fn task_update_with_conn(
         data["acceptance_criteria"] = criteria.clone();
     }
 
+    // Ветка, названная вызывающим, сильнее прочитанной с HEAD: процесс MCP
+    // стоит там, где запущена сессия, а работа может идти в другом дереве.
+    if let Some(branch) = params.get("branch").and_then(|b| b.as_str()) {
+        let mut fields = aurelius_core::tasks::TaskFields::from_data(&data);
+        fields.git = Some(aurelius_core::task_git::GitBinding {
+            branch: branch.to_owned(),
+            worktree: params
+                .get("worktree")
+                .and_then(|w| w.as_str())
+                .map(str::to_owned),
+            explicit: true,
+        });
+        data = fields.merge_into(&data);
+    }
+
     // Provenance — alongside the other edits, not a separate call: a task's
     // confidence can change AFTER a measurement, and this is exactly that
     // case. Without any fields given, `write_into` leaves `data` untouched.
@@ -293,6 +313,7 @@ fn task_update_with_conn(
         "activated_at": fields.activated_at.map(|d| d.to_rfc3339()),
         "closed_at": fields.closed_at.map(|d| d.to_rfc3339()),
         "resolution": fields.resolution,
+        "git": fields.git,
         "provenance": {
             "confidence": current_prov.confidence_or_default().as_str(),
             "subject": current_prov.subject,
@@ -394,7 +415,7 @@ fn task_list_with_conn(
             if full {
                 task_item_full(t, &fields, status, ripe, log_count, full_notes)
             } else {
-                task_item_compact(t, &fields, status, ripe, log_count, full_notes)
+                task_item_compact(conn, t, &fields, status, ripe, log_count, full_notes)
             }
         })
         .collect();
@@ -461,6 +482,18 @@ fn task_item_full(
     })
 }
 
+/// Состояние привязанной ветки задачи относительно вышестоящей — локальный
+/// git, без сети (`task_git::branch_state`).
+fn branch_state(
+    conn: &rusqlite::Connection,
+    task: &aurelius_core::models::Node,
+    binding: &aurelius_core::task_git::GitBinding,
+) -> Option<String> {
+    let project = task.data.get("project").and_then(|p| p.as_str());
+    let root = aurelius_core::task_git::root_for(conn, project, binding)?;
+    aurelius_core::task_git::branch_state(&root, &binding.branch)
+}
+
 /// Компактная (дефолтная) форма одной задачи: та же тримка, что
 /// `compact_node_json` в `status.rs` применяет к узлу — короткая дата вместо
 /// RFC3339, без авторов, `evidence` только когда в ней вообще что-то есть, а
@@ -469,6 +502,7 @@ fn task_item_full(
 /// `null`. `full_notes=true` работает и здесь, независимо от `full`: note
 /// целиком, но остальные поля — всё так же в компактной форме.
 fn task_item_compact(
+    conn: &rusqlite::Connection,
     t: &aurelius_core::models::Node,
     fields: &aurelius_core::tasks::TaskFields,
     status: &str,
@@ -499,6 +533,13 @@ fn task_item_compact(
         "resolution": fields.resolution,
         "ripe": ripe,
     });
+    if let Some(binding) = &fields.git {
+        v["branch"] = json!(binding.branch);
+        // Закрытой задаче состояние ветки уже не нужно — git не зовём.
+        if !matches!(status, "done" | "cancelled") {
+            v["branch_state"] = json!(branch_state(conn, t, binding));
+        }
+    }
     let summary = aurelius_core::tasks::evidence_summary(fields);
     if summary.total > 0 {
         let mut evidence = json!(summary);
@@ -915,6 +956,20 @@ fn task_view_with_conn(
         .unwrap_or("backlog");
     let fields = aurelius_core::tasks::TaskFields::from_data(&task.data);
     let ripe = aurelius_core::tasks::is_ripe(&fields, status_str);
+    // Привязка с живым состоянием: ветка — локальным git, PR — через `gh`
+    // (сеть, поэтому только здесь, а не в `task_list`, и не для закрытых).
+    let git = fields.git.as_ref().map(|binding| {
+        let mut v = json!(binding);
+        let project = task.data.get("project").and_then(|p| p.as_str());
+        if let Some(root) = aurelius_core::task_git::root_for(conn, project, binding) {
+            v["state"] = json!(aurelius_core::task_git::branch_state(&root, &binding.branch));
+            if !matches!(status_str, "done" | "cancelled") {
+                v["pull_request"] =
+                    json!(aurelius_core::task_git::pull_request(&root, &binding.branch));
+            }
+        }
+        v
+    });
 
     Ok(json!({
         // Сама задача НИКОГДА не режется: все поля целиком, как и раньше.
@@ -933,6 +988,7 @@ fn task_view_with_conn(
         "resolution": fields.resolution,
         "evidence": fields.evidence,
         "ripe": ripe,
+        "git": git,
         // Честный отчёт об урезании — молчаливая обрезка хуже длинного ответа:
         // читатель обязан узнать, что именно и сколько осталось за кадром, и
         // как это достать, а не догадываться по круглым числам вроде "5".
@@ -1330,6 +1386,41 @@ mod tests {
     /// правила «одна активная задача на проект» — CLI (`au task activate`)
     /// вытесняет прежнюю активную в backlog и ставит `activated_at` на
     /// каждое взятие. Тест падал на прежней реализации.
+    #[test]
+    fn task_update_branch_binds_task_and_view_and_list_show_it() {
+        let (_tmp, conn) = setup();
+        let id = seed_task_in_project(&conn, "proj-git", "задача с веткой");
+
+        let result = task_update_with_conn(
+            &conn,
+            &json!({"id": id.to_string(), "status": "active", "branch": "feat/x"}),
+        )
+        .expect("task_update branch");
+        assert_eq!(result["git"]["branch"], json!("feat/x"));
+        assert_eq!(result["git"]["explicit"], json!(true));
+
+        let view = task_view_with_conn(&conn, &json!({"id": id.to_string()})).expect("task_view");
+        assert_eq!(view["git"]["branch"], json!("feat/x"));
+
+        let list = task_list_with_conn(&conn, &json!({"project": "proj-git"})).expect("task_list");
+        assert_eq!(list["tasks"][0]["branch"], json!("feat/x"));
+        // Каталог проекта неизвестен — состояние не выдумывается.
+        assert!(list["tasks"][0].get("branch_state").is_none());
+    }
+
+    /// Активация без названной ветки в чужом каталоге (cwd теста — не
+    /// репозиторий проекта задачи) привязку не ставит: чужая ветка хуже
+    /// отсутствующей.
+    #[test]
+    fn task_update_active_does_not_bind_branch_of_foreign_repo() {
+        let (_tmp, conn) = setup();
+        let id = seed_task(&conn, "proj-git-foreign", "без ветки");
+        let result =
+            task_update_with_conn(&conn, &json!({"id": id.to_string(), "status": "active"}))
+                .expect("task_update active");
+        assert!(result["git"].is_null(), "{}", result["git"]);
+    }
+
     #[test]
     fn task_update_active_sets_activated_at_and_evicts_previous_active() {
         let (_tmp, conn) = setup();

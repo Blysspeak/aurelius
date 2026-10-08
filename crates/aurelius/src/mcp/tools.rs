@@ -523,7 +523,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "task_update",
-                "description": "Update task status, priority or acceptance criteria (backlog → active → done/blocked/cancelled). 'active' stamps activated_at and moves any other active task of the project back to backlog (one active per project, same rule as `au task activate`). 'done' stamps closed_at and builds the resolution like the CLI: commit from git HEAD unless given, files from edits traced since activation; commit/pull_request/unconfirmed only refine it. Legacy started_at/completed_at are still tracked. Accepts memory_add's provenance fields (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way; this is how a changed confidence lands on the task. resolution is not supported: to supersede a fact by subject, use memory_add.",
+                "description": "Update task status, priority or acceptance criteria (backlog → active → done/blocked/cancelled). 'active' stamps activated_at, binds the task to the current git branch and worktree (shown with push/PR state by task_view) and moves any other active task of the project back to backlog (one active per project, same rule as `au task activate`). 'done' stamps closed_at and builds the resolution like the CLI: commit from git HEAD unless given, files from edits traced since activation; commit/pull_request/unconfirmed only refine it. Legacy started_at/completed_at are still tracked. Accepts memory_add's provenance fields (confidence, evidence, subject, volatility, claim, measured_at, verify_with), parsed the same way; this is how a changed confidence lands on the task. resolution is not supported: to supersede a fact by subject, use memory_add.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -565,6 +565,14 @@ pub fn tool_definitions() -> serde_json::Value {
                         "unconfirmed": {
                             "type": "boolean",
                             "description": "Only with status='done'. Force-mark the resolution as unconfirmed even if a commit/PR/edited files were found (default: unconfirmed only when nothing was found)"
+                        },
+                        "branch": {
+                            "type": "string",
+                            "description": "Git branch the task is worked on. Read from the repo's HEAD on activation and then follows file edits; name it here when the work happens elsewhere (another worktree) — a named branch is never moved automatically"
+                        },
+                        "worktree": {
+                            "type": "string",
+                            "description": "Only with 'branch'. Absolute path of the git worktree that branch is checked out in"
                         },
                         "confidence": {
                             "type": "string",
