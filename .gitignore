@@ -35,3 +35,8 @@ fixtures/eval/*.db.zst
 # the files are absent.
 fixtures/eval/search-baseline.jsonl
 fixtures/eval/search-holdout.jsonl
+
+# Spec Kit scaffolding (templates, scripts, speckit-* skills): local tooling,
+# not part of the product. The specs themselves live in specs/.
+.specify/
+.claude/skills/
