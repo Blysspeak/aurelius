@@ -159,7 +159,6 @@ fn task_update_with_conn(
     // Merge data fields
     let mut data = node.data.clone();
     let now = chrono::Utc::now();
-    let mut evicted: Option<graph::EvictedTask> = None;
 
     if let Some(status) = params.get("status").and_then(|s| s.as_str()) {
         if status == "active" {
@@ -181,16 +180,13 @@ fn task_update_with_conn(
                 data["started_at"] = json!(now.to_rfc3339());
             }
 
-            // T008/FR-031, симметрия с `au task activate`: в проекте не
-            // более одной активной задачи — взятие этой вытесняет прежнюю
-            // активную того же проекта в backlog. Общая функция ядра, не
-            // вторая копия правила.
+            // Взятие в работу не трогает другие задачи проекта: активных
+            // может быть несколько.
             let project = data
                 .get("project")
                 .and_then(|p| p.as_str())
                 .unwrap_or("unknown")
                 .to_owned();
-            evicted = graph::evict_active(conn, &project, node.id)?;
             if let Some(obj) = data.as_object_mut() {
                 obj.remove("blocked_by");
             }
@@ -247,7 +243,7 @@ fn task_update_with_conn(
                 unconfirmed,
             );
             let confirmed = resolution.confirmed;
-            fields.closed_at = Some(now);
+            fields.close(now);
             fields.resolution = Some(resolution);
             data = fields.merge_into(&data);
             if !confirmed {
@@ -277,14 +273,17 @@ fn task_update_with_conn(
     // стоит там, где запущена сессия, а работа может идти в другом дереве.
     if let Some(branch) = params.get("branch").and_then(|b| b.as_str()) {
         let mut fields = aurelius_core::tasks::TaskFields::from_data(&data);
-        fields.git = Some(aurelius_core::task_git::GitBinding {
-            branch: branch.to_owned(),
-            worktree: params
-                .get("worktree")
-                .and_then(|w| w.as_str())
-                .map(str::to_owned),
-            explicit: true,
-        });
+        fields.bind(
+            aurelius_core::task_git::GitBinding {
+                branch: branch.to_owned(),
+                worktree: params
+                    .get("worktree")
+                    .and_then(|w| w.as_str())
+                    .map(str::to_owned),
+                explicit: true,
+            },
+            now,
+        );
         data = fields.merge_into(&data);
     }
 
@@ -303,7 +302,7 @@ fn task_update_with_conn(
     // earlier, not pretend the task went back to unverified.
     let current_prov = Provenance::from_data(&data);
 
-    let mut result = json!({
+    let result = json!({
         "id": node.id.to_string(),
         "label": node.label,
         "status": data["status"],
@@ -319,11 +318,6 @@ fn task_update_with_conn(
             "subject": current_prov.subject,
         },
     });
-    // T009, симметрия с CLI: молчаливое вытеснение выглядит как потеря
-    // задачи — сказать вслух, кого вытеснили.
-    if let Some(ev) = &evicted {
-        result["evicted"] = json!({"id": ev.id.to_string(), "label": ev.label});
-    }
     Ok(result)
 }
 
@@ -1389,11 +1383,6 @@ mod tests {
             .is_some());
     }
 
-    /// Асимметрия задачи 007: до правки MCP `task_update` при переходе в
-    /// `active` писал только легаси `started_at` (и то один раз) и не знал
-    /// правила «одна активная задача на проект» — CLI (`au task activate`)
-    /// вытесняет прежнюю активную в backlog и ставит `activated_at` на
-    /// каждое взятие. Тест падал на прежней реализации.
     #[test]
     fn task_update_branch_binds_task_and_view_and_list_show_it() {
         let (_tmp, conn) = setup();
@@ -1429,8 +1418,10 @@ mod tests {
         assert!(result["git"].is_null(), "{}", result["git"]);
     }
 
+    /// Взятие задачи в работу ставит ей `activated_at` и не снимает с работы
+    /// другую активную задачу того же проекта: активных может быть несколько.
     #[test]
-    fn task_update_active_sets_activated_at_and_evicts_previous_active() {
+    fn task_update_active_sets_activated_at_and_keeps_previous_active() {
         let (_tmp, conn) = setup();
         let old_active = seed_task(&conn, "proj-b", "старая активная");
         // Активируем первую задачу напрямую в data, как будто она уже была
@@ -1457,15 +1448,49 @@ mod tests {
             result["activated_at"]
         );
 
-        let evicted_node = graph::get_node(&conn, &old_active.to_string())
+        let previous = graph::get_node(&conn, &old_active.to_string())
             .expect("get_node")
             .expect("node exists");
         assert_eq!(
-            evicted_node.data.get("status").and_then(|s| s.as_str()),
-            Some("backlog"),
-            "прежняя активная задача проекта обязана быть вытеснена в backlog"
+            previous.data.get("status").and_then(|s| s.as_str()),
+            Some("active"),
+            "прежняя активная задача проекта остаётся в работе"
         );
-        assert_eq!(result["evicted"]["id"], old_active.to_string());
+    }
+
+    /// Привязка к ветке без перевода в `active` — уже работа: «Взята»
+    /// ставится в этот момент.
+    #[test]
+    fn task_update_branch_alone_stamps_activated_at() {
+        let (_tmp, conn) = setup();
+        let id = seed_task(&conn, "proj-bind", "ветка без активации");
+        let result =
+            task_update_with_conn(&conn, &json!({"id": id.to_string(), "branch": "feat/y"}))
+                .expect("task_update branch");
+        assert!(
+            result["activated_at"].is_string(),
+            "{}",
+            result["activated_at"]
+        );
+    }
+
+    /// Задача, закрытая из backlog без взятия в работу, получает «Взята»,
+    /// равную моменту закрытия — пустой дата не остаётся.
+    #[test]
+    fn task_update_done_from_backlog_stamps_activated_at_equal_to_closed_at() {
+        let (_tmp, conn) = setup();
+        let id = seed_task(&conn, "proj-close", "закрыта без взятия");
+        let result = task_update_with_conn(
+            &conn,
+            &json!({"id": id.to_string(), "status": "done", "unconfirmed": true}),
+        )
+        .expect("task_update done");
+        assert!(
+            result["activated_at"].is_string(),
+            "{}",
+            result["activated_at"]
+        );
+        assert_eq!(result["activated_at"], result["closed_at"]);
     }
 
     /// Находка 4 (адверсариальный разбор спеки 007): повторный вызов со

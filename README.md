@@ -383,8 +383,11 @@ backlog → active → done
 `task_log` never activates a task — recording work is an observation, not a decision to take it
 into work. Activation is explicit: `task_update` with `status=active`, or `au task activate`.
 `task_update` tracks timestamps automatically.
-A project has at most one active task at a time — activating another demotes the previous
-active task back to `backlog`, keeping its accumulated timestamps and history intact.
+A project may hold several active tasks at once — activating one leaves the others as they
+are. The "taken into work" time (`activated_at`) is stamped once, by whichever comes first:
+activation, binding the task to a branch, or closing it. A run's evidence and a file edit go
+to the active task bound to the branch they happen on; with no such task, to the one taken
+into work last.
 
 ### Three Timestamps
 
@@ -490,13 +493,10 @@ while the runner is still alive; `au task release` records the outcome. The gran
 single `UPDATE … RETURNING`, so two concurrent `claim` calls cannot land on the same
 task — not "unlikely", but structurally impossible.
 
-`claim` also honours the one-active-task-per-project rule the other two entry points
-(`au task activate`, MCP `task_update`) enforce: if the project already has a different
-active task, that one is evicted back to the queue first. The exception is an active task
-still under someone else's live lease — there `claim` declines instead, and the task it
-had just taken is rolled back untouched. Evicting would return that task to the pool
-while its lease still holds, so a third owner could claim it: one double-grant would be
-traded for another.
+The queue hands out one work order per project at a time: if the project already has an
+active task under someone else's live lease, `claim` declines, and the task it had just
+taken is rolled back untouched. An active task without a lease — one a person took into
+work — does not stand in the way and stays active.
 
 ```bash
 au task claim --owner smena@host/123 --run 42 --lease-minutes 50   # take one machine-fit task

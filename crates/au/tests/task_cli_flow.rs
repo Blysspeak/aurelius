@@ -190,51 +190,80 @@ fn task_done_records_commit_and_pull_request_without_swapping_them() {
     );
 }
 
-/// `au task activate` вытесняет прежнюю активную задачу того же проекта в
-/// `backlog` и обязана сказать об этом вслух (T009) — молчаливое вытеснение
-/// выглядит как потеря задачи.
+/// `au task activate` не снимает с работы другую активную задачу того же
+/// проекта: в проекте может быть несколько задач в работе одновременно.
 #[test]
-fn task_activate_evicts_previous_active_and_reports_it() {
-    let home = TmpHome::dir("activate-evict");
+fn task_activate_keeps_previous_active_task_active() {
+    let home = TmpHome::dir("activate-several");
 
     let (code, out, _) = run(
         &home,
-        &["task", "new", "первая активная", "--project", "proj-evict"],
+        &[
+            "task",
+            "new",
+            "первая активная",
+            "--project",
+            "proj-several",
+        ],
     );
     assert_eq!(code, 0);
     let first_id = created_task_id(&out);
 
     let (code, out, _) = run(
         &home,
-        &["task", "new", "вторая активная", "--project", "proj-evict"],
+        &[
+            "task",
+            "new",
+            "вторая активная",
+            "--project",
+            "proj-several",
+        ],
     );
     assert_eq!(code, 0);
     let second_id = created_task_id(&out);
 
     let (code, out, err) = run(&home, &["task", "activate", &first_id]);
     assert_eq!(code, 0, "первая активация: stdout={out} stderr={err}");
-    assert!(
-        out.contains("Task activated"),
-        "первая активация не должна упоминать вытеснение: {out}"
-    );
-
     let (code, out, err) = run(&home, &["task", "activate", &second_id]);
     assert_eq!(code, 0, "вторая активация: stdout={out} stderr={err}");
-    assert!(
-        out.contains("вытеснена в backlog"),
-        "вторая активация обязана сообщить о вытеснении первой: {out}"
-    );
-    assert!(
-        out.contains("первая активная"),
-        "сообщение обязано назвать именно вытесненную задачу: {out}"
-    );
 
-    // Первая реально ушла в backlog — не только текст сообщения.
-    let (code, show_out, _) = run(&home, &["task", "show", &first_id]);
+    for id in [&first_id, &second_id] {
+        let (code, show_out, _) = run(&home, &["task", "show", id]);
+        assert_eq!(code, 0);
+        assert!(
+            show_out.contains("Status:   active"),
+            "обе задачи обязаны остаться в работе:\n{show_out}"
+        );
+    }
+}
+
+/// Задача, закрытая без взятия в работу, получает «Взята» — пустой дата не
+/// остаётся.
+#[test]
+fn task_done_from_backlog_fills_taken_date() {
+    let home = TmpHome::dir("done-cold");
+
+    let (code, out, _) = run(
+        &home,
+        &[
+            "task",
+            "new",
+            "закрыта без взятия",
+            "--project",
+            "proj-cold",
+        ],
+    );
+    assert_eq!(code, 0);
+    let id = created_task_id(&out);
+
+    let (code, out, err) = run(&home, &["task", "done", &id, "--unconfirmed"]);
+    assert_eq!(code, 0, "закрытие: stdout={out} stderr={err}");
+
+    let (code, show_out, _) = run(&home, &["task", "show", &id]);
     assert_eq!(code, 0);
     assert!(
-        show_out.contains("Status:   backlog"),
-        "вытесненная задача обязана реально стать backlog:\n{show_out}"
+        !show_out.contains("Взята:    —"),
+        "у закрытой задачи «Взята» обязана быть заполнена:\n{show_out}"
     );
 }
 

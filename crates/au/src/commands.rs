@@ -1629,14 +1629,13 @@ fn activate_task(
     conn: &rusqlite::Connection,
     task: &aurelius_core::models::Node,
     named: Option<aurelius_core::task_git::GitBinding>,
-) -> Result<Option<graph::EvictedTask>> {
+) -> Result<()> {
     let project = task
         .data
         .get("project")
         .and_then(|p| p.as_str())
         .unwrap_or("unknown")
         .to_owned();
-    let evicted = graph::evict_active(conn, &project, task.id)?;
 
     let was_active = task.data.get("status").and_then(|s| s.as_str()) == Some("active");
     let mut data = task.data.clone();
@@ -1659,7 +1658,7 @@ fn activate_task(
     data = fields.merge_into(&data);
 
     graph::update_node(conn, task.id, None, Some(data))?;
-    Ok(evicted)
+    Ok(())
 }
 
 /// What `au task update --due` did to the task's attached reminder — moved
@@ -2419,7 +2418,7 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 }
             }
             let confirmed = resolution.confirmed;
-            fields.closed_at = Some(chrono::Utc::now());
+            fields.close(chrono::Utc::now());
             fields.resolution = Some(resolution);
             let data = fields.merge_into(&data);
 
@@ -2450,19 +2449,12 @@ pub async fn task(action: TaskAction) -> Result<()> {
                 worktree,
                 explicit: true,
             });
-            let evicted = activate_task(&conn, &task, named)?;
+            activate_task(&conn, &task, named)?;
             println!("▶ Task activated: {}", task.label);
             let bound = graph::get_node(&conn, &task.id.to_string())?
                 .and_then(|n| task_fields::TaskFields::from_data(&n.data).git);
             if let Some(binding) = bound {
                 println!("  ветка: {}", binding.branch);
-            }
-            // T009: молчаливое вытеснение выглядит как потеря задачи.
-            if let Some(evicted) = evicted {
-                println!(
-                    "  ↩ вытеснена в backlog: {} [{}]",
-                    evicted.label, evicted.id
-                );
             }
         }
 
@@ -2505,9 +2497,10 @@ pub async fn task(action: TaskAction) -> Result<()> {
             let task = match (&id, &project) {
                 (Some(id), _) => find_task(&conn, id)?,
                 (None, Some(project)) => {
-                    let mut active =
-                        graph::get_tasks_filtered(&conn, Some(project), Some("active"), None, 1)?;
-                    match active.pop() {
+                    // Активных в проекте может быть несколько: улика уходит
+                    // той, что ведётся в ветке каталога вызывающего.
+                    let cwd = std::env::current_dir().ok();
+                    match task_fields::active_for(&conn, project, cwd.as_deref())? {
                         Some(task) => task,
                         // Отказ, но не потеря: прогон уже в журнале вызывающего.
                         // Узел прогона не заводится (28.09.2026) — `au db prune`
@@ -4771,24 +4764,22 @@ pub async fn trace_cmd(
             // привязка хуже отсутствующей.
             if matches!(kind, TraceKind::FileEdit) {
                 if let Some(project) = current_dir_name() {
-                    if let Ok(mut active) =
-                        graph::get_tasks_filtered(&conn, Some(&project), Some("active"), None, 1)
+                    let file = std::path::Path::new(&payload);
+                    if let Ok(Some(task)) = task_fields::active_for(&conn, &project, file.parent())
                     {
-                        if let Some(task) = active.pop() {
-                            let mut fields = task_fields::TaskFields::from_data(&task.data);
-                            fields.last_edit_at = Some(chrono::Utc::now());
-                            // Привязка идёт за правкой: задачу берут в
-                            // работу раньше, чем заводят ветку.
-                            if let Some(moved) = aurelius_core::task_git::follow_edit(
-                                fields.git.as_ref(),
-                                &project,
-                                std::path::Path::new(&payload),
-                            ) {
-                                fields.git = Some(moved);
-                            }
-                            let data = fields.merge_into(&task.data);
-                            let _ = graph::update_node(&conn, task.id, None, Some(data));
+                        let mut fields = task_fields::TaskFields::from_data(&task.data);
+                        fields.last_edit_at = Some(chrono::Utc::now());
+                        // Привязка идёт за правкой: задачу берут в
+                        // работу раньше, чем заводят ветку.
+                        if let Some(moved) = aurelius_core::task_git::follow_edit(
+                            fields.git.as_ref(),
+                            &project,
+                            std::path::Path::new(&payload),
+                        ) {
+                            fields.git = Some(moved);
                         }
+                        let data = fields.merge_into(&task.data);
+                        let _ = graph::update_node(&conn, task.id, None, Some(data));
                     }
                 }
             }

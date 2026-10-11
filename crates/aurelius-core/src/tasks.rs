@@ -89,6 +89,27 @@ pub struct TaskFields {
 }
 
 impl TaskFields {
+    /// Берёт задачу в работу в момент `at`, если она ещё не взята. «Взята»
+    /// ставится один раз — первым из трёх событий: перевод в `active`,
+    /// привязка к ветке ([`Self::bind`]) или закрытие ([`Self::close`]).
+    pub fn take(&mut self, at: DateTime<Utc>) {
+        self.activated_at.get_or_insert(at);
+    }
+
+    /// Привязывает задачу к ветке. Привязка — уже работа, поэтому задача
+    /// считается взятой, даже если её не переводили в `active`.
+    pub fn bind(&mut self, binding: crate::task_git::GitBinding, at: DateTime<Utc>) {
+        self.git = Some(binding);
+        self.take(at);
+    }
+
+    /// Закрывает задачу в момент `at`. Задача, закрытая без взятия в работу,
+    /// считается взятой в момент закрытия — пустой «Взята» не остаётся.
+    pub fn close(&mut self, at: DateTime<Utc>) {
+        self.closed_at = Some(at);
+        self.take(at);
+    }
+
     /// Читает восемь полей из `Node.data`, игнорируя все остальные ключи,
     /// которые там лежат (`status`, `priority`, `lease`, `attempts`, ...).
     /// Узел без единого нового ключа даёт `TaskFields::default()` — не
@@ -383,6 +404,37 @@ pub fn ripe_evidence<'a>(fields: &'a TaskFields, status: &str) -> Option<&'a Evi
 }
 
 /// `true`, если задача созрела к закрытию — см. [`ripe_evidence`].
+/// Какой активной задаче проекта принадлежит работа в каталоге `dir`.
+///
+/// В проекте может быть несколько активных задач, поэтому улика прогона и
+/// правка файла выбирают свою так, по порядку:
+/// 1. активная одна — она;
+/// 2. иначе та, что привязана к ветке каталога `dir`;
+/// 3. иначе взятая в работу последней.
+///
+/// `None` — активных задач в проекте нет.
+pub fn active_for(
+    conn: &rusqlite::Connection,
+    project: &str,
+    dir: Option<&Path>,
+) -> anyhow::Result<Option<crate::models::Node>> {
+    let mut active =
+        crate::graph::get_tasks_filtered(conn, Some(project), Some("active"), None, 200)?;
+    if active.len() > 1 {
+        let branch = dir
+            .and_then(crate::task_git::detect)
+            .map(|(_, binding)| binding.branch);
+        let on_branch = |n: &crate::models::Node| {
+            branch.is_some() && TaskFields::from_data(&n.data).git.map(|g| g.branch) == branch
+        };
+        if let Some(i) = active.iter().position(on_branch) {
+            return Ok(Some(active.swap_remove(i)));
+        }
+        active.sort_by_key(|n| TaskFields::from_data(&n.data).activated_at);
+    }
+    Ok(active.pop())
+}
+
 pub fn is_ripe(fields: &TaskFields, status: &str) -> bool {
     ripe_evidence(fields, status).is_some()
 }
@@ -1882,5 +1934,123 @@ mod tests {
             Some(text.as_str()),
             "full note text must survive intact"
         );
+    }
+
+    /// Одна активная задача проекта — она и есть, куда бы ни смотрел каталог.
+    #[test]
+    fn active_for_returns_the_only_active_task() {
+        let (_tmp, conn) = setup();
+        let only = seed_task(
+            &conn,
+            "[p] единственная",
+            json!({"status": "active", "project": "p"}),
+        );
+        seed_task(
+            &conn,
+            "[other] чужая",
+            json!({"status": "active", "project": "other"}),
+        );
+        seed_task(
+            &conn,
+            "[p] в очереди",
+            json!({"status": "backlog", "project": "p"}),
+        );
+
+        let found = active_for(&conn, "p", None)
+            .expect("active_for")
+            .expect("есть активная");
+        assert_eq!(found.id, only);
+        assert!(active_for(&conn, "empty", None)
+            .expect("active_for")
+            .is_none());
+    }
+
+    /// Активных несколько, ветку каталога спросить не у кого — работа уходит
+    /// задаче, взятой последней.
+    #[test]
+    fn active_for_falls_back_to_the_task_taken_last() {
+        let (_tmp, conn) = setup();
+        seed_task(
+            &conn,
+            "[p] взята раньше",
+            json!({"status": "active", "project": "p", "activated_at": "2026-08-30T09:00:00Z"}),
+        );
+        let later = seed_task(
+            &conn,
+            "[p] взята позже",
+            json!({"status": "active", "project": "p", "activated_at": "2026-08-30T12:00:00Z"}),
+        );
+
+        let found = active_for(&conn, "p", None)
+            .expect("active_for")
+            .expect("есть активная");
+        assert_eq!(found.id, later);
+    }
+
+    /// Активных несколько — работа в каталоге уходит той, что привязана к его
+    /// ветке, даже если другая взята позже.
+    #[test]
+    fn active_for_prefers_the_task_bound_to_the_branch_of_the_directory() {
+        let (_tmp, conn) = setup();
+        let repo =
+            std::env::temp_dir().join(format!("aurelius-active-for-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .expect("запустить git")
+        };
+        assert!(run_git(&["init", "-q", "-b", "feat/here"]).status.success());
+
+        let here = seed_task(
+            &conn,
+            "[p] в этой ветке",
+            json!({
+                "status": "active", "project": "p",
+                "activated_at": "2026-08-30T09:00:00Z",
+                "git": {"branch": "feat/here"},
+            }),
+        );
+        seed_task(
+            &conn,
+            "[p] в другой ветке, взята позже",
+            json!({
+                "status": "active", "project": "p",
+                "activated_at": "2026-08-30T12:00:00Z",
+                "git": {"branch": "feat/elsewhere"},
+            }),
+        );
+
+        let found = active_for(&conn, "p", Some(&repo))
+            .expect("active_for")
+            .expect("есть активная");
+        let _ = std::fs::remove_dir_all(&repo);
+        assert_eq!(found.id, here);
+    }
+
+    /// «Взята» ставится один раз: привязка и закрытие заполняют пустую дату
+    /// и не сдвигают уже стоящую.
+    #[test]
+    fn take_bind_and_close_stamp_activated_at_once() {
+        let first: DateTime<Utc> = "2026-08-30T09:00:00Z".parse().expect("rfc3339");
+        let later: DateTime<Utc> = "2026-08-30T12:00:00Z".parse().expect("rfc3339");
+        let binding = crate::task_git::GitBinding {
+            branch: "feat/x".to_owned(),
+            worktree: None,
+            explicit: true,
+        };
+
+        let mut closed_cold = TaskFields::default();
+        closed_cold.close(later);
+        assert_eq!(closed_cold.activated_at, Some(later));
+
+        let mut bound = TaskFields::default();
+        bound.bind(binding, first);
+        bound.close(later);
+        assert_eq!(bound.activated_at, Some(first));
+        assert_eq!(bound.closed_at, Some(later));
     }
 }

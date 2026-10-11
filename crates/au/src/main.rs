@@ -145,9 +145,8 @@ pub enum TaskAction {
         /// Reason for blocking
         reason: String,
     },
-    /// Activate a task (set status to active). Evicts the project's
-    /// previously active task back into `backlog` — a project holds no more
-    /// than one active task (spec 007, FR-031)
+    /// Activate a task (set status to active). Other active tasks of the
+    /// project stay active — a project may hold several at once
     Activate {
         /// Task UUID or label
         id: String,
