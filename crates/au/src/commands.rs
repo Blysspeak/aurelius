@@ -1575,6 +1575,49 @@ fn path_before(
 /// время взятия в работу, не трогая `closed_at`/`resolution` — при
 /// переоткрытии они остаются историей, а не стираются.
 ///
+/// Строка `au task list --json`: то же, что печатает текстовый список, плюс
+/// `parent` — задача, чьей подзадачей эта является (ребро `subtask_of`), чтобы
+/// читатель собрал дерево без второго запроса на каждую задачу.
+fn task_list_json(
+    conn: &rusqlite::Connection,
+    t: &aurelius_core::models::Node,
+) -> Result<serde_json::Value> {
+    use aurelius_core::task_git;
+    use rusqlite::OptionalExtension;
+    let st = t.data.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+    let project = t.data.get("project").and_then(|p| p.as_str());
+    let fields = task_fields::TaskFields::from_data(&t.data);
+    let parent: Option<String> = conn
+        .query_row(
+            "SELECT to_id FROM edges
+             WHERE from_id = ?1 AND relation = 'subtask_of' AND deleted_at IS NULL",
+            [t.id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let branch_state = fields
+        .git
+        .as_ref()
+        .filter(|_| !matches!(st, "done" | "cancelled"))
+        .and_then(|b| Some((task_git::root_for(conn, project, b)?, b)))
+        .and_then(|(root, b)| task_git::branch_state(&root, &b.branch));
+    let criteria = task_fields::task_criteria(&t.data);
+    Ok(json!({
+        "id": t.id.to_string(),
+        "label": t.label,
+        "project": project,
+        "status": st,
+        "priority": t.data.get("priority"),
+        "ripe": task_fields::is_ripe(&fields, st),
+        "parent": parent,
+        "branch": fields.git.as_ref().map(|b| &b.branch),
+        "worktree": fields.git.as_ref().and_then(|b| b.worktree.as_ref()),
+        "branch_state": branch_state,
+        "criteria_met": criteria.iter().filter(|c| c.met_at.is_some()).count(),
+        "criteria_total": criteria.len(),
+    }))
+}
+
 /// Находка 4 (адверсариальный разбор спеки 007): `activated_at` ставится
 /// ОДИН РАЗ, на переход в active — не на каждый вызов `au task activate` на
 /// уже активной задаче. Симметрия с MCP `task_update` (`handlers/task.rs`).
@@ -1943,14 +1986,24 @@ pub async fn task(action: TaskAction) -> Result<()> {
             project,
             status,
             priority,
+            limit,
+            json: as_json,
         } => {
             let tasks = graph::get_tasks_filtered(
                 &conn,
                 project.as_deref(),
                 status.as_deref(),
                 priority.as_deref(),
-                30,
+                limit,
             )?;
+            if as_json {
+                let out = tasks
+                    .iter()
+                    .map(|t| task_list_json(&conn, t))
+                    .collect::<Result<Vec<_>>>()?;
+                println!("{}", serde_json::to_string(&out)?);
+                return Ok(());
+            }
             if tasks.is_empty() {
                 println!("No tasks found.");
                 return Ok(());
