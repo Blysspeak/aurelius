@@ -205,9 +205,7 @@ fn lease_is_live(data: &Value, now_str: &str) -> bool {
 }
 
 /// `data` активных задач того же проекта, кроме только что взятой `claimed`.
-/// Отдельная функция от [`evict_active`]: той для объявления вслух хватает
-/// `id`+`label`, а здесь нужна ещё и аренда (`data.lease`), чтобы решить,
-/// вытеснять конфликт или отказать в `claim` целиком (см. [`claim`]).
+/// Нужна аренда каждой (`data.lease`): по ней [`claim`] решает, отказать ли.
 fn other_active_tasks(
     conn: &Connection,
     project: &str,
@@ -237,19 +235,16 @@ fn other_active_tasks(
 /// Взять один наряд из машинного пула. `project` сужает отбор до задач с тем
 /// же `data.project`; `None` не сужает ничего. См. [`CLAIM_SQL`].
 ///
-/// T029, находка 5 (адверсариальный разбор спеки 007): [`CLAIM_SQL`] отбирает
-/// наряд только по его СОБСТВЕННОМУ статусу и не смотрит, есть ли в том же
-/// проекте уже другая активная задача — `claim` был третьим путём взятия в
-/// работу в обход инварианта «одна активная задача на проект» (FR-031),
-/// который для двух других путей (`au task activate`, MCP `task_update`)
-/// соблюдает [`evict_active`]. Правило то же самое, вызванное отсюда, а не
-/// продублированное.
+/// [`CLAIM_SQL`] отбирает наряд только по его СОБСТВЕННОМУ статусу. Очередь
+/// при этом выдаёт на проект один наряд за раз: если в проекте уже есть
+/// активная задача под живой арендой, взятие отказывается (`claim_locked`).
+/// Активная задача без аренды, взятая человеком, наряду не мешает.
 ///
-/// Обёртка нужна ради явной транзакции: сама проверка и возможное вытеснение
-/// идут ПОСЛЕ атомарного `UPDATE ... RETURNING`, и если конфликт разрешается
-/// отказом (см. `claim_locked`), только что взятый наряд обязан вернуться в
-/// точности в прежнее состояние — `ROLLBACK` делает это без ручного учёта
-/// каждого задетого поля (`status`, `lease`, `attempts`, `updated_at`).
+/// Обёртка нужна ради явной транзакции: проверка идёт ПОСЛЕ атомарного
+/// `UPDATE ... RETURNING`, и при отказе только что взятый наряд обязан
+/// вернуться в точности в прежнее состояние — `ROLLBACK` делает это без
+/// ручного учёта каждого задетого поля (`status`, `lease`, `attempts`,
+/// `updated_at`).
 pub fn claim(
     conn: &Connection,
     owner: &str,
@@ -309,20 +304,13 @@ fn claim_locked(
         let conflicts = other_active_tasks(conn, task_project, id)?;
         let live_conflict = conflicts.iter().any(|c| lease_is_live(c, &now_str));
         if live_conflict {
-            // Чужая живая аренда: вытеснение молча ставит конфликтующую
-            // задачу в `backlog`, НЕ трогая её `lease.until` — а `CLAIM_SQL`
-            // допускает в пул любую задачу со статусом `backlog` независимо
-            // от аренды (ветка "OR status='active' AND lease истёк" нужна
-            // только для активных). Вытесненная так задача немедленно стала
-            // бы claim-абельной третьим владельцем, хотя её аренда ещё не
-            // истекла, — то есть чинили бы двойной `active`, а сломали бы
-            // двойную выдачу аренды. Честнее отказать в этом взятии: наш
-            // `ROLLBACK` в `claim` возвращает только что взятый наряд как
-            // будто claim по нему не выполнялся.
+            // Чужая живая аренда в том же проекте: очередь нарядов выдаёт
+            // на проект один наряд за раз, чтобы два исполнителя не писали в
+            // один каталог. Это правило очереди, а не статуса: человек может
+            // держать в проекте сколько угодно активных задач. Наш `ROLLBACK`
+            // в `claim` возвращает только что взятый наряд как будто claim по
+            // нему не выполнялся.
             return Err(LeaseError::NoTasksAvailable.into());
-        }
-        if !conflicts.is_empty() {
-            evict_active(conn, task_project, id)?;
         }
     }
 
@@ -425,7 +413,7 @@ fn release_done(
     // finding).
     let resolution =
         crate::tasks::build_resolution(conn, fields.activated_at, project, None, None, false);
-    fields.closed_at = Some(now);
+    fields.close(now);
     fields.resolution = Some(resolution);
     fields.evidence.push(crate::tasks::EvidenceEntry {
         command: evidence.to_owned(),
@@ -1037,57 +1025,6 @@ pub fn set_fitness(
     Ok(())
 }
 
-/// Прежняя активная задача проекта, вытесненная взятием новой в работу. Несёт
-/// ровно то, что нужно сказать вслух (T009) — карточку открывают отдельно.
-#[derive(Debug, Clone)]
-pub struct EvictedTask {
-    pub id: Uuid,
-    pub label: String,
-}
-
-/// Вытесняет прежнюю активную задачу того же проекта в `backlog` (T008,
-/// FR-031, спека 007): в проекте не более одной активной задачи, взятие новой
-/// снимает прежнюю. Меняется только `data.status` — времена, `evidence` и
-/// `last_edit_at` вытесненной задачи трогать физически нечем, `json_set` с
-/// одним путём не задевает остальные ключи.
-///
-/// `activating` исключён из отбора: реактивация уже активной задачи не
-/// вытесняет саму себя. Отбор идёт строго по `data.project` — вытеснение не
-/// пересекает границу проекта (T011).
-pub fn evict_active(
-    conn: &Connection,
-    project: &str,
-    activating: Uuid,
-) -> anyhow::Result<Option<EvictedTask>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, label FROM nodes
-          WHERE node_type = '\"task\"' AND deleted_at IS NULL
-            AND id != ?1
-            AND json_extract(data,'$.status') = 'active'
-            AND json_extract(data,'$.project') = ?2",
-    )?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map(params![activating.to_string(), project], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let now = Utc::now().to_rfc3339();
-    let mut evicted = None;
-    for (id_str, label) in rows {
-        let id: Uuid = id_str.parse().map_err(|e| {
-            anyhow::anyhow!("активная задача вернула нечитаемый id '{id_str}': {e}")
-        })?;
-        conn.execute(
-            "UPDATE nodes SET data = json_set(data, '$.status', 'backlog'), updated_at = ?1
-              WHERE id = ?2",
-            params![now, id.to_string()],
-        )?;
-        evicted = Some(EvictedTask { id, label });
-    }
-    Ok(evicted)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1410,18 +1347,12 @@ mod tests {
         );
     }
 
-    // --- T029: находка 5 — claim и инвариант «одна активная на проект» -----
+    // --- claim и активные задачи того же проекта ---------------------------
 
-    /// T029, находка 5 (адверсариальный разбор спеки 007): `claim` — третий
-    /// путь взятия задачи в работу, и до починки он не звал `evict_active`
-    /// вовсе: живая репродукция была `au task activate` (A становится
-    /// active), затем `au task claim` (B становится active тоже) — `au task
-    /// list --project P` показывал ДВЕ активные задачи одного проекта, ровно
-    /// то, что `evict_active` обязан предотвращать (FR-031). Прежняя
-    /// активная задача БЕЗ живой аренды (обычная активация человеком, не
-    /// наряд) вытесняется в `backlog`, как и в двух других путях.
+    /// Активная задача без аренды (её взял человек) наряду не мешает и сама
+    /// остаётся активной: в проекте может быть несколько задач в работе.
     #[test]
-    fn claim_evicts_previous_active_task_without_live_lease() {
+    fn claim_leaves_previous_active_task_without_live_lease_active() {
         let (_tmp, conn) = setup();
         let previous_active = seed_task_with(
             &conn,
@@ -1439,19 +1370,15 @@ mod tests {
             .expect("query node")
             .expect("node exists");
         assert_eq!(
-            prev.data["status"], "backlog",
-            "claim обязан вытеснить прежнюю активную задачу проекта, как и au task activate"
+            prev.data["status"], "active",
+            "взятие наряда не снимает с работы задачу, взятую человеком"
         );
     }
 
-    /// Асимметрия предыдущего теста: прежняя активная задача под ЖИВОЙ чужой
-    /// арендой — `claim` обязан отказать, а не вытеснить. Вытеснение
-    /// поставило бы её в `backlog`, НЕ трогая `lease.until`, а `CLAIM_SQL`
-    /// берёт из пула любую задачу со статусом `backlog` независимо от
-    /// аренды — то есть починка одной двойной выдачи создала бы другую
-    /// (третий владелец забрал бы задачу, чья аренда ещё не истекла). Наряд,
-    /// взятый ЭТИМ вызовом, обязан вернуться в точности в исходное
-    /// состояние — это и проверяет откат `attempts`.
+    /// Прежняя активная задача под ЖИВОЙ чужой арендой — `claim` обязан
+    /// отказать: очередь выдаёт на проект один наряд за раз. Наряд, взятый
+    /// ЭТИМ вызовом, обязан вернуться в точности в исходное состояние — это и
+    /// проверяет откат `attempts`.
     #[test]
     fn claim_refuses_when_conflicting_active_task_holds_a_live_lease() {
         let (_tmp, conn) = setup();
@@ -1475,7 +1402,7 @@ mod tests {
                 err.downcast_ref::<LeaseError>(),
                 Some(LeaseError::NoTasksAvailable)
             ),
-            "конфликт с живой чужой арендой обязан выглядеть как «нарядов нет», а не вытеснять её: {err:#}"
+            "конфликт с живой чужой арендой обязан выглядеть как «нарядов нет»: {err:#}"
         );
 
         let backlog_node = crate::graph::get_node(&conn, &backlog_id.to_string())
@@ -1495,7 +1422,7 @@ mod tests {
             .expect("node exists");
         assert_eq!(
             previous.data["status"], "active",
-            "живая чужая аренда не должна быть вытеснена"
+            "задача под живой чужой арендой остаётся в работе"
         );
         assert_eq!(previous.data["lease"]["until"], live_until);
     }
@@ -1786,101 +1713,5 @@ mod tests {
         );
         let err = set_fitness(&conn, id, FitnessVerdict::Machine, "   ").unwrap_err();
         assert!(err.to_string().contains("пустым"));
-    }
-
-    /// T010: две задачи проекта, взятие второй переводит первую в `backlog`
-    /// и не стирает её `activated_at`.
-    #[test]
-    fn evict_active_moves_previous_task_to_backlog_and_keeps_its_times() {
-        let (_tmp, conn) = setup();
-        let first = seed_task_with(
-            &conn,
-            "[aurelius] первая активная",
-            None,
-            &[],
-            serde_json::json!({
-                "status": "active",
-                "project": "aurelius",
-                "activated_at": "2026-08-30T09:00:00Z",
-            }),
-        );
-        let second = seed_task_with(
-            &conn,
-            "[aurelius] вторая, берётся в работу",
-            None,
-            &[],
-            serde_json::json!({"status": "backlog", "project": "aurelius"}),
-        );
-
-        let evicted = evict_active(&conn, "aurelius", second)
-            .expect("evict_active")
-            .expect("прежняя активная задача обязана быть вытеснена");
-        assert_eq!(evicted.id, first);
-
-        let node = crate::graph::get_node(&conn, &first.to_string())
-            .expect("query node")
-            .expect("node exists");
-        assert_eq!(node.data["status"], "backlog");
-        assert_eq!(
-            node.data["activated_at"], "2026-08-30T09:00:00Z",
-            "вытеснение не имеет права стирать времена вытесненной задачи"
-        );
-    }
-
-    /// T011: вытеснение не пересекает границу проекта — активная задача
-    /// другого проекта остаётся активной.
-    #[test]
-    fn evict_active_does_not_cross_project_boundary() {
-        let (_tmp, conn) = setup();
-        let other_project_active = seed_task_with(
-            &conn,
-            "[boostix] чужая активная",
-            None,
-            &[],
-            serde_json::json!({"status": "active", "project": "boostix"}),
-        );
-        let taking_over = seed_task_with(
-            &conn,
-            "[aurelius] берётся в работу",
-            None,
-            &[],
-            serde_json::json!({"status": "backlog", "project": "aurelius"}),
-        );
-
-        let evicted =
-            evict_active(&conn, "aurelius", taking_over).expect("evict_active по aurelius");
-        assert!(
-            evicted.is_none(),
-            "в aurelius не было активной — вытеснять нечего"
-        );
-
-        let node = crate::graph::get_node(&conn, &other_project_active.to_string())
-            .expect("query node")
-            .expect("node exists");
-        assert_eq!(
-            node.data["status"], "active",
-            "активная задача другого проекта не должна была тронута"
-        );
-    }
-
-    /// Реактивация уже активной задачи не вытесняет саму себя.
-    #[test]
-    fn evict_active_excludes_the_task_being_activated() {
-        let (_tmp, conn) = setup();
-        let id = seed_task_with(
-            &conn,
-            "[aurelius] уже активная",
-            None,
-            &[],
-            serde_json::json!({"status": "active", "project": "aurelius"}),
-        );
-
-        let evicted = evict_active(&conn, "aurelius", id).expect("evict_active");
-        assert!(evicted.is_none(), "задача не вытесняет саму себя");
-
-        let node = crate::graph::get_node(&conn, &id.to_string())
-            .expect("query node")
-            .expect("node exists");
-        assert_eq!(node.data["status"], "active");
     }
 }
