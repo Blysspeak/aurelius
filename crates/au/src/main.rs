@@ -60,6 +60,11 @@ pub enum TaskAction {
         /// Filter by priority
         #[arg(long)]
         priority: Option<String>,
+        /// Max tasks returned
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
     },
     /// Edit an existing task: priority, title, description, and added
     /// acceptance criteria. Flags are independent — any combination in one
