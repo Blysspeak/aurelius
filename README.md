@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/v3.6.0-stable-a6e3a1?style=flat-square" alt="v3.6.0">
+  <img src="https://img.shields.io/badge/v3.7.0-stable-a6e3a1?style=flat-square" alt="v3.7.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
   <img src="https://img.shields.io/badge/MCP-35_tools-a6e3a1?style=flat-square" alt="MCP">
@@ -97,9 +97,9 @@ only an entry pointing at the old wrapper script is stale — replace it with
 
 ```
 $ au --version
-au 3.6.0 (0123456789ab)
+au 3.7.0 (0123456789ab)
 $ aurelius --version        # the MCP binary answers too, instead of holding stdin open
-aurelius 3.6.0 (0123456789ab)
+aurelius 3.7.0 (0123456789ab)
 ```
 
 The parenthesis is the 12-character commit the binary was built from, with `-dirty` appended
