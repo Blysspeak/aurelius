@@ -13,6 +13,8 @@ import { hexToRgb, typeColor, typeRadius } from '../lib/palette'
 const BG = '#11181d'
 const MIN_NODE_PX = 2.2
 const DIM = 0.16
+/** Largest zoom a 'fit' may choose, in pixels per layout unit. */
+const MAX_FIT_SCALE = 3.2
 
 export type Backend = 'WebGPU' | 'WebGL2'
 
@@ -301,7 +303,8 @@ export class GraphRenderer {
 
   /** Fit a world-space circle into the viewport, with an eased move. */
   fitCircle(cx: number, cy: number, r: number, ms = 450) {
-    const scale = Math.min(this.width, this.height) / (2 * Math.max(r, 10)) * 0.92
+    // Capped so a 100-node project does not open with beads the size of coins.
+    const scale = Math.min(MAX_FIT_SCALE, (Math.min(this.width, this.height) / (2 * Math.max(r, 10))) * 0.92)
     this.animateTo({ cx, cy, scale }, ms)
   }
 
