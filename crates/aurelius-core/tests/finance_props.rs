@@ -198,17 +198,35 @@ fn garbage_amount() -> impl Strategy<Value = String> {
         }
     });
     prop_oneof![
-        (mant.clone(), prop::sample::select(&["e", "E", "e+", "e-", "E-"][..]), 0_u32..30)
+        (
+            mant.clone(),
+            prop::sample::select(&["e", "E", "e+", "e-", "E-"][..]),
+            0_u32..30
+        )
             .prop_map(|(m, e, x)| format!("{m}{e}{x}")),
-        (prop::sample::select(&["-", "+", "−"][..]), mant.clone()).prop_map(|(s, m)| format!("{s}{m}")),
+        (prop::sample::select(&["-", "+", "−"][..]), mant.clone())
+            .prop_map(|(s, m)| format!("{s}{m}")),
         (0_usize..5, 0_usize..9, any::<bool>()).prop_map(|(i, f, comma)| {
             let int = "0".repeat(i);
             let frac = "0".repeat(f);
             let sep = if comma { "," } else { "." };
-            if f == 0 { if int.is_empty() { String::from("0") } else { int } } else { format!("{int}{sep}{frac}") }
+            if f == 0 {
+                if int.is_empty() {
+                    String::from("0")
+                } else {
+                    int
+                }
+            } else {
+                format!("{int}{sep}{frac}")
+            }
         }),
-        prop::sample::select(&["", " ", ".", ",", "..", "1.2.3", "1,2,3", "nan", "inf", "0x10", "1/2", "١٢", "12abc"][..])
-            .prop_map(str::to_owned),
+        prop::sample::select(
+            &[
+                "", " ", ".", ",", "..", "1.2.3", "1,2,3", "nan", "inf", "0x10", "1/2", "١٢",
+                "12abc"
+            ][..]
+        )
+        .prop_map(str::to_owned),
     ]
 }
 
@@ -271,23 +289,29 @@ const TS_HI: i64 = 1_798_761_600;
 
 fn gen_entry() -> impl Strategy<Value = Gen> {
     (
-        (0_u8..3, 0_usize..CURRENCIES.len(), 1_i64..=1_000_000_000_000),
+        (
+            0_u8..3,
+            0_usize..CURRENCIES.len(),
+            1_i64..=1_000_000_000_000,
+        ),
         (1_usize..CURRENCIES.len(), 1_i64..=1_000_000_000_000),
         (prop::sample::select(CATEGORIES), any::<bool>()),
         (TS_LO..TS_HI, prop::bool::weighted(0.2), any::<bool>()),
     )
-        .prop_map(|((k, cur, minor), (off, cminor), (category, wc), (ts, voided, comma))| Gen {
-            kind: [Kind::Expense, Kind::Income, Kind::Exchange][usize::from(k)],
-            cur,
-            minor,
-            counter_cur: (cur + off) % CURRENCIES.len(),
-            counter_minor: cminor,
-            category,
-            with_category: wc,
-            ts,
-            voided,
-            comma,
-        })
+        .prop_map(
+            |((k, cur, minor), (off, cminor), (category, wc), (ts, voided, comma))| Gen {
+                kind: [Kind::Expense, Kind::Income, Kind::Exchange][usize::from(k)],
+                cur,
+                minor,
+                counter_cur: (cur + off) % CURRENCIES.len(),
+                counter_minor: cminor,
+                category,
+                with_category: wc,
+                ts,
+                voided,
+                comma,
+            },
+        )
 }
 
 fn to_new(g: &Gen) -> NewEntry {
@@ -473,7 +497,12 @@ proptest! {
 /// One way to make an entry invalid.
 fn poison(mut e: NewEntry, how: u8) -> NewEntry {
     match how {
-        0 => e.amount = format!("{}.123456789", e.amount.split(['.', ',']).next().unwrap_or("1")),
+        0 => {
+            e.amount = format!(
+                "{}.123456789",
+                e.amount.split(['.', ',']).next().unwrap_or("1")
+            )
+        }
         1 => e.currency = "DOGE".into(),
         2 => {
             e.kind = Kind::Exchange;
@@ -616,9 +645,17 @@ fn finance_owner_phrasing_as_strings() {
         ("30", 6, 30_000_000),
     ];
     for &(raw, scale, minor) in cases {
-        assert_eq!(finance::parse_amount(raw, scale).ok(), Some(minor), "'{raw}'");
+        assert_eq!(
+            finance::parse_amount(raw, scale).ok(),
+            Some(minor),
+            "'{raw}'"
+        );
         let via_mcp = mcp_amount(&serde_json::to_string(raw).expect("json"));
-        assert_eq!(finance::parse_amount(&via_mcp, scale).ok(), Some(minor), "mcp '{raw}'");
+        assert_eq!(
+            finance::parse_amount(&via_mcp, scale).ok(),
+            Some(minor),
+            "mcp '{raw}'"
+        );
     }
 }
 
@@ -632,7 +669,11 @@ fn finance_owner_phrasing_as_json_numbers_ok() {
     ];
     for &(lit, scale, minor) in cases {
         let s = mcp_amount(lit);
-        assert_eq!(finance::parse_amount(&s, scale).ok(), Some(minor), "{lit} -> '{s}'");
+        assert_eq!(
+            finance::parse_amount(&s, scale).ok(),
+            Some(minor),
+            "{lit} -> '{s}'"
+        );
     }
     // Fractional JSON numbers have been through f64: refused, never rounded.
     for lit in ["25.5", "25.50", "11.6"] {
@@ -650,7 +691,11 @@ fn finance_bug_json_number_small_amount_rejected() {
     let err = mcp_amount_result("0.00000001").expect_err("fractional number");
     assert!(format!("{err:#}").contains("decimal string"), "{err:#}");
     let s = mcp_amount("\"0.00000001\"");
-    assert_eq!(finance::parse_amount(&s, 8).ok(), Some(1), "0.00000001 -> '{s}'");
+    assert_eq!(
+        finance::parse_amount(&s, 8).ok(),
+        Some(1),
+        "0.00000001 -> '{s}'"
+    );
 }
 
 proptest! {

@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{
-    hooks, DbAction, DocAction, FinAction, FinCurrencyAction, FinRateAction, GraphAction, HomeAction,
-    IdentityAction, RemindAction, SecretAction, ShareAction, TaskAction,
+    hooks, DbAction, DocAction, FinAction, FinCurrencyAction, FinRateAction, GraphAction,
+    HomeAction, IdentityAction, RemindAction, SecretAction, ShareAction, TaskAction,
 };
 
 use aurelius_core::db::db_path;
@@ -3919,7 +3919,9 @@ fn fin_blocking(action: FinAction) -> Result<()> {
                         r.usd_per_unit,
                         r.units_per_usd,
                         r.source_label,
-                        r.entry_id.map(|id| format!(" · запись #{id}")).unwrap_or_default()
+                        r.entry_id
+                            .map(|id| format!(" · запись #{id}"))
+                            .unwrap_or_default()
                     );
                 }
                 Ok(())
