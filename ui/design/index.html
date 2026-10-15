@@ -114,6 +114,11 @@ body.nogl .glass { background: rgba(14, 16, 19, .94); box-shadow: inset 0 0 0 1p
 /* memory */
 #m-stats { position: absolute; bottom: 26px; right: 28px; text-align: right; font-size: var(--t11); color: var(--bone-3); line-height: 1.7; }
 #m-stats b { font-weight: 400; color: var(--bone); }
+#m-legend-chip { left: 24px; top: auto; bottom: 28px; opacity: 1; z-index: 2; }
+#m-hint { position: absolute; left: 24px; bottom: 60px; font-size: 11px; color: var(--bone-3); white-space: nowrap; pointer-events: none; transition: opacity 900ms; }
+#m-hint.off { opacity: 0; }
+#m-legend:not(.open) { display: none; }
+#m-legend { padding: 12px 14px; border-radius: 12px; background: rgba(7, 10, 18, .86); box-shadow: inset 0 0 0 1px var(--line-2); z-index: 3; }
 #m-legend { position: absolute; left: 24px; bottom: 28px; display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--bone-2); max-width: 340px; }
 #m-legend .lg { display: flex; align-items: center; gap: 10px; }
 #m-legend .lg svg { flex: none; filter: drop-shadow(0 0 4px currentColor); }
@@ -453,6 +458,8 @@ table.spec { width: 100%; border-collapse: collapse; margin-top: 6px; }
   <div id="m-lens-hint" class="stg"><span class="kbd">пробел</span> память во времени · <span class="kbd">C</span> цепочка · <span class="kbd">/</span> поиск · клик раскрывает узел · <span class="kbd">Esc</span> назад</div>
   <div id="m-stats" class="stg mono"></div>
   <div id="m-labels" class="live"></div>
+  <button id="m-legend-chip" class="mchip" aria-expanded="false" aria-controls="m-legend">? легенда</button>
+  <div id="m-hint" aria-live="polite">ветки — темы проектов · клик по узлу — цепочка · U — записи без связей · ? — легенда</div>
   <div id="m-legend" class="live stg"></div>
   <div id="m-card"></div>
   <div id="m-themes"></div>

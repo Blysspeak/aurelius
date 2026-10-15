@@ -79,20 +79,111 @@ for p in top:
     after = sum(1 for v in th.values() if v)
     coverage[plabel] = [len(mem), before, after]
     theme_full.update({k: v for k, v in th.items() if v})
+# ---- harder inference for linked nodes without a theme (orchestrator, 15.10). A molecule = component over the
+# logical relations the UI builds its chains from, inside one project, sessions and projects excluded.
+MOLREL = {'subtask_of', 'contains', 'solves', 'refines', 'supersedes', 'implements', 'blocks', 'caused_by', 'depends_on', 'prerequisite', 'next_step', 'verified_by'}
+uf = {}
+def find(a):
+    while uf.get(a, a) != a:
+        uf[a] = uf.get(uf[a], uf[a]); a = uf[a]
+    return a
+for e in edges:
+    a, b, r = e['from_id'], e['to_id'], e['relation']
+    if r not in MOLREL or a not in nodes or b not in nodes: continue
+    if r == 'contains' and ntype(nodes[a]) not in ('task', 'work_log'): continue
+    if 'session' in (ntype(nodes[a]), ntype(nodes[b])) or 'project' in (ntype(nodes[a]), ntype(nodes[b])): continue
+    if proj_of.get(a) is None or proj_of.get(a) != proj_of.get(b): continue
+    ra, rb = find(a), find(b)
+    if ra != rb: uf[ra] = rb
+mols = collections.defaultdict(list)
+for k in proj_of:
+    if k in nodes and ntype(nodes[k]) not in ('session', 'project'): mols[find(k)].append(k)
+KEEP = {}
+for p in top:
+    cnt0 = collections.Counter(theme_full[k] for k in members[p] if k in theme_full)
+    KEEP[p] = [t for t, _ in cnt0.most_common(12)]
+RU = {'antifraud': ['антифрод'], 'payment': ['платеж', 'платёж'], 'window': ['окно'], 'bank': ['банк'], 'workspace': ['воркспейс'],
+      'cabinet': ['кабинет'], 'release': ['релиз'], 'payouts': ['выплат'], 'prod': ['прод'], 'stand': ['стенд'], 'overpay': ['оверпей'],
+      'scutum': ['скутум'], 'design': ['дизайн'], 'backend': ['бэкенд'], 'frontend': ['фронтенд'], 'mask': ['маск'], 'audit': ['аудит'],
+      'hooks': ['хук'], 'gate': ['гейт'], 'dispatch': ['диспетч'], 'snapshot': ['снапшот', 'снимок'], 'finance': ['финанс'], 'reminders': ['напоминан'],
+      'covers': ['обложк'], 'publish': ['публикац'], 'spec': ['спек'], 'task': ['задач'], 'client': ['клиент'], 'ui': ['интерфейс']}
+def aliases(name):
+    n = name.lower(); out = {n}
+    m = re.fullmatch(r'#(\d+)', n)
+    if m: out |= {m.group(1), 't' + m.group(1)}
+    seg = [x for x in re.split(r'[-_/\s]+', n) if x]
+    if len(seg) > 1: out |= {' '.join(seg), ''.join(seg)}
+    m = re.fullmatch(r'([a-z]+)(\d+)', n)
+    if m: out.add(m.group(1) + ' ' + m.group(2)); out |= {r + m.group(2) for r in RU.get(m.group(1), [])}
+    if len(seg) == 1 and seg[0] in RU: out |= set(RU[seg[0]])
+    if len(seg) > 1 and all(x in RU for x in seg): out.add(' '.join(RU[x][0] for x in seg))
+    return {a for a in out if len(a) >= 3}
+APAT = {p: [(t, re.compile(r'(?<![\w#])(' + '|'.join(re.escape(a) for a in sorted(aliases(t), key=len, reverse=True)) + r')', re.I)) for t in KEEP[p] if aliases(t)] for p in top}
+def text_of(k):
+    x = nodes[k]; dd = x.get('data') or {}
+    return ((x.get('label') or '') + ' ' + (dd.get('claim') or '')).lower()
+def kw(p, k):
+    hits = {t for t, rx in APAT.get(p, []) if rx.search(text_of(k))}
+    return hits.pop() if len(hits) == 1 else None
+linked = {k for r, ms in mols.items() if len(ms) > 1 for k in ms}
+def themeless():
+    c = collections.Counter(proj_of[k] for k in linked if k not in theme_full and proj_of.get(k) in members)
+    return {nodes[p]['label']: c.get(p, 0) for p in top}
+INFER = {'before': themeless()}
+for root, ms in mols.items():                                  # a. molecule majority
+    if len(ms) < 2: continue
+    c = collections.Counter(theme_full[k] for k in ms if k in theme_full)
+    if c:
+        t = c.most_common(1)[0][0]
+        for k in ms: theme_full.setdefault(k, t)
+INFER['a_majority'] = themeless()
+for root, ms in mols.items():                                  # b. keyword match, unique only; a molecule takes it whole
+    if len(ms) < 2 or all(k in theme_full for k in ms): continue
+    p = proj_of.get(ms[0]); found = {kw(p, k) for k in ms if k not in theme_full} - {None}
+    if len(found) == 1:
+        t = found.pop()
+        for k in ms: theme_full.setdefault(k, t)
+INFER['b_keyword'] = themeless()
+for root, ms in mols.items():                                  # c. the molecule's task label decides
+    if len(ms) < 2 or all(k in theme_full for k in ms): continue
+    p = proj_of.get(ms[0]); found = {kw(p, k) for k in ms if ntype(nodes[k]) == 'task'} - {None}
+    if len(found) == 1:
+        t = found.pop()
+        for k in ms: theme_full.setdefault(k, t)
+INFER['c_task'] = themeless()
+# the remainder: "без темы" branches by month of the molecule's newest member; more than 6 months -> older merged
+MN_RU = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
+month_of = {}
+for root, ms in mols.items():
+    if len(ms) < 2 or all(k in theme_full for k in ms): continue
+    newest = max(nodes[k]['created_at'][:7] for k in ms)
+    for k in ms:
+        if k not in theme_full: month_of[k] = newest
+NOTHEME = {}
+for p in top:
+    mon = sorted({m for k, m in month_of.items() if proj_of.get(k) == p}, reverse=True)
+    recent = mon[:6]
+    for k, m in month_of.items():
+        if proj_of.get(k) == p: NOTHEME[k] = ('без темы · ' + MN_RU[int(m[5:7]) - 1]) if m in recent else 'без темы · раньше'
+INFER['d_month_branches'] = {nodes[p]['label']: sum(1 for k in NOTHEME if proj_of.get(k) == p) for p in top}
+print('inference', json.dumps(INFER, ensure_ascii=False))
 THEMES = []
 TINDEX = {}
 for p in top:
     plabel = nodes[p]['label']
     cnt = collections.Counter(theme_full[k] for k in members[p] if k in theme_full)
-    keep = [t for t, _ in cnt.most_common(12)]
+    keep = [t for t in KEEP[p] if cnt.get(t)]
     for t in keep:
         TINDEX[(p, t)] = len(THEMES); THEMES.append([plabel, t, cnt[t]])
     rest = sum(c for t, c in cnt.items() if t not in keep)
     if rest:
         TINDEX[(p, '…')] = len(THEMES); THEMES.append([plabel, 'другие темы', rest])
+    nt = collections.Counter(NOTHEME[k] for k in members[p] if k in NOTHEME)
+    for t, c in sorted(nt.items(), key=lambda kv: (kv[0] == 'без темы · раньше', kv[0])):
+        TINDEX[(p, t)] = len(THEMES); THEMES.append([plabel, t, c])
 def theme_idx(k):
     p = proj_of.get(k)
-    t = theme_full.get(k)
+    t = theme_full.get(k) or NOTHEME.get(k)
     if p is None or t is None: return -1
     return TINDEX.get((p, t), TINDEX.get((p, '…'), -1))
 print('coverage', json.dumps(coverage, ensure_ascii=False))
@@ -138,7 +229,7 @@ for p in top:
                 if v in mset and v not in got and ntype(nodes[v]) != 'session' and (not same_theme or theme_full.get(v) in (None, same_theme)): q.append(v)
     themed = collections.defaultdict(list)
     for x in m:
-        if theme_idx(x) >= 0 and THEMES[theme_idx(x)][1] != 'другие темы': themed[theme_full[x]].append(x)
+        if theme_idx(x) >= 0 and THEMES[theme_idx(x)][1] != 'другие темы': themed[theme_full.get(x) or NOTHEME.get(x)].append(x)
     tot_t = sum(len(v) for v in themed.values()) or 1
     for t, xs in themed.items():
         cap = len(got) + max(12, int(k * 0.8 * len(xs) / tot_t))
@@ -263,7 +354,7 @@ else:
     GHASH = hashlib.sha1(json.dumps([N, E], ensure_ascii=False).encode()).hexdigest()[:16]
 graph = {
     'types': TYPES, 'conf': CONF, 'rels': RELS, 'nodes': [] if FULL else N, 'edges': [] if FULL else E, 'focus': idx[FOCUS],
-    'bin': BIN, 'hash': GHASH, 'status': STATUS, 'bigDays': big_days(),
+    'bin': BIN, 'hash': GHASH, 'inference': INFER, 'status': STATUS, 'bigDays': big_days(),
     'expand': idx[EXP], 'details': details,
     'projects': [pstats(p) for p in top],
     'themes': THEMES, 'coverage': coverage,

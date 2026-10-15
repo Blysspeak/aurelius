@@ -1043,6 +1043,7 @@ onmessage = async (e) => {
     if (L.layoutP >= 1 && !L.done) {
       L.done = now;
       window.__auVisible = window.__auInteractive = true; performance.mark('au-interactive');
+      setTimeout(() => $('#m-hint').classList.add('off'), 10000); // the one-line hint lives for the first 10 s
       $('#stages').style.opacity = 0;
       const tr = `opacity ${REDUCE ? 160 : 900}ms cubic-bezier(.16,1,.3,1)`;
       $('#rail').style.transition = $('#cmd').style.transition = tr;
@@ -1564,7 +1565,12 @@ onmessage = async (e) => {
     state.hoverProj = null; showCard(null);
   }
   let legendMode = '', legendRect = null;
-  function measureLegend() { const r = $('#m-legend').getBoundingClientRect(); legendRect = r.width ? [r.left - 8, r.top - 8, r.width + 16, r.height + 16] : null; }
+  // the legend folds into a "?" chip (it sat on the BOOSTIX cluster); hover or click opens it, click pins it
+  { const chip = $('#m-legend-chip'), lg = $('#m-legend'); let pinned = false, over = 0;
+    const set = () => { const on = pinned || over > 0; lg.classList.toggle('open', on); chip.setAttribute('aria-expanded', on); requestAnimationFrame(measureLegend); };
+    for (const el of [chip, lg]) { el.addEventListener('pointerenter', () => { over++; set(); }); el.addEventListener('pointerleave', () => { over = Math.max(0, over - 1); setTimeout(set, 120); }); }
+    chip.addEventListener('click', () => { pinned = !pinned; set(); }); }
+  function measureLegend() { const lg = $('#m-legend'), r = (lg.classList.contains('open') ? lg : $('#m-legend-chip')).getBoundingClientRect(); legendRect = r.width ? [r.left - 8, r.top - 8, r.width + 16, r.height + 16] : null; }
   function updateLegend(zr) {
     const mode = zr < 2.6 ? 'over' : 'near';
     if (mode === legendMode) return; legendMode = mode;
@@ -2051,7 +2057,7 @@ onmessage = async (e) => {
     fitCamera(true);
     $('#loader').style.display = 'none'; $('#rail').style.opacity = 1; $('#cmd').style.opacity = 1;
     setScreen(initialScreen(), true);
-    window.__auVisible = window.__auInteractive = true;
+    window.__auVisible = window.__auInteractive = true; setTimeout(() => $('#m-hint').classList.add('off'), 10000);
     if (params.get('focus') === 'expand') select(GA.expand, true);
     if (GA.bin) (window.requestIdleCallback || setTimeout)(() => ensureLabels(), { timeout: 1500 });
   } else startLoader();
