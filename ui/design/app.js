@@ -34,7 +34,7 @@
   const ctx = scene.getContext('2d');
   let VW = 0, VH = 0, DPR = 1;
   function resize() {
-    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    DPR = Math.min(window.devicePixelRatio || 1, 2); vignette = null;
     VW = innerWidth; VH = innerHeight;
     for (const c of [scene, glCanvas]) { c.width = Math.round(VW * DPR); c.height = Math.round(VH * DPR); }
     fitCamera(true);
@@ -105,16 +105,25 @@
   const GA = AU.graph;
   const T = GA.types;
   const NN = GA.nodes.length;
-  const nodes = GA.nodes.map((n, i) => ({ i, t: T[n[0]], c: n[1], label: n[2], age: n[3], st: n[4] || null, x: 0, y: 0, sx: VW / 2, sy: VH / 2, a: 0, bx: 0, by: 0, ba: 0, deg: 0, z: clamp(n[3] / 420, 0, 1) }));
+  const nodes = GA.nodes.map((n, i) => ({ nd: 0, i, t: T[n[0]], c: n[1], label: n[2], age: n[3], st: n[4] || null, x: 0, y: 0, sx: VW / 2, sy: VH / 2, a: 0, bx: 0, by: 0, ba: 0, deg: 0, z: clamp(n[3] / 420, 0, 1) }));
   const links = [];
   const adj = nodes.map(() => []);
   for (let k = 0; k < GA.edges.length; k += 3) {
     const a = GA.edges[k], b = GA.edges[k + 1], r = GA.rels[GA.edges[k + 2]];
-    links.push({ source: a, target: b, rel: r });
+    links.push({ source: nodes[a], target: nodes[b], rel: r, li: links.length, bend: (hash(k * 0.37 + 11) - 0.5) * 0.42 });
     adj[a].push([b, r, 'out']); adj[b].push([a, r, 'in']);
     nodes[a].deg++; nodes[b].deg++;
+    if (r !== 'belongs_to') { nodes[a].nd = (nodes[a].nd || 0) + 1; nodes[b].nd = (nodes[b].nd || 0) + 1; }
   }
-  const projHub = new Map(GA.projects.map(([i, label, n]) => [i, { label, n }]));
+  const projHub = new Map(GA.projects.map(([i, label, n, last, act, open, blk]) => [i, { label, n, last, act, open, blk }]));
+  // bioluminescence by meaning: five groups, shape still names the exact type
+  const GROUP = { decision: 'k', concept: 'k', solution: 'k', doc: 'k', skill: 'k', digest: 'k', task: 'w', work_log: 'w', session: 'w', reminder: 'w', problem: 'p', user_fact: 'o', person: 'o', file: 'i', dependency: 'i', server: 'i', crate: 'i', project: 'i', module: 'i', config: 'i' };
+  const GHEX = { k: '#5CE1E6', w: '#FFB547', p: '#FF5C7A', o: '#7CF0A9', i: '#8FA3B8' };
+  const GNAME = { k: 'знания', w: 'работа', p: 'проблемы', o: 'факты владельца', i: 'инфраструктура' };
+  const rgb = (h) => [parseInt(h.slice(1, 3), 16) / 255, parseInt(h.slice(3, 5), 16) / 255, parseInt(h.slice(5, 7), 16) / 255];
+  const GC = Object.fromEntries(Object.entries(GHEX).map(([k, v]) => [k, rgb(v)]));
+  const SHAPE_ID = { concept: 0, decision: 1, problem: 2, task: 3, solution: 4, work_log: 5, session: 6, user_fact: 7, person: 7, project: 8 };
+  nodes.forEach((n) => { n.g = GROUP[n.t] || 'i'; n.shape = SHAPE_ID[n.t] ?? 9; n.open = GA.nodes[n.i][5] === 1; n.attn = (n.t === 'task' && n.st === 'active') || n.open || (n.t === 'task' && n.st === 'blocked'); });
   const typeOn = new Set(T);
 
   // sprites: type = glyph shape, confidence = light quality, never hue
@@ -161,24 +170,66 @@
     spriteCache.set(key, o);
     return o;
   }
-  function glyphCanvas(t, conf, css = 14) {
+  function glyphCanvas(t, conf, css = 14, hex) {
     const cv = document.createElement('canvas'); cv.width = cv.height = css * 2;
     const c = cv.getContext('2d');
     const kind = glyphKind(t), r = css * 0.28;
     drawGlyph(c, conf === 4 ? 'ring' : kind, css, css, r * 2, CONF_LOOK[conf][0], conf === 4 || kind === 'ring' || kind === 'double');
+    if (hex) { c.globalCompositeOperation = 'source-in'; c.fillStyle = hex; c.fillRect(0, 0, cv.width, cv.height); }
     return cv;
   }
 
-  // ------------------------------------------------------------------ layout (d3-force, real ticks drive the loader)
+  // ------------------------------------------------------------------ layout: ganglia (real d3 ticks drive the loader)
+  // Each project is an organic cluster; inside it radius follows age (recent at the core).
+  // belongs_to only decides membership and is never drawn.
+  const hubOf = new Int32Array(NN).fill(-1);
+  for (const l of links) {
+    if (l.rel !== 'belongs_to') continue;
+    if (projHub.has(l.target.i)) hubOf[l.source.i] = l.target.i; else if (projHub.has(l.source.i)) hubOf[l.target.i] = l.source.i;
+  }
+  for (const i of projHub.keys()) hubOf[i] = i;
+  for (let pass = 0; pass < 3; pass++) for (const n of nodes) if (hubOf[n.i] < 0) { const nb = adj[n.i].find(([j, r]) => r !== 'belongs_to' && hubOf[j] >= 0); if (nb) hubOf[n.i] = hubOf[nb[0]]; }
+  const OTHER = -2;
+  for (const n of nodes) { if (hubOf[n.i] < 0) hubOf[n.i] = OTHER; n.hub = hubOf[n.i]; }
+  const ganglia = new Map();
+  for (const n of nodes) { if (!ganglia.has(n.hub)) ganglia.set(n.hub, { key: n.hub, members: [], x: 0, y: 0 }); ganglia.get(n.hub).members.push(n); }
+  for (const G of ganglia.values()) {
+    G.members.sort((a, b) => a.age - b.age);
+    G.R = 6.4 * Math.sqrt(G.members.length) + 14; G.rr = G.R; G.f = 1;
+    G.ph1 = hash(G.key * 1.3 + 7) * 6.28; G.ph2 = hash(G.key * 2.1 + 3) * 6.28;
+    const cnt = { k: 0, w: 0, p: 0, o: 0, i: 0 }; G.members.forEach((m) => cnt[m.g]++); G.dom = Object.entries(cnt).sort((x, y) => y[1] - x[1])[0][0];
+    G.label = G.key === OTHER ? 'вне проектов' : projHub.get(G.key).label;
+    G.info = G.key === OTHER ? null : projHub.get(G.key);
+  }
+  (function pack() { // circle packing of ganglia by size, even gaps
+    const D = [...ganglia.values()].sort((a, b) => b.R - a.R);
+    D.forEach((G, k) => { const a = k * 2.39996, r = 40 * Math.sqrt(k); G.x = Math.cos(a) * r; G.y = Math.sin(a) * r; });
+    const ps = d3.forceSimulation(D).force('c', d3.forceCollide((G) => G.R * 1.18 + 30).iterations(4)).force('x', d3.forceX(0).strength(0.05)).force('y', d3.forceY(0).strength(0.07)).stop();
+    for (let k = 0; k < 400; k++) ps.tick();
+  })();
+  for (const G of ganglia.values()) {
+    const m = G.members.length;
+    G.members.forEach((n, k) => {
+      if (n.i === G.key) { n.ax = G.x; n.ay = G.y; return; }
+      const t = (k + 0.5) / m;
+      const th = k * 2.39996 + (hash(n.i * 1.7) - 0.5) * 1.6;
+      const lobe = 1 + 0.2 * Math.sin(2 * th + G.ph1) + 0.13 * Math.sin(3 * th + G.ph2); // organic outline, not a disc
+      const r = G.R * lobe * Math.sqrt(t) * (0.9 + 0.2 * hash(n.i * 3.3));
+      n.ax = G.x + Math.cos(th) * r; n.ay = G.y + Math.sin(th) * r;
+    });
+  }
+  const nbLinks = [];
+  for (const l of links) if (l.rel !== 'belongs_to') nbLinks.push({ source: l.source.i, target: l.target.i });
   let sim, tick = 0;
   const TICKS = 300;
+  function anchorForce(alpha) { for (const n of nodes) { n.vx += (n.ax - n.x) * 0.09 * alpha; n.vy += (n.ay - n.y) * 0.09 * alpha; } }
   function newSim() {
-    nodes.forEach((n, i) => { const a = i * 2.39996, r = 6 * Math.sqrt(i); n.x = Math.cos(a) * r; n.y = Math.sin(a) * r; n.vx = n.vy = 0; });
+    nodes.forEach((n) => { n.x = n.ax + (hash(n.i) - 0.5) * 6; n.y = n.ay + (hash(n.i + 5) - 0.5) * 6; n.vx = n.vy = 0; });
     tick = 0;
     sim = d3.forceSimulation(nodes)
-      .force('charge', d3.forceManyBody().strength(-16).theta(0.95).distanceMax(320))
-      .force('link', d3.forceLink(links).distance((l) => (l.rel === 'belongs_to' ? 30 : 12)).strength((l) => (l.rel === 'belongs_to' ? 0.22 : 0.7)))
-      .force('x', d3.forceX(0).strength(0.035)).force('y', d3.forceY(0).strength(0.035))
+      .force('link', d3.forceLink(nbLinks.map((l) => ({ ...l }))).distance(10).strength(0.08))
+      .force('charge', d3.forceManyBody().strength(-2.4).theta(0.9).distanceMax(40))
+      .force('anchor', anchorForce)
       .stop();
   }
   function stepSim(n) { for (let k = 0; k < n && tick < TICKS; k++) { sim.tick(); tick++; } }
@@ -198,16 +249,15 @@
     const k = Math.min(aw / Math.max(b.x1 - b.x0, 1e-3), ah / Math.max(b.y1 - b.y0, 1e-3)) * 0.95;
     return { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2, k: isFinite(k) && k > 0 ? Math.min(k, 40) : 1 };
   }
-  function fitCamera(instant) { if (!nodes.length) return; const t = fitTarget(); if (instant) Object.assign(cam, t); else fly(t); }
+  function fitCamera(instant) { if (!nodes.length) return; const t = fitTarget(); if (state.sel == null) fitK = t.k; if (instant) Object.assign(cam, t); else fly(t); }
   function fly(t, dur = 640) { camFly = { from: { x: cam.x, y: cam.y, k: cam.k }, to: t, t0: performance.now(), dur: REDUCE ? 1 : dur }; }
   function originX() { const railW = 132; const detailW = state.sel != null && state.screen === 'memory' ? 440 : 0; return railW + (VW - railW - detailW) / 2; }
   function project(n) {
-    const f = 1 - 0.2 * n.z; // age = depth: older nodes recede toward the vanishing point
-    return [cam.ox + (n.x - cam.x) * cam.k * f, cam.oy + (n.y - cam.y) * cam.k * f];
+    return [cam.ox + (n.x - cam.x) * cam.k, cam.oy + (n.y - cam.y) * cam.k];
   }
 
   // ------------------------------------------------------------------ state
-  const state = { screen: 'memory', prev: null, morph0: 0, sel: null, hover: null, selT: 0, lens: false, loader: null, filterType: null, fin: { a: 0, b: AU.fin.months.length - 1, kind: -1, cat: -1, q: '', voided: false }, task: 'b7a7d9af' };
+  const state = { hoverProj: null, screen: 'memory', prev: null, morph0: 0, sel: null, hover: null, selT: 0, lens: false, loader: null, filterType: null, fin: { a: 0, b: AU.fin.months.length - 1, kind: -1, cat: -1, q: '', voided: false }, task: 'b7a7d9af' };
 
   // ------------------------------------------------------------------ finance model
   const F = AU.fin;
@@ -254,7 +304,7 @@
     }
   }
   function statsLine() {
-    $('#m-stats').innerHTML = `<b>${nf0.format(GA.full.nodes)}</b> узлов · <b>${nf0.format(GA.full.edges)}</b> связей<br>в прототипе ${nf0.format(NN)} узлов, ${nf0.format(links.length)} связей<br>${GA.projects.length} проектов-ядер · свет = уверенность, глубина = возраст` + (params.has('fps') ? '<br><span id="fps"></span>' : '');
+    $('#m-stats').innerHTML = `<b>${nf0.format(GA.full.nodes)}</b> узлов · <b>${nf0.format(GA.full.edges)}</b> связей<br>в прототипе ${nf0.format(NN)} узлов, ${nf0.format(links.length)} связей<br>облако = проект · ядро = свежее · цвет = смысл` + (params.has('fps') ? '<br><span id="fps"></span>' : '');
   }
   function showNode(i) {
     const D = $('#m-detail');
@@ -284,6 +334,7 @@
       ${!d ? '<div class="sec"><p class="note">Заметка, claim и улики этого узла в снимок не попали; в фазе 2 их отдаёт /api/node/:id.</p></div>' : ''}
       <div class="sec"><span class="cap">связи · ${nf0.format(adj[i].length)}</span><div class="links">${links || '<p class="note">нет связей в выборке</p>'}</div></div>`;
     D.querySelector('.kind').append(sp, document.createTextNode(n.t.replace('_', ' ')));
+    D.dataset.tint = GHEX[n.g];
     D.classList.add('on');
     D.scrollTop = 0;
   }
@@ -296,7 +347,7 @@
     showNode(i);
     if (i != null && flyTo !== false) {
       const n = nodes[i];
-      fly({ x: n.x, y: n.y, k: Math.max(cam.k, fitTarget().k * 2.2) }, 720);
+      fly({ x: n.x, y: n.y, k: Math.max(cam.k, fitK * 4.6) }, 760);
     } else if (i == null) fitCamera(false);
   }
 
@@ -326,7 +377,7 @@
         b.className = 'trow'; b.dataset.id = t.id;
         b.innerHTML = `<span class="pt" ${g != null ? `data-g="${g}"` : ''}></span><span class="tt">${esc(stripProj(t.label))}</span>
           <span class="tm"><span class="prio" title="${t.priority}">${[1, 2, 3, 4].map((k) => `<i class="${k <= p ? 'on' : ''}" style="height:${2 + k * 2}px"></i>`).join('')}</span>${t.criteria_total ? `<span>${t.criteria_met}/${t.criteria_total}</span>` : ''}${t.branch ? `<span>${esc(t.branch)}</span>` : ''}</span>`;
-        if (g == null) b.querySelector('.pt').append(glyphCanvas('task', st === 'active' ? 1 : 3, 10));
+        if (g == null) b.querySelector('.pt').append(glyphCanvas('task', st === 'active' ? 1 : 3, 10, '#FFB547'));
         lane.append(b);
       }
       el.append(lane);
@@ -368,7 +419,7 @@
     const crit = (d && d.data.acceptance_criteria) || [];
     const met = t.criteria_met || 0;
     const st = { backlog: 'бэклог', active: 'в работе', blocked: 'блок', done: 'готово', cancelled: 'отменена' }[t.status] || t.status;
-    $('#t-detail').innerHTML = `<div class="tline"><span>${st}</span><span>${esc(t.priority)}</span><span class="mono" style="letter-spacing:0">${t.id.slice(0, 8)}</span></div>
+    $('#t-detail').innerHTML = `<div class="tline"><span class="chip st-${t.status}">${st}</span><span>${esc(t.priority)}</span><span class="mono" style="letter-spacing:0">${t.id.slice(0, 8)}</span></div>
       <h2>${esc(stripProj(t.label))}</h2>
       ${d ? `<div class="dates"><div class="y"><span class="cap">заведена</span><span class="num">${dmy(d.created_at)}</span></div><div class="${d.data.activated_at ? 'y' : ''}"><span class="cap">взята</span><span class="num">${dmy(d.data.activated_at || d.data.started_at)}</span></div><div class="${d.data.closed_at ? 'y' : ''}"><span class="cap">закрыта</span><span class="num">${dmy(d.data.closed_at)}</span></div></div>` : ''}
       ${d && d.note ? `<div class="sec"><p class="note" style="color:var(--bone-2);line-height:1.6;margin-top:18px">${esc(d.note.slice(0, 420))}${d.note.length > 420 ? '…' : ''}</p></div>` : ''}
@@ -423,6 +474,7 @@
     $('#f-inc').innerHTML = `+${usd(inc)}`;
     const net = inc - exp;
     $('#f-net').textContent = (net >= 0 ? '+' : '−') + usd(Math.abs(net));
+    $('#f-net').className = 'sm ' + (net >= 0 ? 'pos' : 'neg');
     const ML = (k) => new Date(k + '-01T00:00').toLocaleDateString('ru-RU', { month: 'short', year: 'numeric' });
     $('#f-per').textContent = all ? 'всё время' : `${ML(months[a])} — ${ML(months[b])}`;
     $('#f-cnt').textContent = `${nf0.format(t.n)} записей · ${F.voided_excluded} отменённых вне итога`;
@@ -464,6 +516,14 @@
   }
   $('#f-rows').addEventListener('pointerover', (e) => { const tr = e.target.closest('tr[data-why]'); if (tr) tip(e, 'отменена', tr.dataset.why); });
   $('#f-rows').addEventListener('pointerout', () => tip(null));
+  $('#f-field').addEventListener('pointermove', (e) => {
+    if (!finGeom || e.target.closest('#f-bar, #f-scrub')) { tip(null); return; }
+    const m = Math.floor((e.clientX - finGeom.r.left) / finGeom.colW);
+    if (m < 0 || m >= months.length || e.clientY < finGeom.r.top || e.clientY > finGeom.r.bottom) { tip(null); return; }
+    const M = F.months[m];
+    tip(e, new Date(M.key + '-01T00:00').toLocaleDateString('ru-RU', { month: 'long', year: 'numeric' }), `доход +${nf2.format(+M.income)} · расход −${nf2.format(+M.expense)} USD · ${M.entries} записей`);
+  });
+  $('#f-field').addEventListener('pointerleave', () => tip(null));
 
   // ------------------------------------------------------------------ tooltip
   function tip(e, t, text) {
@@ -481,6 +541,7 @@
     const prev = state.screen;
     if (prev === name && !instant) return;
     state.prev = prev; state.screen = name; state.morph0 = performance.now();
+    document.body.dataset.screen = name;
     for (const n of nodes) { n.bx = n.sx; n.by = n.sy; n.ba = n.a; }
     for (const e of ENT) { e.fx = e.sx; e.fy = e.sy; e.fa = e.a; e.fh = e.h; }
     if (name === 'finance' && prev !== 'finance') { // entries are born from the points of the field
@@ -511,7 +572,8 @@
   function memoryTarget(n, now, out) {
     let [x, y] = project(n);
     let a = CONF_LOOK[n.c][0] > 0.9 ? 1 : 0.85;
-    a *= 1 - 0.55 * n.z; // depth fog
+    a *= 1 - 0.4 * n.z; // older = dimmer (age also sets the radius inside the ganglion)
+    if (state.hoverProj != null && n.hub !== state.hoverProj) a *= 0.22;
     if (state.filterType && n.t !== state.filterType && !(state.filterType === 'doc' && n.t === 'doc')) a *= 0.08;
     const focus = state.hover != null ? state.hover : state.sel;
     if (focus != null) {
@@ -537,12 +599,13 @@
     if (f === focusOf) return;
     focusOf = f; focusSet = new Set(); focusRing = new Map();
     if (f == null) return;
+    fireFrom(f, null, 1, performance.now());
     adj[f].forEach(([j], k) => { focusSet.add(j); focusRing.set(j, (k / adj[f].length) * Math.PI * 2 - Math.PI / 2); });
   }
   const taskTargets = new Map();
   function readTaskTargets() {
     taskTargets.clear();
-    for (const el of $$('#lanes .pt[data-g]')) { const r = el.getBoundingClientRect(); taskTargets.set(+el.dataset.g, [r.left + r.width / 2, r.top + r.height / 2, el.closest('.trow').classList.contains('sel'), el.closest('.lane').classList.contains('active')]); }
+    for (const el of $$('#lanes .pt[data-g]')) { const r = el.getBoundingClientRect(); taskTargets.set(+el.dataset.g, [r.left + r.width / 2, r.top + r.height / 2, el.closest('.trow').classList.contains('sel'), el.closest('.lane').classList.contains('active'), el.closest('.lane').classList.contains('done')]); }
   }
   let finGeom = null;
   function readFinGeom() {
@@ -646,8 +709,11 @@
     'slab-clear': { r: 14, bevel: 18, strength: 0.6, absorb: 0.22, disp: 0.7, rim: 0.85, sheen: 0.6 },
     bar: { r: 16, bevel: 12, strength: 0.9, absorb: 0.78, disp: 0.8, rim: 1.0, sheen: 0.9 },
   };
+  let secRGB = [0.36, 0.88, 0.9];
   function collectSlabs() {
     const out = [];
+    const sc = getComputedStyle(document.body).getPropertyValue('--sec').match(/[\d.]+/g);
+    if (sc && sc.length >= 3) secRGB = sc.slice(0, 3).map((v) => +v / 255);
     for (const el of $$('[data-glass]')) {
       if (out.length >= 10) break;
       const scr = el.closest('.screen');
@@ -661,14 +727,233 @@
       const r = el.getBoundingClientRect();
       if (r.bottom < 0 || r.top > VH || r.width < 4) continue;
       const k = SLAB[el.dataset.glass];
-      out.push({ x: r.left, y: r.top, w: r.width, h: r.height, presence: pres, ...k, r: Math.min(k.r, r.height / 2) });
+      let tint = null;
+      if (el.id === 'pill') tint = [...secRGB, 0.85];
+      else if (el.id === 'cmd') tint = [...secRGB, 0.25];
+      else if (el.id === 't-detail') tint = [...GC.w, 0.3];
+      else if (el.dataset.tint) tint = [...rgb(el.dataset.tint), 0.32];
+      out.push({ x: r.left, y: r.top, w: r.width, h: r.height, presence: pres, ...k, r: Math.min(k.r, r.height / 2), tint });
     }
     return out;
   }
 
+  // ------------------------------------------------------------------ neural field (GL)
+  const ggl = glass ? window.GraphGL.init(glass.gl) : null;
+  const EB = new Float32Array(16000 * 16), NB = new Float32Array(16000 * 11);
+  let fitK = 1;
+  const pulses = [];
+  let lastAmbient = 0;
+  const nbIdx = links.filter((l) => l.rel !== 'belongs_to');
+  const crossIdx = nbIdx.filter((l) => l.source.hub !== l.target.hub);
+  function fireFrom(f, from, hop, t0) { // activation spreading: one hop, then the next
+    if (pulses.length > 260) return;
+    let k = 0;
+    for (const l of nbIdx) {
+      if (l.source.i !== f && l.target.i !== f) continue;
+      const other = l.source.i === f ? l.target : l.source;
+      if (from != null && other.i === from) continue;
+      pulses.push({ l, rev: l.target.i === f, t0: t0 + hash(l.li) * 90, dur: 520 + hash(l.li + 3) * 260, hop, root: f });
+      if (++k >= (hop === 1 ? 40 : 5)) break;
+    }
+  }
+  function curvePt(A, B, bend, t) {
+    const dx = B.sx - A.sx, dy = B.sy - A.sy, L = Math.hypot(dx, dy) || 1;
+    const cx = (A.sx + B.sx) / 2 - (dy / L) * bend * L, cy = (A.sy + B.sy) / 2 + (dx / L) * bend * L;
+    const s1 = 1 - t; return [s1 * s1 * A.sx + 2 * s1 * t * cx + t * t * B.sx, s1 * s1 * A.sy + 2 * s1 * t * cy + t * t * B.sy];
+  }
+  const colTmp = [0, 0, 0];
+  function colOf(n, sat) {
+    const c = GC[n.g]; const L = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    colTmp[0] = lerp(L * 0.86, c[0], sat); colTmp[1] = lerp(L * 0.93, c[1], sat); colTmp[2] = lerp(L * 1.05, c[2], sat);
+    return colTmp;
+  }
+  const CONF_I = [0.62, 1.0, 0.82, 0.62, 0.5];
+  function buildGraph(now, scr, L) {
+    if (!ggl) return null;
+    const zr = clamp(cam.k / fitK, 0.15, 60);
+    const memo = scr === 'memory' || scr === 'spec';
+    const loaderOn = L && !L.done;
+    const glyphZ = memo ? sstep(2.2, 4.2, zr) : 0;
+    const satZ = loaderOn ? 0.55 : memo ? lerp(0.5, 1, sstep(1.4, 4, zr)) : 1;
+    const focus = focusOf;
+    const hp = state.hoverProj;
+    for (const G of ganglia.values()) { const area = Math.PI * Math.pow(G.rr * cam.k, 2) || 1; G.f = clamp(Math.sqrt(0.0026 / (G.members.length / area)), 0.2, 1.2); }
+    let ne = 0, nn = 0;
+    const putE = (A, B, bend, w, t0, t1, ca, a0, cb, a1) => {
+      if (ne >= 16000) return; const o = ne++ * 16;
+      EB[o] = A.sx; EB[o + 1] = A.sy; EB[o + 2] = B.sx; EB[o + 3] = B.sy; EB[o + 4] = bend; EB[o + 5] = w; EB[o + 6] = t0; EB[o + 7] = t1;
+      EB[o + 8] = ca[0]; EB[o + 9] = ca[1]; EB[o + 10] = ca[2]; EB[o + 11] = a0; EB[o + 12] = cb[0]; EB[o + 13] = cb[1]; EB[o + 14] = cb[2]; EB[o + 15] = a1;
+    };
+    const putN = (x, y, size, ext, c, I, halo, shape, glyph) => {
+      if (nn >= 16000 || I <= 0.002) return; const o = nn++ * 11;
+      NB[o] = x; NB[o + 1] = y; NB[o + 2] = size; NB[o + 3] = ext; NB[o + 4] = c[0]; NB[o + 5] = c[1]; NB[o + 6] = c[2]; NB[o + 7] = I; NB[o + 8] = halo; NB[o + 9] = shape; NB[o + 10] = glyph;
+    };
+    // axons and dendrites
+    const eBase = loaderOn ? 0.1 * sstep(0.45, 1, L.layoutP) : memo ? lerp(0.13, 0.3, sstep(1, 4, zr)) * (scr === 'spec' ? 0.15 : 1) : 0.0;
+    if (eBase > 0) for (const l of nbIdx) {
+      const A = l.source, B = l.target;
+      if (A.a < 0.03 || B.a < 0.03) continue;
+      const cross = A.hub !== B.hub;
+      const GA_ = ganglia.get(A.hub);
+      let al = eBase * Math.min(A.a, B.a, 1) * (cross ? 3 : (GA_ ? GA_.f * GA_.f * 1.4 : 1));
+      let w = 1.0 + Math.min(A.nd, 14) * 0.07 + (cross ? 0.8 : 0);
+      let sat = satZ;
+      if (focus != null) { if (A.i === focus || B.i === focus) { al = 0.85; w += 0.5; sat = 1; } else al *= 0.22; }
+      if (hp != null && A.hub !== hp && B.hub !== hp) al *= 0.25;
+      if (al < 0.004) continue;
+      const ca = colOf(A, sat).slice(), cb = colOf(B, sat).slice();
+      putE(A, B, l.bend, w, 0, 1, ca, al, cb, al);
+      if (zr > 1.6 || (focus != null && al > 0.5)) { const [x, y] = curvePt(A, B, l.bend, 0.965); putN(x, y, 1.5, 2.2, cb, al * 1.6, 0.6, 0, 0); } // synapse bulb
+    }
+    // action potentials
+    if (memo && !loaderOn && !REDUCE) {
+      if (now - lastAmbient > 260 && nbIdx.length) {
+        lastAmbient = now;
+        const pool = hash(now) < 0.35 && crossIdx.length ? crossIdx : nbIdx;
+        const l = pool[Math.floor(hash(now * 1.37) * pool.length) % pool.length];
+        if (l.source.a > 0.2 && l.target.a > 0.2) pulses.push({ l, rev: hash(now * 2.1) > 0.5, t0: now, dur: 1100 + hash(now) * 700, hop: 9 });
+      }
+      for (let k = pulses.length - 1; k >= 0; k--) {
+        const P = pulses[k]; const u = (now - P.t0) / P.dur;
+        if (u < 0) continue;
+        if (u >= 1) { pulses.splice(k, 1); if (P.hop < 3 && focusOf === P.root) { const arr = P.rev ? P.l.source : P.l.target; fireFrom(arr.i, P.rev ? P.l.target.i : P.l.source.i, P.hop + 1, now); } continue; }
+        const A = P.rev ? P.l.target : P.l.source, B = P.rev ? P.l.source : P.l.target;
+        const bend = P.rev ? -P.l.bend : P.l.bend;
+        const head = u, tail = Math.max(0, u - 0.2);
+        const ca = colOf(A, 1).slice();
+        const amp = P.hop === 9 ? 1.6 : 2.8 / P.hop;
+        putE(A, B, bend, 2.0, tail, head, ca, 0, ca, amp);
+        const [x, y] = curvePt(A, B, bend, head); putN(x, y, 2.2, 3, ca, amp * 0.9, 1.4, 0, 0);
+      }
+    } else pulses.length = 0;
+    // neurons
+    for (const n of nodes) {
+      if (n.a <= 0.01) continue;
+      const inTasks = scr === 'tasks' && taskTargets.has(n.i);
+      if (inTasks) { const tt = taskTargets.get(n.i); putN(n.sx, n.sy, tt[2] ? 6.5 : tt[4] ? 4.2 : 5.2, 2.6, tt[4] ? colOf(n, 0.35) : GC.w, (tt[2] ? 2.4 : tt[3] ? 1.9 : tt[4] ? 0.42 : 1.0) * Math.min(n.a, 1), 1.6, 3, 1); continue; }
+      if (scr === 'tasks' || scr === 'finance') { putN(n.sx, n.sy, 1.6, 2.4, colOf(n, 0.6), n.a * 0.6, 0.8, 0, 0); continue; }
+      const G = ganglia.get(n.hub);
+      const isF = n.i === focus, near = focus != null && focusSet.has(n.i);
+      const recency = n.age < 7 ? 1.75 : n.age < 30 ? 1.1 : 0.72;
+      let I = loaderOn ? n.a * 1.7 * CONF_I[n.c] : n.a * recency * CONF_I[n.c] * (G ? G.f || 1 : 1);
+      let sat = satZ;
+      const leaf = n.nd <= 1 && !n.attn && n.t !== 'project';
+      let size = (1.5 + 0.85 * Math.log2(1 + n.nd)) * clamp(Math.pow(zr, 0.45), 0.85, 2.8);
+      let ext = 3.2, halo = 2.0, glyph = glyphZ;
+      if (loaderOn) { size = lerp(1.7, size, sstep(0.2, 1, L.layoutP)); glyph = 0; halo = 1.6; }
+      else if (leaf && zr < 1.8) { size = 1.25; ext = 2.2; halo = 0.7; I *= 0.85; } // dust at far zoom
+      if (n.attn && !loaderOn) { size = Math.max(size, 4.2); glyph = 1; I = Math.max(I, 1.5 * n.a); sat = 1; halo = 2.6; }
+      if (n.t === 'project') { size = Math.max(size, 4.6); I *= 1.2; }
+      if (hp != null && n.hub === hp) { I *= 1.35; sat = Math.max(sat, 0.9); }
+      if (isF) { size *= 1.7; I = 2.6; sat = 1; glyph = Math.max(glyph, 0.6); }
+      else if (near) { I *= 1.5; sat = 1; }
+      if (scr === 'spec') I *= 0.5;
+      putN(n.sx, n.sy, size, ext, colOf(n, sat), I, halo, n.shape, glyph);
+    }
+    return ggl.draw({ vw: VW, vh: VH, ratio: DPR, edges: EB, nEdges: ne, nodes: NB, nNodes: nn });
+  }
+
+  // ganglion geometry (centroid and a robust radius), recomputed while the layout moves
+  let geomTick = -1;
+  function gangliaGeom() {
+    if (geomTick === tick) return; geomTick = tick;
+    for (const G of ganglia.values()) {
+      let x = 0, y = 0; for (const n of G.members) { x += n.x; y += n.y; } x /= G.members.length; y /= G.members.length;
+      const ds = G.members.map((n) => Math.hypot(n.x - x, n.y - y)).sort((a, b) => a - b);
+      G.cx = x; G.cy = y; G.rr = Math.max(ds[Math.floor(ds.length * 0.9)] || 8, 8);
+    }
+  }
+  const agoTxt = (d) => (d < 1 / 24 ? 'только что' : d < 1 ? `${Math.max(1, Math.round(d * 24))} ч назад` : `${Math.round(d)} дн. назад`);
+  const ICON = { task: (c) => `<svg width="9" height="9" viewBox="0 0 10 10"><rect x="1.5" y="1.5" width="7" height="7" fill="${c}"/></svg>`, prob: (c) => `<svg width="10" height="9" viewBox="0 0 10 9"><path d="M5 .5 9.5 8.5H.5z" fill="${c}"/></svg>` };
+  const labelEls = new Map();
+  function buildLabels() {
+    const box = $('#m-labels'); box.innerHTML = '';
+    const maxN = Math.max(...[...projHub.values()].map((p) => p.n));
+    for (const G of ganglia.values()) {
+      const el = document.createElement('button'); el.className = 'plabel';
+      const info = G.info;
+      const fs = info ? 11 + 3 * Math.sqrt(info.n / maxN) : 11;
+      el.innerHTML = `<span class="pn" style="font-size:${fs.toFixed(1)}px">${esc(G.label)}</span><span class="pm">${info ? `<span class="num">${nf0.format(info.n)}</span> узлов <i class="act ${info.last < 7 ? 'hot' : ''}"></i>${agoTxt(info.last)}` : `<span class="num">${G.members.length}</span> в выборке`}</span>`;
+      el.onclick = () => flyToGanglion(G);
+      el.onpointerenter = () => { state.hoverProj = G.key; showCard(G); };
+      el.onpointerleave = () => { state.hoverProj = null; showCard(null); };
+      box.append(el); labelEls.set(G.key, el);
+    }
+  }
+  function updateLabels(scr, L) {
+    const box = $('#m-labels');
+    const on = scr === 'memory' && (!L || L.done);
+    box.style.opacity = on ? (L ? sstep(0, 900, performance.now() - L.done) : 1) : 0;
+    if (!on) return;
+    gangliaGeom();
+    const placed = [];
+    const railOff = $('#s-memory').getBoundingClientRect().left;
+    const order = [...ganglia.values()].sort((a, b) => (b.info ? b.info.n : 0) - (a.info ? a.info.n : 0));
+    const zr = cam.k / fitK;
+    for (const G of order) {
+      const el = labelEls.get(G.key); if (!el) continue;
+      const [cx, cy] = project({ x: G.cx, y: G.cy });
+      const rpx = G.rr * cam.k;
+      const w = el.offsetWidth, h = el.offsetHeight;
+      let x = cx - w / 2, y = cy - rpx - h - 8;
+      const hit = (x0, y0) => placed.some((r) => x0 < r[0] + r[2] + 6 && x0 + w + 6 > r[0] && y0 < r[1] + r[3] + 4 && y0 + h + 4 > r[1]);
+      if (hit(x, y) || y < 8) y = cy + rpx + 8;
+      const vis = !hit(x, y) && zr < 7 && rpx > 6 && x > 140 && x + w < VW - 10 && y > 6 && y + h < VH - 84 && !(state.sel != null && Math.abs(y + h - (nodes[state.sel].sy - 16)) < 30 && Math.abs(cx - nodes[state.sel].sx) < 240);
+      el.style.transform = `translate(${(x - railOff).toFixed(1)}px, ${y.toFixed(1)}px)`;
+      el.classList.toggle('off', !vis);
+      el.classList.toggle('hl', state.hoverProj === G.key);
+      el.classList.toggle('dim', state.hoverProj != null && state.hoverProj !== G.key);
+      if (vis) placed.push([x, y, w, h]);
+    }
+    updateLegend(zr);
+  }
+  function showCard(G, e) {
+    const c = $('#m-card');
+    if (!G) { c.classList.remove('on'); return; }
+    const info = G.info;
+    const cnt = { k: 0, w: 0, p: 0, o: 0, i: 0 }; G.members.forEach((m) => cnt[m.g]++);
+    const tot = G.members.length;
+    c.innerHTML = `<h3>${esc(G.label)}</h3>
+      <dl><dt>узлов</dt><dd class="num">${nf0.format(info ? info.n : tot)}</dd>
+      <dt>активные задачи</dt><dd class="num">${info ? info.act : '—'}</dd>
+      <dt>открытые проблемы</dt><dd class="num">${info ? nf0.format(info.open) : '—'}</dd>
+      ${info && info.blk ? `<dt>в блоке</dt><dd class="num">${info.blk}</dd>` : ''}
+      <dt>активность</dt><dd>${info ? agoTxt(info.last) : '—'}</dd></dl>
+      <div class="mix">${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) => `<i style="flex:${v};background:${GHEX[k]}" title="${GNAME[k]} ${v}"></i>`).join('')}</div>
+      <p>клик — приблизить проект</p>`;
+    c.dataset.tint = GHEX[G.dom];
+    c.classList.add('on');
+  }
+  function flyToGanglion(G) {
+    gangliaGeom();
+    const aw = VW - 132 - 120, ah = VH - 200;
+    fly({ x: G.cx, y: G.cy, k: Math.min(aw, ah) / (G.rr * 2.6) }, 820);
+    state.hoverProj = null; showCard(null);
+  }
+  let legendMode = '';
+  function updateLegend(zr) {
+    const mode = zr < 2.6 ? 'over' : 'near';
+    if (mode === legendMode) return; legendMode = mode;
+    const L = $('#m-legend');
+    const dot = (hex, s = 8) => `<i class="sw" style="width:${s}px;height:${s}px;background:${hex};box-shadow:0 0 8px ${hex}"></i>`;
+    if (mode === 'over') {
+      L.innerHTML = `<p class="lg"><span class="neb"></span>облако — проект, размер — число узлов</p>
+        <p class="lg"><span class="core"></span>яркое ядро — записано за 7 дней</p>
+        <p class="lg">${ICON.task(GHEX.w)}активная задача</p>
+        <p class="lg">${ICON.prob(GHEX.p)}открытая проблема</p>
+        <p class="lg ax"><span class="axon"></span>длинная линия — связь между проектами</p>
+        <div class="groups">${Object.keys(GHEX).map((k) => `<span>${dot(GHEX[k])}${GNAME[k]}</span>`).join('')}</div>`;
+    } else {
+      const order = ['decision', 'concept', 'solution', 'problem', 'task', 'session', 'work_log', 'user_fact', 'project', 'doc'];
+      L.innerHTML = '<div class="types"></div>' + `<div class="groups">${Object.keys(GHEX).map((k) => `<span>${dot(GHEX[k])}${GNAME[k]}</span>`).join('')}</div>`;
+      const T2 = L.querySelector('.types');
+      for (const t of order) { const s2 = document.createElement('span'); s2.append(glyphCanvas(t, 1, 14, GHEX[GROUP[t] || 'i'])); s2.append(document.createTextNode(t.replace('_', ' '))); T2.append(s2); }
+    }
+  }
+
   // ------------------------------------------------------------------ render
   const tmp = [0, 0, 0];
-  let last = performance.now(), fpsAcc = [], mouse = { x: -1e4, y: -1e4 };
+  let last = performance.now(), fpsAcc = [], mouse = { x: -1e4, y: -1e4 }, vignette = null;
   function frame(now) {
     const dt = Math.min((now - last) / 1000, 0.05); last = now;
     fpsAcc.push(dt); if (fpsAcc.length > 60) fpsAcc.shift();
@@ -681,14 +966,16 @@
     const c = ctx;
     c.setTransform(DPR, 0, 0, DPR, 0, 0);
     c.globalCompositeOperation = 'source-over';
-    c.fillStyle = '#07080a'; c.fillRect(0, 0, VW, VH);
+    c.fillStyle = '#070a12'; c.fillRect(0, 0, VW, VH);
+    c.fillStyle = vignette || (vignette = (() => { const g = c.createRadialGradient(VW * 0.55, VH * 0.45, 0, VW * 0.55, VH * 0.45, Math.max(VW, VH) * 0.75); g.addColorStop(0, 'rgba(20,34,52,0.35)'); g.addColorStop(1, 'rgba(0,0,0,0)'); return g; })());
+    c.fillRect(0, 0, VW, VH);
     const L = state.loader;
     const scr = state.screen;
 
     // ---- graph points: targets per screen, blended by the morph
     if (scr === 'tasks') readTaskTargets();
     if (L && !L.done) {
-      if (L.layoutP > 0 || tick > 0) { if (!camFly) Object.assign(cam, fitTarget()); }
+      if (L.layoutP > 0 || tick > 0) { if (!camFly) { Object.assign(cam, fitTarget()); fitK = cam.k; } }
       const mx = markXf();
       for (const n of nodes) {
         const [mx0, my0] = markPoint(n.mu);
@@ -714,9 +1001,9 @@
       }
     }
 
-    // ---- edges
+    // ---- 2D fallback for the graph (no WebGL2); the GL path is buildGraph()
     const edgeA = L && !L.done ? sstep(0.5, 1, L.layoutP) : 1;
-    if (edgeA > 0) {
+    if (!glass && edgeA > 0) {
       c.lineWidth = 1;
       const focus = focusOf;
       c.beginPath();
@@ -741,7 +1028,7 @@
       }
     }
 
-    // ---- nodes (bloom only on points)
+    if (!glass) {
     c.globalCompositeOperation = 'lighter';
     const zk = clamp(Math.pow(cam.k / (fitTarget().k || 1), 0.35), 0.8, 2.4);
     for (const n of nodes) {
@@ -768,6 +1055,9 @@
       if (state.sel != null) { const n = nodes[state.sel]; c.fillStyle = 'rgba(232,230,225,0.95)'; c.font = '13px Geist, sans-serif'; const t = stripProj(n.label); c.fillText(t.length > 54 ? t.slice(0, 53) + '…' : t, n.sx, n.sy - 16); }
     }
 
+    }
+    updateLabels(scr, L);
+
     // ---- finance: columns of light built from entries
     const finOn = scr === 'finance' || state.prev === 'finance' && now - state.morph0 < MORPH + 300;
     if (finOn) {
@@ -780,14 +1070,15 @@
           const cx = G.r.left + G.colW * (e.m + 0.5) + (e.kind ? -6 : 6) * 0;
           th = Math.max(e.usd * G.scale - 1, 0.6);
           ty = e.kind === 1 ? G.axis - (e.base * G.scale) - th : G.axis + e.base * G.scale + 1;
-          tx = cx; ta = e.m >= ra && e.m <= rb ? (e.kind === 1 ? 0.78 : 0.42) : 0.08;
+          tx = cx; ta = e.m >= ra && e.m <= rb ? (e.kind === 1 ? 0.9 : 0.66) : 0.1;
         } else { tx = e.fx; ty = e.fy; th = 2; ta = 0; }
         const p = morphT(e.id, now);
         e.sx = lerp(e.fx, tx, p); e.sy = lerp(e.fy, ty, p); e.h = lerp(e.fh, th, p); e.a = lerp(e.fa, ta, p);
         if (e.a < 0.01) continue;
-        const w = lerp(2, 5, p);
-        c.fillStyle = `rgba(232,230,225,${e.a})`;
-        c.fillRect(e.sx - w / 2, e.sy, w, Math.max(e.h, 1));
+        const w = lerp(2, Math.min(14, G.colW * 0.14), p);
+        const fin = scr === 'finance' ? p : 0; // points arrive as field light and become income green / expense coral
+        c.fillStyle = e.kind === 1 ? `rgba(${lerp(232, 124, fin) | 0},${lerp(230, 240, fin) | 0},${lerp(225, 169, fin) | 0},${e.a})` : `rgba(${lerp(232, 255, fin) | 0},${lerp(230, 92, fin) | 0},${lerp(225, 122, fin) | 0},${e.a})`;
+        c.fillRect(e.sx - w / 2, e.sy, w, Math.max(e.h - 1.5, 0.6)); // 1.5px surface gap between entries
       }
       // soft column glow
       if (scr === 'finance') {
@@ -795,8 +1086,10 @@
         for (let m = 0; m < months.length; m++) {
           const cx = G.r.left + G.colW * (m + 0.5), on = m >= ra && m <= rb ? 1 : 0.25;
           const mi = Math.round(+F.months[m].income * 100) * G.scale, me = Math.round(+F.months[m].expense * 100) * G.scale;
-          const g = c.createLinearGradient(cx - 18, 0, cx + 18, 0); g.addColorStop(0, 'rgba(232,230,225,0)'); g.addColorStop(0.5, `rgba(232,230,225,${0.035 * p * on})`); g.addColorStop(1, 'rgba(232,230,225,0)');
-          c.fillStyle = g; c.fillRect(cx - 18, G.axis - mi, 36, mi + me);
+          const gi = c.createLinearGradient(cx - 20, 0, cx + 20, 0); gi.addColorStop(0, 'rgba(124,240,169,0)'); gi.addColorStop(0.5, `rgba(124,240,169,${0.06 * p * on})`); gi.addColorStop(1, 'rgba(124,240,169,0)');
+          c.fillStyle = gi; c.fillRect(cx - 20, G.axis - mi, 40, mi);
+          const ge = c.createLinearGradient(cx - 20, 0, cx + 20, 0); ge.addColorStop(0, 'rgba(255,92,122,0)'); ge.addColorStop(0.5, `rgba(255,92,122,${0.05 * p * on})`); ge.addColorStop(1, 'rgba(255,92,122,0)');
+          c.fillStyle = ge; c.fillRect(cx - 20, G.axis, 40, me);
         }
         c.globalCompositeOperation = 'source-over';
         c.fillStyle = `rgba(232,230,225,${0.25 * p})`; c.fillRect(G.r.left, G.axis, G.r.width, 1);
@@ -805,8 +1098,11 @@
         for (const [x, y, w, h, share, inc] of G.bars) {
           if (y > VH || y + h < 0) continue;
           const bw = Math.max(w * share * p * (1 / Math.max(...G.bars.filter((q) => q[5] === inc).map((q) => q[4]))), 1.5);
-          const g = c.createLinearGradient(x, 0, x + bw, 0); g.addColorStop(0, `rgba(232,230,225,${inc ? 0.95 : 0.7})`); g.addColorStop(1, `rgba(232,230,225,${inc ? 0.55 : 0.35})`);
-          c.fillStyle = g; c.fillRect(x, y + 1, bw, h - 2);
+          // sequential, one hue: share sets the lightness (coral for expense, green for income)
+          const rel = share / Math.max(...G.bars.filter((q) => q[5] === inc).map((q) => q[4]));
+          const k = 0.35 + 0.65 * Math.sqrt(rel);
+          c.fillStyle = inc ? `rgba(${124 * k | 0},${240 * k | 0},${169 * k | 0},0.95)` : `rgba(${255 * k | 0},${92 * k | 0},${122 * k | 0},0.95)`;
+          c.fillRect(x, y + 1, bw, h - 2);
         }
         // exchanges: arcs between currency lines
         if (G.exR && G.exR.bottom > 0 && G.exR.top < VH) {
@@ -822,9 +1118,9 @@
             const x = R.left + 48 + ((e.m + day) / span) * (R.width - 56);
             const y0 = yOf(e.cur), y1 = yOf(e.ccur);
             const bulge = 10 + Math.log10(1 + e.usd / 100) * 12;
-            c.strokeStyle = `rgba(232,230,225,${0.35 + 0.5 * p})`; c.lineWidth = 1.2;
+            c.strokeStyle = `rgba(92,225,230,${0.35 + 0.5 * p})`; c.lineWidth = 1.2;
             c.beginPath(); c.moveTo(x, y0); c.bezierCurveTo(x + bulge, y0, x + bulge, y1, x, y1); c.stroke();
-            c.fillStyle = 'rgba(232,230,225,0.9)'; c.fillRect(x - 1, y1 - 1, 2, 2);
+            c.fillStyle = 'rgba(160,245,248,0.95)'; c.fillRect(x - 1, y1 - 1, 2, 2);
           }
         }
         c.globalCompositeOperation = 'source-over';
@@ -862,7 +1158,8 @@
       } else if (lens.pres > 0 && scr === 'memory') {
         obj = { x: lens.x, y: lens.y, z: LENS_Z, size: 110 * (0.6 + 0.4 * lens.pres), extent: 1.12 * Math.max(lens.st, 1), morph: 1, flat: 1, presence: lens.pres, thick: 0.05, inv: stretchInv(lens.vx, lens.vy, lens.st) };
       }
-      glass.frame({ scene, slabs: collectSlabs(), obj, vw: VW, vh: VH, ratio: DPR });
+      const graphTex = buildGraph(now, scr, L);
+      glass.frame({ scene, slabs: collectSlabs(), obj, vw: VW, vh: VH, ratio: DPR, graphTex });
     }
     if (params.has('fps') && $('#fps')) { const avg = fpsAcc.reduce((x, y) => x + y, 0) / fpsAcc.length; $('#fps').textContent = `${(1 / avg).toFixed(0)} fps · ${(avg * 1000).toFixed(1)} мс/кадр`; }
     window.__frames = (window.__frames || 0) + 1;
@@ -881,15 +1178,21 @@
     mouse.x = e.clientX; mouse.y = e.clientY; lens.tx = e.clientX; lens.ty = e.clientY;
     if (dragC) { const dx = e.clientX - dragC.x, dy = e.clientY - dragC.y; if (Math.abs(dx) + Math.abs(dy) > 3) dragC.moved = true; cam.x = dragC.cx - dx / cam.k; cam.y = dragC.cy - dy / cam.k; camFly = null; return; }
     if (state.screen !== 'memory' || state.loader) return;
-    const h = pick(e.clientX, e.clientY);
+    const far = cam.k / fitK < 1.6; // at overview the unit of attention is the project, not the neuron
+    const h = far ? null : pick(e.clientX, e.clientY);
     if (h !== state.hover) { state.hover = h; }
+    let hpG = null;
+    if (h == null && cam.k / fitK < 3) { gangliaGeom(); for (const G of ganglia.values()) { const [cx, cy] = project({ x: G.cx, y: G.cy }); if (Math.hypot(e.clientX - cx, e.clientY - cy) < G.rr * cam.k * 1.05) { hpG = G; break; } } }
+    const hpK = hpG ? hpG.key : null;
+    if (hpK !== state.hoverProj) { state.hoverProj = hpK; showCard(hpG); }
+    if (hpG) { const cdd = $('#m-card'); cdd.style.transform = `translate(${Math.min(e.clientX + 18, VW - 280)}px, ${Math.min(e.clientY + 18, VH - 260)}px)`; }
     if (h != null) tip(e, nodes[h].t.replace('_', ' ') + ' · ' + (GA.conf[nodes[h].c] || 'без оценки'), stripProj(nodes[h].label)); else tip(null);
     glCanvas.style.cursor = h != null ? 'pointer' : 'grab';
   };
   glCanvas.addEventListener('pointermove', onMove);
   window.addEventListener('pointermove', (e) => { lens.tx = e.clientX; lens.ty = e.clientY; });
-  glCanvas.addEventListener('pointerup', (e) => { const d = dragC; dragC = null; if (d && !d.moved) { const h = pick(e.clientX, e.clientY); select(h); } });
-  glCanvas.addEventListener('pointerleave', () => { state.hover = null; tip(null); });
+  glCanvas.addEventListener('pointerup', (e) => { const d = dragC; dragC = null; if (d && !d.moved) { const h = cam.k / fitK < 1.6 ? null : pick(e.clientX, e.clientY); if (h == null && state.hoverProj != null) { flyToGanglion(ganglia.get(state.hoverProj)); return; } select(h); } });
+  glCanvas.addEventListener('pointerleave', () => { state.hover = null; state.hoverProj = null; showCard(null); tip(null); });
   glCanvas.addEventListener('wheel', (e) => {
     if (state.screen !== 'memory') return; e.preventDefault(); camFly = null;
     const f = Math.exp(-e.deltaY * 0.0015), wx = cam.x + (e.clientX - cam.ox) / cam.k, wy = cam.y + (e.clientY - cam.oy) / cam.k;
@@ -930,11 +1233,11 @@
 
   // ------------------------------------------------------------------ spec
   function buildSpec() {
-    const sw = [['--ink', '#07080A', 'поле'], ['--g1', '#0E1013', 'глубина 1'], ['--g2', '#16191D', 'глубина 2'], ['--g3', '#2A2E34', 'линии'], ['--g4', '#5A5F66', 'тихий текст'], ['--bone', '#E8E6E1', 'текст, свет'], ['fringe', '', 'единственный цвет: кайма дисперсии']];
+    const sw = [['--ink', '#070A12', 'поле, сине-чёрное'], ['--g2', '#131A26', 'глубина'], ['--g3', '#26303F', 'линии'], ['--g4', '#5D6878', 'тихий текст'], ['--bone', '#E8E6E1', 'текст'], ['знания', '#5CE1E6', 'decision, concept, solution, doc, skill'], ['работа', '#FFB547', 'task, work_log, session, reminder'], ['проблемы', '#FF5C7A', 'problem, open / blocked'], ['факты владельца', '#7CF0A9', 'user_fact, person'], ['инфраструктура', '#8FA3B8', 'file, dependency, server, project'], ['доход', '#7CF0A9', 'финансы: вверх'], ['расход', '#FF5C7A', 'финансы: вниз'], ['обмен', '#5CE1E6', 'финансы: дуги'], ['fringe', '', 'кайма дисперсии стекла']];
     const gl = ['decision', 'problem', 'solution', 'concept', 'task', 'session', 'work_log', 'user_fact', 'project', 'doc', 'skill', 'file'];
     $('#spec').innerHTML = `
 <h1>Свет и стекло: спецификация интерфейса aurelius</h1>
-<p class="lede">Память — карта ночного неба, свет — единственный материал. Стекло — материал, который этот свет преломляет. Всё монохромно; цвет появляется только как спектральная кайма, которую дисперсия стекла делает из белого света. Концепт «Aurum» с правкой «light and glass».</p>
+<p class="lede">Память — нейронная сеть в темноте: узлы — нейроны, связи — аксоны, по ним бегут импульсы. Цвет — биолюминесценция по смыслу: пять групп, не оттенок на тип. Стекло преломляет этот свет. Минимализм — мало элементов и никакого шума, а не чёрно-белое; бесцветен только знак.</p>
 
 <h2>Знак</h2>
 <div class="marks"><figure><img class="inv" src="logo-mark.svg" alt=""><figcaption>logo-mark.svg — линия, currentColor</figcaption></figure><figure><img class="inv" src="logo-mark-solid.svg" alt=""><figcaption>logo-mark-solid.svg — крупные размеры</figcaption></figure><figure><img class="inv lock" src="logo.svg" alt=""><figcaption>logo.svg — знак и надпись</figcaption></figure></div>
@@ -942,8 +1245,8 @@
 
 <h2>Правила «Aurum · свет и стекло»</h2>
 <ol>
-<li><b>Палитра.</b> Чернила #07080A, шаги графита #0E1013 / #16191D / #2A2E34 / #5A5F66, текст — кость #E8E6E1. Золотой акцент снят: единственный цвет на экране — спектральная кайма стекла, и только на скосах.</li>
-<li><b>Граф.</b> Уверенность — качество света: measured — резкая яркая точка, inferred — мягкий ореол, reported — тусклая точка, stale — полое пепельное кольцо. Тип — форма глифа, никогда не оттенок. Возраст — глубина: старые узлы уходят в туман к точке схода.</li>
+<li><b>Палитра.</b> Фон — глубокие сине-чёрные чернила #070A12 с холодной виньеткой. Пять смысловых групп: знания #5CE1E6, работа #FFB547, проблемы #FF5C7A, факты владельца #7CF0A9, инфраструктура #8FA3B8. Раздел задаёт свой тон (--sec): Память — циан, Задачи — янтарь, Финансы — пара доход/расход; пилюля, линия под заголовком и фокус-кольца берут его и перетекают при смене раздела. Текст всегда кость и серые: цвет несёт смысл, а не украшает.</li>
+<li><b>Граф.</b> Нейрон — маленькая яркая сома с мягким ореолом, размер по степени, яркость по свежести и уверенности. Связь — изогнутый сужающийся аксон с градиентом от цвета источника к цвету цели и синапсом у цели; belongs_to не рисуется. Проект — ганглий: органическое облако, свежее в ядре, старое на краю. Тип — форма глифа внутри группы, глифы проявляются при приближении; на общем плане яркие знаки только у активных задач и открытых проблем. Насыщенность следует вниманию: плотное обесцвечивается к серо-тонированному свету, фокус и активное — полный цвет.</li>
 <li><b>Фокус.</b> Наведение высвечивает соседей, остальное падает до 15% («тишина вокруг мысли»), по связям бежит импульс света. Клик раскрывает соседей орбитой, затем они оседают в раскладку.</li>
 <li><b>Хром.</b> Почти нет: полноэкранное поле, тонкая левая колонка разделов, одна командная строка снизу («/»). Клавиши 1/2/3 — разделы, Esc — назад, L — линза, R — повтор загрузки, 0 — эта спека.</li>
 <li><b>Переходы — морф тех же точек, не смена страниц.</b> Память → Задачи: точки задач остаются и скользят в дорожки статусов, остальное гаснет. → Финансы: поле остывает, точки перестраиваются на оси времени; месяцы — вертикальные столбы света из записей. С prefers-reduced-motion — простое затухание 160 мс.</li>
@@ -965,7 +1268,7 @@
 
 <h2>Палитра</h2>
 <div class="sw">${sw.map(([n, h, d]) => `<div>${n === 'fringe' ? '<i class="fringe"></i>' : `<i style="background:${h}"></i>`}<span>${n}</span><span>${h || 'только стекло'}</span><span>${d}</span></div>`).join('')}</div>
-<p style="margin-top:14px">Текст: кость 100% — основное, 74% — вторичное, 56% — подписи (5.0:1 на чернилах). Пепел #80858C — отменённое (4.6:1). Линии — кость 8% и 16%.</p>
+<p style="margin-top:14px">Проверка dataviz (validate_palette.js, фон #070A12): пять групп проходят CVD-разделение (худшая пара коралл↔янтарь ΔE 15.2 при дейтеранопии) и контраст ≥3:1; яркость выше полосы для заливок — это свет на тёмном, не заливка столбцов, а сталь намеренно малонасыщенна. Пара доход/расход проваливает дейтеранопию (ΔE 1.5), поэтому у неё обязательное второе кодирование: доход вверх и ярче, расход вниз и темнее, знак у суммы. Текст: кость 100% / 74% / 56%; пепел #7F8796 — отменённое.</p>
 
 <h2>Шрифт</h2>
 <div class="scale">
@@ -981,7 +1284,7 @@
 
 <h2>Кодирование графа</h2>
 <div class="glyphs" id="spec-glyphs"></div>
-<p style="margin-top:12px">Размер — степень узла (log), яркость — уверенность, глубина — возраст (0…420 дней → туман до 55% и сжатие к центру на 20%). Проекты — двойные кольца с подписью.</p>
+<p style="margin-top:12px">Цвет — группа, форма — точный тип. Размер — степень узла (log). Свежее 7 дней — яркое ядро ганглия. На общем плане листья — пыль 1–1.5 px, без глифов; глифы проявляются плавно после ×2.2 масштаба.</p>
 
 <h2>Раскладка экрана</h2>
 <div class="layoutmap">
@@ -996,8 +1299,8 @@
 <table class="spec"><thead><tr><th>что</th><th>длительность</th><th>кривая</th><th>как</th></tr></thead><tbody>
 <tr><td>наведение, нажатие</td><td class="mono">120 мс</td><td class="mono">out-expo</td><td>цвет текста, подложка строки</td></tr>
 <tr><td>смена содержимого плиты</td><td class="mono">220 мс</td><td class="mono">out-expo</td><td>opacity; плита не прыгает размером</td></tr>
-<tr><td>вход панели, ступени</td><td class="mono">420 мс + 45 мс шаг</td><td class="mono">cubic-bezier(.16,1,.3,1)</td><td>opacity + clip-path + translateY 10px</td></tr>
-<tr><td>смена раздела</td><td class="mono">640 мс вход / 290 мс выход</td><td class="mono">out-expo / (.5,0,.75,0)</td><td>DOM: clip-path reveal; поле: морф точек</td></tr>
+<tr><td>вход раздела, панели, ступени</td><td class="mono">740 мс (0.45 с видимо)</td><td class="mono">linear() пружина, bounce 0</td><td>opacity + clip-path + translateY 10px; кривая сгенерирована по модели пружины Motion (visualDuration 0.45)</td></tr>
+<tr><td>смена раздела</td><td class="mono">740 мс вход / 290 мс выход</td><td class="mono">пружина / (.5,0,.75,0)</td><td>DOM: clip-path reveal; поле: морф точек; тон раздела перетекает через @property --sec</td></tr><tr><td>импульсы</td><td class="mono">1.1–1.8 с фон, 0.52–0.78 с активация</td><td class="mono">линейно по кривой</td><td>фон — несколько в секунду по экрану; наведение — волна от узла: хоп 1, затем хоп 2 и 3</td></tr>
 <tr><td>морф точек</td><td class="mono">900 мс + разброс до 280 мс</td><td class="mono">out-expo</td><td>позиция, яркость, высота сегмента</td></tr>
 <tr><td>камера (перелёт к узлу)</td><td class="mono">640–720 мс</td><td class="mono">in-out cubic</td><td>центр и масштаб (масштаб — в логарифме)</td></tr>
 <tr><td>орбита соседей</td><td class="mono">420 мс раскрытие, 760 мс оседание</td><td class="mono">out-expo / in-out</td><td>соседи на кольце, затем в раскладку</td></tr>
@@ -1033,21 +1336,21 @@
 
 <h2>Фаза 2: как это ляжет на three.js WebGPU</h2>
 <ul>
-<li>Граф уже рисуется инстансами в WebGPURenderer (WebGL2 запасной). Его надо рисовать в RenderTarget того же размера, затем полноэкранный TSL-проход стекла: плиты — массив из ≤10 rect-униформ, как в glass.js FS1; объект — SDF-raymarch внутри ограничивающей сферы, как FS2. Порядок проходов тот же: поле → плиты → объект → DOM-текст поверх.</li>
+<li>three.js r18x (context7, /mrdoob/three.js): RenderPipeline + pass(scene, camera) даёт текстуру сцены; нейроны — InstancedMesh или Sprite-инстансы, аксоны — один инстанс-буфер полос с кривой в вершинном TSL-шейдере (как EDGE_VS в graph.js), импульсы — те же полосы с окном [t−0.2, t]. Свечение — bloom(scenePass, strength, radius, threshold) с высоким порогом и малым радиусом; тон — renderer.toneMapping = NeutralToneMapping или своя Fn по яркости с сохранением оттенка, как graphAt() в glass.js. Стекло — Fn-узел поверх текстуры сцены: плиты ≤10 прямоугольников, объект — ограниченный raymarch.</li>
 <li>Глифы — атлас-текстура 18 форм × 5 уровней света, атрибуты инстанса: тип, уверенность, возраст, степень. Морф — два буфера позиций (from/to) и униформа времени, смешивание в вершинном шейдере; разброс — hash(id).</li>
 <li>Загрузка: fetch через ReadableStream с Content-Length → длина штриха; JSON.parse в воркере с отчётом по чанкам → счётчик; тики раскладки уже в воркере → полёт частиц.</li>
-<li>Стоимость (оценка): плиты — 1 выборка сцены на пиксель + 3 на скосе, ≈0.3 мс на 1080p; линза Ø260px, 110 шагов — ≈0.5–1 мс на дискретной GPU. Узкое место прототипа — копия 2D-холста в текстуру каждый кадр; в фазе 2 её нет: граф сразу в RenderTarget.</li>
+<li>Замер прототипа (1600×1000, RTX 5060 через ANGLE GL, 3 507 узлов, 4 374 аксона): 56–61 fps на общем плане, среднем и крупном планах, с волной активации и с линзой. Оценка для 33k узлов и 21k аксонов: ~0.6 млн вершин полос и 33k квадов — укладывается в кадр на WebGPU, если позиции жить в storage-буфере, а не загружаться из JS каждый кадр; плиты ≈0.3 мс, линза ≈0.5–1 мс.</li>
 </ul>
 `;
     const G = $('#spec-glyphs');
-    for (const t of gl) { const s = document.createElement('span'); s.append(glyphCanvas(t, 1, 18)); s.append(document.createTextNode(t.replace('_', ' '))); G.append(s); }
+    for (const t of gl) { const s = document.createElement('span'); s.append(glyphCanvas(t, 1, 18, GHEX[GROUP[t] || 'i'])); s.append(document.createTextNode(t.replace('_', ' '))); G.append(s); }
     const C = document.createElement('div'); C.className = 'glyphs'; C.style.marginTop = '12px';
     for (const [ci, n] of [[1, 'measured — резкая точка'], [2, 'inferred — мягкий ореол'], [3, 'reported — тусклая'], [4, 'stale — полое кольцо']]) { const s = document.createElement('span'); const cv = document.createElement('canvas'); cv.width = cv.height = 36; cv.style.width = cv.style.height = '18px'; cv.getContext('2d').drawImage(sprite('concept', ci).cv, 0, 0, 36, 36); s.append(cv, document.createTextNode(n)); C.append(s); }
     G.after(C);
   }
 
   // ------------------------------------------------------------------ boot
-  buildLegend(); statsLine(); buildLanes(); showTask(); buildFinance(); buildSpec();
+  buildLegend(); statsLine(); buildLabels(); buildLanes(); showTask(); buildFinance(); buildSpec();
   resize();
   document.fonts.ready.then(() => { if (state.screen === 'finance') renderFin(); });
   if (params.has('skip')) {
@@ -1060,5 +1363,5 @@
   } else startLoader();
   if (params.has('task')) { state.task = params.get('task'); showTask(); }
   requestAnimationFrame(frame);
-  window.__au = { state, setScreen, select, nodes, cam, lens, startLoader };
+  window.__au = { state, setScreen, select, nodes, cam, lens, startLoader, ganglia, gangliaGeom, flyToGanglion, fitK: () => fitK, project, pulses, adj };
 })();

@@ -28,6 +28,10 @@ for k, p in proj_of.items():
     members[p].append(k)
 top = sorted(members, key=lambda p: -len(members[p]))[:14]
 
+adj_nb = collections.defaultdict(list)
+for e in edges:
+    if e['relation'] != 'belongs_to':
+        adj_nb[e['from_id']].append(e['to_id']); adj_nb[e['to_id']].append(e['from_id'])
 FOCUS = next(k for k in nodes if k.startswith('85f5fa07'))
 adj = collections.defaultdict(set)
 for e in edges:
@@ -48,11 +52,33 @@ BUDGET = 3400
 for p in top:
     m = members[p]
     k = max(25, int(BUDGET * len(m) / total))
-    pick |= set(random.sample(m, min(k, len(m))))
+    # edge-aware: grow connected pieces over non-belongs_to edges so neurons keep their dendrites
+    mset = set(m); got = set(); seeds = random.sample(m, len(m))
+    for sd in seeds:
+        if len(got) >= k: break
+        if sd in got: continue
+        q = [sd]
+        while q and len(got) < k:
+            u = q.pop(0)
+            if u in got: continue
+            got.add(u)
+            for v in adj_nb[u]:
+                if v in mset and v not in got: q.append(v)
+    pick |= got
 tl0 = json.load(open('/tmp/aud/tasks.json'))
 pick |= {t['id'] for t in tl0}
 pick = [k for k in pick if k in nodes]
 idx = {k: i for i, k in enumerate(pick)}
+solved = {e['to_id'] for e in edges if e['relation'] == 'solves'} | {e['from_id'] for e in edges if e['relation'] == 'solves'}
+NOW = datetime.datetime(2026, 10, 15, 19, 0, tzinfo=datetime.timezone.utc)
+def days(ts): return (NOW - datetime.datetime.fromisoformat(ts[:19] + '+00:00')).total_seconds() / 86400
+def pstats(p):
+    ms = [nodes[k] for k in members[p] if k in nodes]
+    last = min(days(x.get('updated_at') or x['created_at']) for x in ms)
+    act = sum(1 for x in ms if ntype(x) == 'task' and (x.get('data') or {}).get('status') == 'active')
+    blk = sum(1 for x in ms if ntype(x) == 'task' and (x.get('data') or {}).get('status') == 'blocked')
+    opn = sum(1 for x in ms if ntype(x) == 'problem' and x['id'] not in solved)
+    return [idx[p], nodes[p]['label'], len(members[p]), round(last, 2), act, opn, blk]
 
 def short(s, n=90):
     s = (s or '').replace('\n', ' ')
@@ -65,7 +91,7 @@ for k in pick:
     age = (datetime.datetime(2026, 10, 15, tzinfo=datetime.timezone.utc) - datetime.datetime.fromisoformat(x['created_at'][:19] + '+00:00')).days
     st = dd.get('status') if ntype(x) == 'task' else None
     N.append([TI.get(ntype(x), TI['doc']), CONF.index(dd.get('confidence')) if dd.get('confidence') in CONF else 0,
-              short(x['label'], 80), max(age, 0), st or 0])
+              short(x['label'], 80), max(age, 0), st or 0, 1 if ntype(x) == 'problem' and k not in solved else 0])
 E = []
 seen = set()
 for e in edges:
@@ -112,7 +138,7 @@ conf_counts = collections.Counter((x.get('data') or {}).get('confidence') or 'no
 graph = {
     'types': TYPES, 'conf': CONF, 'rels': RELS, 'nodes': N, 'edges': E, 'focus': idx[FOCUS],
     'expand': idx[EXP], 'details': details,
-    'projects': [[idx[p], nodes[p]['label'], len(members[p])] for p in top],
+    'projects': [pstats(p) for p in top],
     'full': {'nodes': len(d['nodes']), 'edges': len(edges), 'bytes': 81809155,
              'types': type_counts.most_common(), 'rels': rel_counts.most_common(), 'conf': conf_counts.most_common()},
 }

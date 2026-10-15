@@ -20,16 +20,28 @@ uniform float uRatio;
 uniform vec4 uRect[${MAX}];   // x, y, w, h in css px, top-left origin
 uniform vec4 uP[${MAX}];      // radius, bevel, presence, refraction strength
 uniform vec4 uQ[${MAX}];      // absorb, dispersion, rim, sheen
+uniform vec4 uT[${MAX}];      // tint rgb, tint amount
 uniform int uCount;
+uniform sampler2D uGraph;     // half-float neural field, additive light
+uniform float uGraphOn;
 out vec4 o;
 
 float sdRound(vec2 p, vec2 b, float r) {
   vec2 q = abs(p) - b + r;
   return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }
+vec3 graphAt(vec2 uv) {
+  vec3 g = texture(uGraph, uv).rgb;
+  float L = dot(g, vec3(0.2126, 0.7152, 0.0722));
+  float Lt = 1.0 - exp(-1.35 * L);                 // tone map on luminance, hue kept
+  vec3 c = g * (Lt / max(L, 1e-5));
+  return mix(c, vec3(Lt), smoothstep(1.2, 3.5, L) * 0.55); // very hot cores go white, not clipped hue
+}
 vec3 sceneAt(vec2 css) {
-  vec2 uv = vec2(css.x, uView.y - css.y) / uView;
-  return texture(uScene, clamp(uv, vec2(0.0), vec2(1.0))).rgb;
+  vec2 uv = clamp(vec2(css.x, uView.y - css.y) / uView, vec2(0.0), vec2(1.0));
+  vec3 s = texture(uScene, uv).rgb;
+  if (uGraphOn > 0.5) s += graphAt(uv);
+  return s;
 }
 void main() {
   vec2 w = gl_FragCoord.xy / uRatio;
@@ -52,11 +64,13 @@ void main() {
     float k = Q.y * slope;
     vec3 refr = vec3(sceneAt(css + off * (1.0 + k)).r, sceneAt(css + off).g, sceneAt(css + off * (1.0 - k)).b);
     vec3 body = refr * (1.0 - Q.x) + vec3(0.012);
+    vec4 Tn = uT[i];
+    body = mix(body, body * (0.6 + Tn.rgb * 0.9) + Tn.rgb * 0.035, Tn.a);
     vec2 L = normalize(vec2(-0.42, -0.55));         // light from top-left (css y down)
     float facing = max(dot(-g, L), 0.0);
     float rim = smoothstep(1.4, 0.0, abs(d + 0.6)) * (0.18 + 0.82 * facing) * Q.z;
     float sheen = (1.0 - t) * facing * Q.w;
-    body += vec3(rim * 0.62 + sheen * 0.10);
+    body += mix(vec3(1.0), Tn.rgb, Tn.a * 0.7) * (rim * 0.62 + sheen * 0.10);
     float a = smoothstep(0.9, -0.9, d) * P.z;
     col = mix(col, body, a);
   }
@@ -241,7 +255,7 @@ void main() {
       const fb = gl.createFramebuffer();
       gl.bindVertexArray(gl.createVertexArray());
       let fw = 0, fh = 0;
-      const rect = new Float32Array(MAX * 4), P = new Float32Array(MAX * 4), Q = new Float32Array(MAX * 4);
+      const rect = new Float32Array(MAX * 4), P = new Float32Array(MAX * 4), Q = new Float32Array(MAX * 4), TT = new Float32Array(MAX * 4);
       const api = {
         gl,
         setMark(data, n) {
@@ -257,6 +271,7 @@ void main() {
             gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fbTex, 0);
             fw = W; fh = H;
           }
+          gl.activeTexture(gl.TEXTURE0);
           gl.bindTexture(gl.TEXTURE_2D, sceneTex);
           gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, f.scene);
@@ -271,11 +286,14 @@ void main() {
             rect.set([s.x, s.y, s.w, s.h], i * 4);
             P.set([s.r, s.bevel, s.presence, s.strength], i * 4);
             Q.set([s.absorb, s.disp, s.rim, s.sheen], i * 4);
+            TT.set(s.tint || [1, 1, 1, 0], i * 4);
           }
-          gl.uniform4fv(p1.u.uRect, rect); gl.uniform4fv(p1.u.uP, P); gl.uniform4fv(p1.u.uQ, Q);
+          gl.uniform4fv(p1.u.uRect, rect); gl.uniform4fv(p1.u.uP, P); gl.uniform4fv(p1.u.uQ, Q); gl.uniform4fv(p1.u.uT, TT);
           gl.uniform1i(p1.u.uCount, n);
           gl.uniform2f(p1.u.uView, f.vw, f.vh); gl.uniform1f(p1.u.uRatio, f.ratio);
           gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex); gl.uniform1i(p1.u.uScene, 0);
+          gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, f.graphTex || sceneTex); gl.uniform1i(p1.u.uGraph, 2);
+          gl.uniform1f(p1.u.uGraphOn, f.graphTex ? 1 : 0);
           gl.drawArrays(gl.TRIANGLES, 0, 3);
           // pass 2
           gl.bindFramebuffer(gl.FRAMEBUFFER, null);
