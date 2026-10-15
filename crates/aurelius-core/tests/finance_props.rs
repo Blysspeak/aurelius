@@ -2,8 +2,9 @@
 //!
 //! Every test name starts with `finance_` so one filter runs the lot:
 //! `cargo test -p aurelius-core --release -- --include-ignored finance`.
-//! Tests named `finance_bug_*` reproduce a confirmed defect; they are
-//! `#[ignore]`d so a plain `cargo test` stays green, and fail when included.
+//! Tests named `finance_bug_*` reproduced confirmed defects (JSON numbers
+//! through f64); the defects are fixed on feat/finance-rates and the tests
+//! now pin the fixed contract.
 //!
 //! Each database case runs on its own scratch file under the system temp
 //! dir; nothing here resolves `AURELIUS_HOME` or the live database.
@@ -90,6 +91,18 @@ fn decimal_of(v: i128, scale: u32) -> String {
 
 /// Canonical decimal string for `scale`: no leading zeros, no trailing zeros
 /// in the fraction, value > 0. Returned with its exact minor value.
+/// "1,000": a non-zero integer part, a comma and exactly three digits — read
+/// neither as thousands nor as decimals, `parse_amount` asks to clarify.
+fn ambiguous_comma(s: &str) -> bool {
+    s.trim().split_once(',').is_some_and(|(i, f)| {
+        !i.is_empty()
+            && i != "0"
+            && i.chars().all(|c| c.is_ascii_digit())
+            && f.len() == 3
+            && f.chars().all(|c| c.is_ascii_digit())
+    })
+}
+
 fn canonical_amount() -> impl Strategy<Value = (u32, String, i128)> {
     (
         prop::sample::select(SCALES),
@@ -150,7 +163,8 @@ proptest! {
 
         let variant = if comma { s.replace('.', ",") } else { s.clone() };
         let padded = format!("{lead}{variant}{trail}");
-        prop_assert_eq!(finance::parse_amount(&padded, scale).ok(), Some(m), "'{}'", padded);
+        let expected = if ambiguous_comma(&variant) { None } else { Some(m) };
+        prop_assert_eq!(finance::parse_amount(&padded, scale).ok(), expected, "'{}'", padded);
     }
 }
 
@@ -279,7 +293,7 @@ fn gen_entry() -> impl Strategy<Value = Gen> {
 fn to_new(g: &Gen) -> NewEntry {
     let (code, scale) = CURRENCIES[g.cur];
     let mut amount = finance::format_amount(g.minor, scale);
-    if g.comma {
+    if g.comma && !ambiguous_comma(&amount.replace('.', ",")) {
         amount = amount.replace('.', ",");
     }
     let exchange = g.kind == Kind::Exchange;
@@ -575,14 +589,18 @@ proptest! {
 // 5. Owner's phrasing through the MCP parse path
 // ---------------------------------------------------------------------------
 
-/// What `handlers::finance::amount_param` does with a JSON value before
-/// `parse_amount`: strings verbatim, numbers through `Number::to_string`.
+/// The MCP parse path itself (`handlers::finance` calls the same
+/// `finance::amount_from_json`): strings verbatim, integer JSON numbers
+/// exactly, fractional JSON numbers refused.
+fn mcp_amount_result(json_literal: &str) -> anyhow::Result<Option<String>> {
+    let v = serde_json::from_str::<serde_json::Value>(json_literal).expect("json");
+    finance::amount_from_json(&v, "amount")
+}
+
 fn mcp_amount(json_literal: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(json_literal).expect("json") {
-        serde_json::Value::String(s) => s,
-        serde_json::Value::Number(n) => n.to_string(),
-        other => panic!("unexpected {other}"),
-    }
+    mcp_amount_result(json_literal)
+        .expect("accepted")
+        .expect("present")
 }
 
 #[test]
@@ -606,53 +624,75 @@ fn finance_owner_phrasing_as_strings() {
 
 #[test]
 fn finance_owner_phrasing_as_json_numbers_ok() {
-    // JSON numbers the shortest-float form keeps exact.
+    // Integer JSON numbers are exact and accepted.
     let cases: &[(&str, u32, i64)] = &[
         ("25", 2, 2_500),
-        ("25.5", 2, 2_550),
-        ("25.50", 2, 2_550),
         ("75000", 2, 7_500_000),
-        ("11.6", 8, 1_160_000_000),
+        ("30", 6, 30_000_000),
     ];
     for &(lit, scale, minor) in cases {
         let s = mcp_amount(lit);
         assert_eq!(finance::parse_amount(&s, scale).ok(), Some(minor), "{lit} -> '{s}'");
     }
+    // Fractional JSON numbers have been through f64: refused, never rounded.
+    for lit in ["25.5", "25.50", "11.6"] {
+        let err = mcp_amount_result(lit).expect_err(lit);
+        assert!(format!("{err:#}").contains("decimal string"), "{err:#}");
+    }
 }
 
-/// BUG: a JSON number `0.00000001` (1 satoshi) reaches `parse_amount` as
-/// `"1e-8"` and is refused as "not a number". The tool schema says string,
-/// but the handler explicitly accepts numbers (`amount_param`).
+/// Was BUG finance-json-number-exponent: a JSON number `0.00000001` reached
+/// `parse_amount` as `"1e-8"` and was refused as "not a number". Fixed: a
+/// fractional JSON number is refused up front with a message to pass a
+/// decimal string, and the string form is exact.
 #[test]
-#[ignore = "BUG finance-json-number-exponent: JSON number 0.00000001 -> '1e-8' rejected"]
 fn finance_bug_json_number_small_amount_rejected() {
-    let s = mcp_amount("0.00000001");
+    let err = mcp_amount_result("0.00000001").expect_err("fractional number");
+    assert!(format!("{err:#}").contains("decimal string"), "{err:#}");
+    let s = mcp_amount("\"0.00000001\"");
     assert_eq!(finance::parse_amount(&s, 8).ok(), Some(1), "0.00000001 -> '{s}'");
 }
 
 proptest! {
     #![proptest_config(cfg(5_000))]
 
-    /// BUG: any JSON number with more than ~15-17 significant digits goes
-    /// through f64 and is silently rounded before `parse_amount` sees it.
-    /// The module promises "never rounding".
+    /// Was BUG finance-json-number-float: a JSON number went through f64 and
+    /// was silently rounded. Fixed: an amount sent as a JSON number is either
+    /// exact (integer) or refused, never a different value; as a string it
+    /// is always exact.
     #[test]
-    #[ignore = "BUG finance-json-number-float: JSON numbers pass through f64 and are rounded or turned into exponent form"]
     fn finance_bug_json_number_equals_string((scale, s, minor) in canonical_amount()) {
-        let via_number = mcp_amount(&s);
+        match mcp_amount_result(&s) {
+            Ok(via_number) => {
+                let via_number = via_number.unwrap_or_default();
+                prop_assert_eq!(
+                    finance::parse_amount(&via_number, scale).ok().map(i128::from),
+                    Some(minor),
+                    "JSON number {} became '{}' at scale {}", s, via_number, scale
+                );
+            }
+            Err(e) => prop_assert!(
+                s.contains('.') && format!("{e:#}").contains("decimal string"),
+                "integer {} refused: {:#}", s, e
+            ),
+        }
+        let via_string = mcp_amount(&serde_json::to_string(&s).expect("json"));
         prop_assert_eq!(
-            finance::parse_amount(&via_number, scale).ok().map(i128::from),
-            Some(minor),
-            "JSON number {} became '{}' at scale {}", s, via_number, scale
+            finance::parse_amount(&via_string, scale).ok().map(i128::from),
+            Some(minor)
         );
     }
 }
 
-/// Not a defect of the parser as specified, recorded so the behaviour is
-/// visible: with scale >= 3 a thousands comma reads as a decimal comma.
+/// A comma followed by exactly three digits ("1,000") is ambiguous between
+/// a thousands separator and a decimal comma: refused at every scale with a
+/// request to clarify. "25,50" and "0,125" stay decimal.
 #[test]
 fn finance_note_thousands_comma_reads_as_decimal_at_scale_6() {
-    assert_eq!(finance::parse_amount("1,000", 6).ok(), Some(1_000_000)); // 1 USDT, not 1000
-    assert!(finance::parse_amount("1,000", 2).is_err()); // BYN: refused, good
+    let err = finance::parse_amount("1,000", 6).expect_err("ambiguous");
+    assert!(format!("{err:#}").contains("неоднозначна"), "{err:#}");
+    assert!(finance::parse_amount("1,000", 2).is_err());
     assert!(finance::parse_amount("1,000.50", 2).is_err());
+    assert_eq!(finance::parse_amount("25,50", 2).ok(), Some(2_550));
+    assert_eq!(finance::parse_amount("0,125", 6).ok(), Some(125_000));
 }
