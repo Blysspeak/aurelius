@@ -83,6 +83,7 @@ uniform vec4 uSel;    // focus on, focus id, hovered project (-1), type filter (
 uniform vec4 uMode;   // session highlight on, spec screen, ms since the morph started, unused
 uniform vec4 uChain;  // chain amount from, to; screen alpha from, to (staggered by the morph)
 uniform vec4 uEdge;   // edge base alpha, budget gain, importance threshold, unused
+uniform vec4 uVis;    // unlinked points shown (0..1), outside-projects shown, unused, unused
 uniform usampler2D uFlags; // bit 1 focus, 2 near the focus, 4 in the hovered session, 8 drawn by the overlay
 uint dyn(float id) { int i = int(id + 0.5); return texelFetch(uFlags, ivec2(i & 1023, i >> 10), 0).r; }
 float morph(float h) { return outExpo(clamp((uMode.z - h * 280.0) / 900.0, 0.0, 1.0)); }
@@ -123,6 +124,7 @@ float edgeAlpha(out float w, out float sat) {
 }
 void main() {
   bool inc = uSel.x > 0.5 && (abs(aC0.w - uSel.y) < 0.5 || abs(aC1.w - uSel.y) < 0.5);
+  if (abs(aH.x - 1.0) < 0.5 && uVis.y < 0.5 && !inc) { cull(); return; }  // outside projects: hidden until opened
   if ((aB.z < uEdge.z && !inc) || uEdge.x <= 0.0) { cull(); return; }   // strongest first: the importance threshold keeps ~850 on screen
   float w, sat; float al = edgeAlpha(w, sat);
   if (al < 0.004) { cull(); return; }
@@ -170,6 +172,9 @@ void main() {
   bool attn = bit(fl, 1.0), proj = bit(fl, 2.0), virt = bit(fl, 4.0), dust = bit(fl, 8.0), leaf = bit(fl, 16.0), sess = bit(fl, 32.0);
   bool isF = (d & 1u) != 0u, near = (d & 2u) != 0u;
   if ((d & 8u) != 0u || sess) { cull(); return; }
+  if (abs(aF.y - 1.0) < 0.5 && uVis.y < 0.5 && !isF) { cull(); return; }          // outside projects: a chip at the root opens them
+  float dustK = (dust && !attn && !isF && !near && !virt) ? uVis.x : 1.0;        // unlinked: a halo per theme at rest, points on U or close zoom
+  if (dustK <= 0.01) { cull(); return; }
   vec2 scr = world(aW.xy);
   float mA = aX.w;
   bool loader = uLoad.x > 0.5;
@@ -212,6 +217,7 @@ void main() {
   if (virt) { size = 3.2 + aX.x * 0.5; I = max(I, 1.1) * min(a, 1.0); glyph = 1.0; }
   float g2 = glyph;
   if (uZoom.z > 0.0 && aK.y >= 0.0 && !loader) { g2 = glyph + uZoom.z; size = mix(size, max(size, 9.0), uZoom.z); ext = max(ext, 2.4); } // far dot -> mid silhouette -> close icon
+  I *= dustK;
   if (I <= 0.002) { cull(); return; }
   soma(scr, size, ext, colOf(aC.rgb, sat), I, halo, aK.x, g2, aK.y, aF.z, aF.w, uCam2.y);
 }`;
@@ -227,7 +233,7 @@ layout(location=4) in vec4 aH;
 ${COMMON}${FIELD}${SOMA}
 void main() {
   bool inc = uSel.x > 0.5 && (abs(aC0.w - uSel.y) < 0.5 || abs(aC1.w - uSel.y) < 0.5);
-  if (uZoom.x <= 2.2 || (aB.z < uEdge.z && !inc) || uEdge.x <= 0.0) { cull(); return; }
+  if (uZoom.x <= 2.2 || (aB.z < uEdge.z && !inc) || uEdge.x <= 0.0 || (abs(aH.x - 1.0) < 0.5 && uVis.y < 0.5)) { cull(); return; }
   float lw = aB.y;
   float al = uEdge.x * uEdge.y * min(min(aH.y, aH.z), 1.0) * (0.45 + 0.25 * min(lw, 4.0));
   float sat = uZoom.w;
@@ -292,7 +298,7 @@ void main() {
 
   function sh(gl, type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; }
   function prog(gl, vs, fs) { const p = gl.createProgram(); const a = sh(gl, gl.VERTEX_SHADER, vs), b = sh(gl, gl.FRAGMENT_SHADER, fs); gl.attachShader(p, a); gl.attachShader(p, b); gl.linkProgram(p); p.__fs = b; p.__vs = a; return p; } // parallel compile: checked in ready()
-  const UNIF = ['uView', 'uTime', 'uGain', 'uAtlas', 'uGrid', 'uCam', 'uCam2', 'uZoom', 'uLoad', 'uMark', 'uSel', 'uMode', 'uChain', 'uEdge', 'uFlags'];
+  const UNIF = ['uView', 'uTime', 'uGain', 'uAtlas', 'uGrid', 'uCam', 'uCam2', 'uZoom', 'uLoad', 'uMark', 'uSel', 'uMode', 'uChain', 'uEdge', 'uFlags', 'uVis'];
 
   G.GraphGL = {
     init(gl, want) {
@@ -347,7 +353,7 @@ void main() {
         gl.uniform4f(u.uZoom, F[8], F[9], F[10], F[11]); gl.uniform4f(u.uLoad, F[12], F[13], F[14], F[15]);
         gl.uniform4f(u.uMark, F[16], F[17], F[18], F[19]); gl.uniform4f(u.uSel, F[20], F[21], F[22], F[23]);
         gl.uniform4f(u.uMode, F[24], F[25], F[26], F[27]); gl.uniform4f(u.uChain, F[28], F[29], F[30], F[31]);
-        gl.uniform4f(u.uEdge, F[32], F[33], F[34], F[35]); gl.uniform1i(u.uFlags, 4);
+        gl.uniform4f(u.uEdge, F[32], F[33], F[34], F[35]); gl.uniform1i(u.uFlags, 4); gl.uniform4f(u.uVis, F[36], F[37], F[38], F[39]);
       };
       return {
         hdr, light, tex, EDGE_F, NODE_F, FNODE_F, FEDGE_F, ready,

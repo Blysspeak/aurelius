@@ -384,6 +384,7 @@ table.spec { width: 100%; border-collapse: collapse; margin-top: 6px; }
 #m-themes { contain: layout style size; position: absolute; inset: 0; pointer-events: none; }
 .tlabel { position: absolute; left: 0; top: 0; font-size: 11px; letter-spacing: .06em; white-space: nowrap; opacity: 0; transition: opacity var(--d-short); text-shadow: 0 0 6px #070a12, 0 0 12px #070a12; }
 .tlabel .num { color: var(--bone-3); font-size: 10px; }
+.tlabel .du { font-style: normal; color: var(--g4); }
 .tlabel.on { opacity: .92; }
 #m-time .ssc { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
 #m-time .ss { position: absolute; left: 0; top: 9px; width: 1px; height: 8px; background: var(--bone-3); opacity: .35; }
@@ -398,6 +399,10 @@ table.spec { width: 100%; border-collapse: collapse; margin-top: 6px; }
 .cstep.up { flex-direction: column-reverse; }
 #m-root { position: absolute; left: 0; top: 0; width: 80px; display: flex; flex-direction: column; align-items: center; gap: 2px; pointer-events: none; transition: opacity var(--d-med); }
 #m-root img { width: 18px; height: 18px; opacity: .8; }
+.mchip { position: absolute; left: 0; top: 0; opacity: 0; font-size: 11px; color: var(--bone-3); padding: 3px 9px; border-radius: 10px; background: rgba(7, 10, 18, .62); box-shadow: inset 0 0 0 1px var(--line-2); white-space: nowrap; transition: opacity var(--d-med), color var(--d-short); }
+.mchip .num { color: var(--bone-2); }
+.mchip:hover, .mchip.on { color: var(--bone); }
+#m-time .bd.bs { background: var(--bone-2); opacity: .7; }
 .chainlist { list-style: none; display: flex; flex-direction: column; gap: 2px; }
 .chainlist button { display: grid; grid-template-columns: 18px 76px 1fr auto; gap: 8px; align-items: center; width: 100%; text-align: left; padding: 4px 6px; border-radius: 6px; color: var(--bone-2); }
 .chainlist button:hover { background: rgba(232, 230, 225, .05); color: var(--bone); }

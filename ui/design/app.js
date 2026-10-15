@@ -488,6 +488,35 @@ onmessage = async (e) => {
     if (rh) rh.send({ type: 'field', nodes: FN, nNodes: n, edges: FE, nEdges: molE.length }, [FN.buffer, FE.buffer]);
     LOAD.fieldNodes = n; LOAD.fieldEdges = molE.length;
   }
+  // ---- unlinked nodes (no molecule parent) at rest: a few soft density sprites along each theme branch and one per
+  // project pool, tinted by the dominant group, brightness by count; the points themselves come on U or at close zoom
+  const halos = []; const dustOfTheme = new Map(); const OTHER_N = { n: 0 };
+  function buildHalos() {
+    const byT = new Map(), byPool = new Map();
+    for (let i = 0; i < NN; i++) {
+      const f = FLG[i]; if (!(f & 3) || nodes[i].attn) { if (HUB[i] === -2 && T[D.typ[i]] !== 'session') OTHER_N.n++; continue; }
+      if (HUB[i] === -2) { OTHER_N.n++; continue; }
+      const p = parent[i], key = (f & 1) && p >= NN ? p : -1;
+      const m = key >= 0 ? byT : byPool, k2 = key >= 0 ? key : HUB[i];
+      let a = m.get(k2); if (!a) m.set(k2, (a = [])); a.push(i);
+    }
+    const emit = (list, hub, ox, oy) => {
+      list.sort((a, b) => Math.hypot(AX[a] - ox, AY[a] - oy) - Math.hypot(AX[b] - ox, AY[b] - oy));
+      const k = Math.min(5, Math.max(1, Math.ceil(list.length / 40)));
+      for (let s2 = 0; s2 < k; s2++) {
+        const seg = list.slice(Math.floor(s2 * list.length / k), Math.floor((s2 + 1) * list.length / k)); if (!seg.length) continue;
+        let x = 0, y = 0, amax = 0; const cnt = { k: 0, w: 0, p: 0, o: 0, i: 0 };
+        for (const i of seg) { x += AX[i]; y += AY[i]; cnt[nodes[i].g]++; if (D.age[i] > amax) amax = D.age[i]; }
+        x /= seg.length; y /= seg.length;
+        let r2 = 0; for (const i of seg) r2 += (AX[i] - x) ** 2 + (AY[i] - y) ** 2;
+        const g = Object.entries(cnt).sort((a, b) => b[1] - a[1])[0][0];
+        halos.push({ x, y, r: Math.max(3, Math.sqrt(r2 / seg.length)), n: seg.length, g, hub, birth: -amax });
+      }
+    };
+    for (const [ti, list] of byT) { dustOfTheme.set(ti, list.length); emit(list, HUB[ti], AX[HUB[ti]] ?? 0, AY[HUB[ti]] ?? 0); }
+    for (const [hub, list] of byPool) emit(list, hub, list.reduce((a, i) => a + AX[i], 0) / list.length, list.reduce((a, i) => a + AY[i], 0) / list.length);
+    for (const G of ganglia.values()) { G.unl = 0; for (const m of G.members) if (m.i < NN && (FLG[m.i] & 3) && !m.attn) G.unl++; }
+  }
   // ---- picking: a uniform grid over world coordinates (CSR), queried around the pointer
   let grid = null;
   async function buildGrid() {
@@ -530,7 +559,7 @@ onmessage = async (e) => {
   }
 
   // ------------------------------------------------------------------ state
-  const state = { sessHi: null, hoverProj: null, screen: 'memory', prev: null, morph0: 0, sel: null, hover: null, selT: 0, chain: null, loader: null, replay: { s: 1, playing: false }, filterType: null, fin: { hover: -1, a: 0, b: AU.fin.months.length - 1, kind: -1, cat: -1, q: '', voided: false }, task: 'b7a7d9af' };
+  const state = { sessHi: null, hoverProj: null, screen: 'memory', prev: null, morph0: 0, sel: null, hover: null, selT: 0, chain: null, loader: null, replay: { s: 1, playing: false }, filterType: null, showU: false, showOther: false, fin: { hover: -1, a: 0, b: AU.fin.months.length - 1, kind: -1, cat: -1, q: '', voided: false }, task: 'b7a7d9af' };
 
   // ------------------------------------------------------------------ finance model
   const F = AU.fin;
@@ -909,6 +938,7 @@ onmessage = async (e) => {
   // move on their own (the chain path, task points) leave the field for the overlay until they settle back
   const SCREEN_A = { memory: 1, spec: 0.07, tasks: 0, finance: 0 };
   const mode = { c0: 0, c1: 0, f0: 1, f1: 1 };
+  let dustA = 0; // unlinked points: 0 at rest, 1 on U or at close zoom
   const ovl = new Map(); // node index -> { bx, by, ba }
   function startMorph(instant) {
     const now = performance.now();
@@ -928,6 +958,8 @@ onmessage = async (e) => {
   // the alpha the field gives a node right now (CPU mirror of FNODE_VS, for picking, pulses and hand-offs)
   function fieldA(i) {
     const n = nodes[i]; if (n.session) return 0;
+    if (HUB[i] === -2 && !state.showOther && i !== focusOf) return 0;
+    if (i < NN && (FLG[i] & 3) && !n.attn && i !== focusOf && !focusSet.has(i) && dustA < 0.1) return 0;
     const R2 = state.replay; if (R2.s < 0.999 && n.birth > R2.t + R2.fade) return 0;
     let a = restA(i) * (1 - 0.4 * n.z);
     if (state.sessHi != null) return sessSet.has(i) ? 1.3 : 0.12 * restA(i);
@@ -1151,44 +1183,58 @@ onmessage = async (e) => {
     const now = new Date('2026-10-15T19:00');
     let ticks = '';
     for (let m = 0; m < 7; m++) { const d = new Date(now.getFullYear(), now.getMonth() - m, 1); const age = (now - d) / 864e5; if (age > AGE_MAX) break; ticks += `<span class="tk" style="left:${(sAt(-age) * 100).toFixed(2)}%">${MN[d.getMonth()]}</span>`; }
-    const sess = []; for (let i = 0; i < NN; i++) if (T[D.typ[i]] === 'session' && D.age[i] <= AGE_MAX) sess.push(i);
-    sess.sort((a, b) => sAt(-D.age[a]) - sAt(-D.age[b]));
-    const sessS = Float32Array.from(sess, (i) => sAt(-D.age[i]));     // tick positions as fractions, sorted: hover is a binary search
-    ticks += '<canvas class="ssc"></canvas><span class="ss on" style="display:none"></span>'; // 1.8k session ticks in one canvas, not 1.8k spans to lay out
-    ticks += BIG_DAYS.map((b) => `<span class="bd" style="left:${(sAt(-b.age) * 100).toFixed(2)}%" title="${esc(b.label)} · ${b.n} записей"></span>`).join('');
+    // activity: nodes created per day as one filled curve on the log time axis; ≤12 labelled peaks
+    // (busiest days and the sessions that produced most) instead of 1.8k session ticks
+    const byDay = new Map();
+    for (let i = 0; i < NN; i++) { if (T[D.typ[i]] === 'session') continue; const d = Math.floor(D.age[i]); let a = byDay.get(d); if (!a) byDay.set(d, (a = [])); a.push(i); }
+    const sess = [];
+    for (let i = 0; i < NN; i++) if (T[D.typ[i]] === 'session' && D.age[i] <= AGE_MAX) { let n = 0; for (let q = adjS[i]; q < adjS[i + 1]; q++) { const k = adjK[q]; if (D.ea[k] === i && (GA.rels[D.er[k]] === 'contains' || GA.rels[D.er[k]] === 'related_to')) n++; } sess.push([i, n]); }
+    sess.sort((a, b) => b[1] - a[1]);
+    const marks = BIG_DAYS.map((b) => ({ x: sAt(-b.age), t: b.label, n: b.n, day: Math.floor(b.age) }));
+    for (const [i, n] of sess) { if (marks.length >= 12) break; const x = sAt(-D.age[i]); if (marks.some((m) => Math.abs(m.x - x) < 0.012)) continue; marks.push({ x, s: i, n }); }
+    ticks += '<canvas class="ssc"></canvas>';
+    ticks += marks.map((m, k) => `<span class="bd${m.s != null ? ' bs' : ''}" data-k="${k}" style="left:${(m.x * 100).toFixed(2)}%"></span>`).join('');
     T2.innerHTML = `<button class="play" aria-label="Проиграть память">${ico('fin-income', 'pl')}</button><div class="tr"><div class="fill"></div>${ticks}<div class="hd" role="slider" tabindex="0" aria-label="Момент памяти"></div></div><span class="when num"></span><span class="say"></span>`;
     $('.play', T2).onclick = togglePlay;
     const tr = $('.tr', T2);
-    const ssOn = $('.ss.on', T2), ssc = $('.ssc', T2);
+    const ssc = $('.ssc', T2);
     drawTicks = () => {
       const r = tr.getBoundingClientRect(); trRect = r; tlDom.w = r.width; tlDom.k = '';
-      const d = Math.min(devicePixelRatio || 1, 2); ssc.width = Math.round(r.width * d); ssc.height = Math.round(r.height * d);
-      const c2 = ssc.getContext('2d', CPU2D); c2.setTransform(d, 0, 0, d, 0, 0); c2.fillStyle = 'rgba(232,230,225,0.196)';
-      for (let k = 0; k < sessS.length; k++) c2.fillRect(Math.round(sessS[k] * r.width), 9, 1, 8);
+      const d = Math.min(devicePixelRatio || 1, 2), W = Math.max(1, Math.round(r.width)); ssc.width = Math.round(r.width * d); ssc.height = Math.round(r.height * d);
+      const sum = new Float32Array(W), days = new Float32Array(W);
+      for (const [day, a] of byDay) { const c = Math.min(W - 1, Math.max(0, Math.floor(sAt(-(day + 0.5)) * W))); sum[c] += a.length; days[c] += 1; }
+      const v = new Float32Array(W); let last = 0;
+      for (let c = 0; c < W; c++) { if (days[c]) last = Math.log1p(sum[c] / days[c]); v[c] = days[c] ? last : last * 0.92; last = v[c]; } // per-day mean, log-scaled
+      const sm = new Float32Array(W); for (let c = 0; c < W; c++) { let a = 0, n = 0; for (let k = -3; k <= 3; k++) { const q = c + k; if (q >= 0 && q < W) { a += v[q] * (4 - Math.abs(k)); n += 4 - Math.abs(k); } } sm[c] = a / n; }
+      let mx = 0; for (let c = 0; c < W; c++) if (sm[c] > mx) mx = sm[c];
+      const c2 = ssc.getContext('2d', CPU2D); c2.setTransform(d, 0, 0, d, 0, 0); c2.clearRect(0, 0, W, r.height);
+      const base = r.height / 2, hmax = base - 2;
+      c2.beginPath(); c2.moveTo(0, base); for (let c = 0; c < W; c++) c2.lineTo(c + 0.5, base - (sm[c] / (mx || 1)) * hmax); c2.lineTo(W, base); c2.closePath();
+      const gr = c2.createLinearGradient(0, base - hmax, 0, base); gr.addColorStop(0, 'rgba(232,230,225,0.30)'); gr.addColorStop(1, 'rgba(232,230,225,0.05)');
+      c2.fillStyle = gr; c2.fill();
+      c2.beginPath(); for (let c = 0; c < W; c++) c2.lineTo(c + 0.5, base - (sm[c] / (mx || 1)) * hmax); c2.strokeStyle = 'rgba(232,230,225,0.45)'; c2.lineWidth = 1; c2.stroke();
     };
     requestAnimationFrame(drawTicks);
     let drag = false;
     const setX = (x) => { const r = tr.getBoundingClientRect(); state.replay.s = clamp((x - r.left) / r.width, 0, 1); state.replay.playing = false; };
+    const light = (key, set) => { if (key === state.sessHi) return; for (const j of sessSet) setFlag(j, 4, false); state.sessHi = key; sessSet = set; for (const j of sessSet) setFlag(j, 4, true); };
     tr.addEventListener('pointerdown', (e) => { drag = true; tr.setPointerCapture(e.pointerId); setX(e.clientX); });
     tr.addEventListener('pointermove', (e) => {
       if (drag) { setX(e.clientX); return; }
-      // sessions are time: hovering a session tick lights up everything it produced, wherever it sits
+      // time is the curve: hovering a day lights what was created that day; a session peak lights what it produced
       const r = trRect || (trRect = tr.getBoundingClientRect());
-      const fx = (e.clientX - r.left) / r.width;
-      let lo = 0, hi = sessS.length; while (lo < hi) { const m = (lo + hi) >> 1; if (sessS[m] < fx) lo = m + 1; else hi = m; }
-      let bk = -1, bd = 6;
-      for (const k of [lo - 1, lo]) if (k >= 0 && k < sessS.length) { const d = Math.abs(sessS[k] - fx) * r.width; if (d < bd) { bd = d; bk = k; } }
-      const si = bk >= 0 ? sess[bk] : null;
-      if (si !== state.sessHi) {
-        if (si != null) { ssOn.style.display = ''; ssOn.style.transform = `translateX(${(sessS[bk] * r.width).toFixed(1)}px)`; } else ssOn.style.display = 'none';
-        for (const j of sessSet) setFlag(j, 4, false);
-        state.sessHi = si; sessSet = new Set(si == null ? [] : adj[si].filter(([j, r2, dir]) => dir === 'out' && (r2 === 'contains' || r2 === 'related_to')).map(([j]) => j));
-        for (const j of sessSet) setFlag(j, 4, true);
-        if (si != null) ensureLabels();
+      const fx = clamp((e.clientX - r.left) / r.width, 0, 1);
+      let mk = null, bd = 6; for (const m of marks) { const dd = Math.abs(m.x - fx) * r.width; if (dd < bd) { bd = dd; mk = m; } }
+      if (mk && mk.s != null) {
+        const si = mk.s; light(si, new Set(adj[si].filter(([j, r2, dir]) => dir === 'out' && (r2 === 'contains' || r2 === 'related_to')).map(([j]) => j)));
+        ensureLabels(); tip(e, 'сессия · ' + sessSet.size + ' записей', stripProj(nodes[si].label)); return;
       }
-      if (si != null) tip(e, 'сессия · ' + sessSet.size + ' записей', stripProj(nodes[si].label)); else tip(null);
+      const day = mk ? mk.day : Math.floor(-timeAt(fx)), list = byDay.get(day) || [];
+      light('d' + day, new Set(list));
+      const when = new Date(Date.parse('2026-10-15T19:00') - day * 864e5).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' });
+      tip(e, when + ' · ' + nf0.format(list.length) + ' записей', mk ? mk.t : 'создано в этот день — подсвечено на поле');
     });
-    tr.addEventListener('pointerleave', () => { if (state.sessHi != null) { for (const j of sessSet) setFlag(j, 4, false); state.sessHi = null; sessSet = new Set(); ssOn.style.display = 'none'; } tip(null); });
+    tr.addEventListener('pointerleave', () => { if (state.sessHi != null) light(null, new Set()); tip(null); });
     tr.addEventListener('pointerup', () => { drag = false; });
     $('.hd', T2).addEventListener('keydown', (e) => { const d = e.key === 'ArrowLeft' ? -0.02 : e.key === 'ArrowRight' ? 0.02 : 0; if (d) { state.replay.s = clamp(state.replay.s + d, 0, 1); e.preventDefault(); } });
   }
@@ -1226,7 +1272,7 @@ onmessage = async (e) => {
   // The field (every node and molecule edge) sits on the GPU; per frame the CPU only fills one uniform block
   // and the overlay: theme spines, axons to the root, pulses, focus arcs, the chain path, task points.
   const EB = new Float32Array(16000 * 20), NB = new Float32Array(40000 * 16);
-  const FU = new Float32Array(36);
+  const FU = new Float32Array(40);
   let fitK = 1, lightGain = 1;
   const pulses = [];
   let lastAmbient = 0;
@@ -1379,6 +1425,17 @@ onmessage = async (e) => {
     // the root: one soma everything converges on
     if (memo && chain && chain.pos.has(ROOT)) { const pr = chain.pos.get(ROOT), p0 = morphT(7, now); rootN.sx = lerp(rootN.bx ?? rootN.sx, pr[0], p0); rootN.sy = lerp(rootN.by ?? rootN.sy, pr[1], p0); putN(rootN.sx, rootN.sy, 8, 3.5, [0.95, 0.94, 0.92], 2.4, 3, 0, 0); }
     if (memo && !chain) { const [rx, ry] = project(rootN); rootN.sx = rx; rootN.sy = ry; putN(rx, ry, 7 * clamp(Math.pow(zr, 0.3), 1, 2), 3.5, [0.95, 0.94, 0.92], (loaderOn ? L.layoutP * 2 : 2.2) * oa, 3, 0, 0); }
+    // density halos of the unlinked: fade out as the points come in
+    dustA = Math.max(state.showU ? 1 : 0, memo ? sstep(4.5, 6.5, zr) : 0);
+    const hk = (1 - dustA) * (loaderOn ? sstep(0.6, 1, L.layoutP) : 1) * (chain ? 0 : 1) * (scr === 'memory' ? 1 : scr === 'spec' ? 0.07 : 0) * (focus != null ? 0.35 : 1);
+    if (hk > 0.01) for (const h of halos) {
+      if (h.hub === -2 && !state.showOther) continue;
+      const x = cam.ox + (h.x - cam.x) * cam.k, y = cam.oy + (h.y - cam.y) * cam.k, rpx = h.r * cam.k;
+      if (x < -rpx * 3 || x > VW + rpx * 3 || y < -rpx * 3 || y > VH + rpx * 3) continue;
+      const I = hk * (hp != null && hp !== h.hub ? 0.22 : 1) * clamp(0.02 + 0.016 * Math.log2(1 + h.n), 0.02, 0.16);
+      colOf({ g: h.g }, satZ, CA);
+      putN(x, y, Math.max(3, rpx * 0.7), 3.2, CA, I, 2.2, 5, 0, -1, h.birth); // mostly halo: a soft haze, not a bright ball
+    }
     // overlay nodes
     for (const i of ovl.keys()) putNode(nodes[i], scr, zr, glyphZ, iconZ, satZ, loaderOn);
     // field uniforms
@@ -1394,6 +1451,7 @@ onmessage = async (e) => {
     const b = bounds(); const frac = clamp((VW * VH) / Math.max((b.x1 - b.x0) * (b.y1 - b.y0) * cam.k * cam.k, 1), 0.002, 1);
     const want = Math.floor(850 / frac), keep = Math.min(850, impSorted.length * frac);
     F[32] = eBase; F[33] = clamp(Math.sqrt(320 / Math.max(keep, 1)), 0.4, 1.2); F[34] = want >= impSorted.length ? -1 : impSorted[want];
+    F[36] = dustA; F[37] = state.showOther ? 1 : 0;
     // u8 light buffer: accumulate pre-scaled light (density-based exposure), expanded again in the tone map
     lightGain = lightMode === 'u8' ? clamp(0.3 * Math.sqrt(700 / Math.max(nn + NT * frac * 0.5, 1)), 0.1, 0.3) : 1;
     return { gain: lightGain, vw: VW, vh: VH, ratio: DPR, edges: EB.slice(0, ne * 20), nEdges: ne, nodes: NB.slice(0, nn * 16), nNodes: nn, tNow: replayOn ? state.replay.t : 0, tFade: replayOn ? state.replay.fade : 0.001, field: FU.slice() };
@@ -1420,7 +1478,7 @@ onmessage = async (e) => {
   const themeEls = new Map();
   function buildThemeLabels() {
     const box = $('#m-themes'); box.innerHTML = '';
-    for (const tn of themeNodes.values()) { const el = document.createElement('span'); el.className = 'tlabel'; el.innerHTML = `${esc(tn.label)} <span class="num">${nf0.format(tn.count)}</span>`; el.style.color = GHEX[tn.g]; box.append(el); themeEls.set(tn.i, el); }
+    for (const tn of themeNodes.values()) { const el = document.createElement('span'); el.className = 'tlabel'; const du = dustOfTheme.get(tn.i) || 0; el.innerHTML = `${esc(tn.label)} <span class="num">${nf0.format(tn.count)}${du ? ` <i class="du">+${nf0.format(du)}</i>` : ''}</span>`; el.style.color = GHEX[tn.g]; box.append(el); themeEls.set(tn.i, el); }
   }
   const setOn = (el, cls, v) => { const k = '__' + cls; if (el[k] !== v) { el[k] = v; el.classList.toggle(cls, v); } };
   function updateThemeLabels(scr, L, off) {
@@ -1450,6 +1508,7 @@ onmessage = async (e) => {
     if (!on) return;
     updateLegend(cam.k / fitK);
     const placed = legendRect ? [legendRect] : []; // the legend is an obstacle: no project label lands on it
+    for (const ch of [chips.other, chips.u]) if (ch && ch.__op === '1') { if (ch.__w == null) { ch.__w = ch.offsetWidth; ch.__h = ch.offsetHeight; } placed.push([rootN.sx - ch.__w / 2, rootN.sy + (ch === chips.u ? 72 : 50), ch.__w, ch.__h]); } // so are the chips at the root
     const order = [...ganglia.values()].sort((a, b) => (b.info ? b.info.n : 0) - (a.info ? a.info.n : 0));
     const zr = cam.k / fitK;
     for (const G of order) {
@@ -1462,7 +1521,7 @@ onmessage = async (e) => {
       let x = cx - w / 2, y = cy - rpx - h - 8;
       const hit = (x0, y0) => placed.some((r) => x0 < r[0] + r[2] + 6 && x0 + w + 6 > r[0] && y0 < r[1] + r[3] + 4 && y0 + h + 4 > r[1]);
       if (hit(x, y) || y < 8) y = cy + rpx + 8;
-      const chainHide = !!state.chain; // in chain mode the project is already a step on the path
+      const chainHide = !!state.chain || (G.key === -2 && !state.showOther); // chain: the project is a step on the path; outside projects: a chip
       const vis = !chainHide && !hit(x, y) && zr < 7 && (sector || rpx > 6) && x > 140 && x + w < VW - 10 && y > 6 && y + h < VH - 84 && !(state.sel != null && Math.abs(y + h - (nodes[state.sel].sy - 16)) < 30 && Math.abs(cx - nodes[state.sel].sx) < 240);
       const tr = `translate(${(x - railOff).toFixed(1)}px, ${y.toFixed(1)}px)`;
       if (el.__t !== tr) { el.__t = tr; el.style.transform = tr; }
@@ -1492,7 +1551,7 @@ onmessage = async (e) => {
       <dt>открытые проблемы</dt><dd class="num">${info ? nf0.format(info.open) : '—'}</dd>
       ${info && info.blk ? `<dt>в блоке</dt><dd class="num">${info.blk}</dd>` : ''}
       <dt>активность</dt><dd>${info ? agoTxt(info.last) : '—'}</dd>
-      <dt>без связей</dt><dd class="num">${info && info.lonely != null ? Math.round(100 * info.lonely / info.n) + '% проекта' : '—'}</dd>
+      <dt>без связей</dt><dd class="num">+${nf0.format(G.unl || 0)}${info && info.lonely != null ? ' · ' + Math.round(100 * info.lonely / info.n) + '% проекта' : ''}</dd>
       <dt>тем</dt><dd class="num">${[...themeNodes.values()].filter((t) => t.hub === G.key).length}</dd></dl>
       <div class="mix">${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) => `<i style="flex:${v};background:${GHEX[k]}" title="${GNAME[k]} ${v}"></i>`).join('')}</div>
       <p>клик — приблизить проект</p>`;
@@ -1518,7 +1577,8 @@ onmessage = async (e) => {
         <p class="lg"><span class="core"></span>яркое ядро — записано за 7 дней</p>
         <p class="lg">${ico('task', '', 'color:' + GHEX.w)}активная задача</p>
         <p class="lg">${ico('problem', '', 'color:' + GHEX.p)}открытая проблема</p>
-        <p class="lg"><span class="core"></span>пыль — записи без связей; сессии — засечки на шкале времени</p>
+        <p class="lg"><span class="neb"></span>дымка вдоль ветки — записи без связей, +N у темы; U — показать точками</p>
+        <p class="lg"><span class="axon"></span>кривая внизу — сколько записано за день; наведи — подсветится</p>
         <div class="groups">${Object.keys(GHEX).map((k) => `<span>${dot(GHEX[k])}${GNAME[k]}</span>`).join('')}</div>`;
     } else {
       const order = ['decision', 'concept', 'solution', 'problem', 'task', 'session', 'work_log', 'user_fact', 'project', 'doc'];
@@ -1693,6 +1753,7 @@ onmessage = async (e) => {
     updateLabels(scr, L, railOff);
     updateThemeLabels(scr, L, railOff);
     updateChainLabels();
+    updateChips(scr, L);
     { const rl = $('#m-root'); const on = scr === 'memory' && (!L || L.done) && !state.chain; const op = on ? '1' : '0'; if (rl.__op !== op) { rl.__op = op; rl.style.opacity = op; } if (on) { const t2 = `translate(${(rootN.sx - railOff - 40).toFixed(1)}px, ${(rootN.sy + 14).toFixed(1)}px)`; if (rl.__t !== t2) { rl.__t = t2; rl.style.transform = t2; } } }
     if (params.has('fps') && $('#fps') && now - fpsT > 250) { fpsT = now; const avg = fpsAcc.reduce((x, y) => x + y, 0) / fpsAcc.length; $('#fps').textContent = `${(1 / avg).toFixed(0)} fps · ${(avg * 1000).toFixed(1)} мс/кадр`; }
     window.__frames = (window.__frames || 0) + 1;
@@ -1732,7 +1793,7 @@ onmessage = async (e) => {
     const h = far ? null : pick(e.clientX, e.clientY);
     if (h !== state.hover) { state.hover = h; }
     let hpG = null;
-    if (h == null && cam.k / fitK < 3) { for (const G of ganglia.values()) { const [cx, cy] = project({ x: G.cx, y: G.cy }); if (Math.hypot(e.clientX - cx, e.clientY - cy) < G.rr * cam.k * 1.05) { hpG = G; break; } } }
+    if (h == null && cam.k / fitK < 3) { for (const G of ganglia.values()) { if (G.key === -2 && !state.showOther) continue; const [cx, cy] = project({ x: G.cx, y: G.cy }); if (Math.hypot(e.clientX - cx, e.clientY - cy) < G.rr * cam.k * 1.05) { hpG = G; break; } } }
     const hpK = hpG ? hpG.key : null;
     if (hpK !== state.hoverProj) { state.hoverProj = hpK; showCard(hpG); }
     if (hpG) { const cdd = $('#m-card'); cdd.style.transform = `translate(${Math.min(e.clientX + 18, VW - 280)}px, ${Math.min(e.clientY + 18, VH - 260)}px)`; }
@@ -1785,6 +1846,7 @@ onmessage = async (e) => {
     else if (k === ' ' && state.screen === 'memory') { e.preventDefault(); togglePlay(); }
     else if ((k === 'c' || k === 'C' || k === 'с' || k === 'С') && state.screen === 'memory' && (state.hover != null || state.sel != null)) enterChain(state.hover != null ? state.hover : state.sel);
     else if (k === 'r' || k === 'R' || k === 'к' || k === 'К') startLoader();
+    else if ((k === 'u' || k === 'U' || k === 'г' || k === 'Г') && state.screen === 'memory') { state.showU = !state.showU; }
     else if (k === 'Escape') { if (state.chain || state.sel != null) select(null); else if (state.screen !== 'memory') setScreen('memory'); }
   });
   window.addEventListener('resize', resize);
@@ -1950,16 +2012,36 @@ onmessage = async (e) => {
     G.after(C);
   }
 
+  // ---- chips under the root: «outside projects» opens the hidden cloud; «unlinked» counts what U shows
+  const chips = {};
+  function buildChips() {
+    const host = $('#m-root').parentElement;
+    const mk = (cls, html, on) => { const b = document.createElement('button'); b.className = 'mchip ' + cls; b.innerHTML = html; b.onclick = on; host.append(b); return b; };
+    let unl = 0; for (const G of ganglia.values()) if (G.key !== -2) unl += G.unl || 0;
+    chips.other = mk('other', `вне проектов: <span class="num">${nf0.format(OTHER_N.n)}</span>`, () => { state.showOther = !state.showOther; chips.other.classList.toggle('on', state.showOther); if (state.showOther) { const G = ganglia.get(-2); if (G) flyToGanglion(G); } });
+    chips.u = mk('unl', `без связей: <span class="num">${nf0.format(unl)}</span> · U`, () => { state.showU = !state.showU; });
+    if (!OTHER_N.n) chips.other.style.display = 'none';
+  }
+  function updateChips(scr, L) {
+    if (!chips.other) return;
+    const on = scr === 'memory' && (!L || L.done) && !state.chain;
+    const place = (el, dy, vis) => { const op = vis ? '1' : '0'; if (el.__op !== op) { el.__op = op; el.style.opacity = op; el.style.pointerEvents = vis ? 'auto' : 'none'; } if (vis) { const t2 = `translate(${(rootN.sx - railOff).toFixed(1)}px, ${(rootN.sy + dy).toFixed(1)}px) translateX(-50%)`; if (el.__t !== t2) { el.__t = t2; el.style.transform = t2; } } };
+    place(chips.other, 50, on);
+    place(chips.u, 72, on && state.showU);
+    chips.u.classList.toggle('on', state.showU);
+  }
+
   // ------------------------------------------------------------------ boot
   await buildField();
   await buildGrid();
+  buildHalos();
   model = true;
   if (rh) (window.requestIdleCallback || setTimeout)(() => buildAtlas(), { timeout: 2500 }); // icons only matter at close zoom
   await yieldT();
   buildLegend(); statsLine();
   if ($('#lightbuf')) $('#lightbuf').textContent = 'light buffer: ' + (lightMode || (rh ? '…' : '2d'));
   await yieldT();
-  buildLabels(); buildThemeLabels();
+  buildLabels(); buildThemeLabels(); buildChips();
   await yieldT();
   buildTimeline();
   LOAD.parse = 1;
