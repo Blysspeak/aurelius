@@ -1638,8 +1638,7 @@ No arguments or options besides `--help`.
 ### au db prune
 
 List what the four prune rules would remove; `--apply` soft-deletes them. Nothing with a claim
-is removed. (The binary's help text still says "three rules"; the code has four, listed in
-[Maintenance](#maintenance).)
+is removed. The rules are listed in [Maintenance](#maintenance).
 
 <!-- au:db prune -->
 ```
