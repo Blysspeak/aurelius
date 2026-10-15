@@ -72,11 +72,11 @@
 
   // signed distance field of the extruded mark for the glass raymarch
   if (glass) (function markSDF() {
-    const N = 320, cv = document.createElement('canvas'); cv.width = cv.height = N;
+    const N = 1024, cv = document.createElement('canvas'); cv.width = cv.height = N;
     const c = cv.getContext('2d'); const k = N / (2 * MK.R);
     c.setTransform(k, 0, 0, k, N / 2 - MK.c[0] * k, N / 2 - MK.c[1] * k);
     c.strokeStyle = '#fff'; c.fillStyle = '#fff'; c.lineCap = 'round'; c.lineJoin = 'round';
-    for (const [r, w] of [[338, 15], [308, 8]]) { c.lineWidth = w; c.beginPath(); c.arc(MK.c[0], MK.c[1], r, 0, Math.PI * 2); c.stroke(); }
+    for (const [r, w] of [[338, 15], [308, 9]]) { c.lineWidth = w; c.beginPath(); c.arc(MK.c[0], MK.c[1], r, 0, Math.PI * 2); c.stroke(); }
     c.save(); c.translate(0, 1024); c.scale(0.1, -0.1); c.lineWidth = 130; c.stroke(new Path2D(MK.sil)); c.restore();
     c.lineWidth = 10; for (const [a, b] of MK.edges) { c.beginPath(); c.moveTo(...MK.nodes[a]); c.lineTo(...MK.nodes[b]); c.stroke(); }
     for (const n of MK.nodes) { c.beginPath(); c.arc(n[0], n[1], 21, 0, Math.PI * 2); c.fill(); }
@@ -92,6 +92,12 @@
     edt(fin); edt(fout);
     const out = new Float32Array(N * N);
     for (let i = 0; i < N * N; i++) out[i] = (fout[i] > 0 ? Math.sqrt(fout[i]) - 0.5 : -(Math.sqrt(fin[i]) - 0.5)) * (2 / N);
+    // two separable box passes (radius 3 texels) remove the stair-steps of the thresholded mask
+    const tmpB = new Float32Array(N * N);
+    for (let pass = 0; pass < 2; pass++) {
+      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { let a = 0, c2 = 0; for (let k = -3; k <= 3; k++) { const xx = x + k; if (xx >= 0 && xx < N) { a += out[y * N + xx]; c2++; } } tmpB[y * N + x] = a / c2; }
+      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { let a = 0, c2 = 0; for (let k = -3; k <= 3; k++) { const yy = y + k; if (yy >= 0 && yy < N) { a += tmpB[yy * N + x]; c2++; } } out[y * N + x] = a / c2; }
+    }
     glass.setMark(out, N);
   })();
 
@@ -490,6 +496,7 @@
     $$('#rail nav button').forEach((b) => (b.dataset.go === name ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current')));
     if (location.hash !== '#' + name) history.replaceState(null, '', location.pathname + location.search + '#' + name);
     if (name === 'memory') fitCamera(false);
+    $('#cmd').classList.toggle('away', name !== 'memory' && document.activeElement !== cmdIn);
     if (name !== 'memory' && state.lens) state.lens = false;
     tip(null);
   }
@@ -647,7 +654,7 @@
       let pres = 1;
       if (scr) { if (!scr.classList.contains('on') && !scr.classList.contains('leave')) continue; pres = +getComputedStyle(scr).opacity; }
       if (el.closest('#rail')) pres *= +$('#rail').style.opacity || 0;
-      if (el.closest('#cmd')) pres *= +$('#cmd').style.opacity || 0;
+      if (el.closest('#cmd')) pres *= +getComputedStyle($('#cmd')).opacity || 0;
       if (el.id === 'pill') pres *= +el.style.opacity || 0;
       const cs = getComputedStyle(el);
       if (cs.display === 'none' || pres <= 0.01) continue;
@@ -756,7 +763,8 @@
     // project labels
     if ((scr === 'memory') && (!L || L.done)) {
       c.font = '11px Geist, sans-serif'; c.textAlign = 'center';
-      for (const [i, p] of projHub) { const n = nodes[i]; if (n.a < 0.2) continue; c.fillStyle = `rgba(232,230,225,${0.5 * Math.min(n.a, 1)})`; c.fillText(p.label.length > 26 ? p.label.slice(0, 25) + '…' : p.label, n.sx, n.sy - 12); }
+      const selN = state.sel != null ? nodes[state.sel] : null;
+      for (const [i, p] of projHub) { const n = nodes[i]; if (n.a < 0.2) continue; if (selN && Math.abs(n.sy - 12 - (selN.sy - 16)) < 24 && Math.abs(n.sx - selN.sx) < 220) continue; c.fillStyle = `rgba(232,230,225,${0.5 * Math.min(n.a, 1)})`; c.fillText(p.label.length > 26 ? p.label.slice(0, 25) + '…' : p.label, n.sx, n.sy - 12); }
       if (state.sel != null) { const n = nodes[state.sel]; c.fillStyle = 'rgba(232,230,225,0.95)'; c.font = '13px Geist, sans-serif'; const t = stripProj(n.label); c.fillText(t.length > 54 ? t.slice(0, 53) + '…' : t, n.sx, n.sy - 16); }
     }
 
@@ -850,7 +858,7 @@
         const pres = sstep(0.7, 1, L.fetchP) * (1 - sstep(0.82, 1, L.layoutP));
         const morph = quintic(sstep(0.42, 0.72, L.layoutP));
         const flat = 1 - 0.96 * sstep(0.7, 0.95, L.layoutP);
-        obj = { x: mx.cx, y: mx.cy, z: 0.3 * mx.s * MK.R, size: mx.s * MK.R, extent: 1.12, morph, flat, presence: pres, thick: 0.045, inv: I3 };
+        obj = { x: mx.cx, y: mx.cy, z: 0.3 * mx.s * MK.R, size: mx.s * MK.R, extent: 1.12, morph, flat, presence: pres, thick: 0.045, inv: I3, aa: true };
       } else if (lens.pres > 0 && scr === 'memory') {
         obj = { x: lens.x, y: lens.y, z: LENS_Z, size: 110 * (0.6 + 0.4 * lens.pres), extent: 1.12 * Math.max(lens.st, 1), morph: 1, flat: 1, presence: lens.pres, thick: 0.05, inv: stretchInv(lens.vx, lens.vy, lens.st) };
       }
@@ -910,12 +918,15 @@
     if (e.target.closest('input, select, textarea')) return;
     const k = e.key;
     if (k === '1') setScreen('memory'); else if (k === '2') setScreen('tasks'); else if (k === '3') setScreen('finance'); else if (k === '0') setScreen('spec');
-    else if (k === '/') { e.preventDefault(); cmdIn.focus(); }
+    else if (k === '/') { e.preventDefault(); $('#cmd').classList.remove('away'); cmdIn.focus(); }
     else if (k === 'l' || k === 'L' || k === 'д' || k === 'Д') { if (state.screen === 'memory') state.lens = !state.lens; }
     else if (k === 'r' || k === 'R' || k === 'к' || k === 'К') startLoader();
     else if (k === 'Escape') { if (state.sel != null) select(null); else if (state.screen !== 'memory') setScreen('memory'); }
   });
   window.addEventListener('resize', resize);
+  // on screens with scrolling content the command line stays out of the way and returns on "/"
+  cmdIn.addEventListener('focus', () => $('#cmd').classList.remove('away'));
+  cmdIn.addEventListener('blur', () => $('#cmd').classList.toggle('away', state.screen !== 'memory'));
 
   // ------------------------------------------------------------------ spec
   function buildSpec() {

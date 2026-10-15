@@ -80,6 +80,7 @@ uniform float uIor;
 uniform float uDispersion;
 uniform float uPresence;
 uniform float uThick;
+uniform float uAA;
 out vec4 o;
 
 float sdMark2(vec2 p) {
@@ -107,7 +108,7 @@ float field(vec3 p) {
 }
 float map(vec3 w) { return field(uInverse * (w - uCenter) / uSize) * uSize * 0.85; }
 vec3 normalAt(vec3 w) {
-  float e = 0.5;
+  float e = 1.1;
   vec2 k = vec2(1.0, -1.0);
   return normalize(k.xyy * map(w + k.xyy * e) + k.yyx * map(w + k.yyx * e) + k.yxy * map(w + k.yxy * e) + k.xxx * map(w + k.xxx * e));
 }
@@ -119,17 +120,15 @@ vec3 studio(vec3 d) {
   float strip = smoothstep(0.12, 0.05, abs(a.x - 0.95)) * smoothstep(0.8, 0.35, abs(a.y - 0.05));
   return vec3(18.0) * key + vec3(8.0) * strip + vec3(smoothstep(0.0, 1.0, d.z) * 0.04);
 }
-void main() {
-  vec2 w = gl_FragCoord.xy / uRatio;
+vec3 render(vec2 w) {
   vec3 base = bg(w);
-  if (uPresence <= 0.0) { o = vec4(base, 1.0); return; }
   vec3 cam = vec3(uView * 0.5, uFocal);
   vec3 rd = normalize(vec3(w, 0.0) - cam);
   vec3 oc = cam - uCenter;
   float b = dot(oc, rd);
   float c = dot(oc, oc) - uBound * uBound;
   float disc = b * b - c;
-  if (disc <= 0.0) { o = vec4(base, 1.0); return; }
+  if (disc <= 0.0) return base;
   float sq = sqrt(disc);
   float t = max(-b - sq, 0.0), tEnd = -b + sq;
   float pixel = 1.0 / uRatio, eps = 0.3 * pixel;
@@ -145,7 +144,7 @@ void main() {
   if (!hit) {
     float cover = clamp(1.0 - closest / (pixel * 1.4), 0.0, 1.0) * uPresence;
     if (cover > 0.0) { vec3 n = normalAt(cam + rd * closestT); base += vec3(0.16) * cover * pow(1.0 - abs(n.z), 2.0); }
-    o = vec4(base, 1.0); return;
+    return base;
   }
   vec3 p = cam + rd * t;
   vec3 n = normalAt(p);
@@ -185,7 +184,17 @@ void main() {
   vec2 facing = normalize(vec2(-0.42, 0.55));
   float rimL = pow(1.0 - cosi, 3.0) * (0.25 + 0.75 * abs(dot(normalize(n.xy + 1e-5), facing))) * 0.6;
   glass = vec3(rimL) + glass * (1.0 - rimL);
-  o = vec4(mix(base, glass, uPresence), 1.0);
+  return mix(base, glass, uPresence);
+}
+void main() {
+  vec2 w = gl_FragCoord.xy / uRatio;
+  if (uPresence <= 0.0) { o = vec4(bg(w), 1.0); return; }
+  if (uAA < 0.5) { o = vec4(render(w), 1.0); return; }
+  // 4 rotated-grid sub-pixel rays: the loader mark is the first thing the owner sees
+  float px = 1.0 / uRatio;
+  vec3 acc = render(w + vec2(0.125, 0.375) * px) + render(w + vec2(-0.375, 0.125) * px)
+           + render(w + vec2(-0.125, -0.375) * px) + render(w + vec2(0.375, -0.125) * px);
+  o = vec4(acc * 0.25, 1.0);
 }`;
 
   function compile(gl, type, src) {
@@ -282,7 +291,7 @@ void main() {
           gl.uniform1f(p2.u.uBound, o.size * o.extent);
           gl.uniform1f(p2.u.uMorph, o.morph); gl.uniform1f(p2.u.uFlat, o.flat);
           gl.uniform1f(p2.u.uIor, 1.5); gl.uniform1f(p2.u.uDispersion, 0.35);
-          gl.uniform1f(p2.u.uPresence, o.presence); gl.uniform1f(p2.u.uThick, o.thick);
+          gl.uniform1f(p2.u.uPresence, o.presence); gl.uniform1f(p2.u.uThick, o.thick); gl.uniform1f(p2.u.uAA, o.aa ? 1 : 0);
           gl.drawArrays(gl.TRIANGLES, 0, 3);
         },
       };
