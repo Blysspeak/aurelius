@@ -2,19 +2,19 @@
 
 ## [v3.8.0] — 2026-10-15
 
-A personal finance ledger in the same memory the agent already uses, notes that attach to their project at write time, and the README split into topic docs.
+Личные финансы в той же памяти, которой уже пользуется агент; записи привязываются к проекту в момент записи; README разделён на тематические документы.
 
 ### Added
-- **finance:** Personal finance ledger. Log spending, income and currency exchanges by voice or text through the agent (`fin_log`, `fin_list`, `fin_stats`, `fin_void`, `fin_categories`, `fin_currencies`, `fin_rate`) or from the shell (`au fin log|list|stats|void|categories|currency|rate`, all with `--json`). Exchanges store both sides and the actual rate and are never counted as spending. Amounts are exact integers in each currency's minor units, and entries are voided, not deleted (2276059d)
-- **finance:** Summaries in USD at the rate for each entry's date, with the rate source shown per entry, stale cached rates marked, and unconverted entries kept in their own bucket. Rates come without API keys from the NBRB (BYN), CBR (RUB), NBK (KZT), ECB (EUR and other fiat) and Kraken (crypto, USDT). Covered by property tests and a 250,000-entry stress run (2276059d)
-- **core:** A record whose project is known creates the missing project hub and links to it as it is written; imports and consolidation digests link to their project too, and a git worktree is named after its main repository (ab011abd)
-- **core:** `au db reattach` finds records not linked to their project hub: dry run by default, `--apply` adds the links in one transaction and never invents hubs for unknown names (ab011abd)
+- **Личные финансы.** Расходы, доходы и обмены валют записываются голосом или текстом через агента (`fin_log`, `fin_list`, `fin_stats`, `fin_void`, `fin_categories`, `fin_currencies`, `fin_rate`) или из консоли (`au fin log|list|stats|void|categories|currency|rate`, у всех есть `--json`). Обмен хранит обе стороны и фактический курс и никогда не считается расходом. Суммы — точные целые в минимальных единицах каждой валюты; ошибочная запись отменяется, а не удаляется (2276059d)
+- **Сводки в USD.** Каждая запись пересчитывается по курсу на свою дату, у каждой виден источник курса, устаревший курс из кэша помечен, записи без курса лежат в отдельной корзине. Курсы берутся без API-ключей: НБРБ (BYN), ЦБ РФ (RUB), НБ РК (KZT), ЕЦБ (EUR и прочий фиат), Kraken (крипта, USDT). Покрыто property-тестами и стресс-прогоном на 250 000 записей (2276059d)
+- **Хаб проекта заводится при записи.** Запись, проект которой известен, сама создаёт недостающий хаб проекта и привязывается к нему в момент записи; импорт и дистиллят тоже привязываются к своему проекту, а рабочее дерево git называется по основному репозиторию (ab011abd)
+- **`au db reattach`.** Находит записи, не привязанные к хабу своего проекта: по умолчанию сухой прогон, `--apply` добавляет связи одной транзакцией и никогда не выдумывает хаб для незнакомого имени (ab011abd)
 
 ### Changed
-- **docs:** README is a short landing page with a documentation map; the reference moved into `docs/` (`mcp-tools`, `memory`, `tasks`, `reminders`, `cli`, `sync`, `hooks`, `architecture`, `roadmap`) (98953374)
+- **README стал короткой посадочной страницей** с картой документации; справочник переехал в `docs/` (`mcp-tools`, `memory`, `tasks`, `reminders`, `cli`, `sync`, `hooks`, `architecture`, `roadmap`) (98953374)
 
 ### Upgrade notes
-- Finance tables are created lazily on first use; the schema version stays at 19, so older binaries keep working on the same database. Reinstall `au` and `aurelius` to get `au fin` and the `fin_*` tools.
+- Таблицы финансов создаются лениво при первом обращении; версия схемы остаётся 19, поэтому старые бинарники продолжают работать с той же базой. Чтобы получить `au fin` и инструменты `fin_*`, переустановите `au` и `aurelius`.
 
 ## [v3.7.0] — 2026-10-11
 
