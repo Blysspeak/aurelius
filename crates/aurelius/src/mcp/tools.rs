@@ -884,7 +884,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "fin_log",
-                "description": "Record the owner's personal money movements — one call per phrase, as a batch. Kinds: expense (money spent), income (money received), exchange (one currency turned into another: amount/currency = what was given, counter_amount/counter_currency = what was received; never counted as expense or income). Returns one human-readable line per entry to read back to the owner; for an exchange the line also shows the effective rate derived from the two sides. All-or-nothing: if any entry is invalid nothing is written and the error names entries[i].\n\nOwner's phrasing -> entries:\n  «потратил 25 BYN» -> expense 25 BYN\n  «потратил 30 USDT» -> expense 30 USDT\n  «перевёл 75000 рублей РФ, получил 2500 BYN» -> exchange 75000 RUB -> 2500 BYN\n  «купил 30 USD на карту КЗ с карты BYN» -> exchange ? BYN -> 30 USD — the BYN side is unknown: ask the owner how many BYN it cost. Cards, accounts and places are not stored; a card mention may go into note.\n\nRules:\n- One phrase may yield several entries — log them together in one batch.\n- If either side of an exchange is missing, do NOT fill it in from an official or market rate — ask the owner, then log.\n- Before choosing a category call fin_categories and reuse an existing one instead of inventing a near-duplicate («еда» vs «продукты»). Categories are lowercase free text; required for expense/income, optional for exchange.\n- Unknown currency code -> ask the owner; do not add currencies on your own (fin_currencies action=add only after he confirms).\n- Amounts are decimal strings in currency units (\"25\", \"11.6\"); more decimals than the currency's precision is refused, never rounded.\n- Corrections: fin_void the wrong entry with a reason, then log the right one.",
+                "description": "Record the owner's personal money movements — one call per phrase, as a batch. Kinds: expense (money spent), income (money received), exchange (one currency turned into another: amount/currency = what was given, counter_amount/counter_currency = what was received; never counted as expense or income). Returns one human-readable line per entry to read back to the owner; for an exchange the line also shows the effective rate derived from the two sides. All-or-nothing: if any entry is invalid nothing is written and the error names entries[i].\n\nOwner's phrasing -> entries:\n  «потратил 25 BYN» -> expense 25 BYN\n  «потратил 30 USDT» -> expense 30 USDT\n  «перевёл 75000 рублей РФ, получил 2500 BYN» -> exchange 75000 RUB -> 2500 BYN\n  «купил 30 USD на карту КЗ с карты BYN» -> exchange ? BYN -> 30 USD — the BYN side is unknown: ask the owner how many BYN it cost. Cards, accounts and places are not stored; a card mention may go into note.\n\nRules:\n- One phrase may yield several entries — log them together in one batch.\n- If either side of an exchange is missing, do NOT fill it in from an official or market rate — ask the owner, then log.\n- Before choosing a category call fin_categories and reuse an existing one instead of inventing a near-duplicate («еда» vs «продукты»). Categories are lowercase free text; required for expense/income, optional for exchange.\n- Unknown currency code -> ask the owner; do not add currencies on your own (fin_currencies action=add only after he confirms).\n- Amounts are decimal STRINGS in currency units (\"25\", \"11.6\", \"0.00000001\"); a fractional JSON number is refused (it has already lost precision in a float), an integer JSON number is accepted. More decimals than the currency's precision is refused, never rounded. \"1,000\" is refused as ambiguous (thousands or decimals?) — ask the owner.\n- Corrections: fin_void the wrong entry with a reason, then log the right one.\n\nUSD: every returned line also shows the USD equivalent, the rate and its source (dictated / actual exchange / NBRB / CBR / NB KZ / ECB / Kraken), or 'нет курса в USD (не пересчитано)'. Rates:\n- The owner names a number («по курсу 3.25», «TON по 1.4») -> after fin_log call fin_rate action=set with that entry_id and rate. A dictated rate beats every other source.\n- «по курсу банка» WITHOUT a number -> do nothing extra: the national bank rate on the entry date is the default (BYN NBRB, RUB CBR, KZT NB KZ, EUR/other fiat ECB; crypto and USDT by Kraken market price, USDT is not assumed 1). Read back the line so the owner sees the source.\n- An exchange converts by its own actual rate when one side is USD.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -895,9 +895,9 @@ pub fn tool_definitions() -> serde_json::Value {
                                 "type": "object",
                                 "properties": {
                                     "kind": { "type": "string", "enum": ["expense", "income", "exchange"] },
-                                    "amount": { "type": "string", "description": "Decimal amount in currency units, e.g. \"25\" or \"0.0015\". For exchange: the amount given." },
+                                    "amount": { "type": "string", "description": "Decimal STRING in currency units, e.g. \"25\" or \"0.0015\" — never a fractional JSON number. For exchange: the amount given." },
                                     "currency": { "type": "string", "description": "Currency code, e.g. BYN, RUB, USD, USDT, TON. For exchange: the currency given." },
-                                    "counter_amount": { "type": "string", "description": "Exchange only, required there: amount received." },
+                                    "counter_amount": { "type": "string", "description": "Exchange only, required there: amount received, as a decimal STRING." },
                                     "counter_currency": { "type": "string", "description": "Exchange only, required there: currency received." },
                                     "category": { "type": "string", "description": "Lowercase free text; reuse one from fin_categories. Required for expense/income." },
                                     "note": { "type": "string", "description": "Anything else worth keeping: card, place, counterparty." },
@@ -919,7 +919,7 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "fin_list",
-                "description": "List finance entries, newest first, each with a human-readable line. Voided entries are hidden unless include_voided=true. Period defaults to the current month.",
+                "description": "List finance entries, newest first, each with a human-readable line. Each entry carries usd (USD equivalent, rate, rate date and source) or null with 'нет курса в USD (не пересчитано)' in its line; rates come lazily from cache or the source, network failure only leaves entries unconverted (see rate_errors). Voided entries are hidden unless include_voided=true. Period defaults to the current month.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -937,14 +937,34 @@ pub fn tool_definitions() -> serde_json::Value {
             },
             {
                 "name": "fin_stats",
-                "description": "Totals for a period, per currency, with no conversion between currencies (no rates are stored). Each currency total has expense, income, exchanged_out and exchanged_in — exchanges are reported separately and never counted as expense or income. groups breaks expense/income down by category, month or currency, one row per key and currency. Voided entries are excluded and counted in voided_excluded. 'text' is a ready human summary.",
+                "description": "Totals for a period. Default base=USD: 'usd' has one USD total (expense, income), usd.groups — USD breakdown by group_by (category by default), usd.sources — how many entries used each rate source, and usd.unconverted — entries with no rate at all (count, ids, native sums); they are never silently dropped. usd.stale_entries / usd.oldest_rate_date — entries converted by a cached rate more than a day older than the operation because the source did not answer (tell the owner the total is approximate); usd.rate_errors — sources that failed or were skipped when the network budget ran out. Each entry converts at the rate on its own date (nearest earlier rate if that day has none): dictated for that entry > actual rate of the owner's exchange > national bank > Kraken market. 'totals' stays per original currency (expense, income, exchanged_out, exchanged_in) — exchanges are never counted as expense or income. groups breaks native expense/income down per key and currency. base=none skips conversion and network. Voided entries are excluded and counted in voided_excluded. 'text' is a ready human summary.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "period": { "type": "string", "description": "today | yesterday | week | month | year | all | <N>d. Default: month." },
                         "since": { "type": "string", "description": "Start, inclusive: YYYY-MM-DD or RFC 3339." },
                         "until": { "type": "string", "description": "End, exclusive: YYYY-MM-DD or RFC 3339." },
-                        "group_by": { "type": "string", "enum": ["category", "month", "currency"], "description": "Default: category." }
+                        "group_by": { "type": "string", "enum": ["category", "month", "currency"], "description": "Default: category." },
+                        "base": { "type": "string", "enum": ["USD", "none"], "description": "Summary currency. Default USD; none = per-currency only, no rates." }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "fin_rate",
+                "description": "Currency rates to USD for finance entries (cached in fin_rates as exact fractions).\n- action=set: the owner dictated a rate for one operation («по курсу 3.25») -> entry_id + rate (decimal STRING). rate_unit: per_usd = units of the currency for 1 USD (default for fiat: «3.25» BYN), usd_per_unit = USD for 1 unit (default for crypto: «TON по 1.4»). For an exchange pass currency to pick the side. A dictated rate beats every other source; returns the entry line with the new USD equivalent.\n- action=clear: drop the dictated rate of entry_id (use when the owner says «по курсу банка» about an entry that has a dictated rate); the normal order applies again.\n- action=list: cached rates, filter by currency, date or since/until, entry_id.\n- action=refresh: forget cached bank/market rates for date (dictated ones stay) and fetch again, for one currency or all enabled ones; use after a source corrected a rate.\n«по курсу банка» with no number needs no call at all: the national bank rate on the entry date is the default.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["set", "clear", "list", "refresh"], "description": "Default: list." },
+                        "entry_id": { "type": "integer", "description": "Entry id (#N). Required for set/clear." },
+                        "rate": { "type": "string", "description": "set: the dictated rate as a decimal STRING, e.g. \"3.25\"." },
+                        "rate_unit": { "type": "string", "enum": ["per_usd", "usd_per_unit"], "description": "set: how the rate reads. Default per_usd for fiat, usd_per_unit for crypto." },
+                        "currency": { "type": "string", "description": "set/clear: which side of an exchange (default: the entry currency). list/refresh: filter to one currency." },
+                        "date": { "type": "string", "description": "YYYY-MM-DD. Required for refresh; list: exactly this date." },
+                        "since": { "type": "string", "description": "list: from this date, YYYY-MM-DD, inclusive." },
+                        "until": { "type": "string", "description": "list: up to this date, YYYY-MM-DD, inclusive." },
+                        "limit": { "type": "integer", "description": "list: default 100." }
                     },
                     "required": []
                 }

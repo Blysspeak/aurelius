@@ -477,7 +477,8 @@ pub enum FinAction {
         #[arg(long)]
         json: bool,
     },
-    /// Итоги по каждой валюте без пересчёта; обмены отдельно от расходов
+    /// Итог и разбивка в USD по курсу на дату каждой записи, рядом — исходные
+    /// валюты; обмены отдельно от расходов
     Stats {
         /// today | yesterday | week | month | year | all | <N>d; по умолчанию month
         #[arg(long)]
@@ -489,6 +490,9 @@ pub enum FinAction {
         /// category | month | currency
         #[arg(long = "by", default_value = "category")]
         by: String,
+        /// USD | none (none — только исходные валюты, без курсов и сети)
+        #[arg(long, default_value = "USD")]
+        base: String,
         #[arg(long)]
         json: bool,
     },
@@ -509,6 +513,68 @@ pub enum FinAction {
     Currency {
         #[command(subcommand)]
         action: FinCurrencyAction,
+    },
+    /// Курсы к USD: названный для записи, кэш, обновление
+    Rate {
+        #[command(subcommand)]
+        action: FinRateAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FinRateAction {
+    /// Названный владельцем курс для записи — выше всех источников
+    Set {
+        /// id записи (#N)
+        entry_id: i64,
+        /// Курс десятичной строкой, например 3.25
+        rate: String,
+        /// Для обмена: валюта стороны; по умолчанию валюта записи
+        #[arg(long)]
+        currency: Option<String>,
+        /// per_usd (единиц за 1 USD, по умолчанию для фиата) | usd_per_unit
+        /// (USD за 1 единицу, по умолчанию для крипты)
+        #[arg(long)]
+        unit: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Снять названный курс записи — снова нацбанк/обмен/биржа
+    Clear {
+        entry_id: i64,
+        #[arg(long)]
+        currency: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Курсы в кэше, свежие сверху
+    List {
+        #[arg(long)]
+        currency: Option<String>,
+        /// Ровно эта дата, ГГГГ-ММ-ДД
+        #[arg(long)]
+        date: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long)]
+        entry_id: Option<i64>,
+        #[arg(long, default_value = "100")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Забыть кэш нацбанков и биржи на дату и запросить заново
+    Refresh {
+        /// ГГГГ-ММ-ДД
+        #[arg(long)]
+        date: String,
+        /// Одна валюта; по умолчанию все включённые
+        #[arg(long)]
+        currency: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{
-    hooks, DbAction, DocAction, FinAction, FinCurrencyAction, GraphAction, HomeAction,
+    hooks, DbAction, DocAction, FinAction, FinCurrencyAction, FinRateAction, GraphAction, HomeAction,
     IdentityAction, RemindAction, SecretAction, ShareAction, TaskAction,
 };
 
@@ -3680,9 +3680,25 @@ async fn drain_embedding_queue(
 /// угадывать по форме, является ли строка ключом или координатой.
 /// `au fin` — тонкая оболочка над `aurelius_core::finance`: разбор флагов и
 /// печать, вся арифметика денег в ядре, общем с MCP `fin_*`.
+///
+/// Курсы подкачиваются блокирующим HTTP-клиентом, а он паникует внутри
+/// tokio-рантайма — поэтому всё тело уходит в `spawn_blocking`.
 pub async fn fin(action: FinAction) -> Result<()> {
+    tokio::task::spawn_blocking(move || fin_blocking(action)).await?
+}
+
+fn fin_blocking(action: FinAction) -> Result<()> {
     use aurelius_core::finance;
+    use aurelius_core::finance_rates as rates;
     let conn = open_and_ensure(&db_path())?;
+    let http: Box<dyn rates::Http> = match rates::LiveHttp::new() {
+        Ok(h) => Box::new(h),
+        Err(_) => Box::new(rates::NoNetwork),
+    };
+    let parse_date = |d: &str| {
+        chrono::NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d")
+            .with_context(|| format!("дата '{d}': ГГГГ-ММ-ДД"))
+    };
     let now = chrono::Utc::now();
     let print_json = |v: serde_json::Value| -> Result<()> {
         println!("{}", serde_json::to_string(&v)?);
@@ -3718,9 +3734,12 @@ pub async fn fin(action: FinAction) -> Result<()> {
                 source,
                 provenance,
             };
-            let written = finance::log(&conn, &[entry], now)?;
+            let mut written = finance::log(&conn, &[entry], now)?;
+            let rate_errors = rates::convert_entries(&conn, &mut written, http.as_ref(), now)?;
             if as_json {
-                return print_json(json!({ "logged": written.len(), "entries": written }));
+                return print_json(
+                    json!({ "logged": written.len(), "entries": written, "rate_errors": rate_errors }),
+                );
             }
             for e in &written {
                 println!("{}", e.line);
@@ -3748,7 +3767,7 @@ pub async fn fin(action: FinAction) -> Result<()> {
                 .as_deref()
                 .map(|k| finance::Kind::parse(k).with_context(|| format!("--kind '{k}'")))
                 .transpose()?;
-            let entries = finance::list(
+            let mut entries = finance::list(
                 &conn,
                 &finance::ListFilter {
                     since: p.since,
@@ -3760,10 +3779,10 @@ pub async fn fin(action: FinAction) -> Result<()> {
                     limit,
                 },
             )?;
+            let rate_errors = rates::convert_entries(&conn, &mut entries, http.as_ref(), now)?;
             if as_json {
-                return print_json(
-                    json!({ "period": p, "count": entries.len(), "entries": entries }),
-                );
+                return print_json(json!({ "period": p, "count": entries.len(),
+                                          "entries": entries, "rate_errors": rate_errors }));
             }
             if entries.is_empty() {
                 println!("Записей нет ({})", p.label);
@@ -3778,6 +3797,7 @@ pub async fn fin(action: FinAction) -> Result<()> {
             since,
             until,
             by,
+            base,
             json: as_json,
         } => {
             let p = finance::resolve_period(
@@ -3788,7 +3808,19 @@ pub async fn fin(action: FinAction) -> Result<()> {
             )?;
             let group_by = finance::GroupBy::parse(&by)
                 .with_context(|| format!("--by '{by}': category | month | currency"))?;
-            let stats = finance::stats(&conn, p.since, p.until, &p.label, group_by)?;
+            let stats = match base.as_str() {
+                "USD" | "usd" => rates::stats_usd(
+                    &conn,
+                    p.since,
+                    p.until,
+                    &p.label,
+                    group_by,
+                    http.as_ref(),
+                    now,
+                )?,
+                "none" => finance::stats(&conn, p.since, p.until, &p.label, group_by)?,
+                other => anyhow::bail!("--base '{other}': USD | none"),
+            };
             if as_json {
                 return print_json(serde_json::to_value(&stats)?);
             }
@@ -3820,6 +3852,118 @@ pub async fn fin(action: FinAction) -> Result<()> {
             }
             Ok(())
         }
+        FinAction::Rate { action } => match action {
+            FinRateAction::Set {
+                entry_id,
+                rate,
+                currency,
+                unit,
+                json: as_json,
+            } => {
+                let unit = unit
+                    .as_deref()
+                    .map(|u| {
+                        rates::RateUnit::parse(u)
+                            .with_context(|| format!("--unit '{u}': per_usd | usd_per_unit"))
+                    })
+                    .transpose()?;
+                let row =
+                    rates::set_dictated(&conn, entry_id, currency.as_deref(), &rate, unit, now)?;
+                let mut entry: Vec<_> = finance::get(&conn, entry_id)?.into_iter().collect();
+                rates::convert_entries(&conn, &mut entry, http.as_ref(), now)?;
+                if as_json {
+                    return print_json(json!({ "rate": row, "entry": entry.first() }));
+                }
+                for e in &entry {
+                    println!("{}", e.line);
+                }
+                Ok(())
+            }
+            FinRateAction::Clear {
+                entry_id,
+                currency,
+                json: as_json,
+            } => {
+                let removed = rates::clear_dictated(&conn, entry_id, currency.as_deref())?;
+                let mut entry: Vec<_> = finance::get(&conn, entry_id)?.into_iter().collect();
+                let rate_errors = rates::convert_entries(&conn, &mut entry, http.as_ref(), now)?;
+                if as_json {
+                    return print_json(json!({ "removed": removed, "entry": entry.first(),
+                                              "rate_errors": rate_errors }));
+                }
+                println!("снято названных курсов: {removed}");
+                for e in &entry {
+                    println!("{}", e.line);
+                }
+                Ok(())
+            }
+            FinRateAction::List {
+                currency,
+                date,
+                since,
+                until,
+                entry_id,
+                limit,
+                json: as_json,
+            } => {
+                let date = date.as_deref().map(parse_date).transpose()?;
+                let rows = rates::list_rates(
+                    &conn,
+                    &rates::RateFilter {
+                        currency,
+                        since: since.as_deref().map(parse_date).transpose()?.or(date),
+                        until: until.as_deref().map(parse_date).transpose()?.or(date),
+                        entry_id,
+                        limit,
+                    },
+                )?;
+                if as_json {
+                    return print_json(json!({ "count": rows.len(), "rates": rows }));
+                }
+                if rows.is_empty() {
+                    println!("Курсов в кэше нет");
+                }
+                for r in &rows {
+                    println!(
+                        "{} {} = {} USD ({} за 1 USD) · {}{}",
+                        r.date,
+                        r.currency,
+                        r.usd_per_unit,
+                        r.units_per_usd,
+                        r.source_label,
+                        r.entry_id.map(|id| format!(" · запись #{id}")).unwrap_or_default()
+                    );
+                }
+                Ok(())
+            }
+            FinRateAction::Refresh {
+                date,
+                currency,
+                json: as_json,
+            } => {
+                let date = parse_date(&date)?;
+                let out = rates::refresh(&conn, date, currency.as_deref(), http.as_ref(), now)?;
+                if as_json {
+                    return print_json(json!({ "date": date, "refreshed": out }));
+                }
+                for r in &out {
+                    match (&r.usd_per_unit, &r.error) {
+                        (Some(v), _) => println!(
+                            "{} {} = {} USD ({} за 1 USD) · {} на {}",
+                            date,
+                            r.currency,
+                            v,
+                            r.units_per_usd.as_deref().unwrap_or(""),
+                            rates::source_label(&r.source),
+                            r.rate_date.as_deref().unwrap_or("")
+                        ),
+                        (None, Some(e)) => println!("{date} {}: нет курса — {e}", r.currency),
+                        (None, None) => println!("{date} {}: нет курса", r.currency),
+                    }
+                }
+                Ok(())
+            }
+        },
         FinAction::Currency { action } => {
             let (value, as_json) = match action {
                 FinCurrencyAction::List { all, json: as_json } => (

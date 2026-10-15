@@ -14,7 +14,8 @@
 //! 4. Нет жёсткого удаления: исправление — это отмена (`voided_at` +
 //!    `void_reason`) и новая запись. Отменённая строка остаётся и в сводки не
 //!    входит.
-//! 5. Сводки — по каждой валюте отдельно, без пересчёта: курсов пока нет.
+//! 5. Сводки — по каждой валюте отдельно; пересчёт в USD по курсу на дату
+//!    операции — в `finance_rates` (поле `usd` у записи и у сводки).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -140,6 +141,9 @@ pub struct Entry {
     pub voided_at: Option<DateTime<Utc>>,
     pub void_reason: Option<String>,
     pub rate: Option<Rate>,
+    /// Эквивалент в USD с курсом и источником; `None` — не пересчитывалась
+    /// или курса нет (`finance_rates::convert_entries`).
+    pub usd: Option<crate::finance_rates::Conversion>,
     /// Одна строка для подтверждения в боте.
     pub line: String,
 }
@@ -178,6 +182,16 @@ pub fn parse_amount(raw: &str, scale: u32) -> Result<i64> {
         .filter(|c| !matches!(c, ' ' | '_' | '\u{a0}' | '\u{202f}'))
         .map(|c| if c == ',' { '.' } else { c })
         .collect();
+    // «1,000»: тысяча или единица с тремя знаками? Угадывать нельзя.
+    if let Some((int, frac)) = raw.trim().split_once(',') {
+        let digits = |p: &str| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit());
+        if digits(int) && int != "0" && frac.len() == 3 && digits(frac) {
+            bail!(
+                "сумма '{raw}' неоднозначна: запятая с тремя цифрами — тысячи или дробь? \
+                 уточни у владельца и передай без разделителя тысяч ('1000') или с точкой ('1.000')"
+            );
+        }
+    }
     let (int_part, frac_part) = match cleaned.split_once('.') {
         Some((i, f)) => (i, f),
         None => (cleaned.as_str(), ""),
@@ -216,6 +230,22 @@ pub fn parse_amount(raw: &str, scale: u32) -> Result<i64> {
         bail!("сумма '{raw}' должна быть больше нуля");
     }
     Ok(minor)
+}
+
+/// Сумма или курс из JSON-параметра: строка — как есть, целое JSON-число —
+/// точно; дробное JSON-число — ошибка: оно уже прошло через f64 (`1e-8`,
+/// `...064007`), а округлять сказанное нельзя.
+pub fn amount_from_json(v: &serde_json::Value, key: &str) -> Result<Option<String>> {
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s.clone())),
+        serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => Ok(Some(n.to_string())),
+        serde_json::Value::Number(n) => bail!(
+            "'{key}': JSON number {n} is not exact - pass the amount as a decimal string, \
+             e.g. \"0.00000001\" (дробное JSON-число прошло через f64; передай строкой)"
+        ),
+        other => bail!("'{key}' must be a decimal string, got {other}"),
+    }
 }
 
 /// Минимальные единицы → десятичная строка без хвостовых нулей: `11.6`, `25`.
@@ -589,6 +619,7 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
         voided_at: row.get::<_, Option<i64>>(12)?.map(from_unix),
         void_reason: row.get(13)?,
         rate,
+        usd: None,
         line: String::new(),
     };
     entry.line = entry_line(&entry);
@@ -605,6 +636,9 @@ pub fn entry_line(e: &Entry) -> String {
     }
     if let Some(r) = &e.rate {
         line.push_str(&format!(" · курс 1 {} = {} {}", r.base, r.value, r.quote));
+    }
+    if let Some(u) = &e.usd {
+        line.push_str(&format!(" {}", u.text));
     }
     if let Some(c) = &e.category {
         line.push_str(&format!(" · {c}"));
@@ -624,6 +658,12 @@ pub fn entry_line(e: &Entry) -> String {
         ));
     }
     line
+}
+
+/// Запись по id, в том числе отменённая.
+pub fn get(conn: &Connection, id: i64) -> Result<Option<Entry>> {
+    ensure_finance_schema(conn)?;
+    get_entry(conn, id)
 }
 
 fn get_entry(conn: &Connection, id: i64) -> Result<Option<Entry>> {
@@ -868,6 +908,9 @@ pub struct Stats {
     pub totals: Vec<CurrencyTotal>,
     pub groups: Vec<GroupRow>,
     pub voided_excluded: i64,
+    /// Итог и разбивка в USD (`finance_rates::stats_usd`); `None` — сводка
+    /// без пересчёта.
+    pub usd: Option<crate::finance_rates::UsdSummary>,
 }
 
 fn total_slot<'a>(
@@ -880,6 +923,19 @@ fn total_slot<'a>(
             currency: code.to_owned(),
             ..CurrencyTotal::default()
         })
+}
+
+/// Ключ группы записи: категория, месяц `ГГГГ-ММ` или код валюты.
+pub(crate) fn group_key(e: &Entry, group_by: GroupBy) -> String {
+    match group_by {
+        GroupBy::Category => e.category.clone().unwrap_or_default(),
+        GroupBy::Month => e
+            .occurred_at
+            .with_timezone(&Local)
+            .format("%Y-%m")
+            .to_string(),
+        GroupBy::Currency => e.currency.clone(),
+    }
 }
 
 fn add_to(slot: &mut i64, v: i64) -> Result<()> {
@@ -939,15 +995,7 @@ pub fn stats(
         } else {
             add_to(&mut t.income_minor, e.amount_minor)?;
         }
-        let key = match group_by {
-            GroupBy::Category => e.category.clone().unwrap_or_default(),
-            GroupBy::Month => e
-                .occurred_at
-                .with_timezone(&Local)
-                .format("%Y-%m")
-                .to_string(),
-            GroupBy::Currency => e.currency.clone(),
-        };
+        let key = group_key(e, group_by);
         let g = groups
             .entry((e.currency.clone(), key.clone()))
             .or_insert_with(|| GroupRow {
@@ -1012,6 +1060,7 @@ pub fn stats(
         totals,
         groups,
         voided_excluded: voided,
+        usd: None,
     })
 }
 
@@ -1022,6 +1071,59 @@ pub fn stats_text(s: &Stats) -> String {
     if s.totals.is_empty() {
         out.push("записей нет".to_owned());
         return out.join("\n");
+    }
+    if let Some(u) = &s.usd {
+        out.push(format!(
+            "Итого в USD: расход {}, доход {}",
+            u.expense, u.income
+        ));
+        for g in &u.groups {
+            let mut parts = Vec::new();
+            if g.expense_minor > 0 {
+                parts.push(format!("−{}", g.expense));
+            }
+            if g.income_minor > 0 {
+                parts.push(format!("+{}", g.income));
+            }
+            if parts.is_empty() {
+                parts.push("0".to_owned());
+            }
+            out.push(format!("  {}: {} USD", g.key, parts.join(" ")));
+        }
+        if u.unconverted.entries > 0 {
+            let lost: Vec<String> = u
+                .unconverted
+                .totals
+                .iter()
+                .map(|t| {
+                    let mut p = Vec::new();
+                    if t.expense_minor > 0 {
+                        p.push(format!("расход {} {}", t.expense, t.currency));
+                    }
+                    if t.income_minor > 0 {
+                        p.push(format!("доход {} {}", t.income, t.currency));
+                    }
+                    p.join(", ")
+                })
+                .collect();
+            out.push(format!(
+                "не пересчитано (нет курса), записей {}: {}",
+                u.unconverted.entries,
+                lost.join("; ")
+            ));
+        }
+        if u.stale_entries > 0 {
+            out.push(format!(
+                "⚠ по устаревшему курсу (источник не ответил): записей {}, самый старый курс {}",
+                u.stale_entries,
+                u.oldest_rate_date.as_deref().unwrap_or("?")
+            ));
+        }
+        if !u.rate_errors.is_empty() {
+            out.push(format!("курсы недоступны: {}", u.rate_errors.join("; ")));
+        }
+        out.push(String::new());
+        out.push("В исходных валютах:".to_owned());
     }
     for t in &s.totals {
         let mut parts = Vec::new();
@@ -1039,7 +1141,7 @@ pub fn stats_text(s: &Stats) -> String {
         }
         out.push(format!("{}: {}", t.currency, parts.join(", ")));
     }
-    if !s.groups.is_empty() {
+    if s.usd.is_none() && !s.groups.is_empty() {
         out.push(String::new());
         out.push(format!("По {}:", s.group_by));
         for g in &s.groups {
