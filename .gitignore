@@ -6,7 +6,9 @@
 
 # UI
 ui/node_modules/
-ui/dist/
+ui/out/
+ui/.next/
+ui/next-env.d.ts
 *.tsbuildinfo
 CLAUDE.md
 
