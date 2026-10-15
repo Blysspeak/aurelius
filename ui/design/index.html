@@ -126,7 +126,7 @@ body.nogl .glass { background: rgba(14, 16, 19, .94); box-shadow: inset 0 0 0 1p
 #m-legend .types { display: grid; grid-template-columns: repeat(2, max-content); gap: 4px 20px; font-size: 11px; color: var(--bone-3); }
 #m-legend .types span { display: flex; align-items: center; gap: 8px; }
 #m-legend .types canvas { width: 14px; height: 14px; }
-#m-labels { position: absolute; inset: 0; pointer-events: none; transition: opacity var(--d-med); }
+#m-labels { contain: layout style size; position: absolute; inset: 0; pointer-events: none; transition: opacity var(--d-med); }
 .plabel { position: absolute; left: 0; top: 0; pointer-events: auto; display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 4px 9px 5px; border-radius: 8px; background: rgba(7, 10, 18, .62); box-shadow: 0 0 18px 8px rgba(7, 10, 18, .55); transition: opacity var(--d-short), color var(--d-short); white-space: nowrap; }
 .plabel .pn { text-transform: uppercase; letter-spacing: .1em; color: var(--bone); }
 .plabel .pm { font-size: 11px; color: var(--bone-3); display: flex; align-items: center; gap: 5px; }
@@ -365,14 +365,14 @@ table.spec { width: 100%; border-collapse: collapse; margin-top: 6px; }
 .isheet figure { display: grid; grid-template-columns: 24px 16px 12px; align-items: end; gap: 10px; padding: 12px 12px 10px; border-radius: 8px; box-shadow: inset 0 0 0 1px var(--line); }
 .isheet .s24 { width: 24px; height: 24px; } .isheet .s16 { width: 16px; height: 16px; } .isheet .s12 { width: 12px; height: 12px; }
 .isheet figcaption { grid-column: 1 / -1; font-size: 11px; color: var(--bone-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#m-time { position: absolute; left: 50%; transform: translateX(-50%); bottom: 22px; width: min(760px, 62vw); height: 44px; display: flex; align-items: center; gap: 14px; padding: 0 16px; border-radius: 22px; background: rgba(10, 15, 26, .72); box-shadow: inset 0 0 0 1px var(--line-2); }
+#m-time { contain: layout style; position: absolute; left: 50%; transform: translateX(-50%); bottom: 22px; width: min(760px, 62vw); height: 44px; display: flex; align-items: center; gap: 14px; padding: 0 16px; border-radius: 22px; background: rgba(10, 15, 26, .72); box-shadow: inset 0 0 0 1px var(--line-2); }
 #m-time .play { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; color: var(--sec); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sec) 50%, transparent); flex: none; }
 #m-time .play .ic { width: 14px; height: 14px; transform: rotate(90deg); }
 #m-time .play.on .ic { transform: none; }
 #m-time .tr { position: relative; flex: 1; height: 26px; cursor: ew-resize; }
 #m-time .tr::before { content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: var(--line-2); }
-#m-time .fill { position: absolute; left: 0; top: 50%; height: 1px; background: var(--sec); opacity: .7; }
-#m-time .hd { position: absolute; top: 50%; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--ink); box-shadow: inset 0 0 0 1.5px var(--sec), 0 0 10px color-mix(in srgb, var(--sec) 60%, transparent); }
+#m-time .fill { position: absolute; left: 0; width: 100%; top: 50%; height: 1px; background: var(--sec); opacity: .7; transform-origin: 0 50%; }
+#m-time .hd { position: absolute; left: 0; top: 50%; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--ink); box-shadow: inset 0 0 0 1.5px var(--sec), 0 0 10px color-mix(in srgb, var(--sec) 60%, transparent); }
 #m-time .tk { position: absolute; top: 15px; transform: translateX(-50%); font-size: 10px; color: var(--g4); pointer-events: none; }
 #m-time .bd { position: absolute; top: 6px; width: 1px; height: 7px; background: var(--c-work); opacity: .8; }
 #m-time .when { width: 64px; text-align: right; font-size: 12px; color: var(--bone-2); flex: none; }
@@ -381,11 +381,12 @@ table.spec { width: 100%; border-collapse: collapse; margin-top: 6px; }
 #cmd { bottom: 76px; }
 #s-memory #m-stats { bottom: 80px; }
 #m-chain { position: absolute; inset: 0; pointer-events: none; }
-#m-themes { position: absolute; inset: 0; pointer-events: none; }
+#m-themes { contain: layout style size; position: absolute; inset: 0; pointer-events: none; }
 .tlabel { position: absolute; left: 0; top: 0; font-size: 11px; letter-spacing: .06em; white-space: nowrap; opacity: 0; transition: opacity var(--d-short); text-shadow: 0 0 6px #070a12, 0 0 12px #070a12; }
 .tlabel .num { color: var(--bone-3); font-size: 10px; }
 .tlabel.on { opacity: .92; }
-#m-time .ss { position: absolute; top: 9px; width: 1px; height: 8px; background: var(--bone-3); opacity: .35; }
+#m-time .ssc { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+#m-time .ss { position: absolute; left: 0; top: 9px; width: 1px; height: 8px; background: var(--bone-3); opacity: .35; }
 #m-time .ss.on { opacity: 1; background: var(--bone); height: 12px; top: 7px; box-shadow: 0 0 6px var(--bone); }
 .cstep { position: absolute; left: 0; top: 0; width: 140px; display: flex; flex-direction: column; align-items: center; gap: 2px; text-align: center; pointer-events: auto; animation: c-in 600ms var(--spring) both; animation-delay: var(--d); }
 @keyframes c-in { from { opacity: 0; } to { opacity: 1; } }
@@ -517,14 +518,12 @@ table.spec { width: 100%; border-collapse: collapse; margin-top: 6px; }
 
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><path id="sil-path" d=""/></svg>
 
-<script src="snapshot.js"></script>
-<script src="../node_modules/d3-dispatch/dist/d3-dispatch.min.js"></script>
-<script src="../node_modules/d3-quadtree/dist/d3-quadtree.min.js"></script>
-<script src="../node_modules/d3-timer/dist/d3-timer.min.js"></script>
-<script src="../node_modules/d3-force/dist/d3-force.min.js"></script>
+<script>document.write('<script src="' + (/[?&]full\b/.test(location.search) ? 'snapshot-full.js' : 'snapshot.js') + '"><\/script>');</script>
 <script src="icons.js"></script>
 <script src="glass.js"></script>
 <script src="graph.js"></script>
+<script src="layout.js"></script>
+<script src="render.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

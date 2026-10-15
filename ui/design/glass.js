@@ -6,7 +6,7 @@
 // Pass 2 (bounded): one raymarched glass object (the loader mark, then the memory lens), ported
 //   from React Bits FluidGlass: biconvex lens SDF, ior 1.5, dispersion 0.35, fresnel, studio rim.
 //   Every pixel outside the object's bounding sphere returns pass 1 untouched.
-(function () {
+function AU_GLASS(G) {
   const VS = `#version 300 es
 const vec2 c[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
 void main() { gl_Position = vec4(c[gl_VertexID], 0.0, 1.0); }`;
@@ -15,6 +15,7 @@ void main() { gl_Position = vec4(c[gl_VertexID], 0.0, 1.0); }`;
   const FS1 = `#version 300 es
 precision highp float;
 uniform sampler2D uScene;
+uniform float uSceneTopDown; // 1 when the scene came as an ImageBitmap: UNPACK_FLIP_Y_WEBGL is ignored for those
 uniform vec2 uView;
 uniform float uRatio;
 uniform vec4 uRect[${MAX}];   // x, y, w, h in css px, top-left origin
@@ -40,7 +41,7 @@ vec3 graphAt(vec2 uv) {
 }
 vec3 sceneAt(vec2 css) {
   vec2 uv = clamp(vec2(css.x, uView.y - css.y) / uView, vec2(0.0), vec2(1.0));
-  vec3 s = texture(uScene, uv).rgb;
+  vec3 s = texture(uScene, vec2(uv.x, mix(uv.y, 1.0 - uv.y, uSceneTopDown))).rgb;
   if (uGraphOn > 0.5) s += graphAt(uv);
   return s;
 }
@@ -258,7 +259,7 @@ void main() {
     return t;
   }
 
-  window.Glass = {
+  G.Glass = {
     init(canvas) {
       const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, premultipliedAlpha: false, preserveDrawingBuffer: true });
       if (!gl) return null;
@@ -271,7 +272,7 @@ void main() {
       const markTex = tex(gl, gl.LINEAR);
       const fb = gl.createFramebuffer();
       gl.bindVertexArray(gl.createVertexArray());
-      let fw = 0, fh = 0;
+      let fw = 0, fh = 0, sceneTopDown = 0;
       const rect = new Float32Array(MAX * 4), P = new Float32Array(MAX * 4), Q = new Float32Array(MAX * 4), TT = new Float32Array(MAX * 4);
       const api = {
         gl, par,
@@ -299,11 +300,14 @@ void main() {
             gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fbTex, 0);
             fw = W; fh = H;
           }
-          gl.activeTexture(gl.TEXTURE0);
-          gl.bindTexture(gl.TEXTURE_2D, sceneTex);
-          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, f.scene);
-          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+          if (f.scene) { // the 2D scene is uploaded only when it changed (loader, finance, resize), not every frame
+            sceneTopDown = typeof ImageBitmap !== 'undefined' && f.scene instanceof ImageBitmap ? 1 : 0;
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, sceneTex);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, f.scene);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+          }
           // pass 1
           gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
           gl.viewport(0, 0, W, H);
@@ -319,7 +323,7 @@ void main() {
           gl.uniform4fv(p1.u.uRect, rect); gl.uniform4fv(p1.u.uP, P); gl.uniform4fv(p1.u.uQ, Q); gl.uniform4fv(p1.u.uT, TT);
           gl.uniform1i(p1.u.uCount, n);
           gl.uniform2f(p1.u.uView, f.vw, f.vh); gl.uniform1f(p1.u.uRatio, f.ratio);
-          gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex); gl.uniform1i(p1.u.uScene, 0);
+          gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex); gl.uniform1i(p1.u.uScene, 0); gl.uniform1f(p1.u.uSceneTopDown, sceneTopDown);
           gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, f.graphTex || sceneTex); gl.uniform1i(p1.u.uGraph, 2);
           gl.uniform1f(p1.u.uGraphOn, f.graphTex ? 1 : 0); gl.uniform1f(p1.u.uGraphScale, 1 / (f.graphGain || 1));
           gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -352,4 +356,5 @@ void main() {
       return api;
     },
   };
-})();
+}
+if (typeof window !== 'undefined') AU_GLASS(window);

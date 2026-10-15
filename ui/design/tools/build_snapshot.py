@@ -3,6 +3,7 @@ import json, random, collections, sys, datetime
 
 random.seed(7)
 OUT = sys.argv[1]
+FULL = '--full' in sys.argv[2:]          # every node and edge of the graph, not the ~3.5k sample
 d = json.load(open('/tmp/aud/graph.json'))
 nodes = {x['id']: x for x in d['nodes']}
 edges = d['edges']
@@ -153,6 +154,8 @@ for p in top:
     pick |= got
 tl0 = json.load(open('/tmp/aud/tasks.json'))
 pick |= {t['id'] for t in tl0}
+if FULL:
+    pick = list(nodes)
 pick = [k for k in pick if k in nodes]
 idx = {k: i for i, k in enumerate(pick)}
 solved = {e['to_id'] for e in edges if e['relation'] == 'solves'} | {e['from_id'] for e in edges if e['relation'] == 'solves'}
@@ -223,8 +226,44 @@ type_counts = collections.Counter(ntype(x) for x in d['nodes'])
 rel_counts = collections.Counter(e['relation'] for e in edges)
 conf_counts = collections.Counter((x.get('data') or {}).get('confidence') or 'none' for x in d['nodes'])
 
+import hashlib, os, struct
+STATUS = [None, 'backlog', 'active', 'blocked', 'done', 'cancelled']
+def big_days():
+    # the days with the most writing, named by a release or a task of that day (was computed in app.js)
+    by = collections.defaultdict(list)
+    for i, r in enumerate(N): by[int(r[3] // 1)].append(i)
+    top7 = sorted(by.items(), key=lambda kv: -len(kv[1]))[:7]
+    out = []
+    for d, arr in top7:
+        lab = lambda i: N[i][2]
+        rel = next((i for i in arr if re.search(r'релиз|release|v\d+\.\d+', lab(i), re.I)), None)
+        if rel is None: rel = next((i for i in arr if TYPES[N[i][0]] == 'task'), None)
+        if rel is None: rel = next((i for i in arr if TYPES[N[i][0]] == 'decision'), arr[0])
+        t = re.sub(r'^T\d+\s*', '', re.sub(r'^\[[^\]]+\]\s*', '', lab(rel)))
+        out.append({'age': d + 0.5, 'n': len(arr), 'label': t if len(t) <= 34 else t[:33] + '…'})
+    return sorted(out, key=lambda b: -b['age'])
+BIN = None
+if FULL:
+    # compact binary graph: typed arrays only; labels go to a separate text file loaded on demand
+    n, ne = len(N), len(E) // 3
+    def pad(b): return b + b'\0' * (-len(b) % 4)
+    body = b'AUG2' + struct.pack('<III', 1, n, ne)
+    body += pad(bytes(r[0] for r in N) + bytes(r[1] for r in N) + bytes(STATUS.index(r[4]) if r[4] in STATUS else 0 for r in N) + bytes(r[5] for r in N))
+    body += pad(struct.pack('<%dh' % n, *[r[6] for r in N]))
+    body += struct.pack('<%df' % n, *[r[3] for r in N])
+    body += struct.pack('<%dI' % ne, *E[0::3]) + struct.pack('<%dI' % ne, *E[1::3])
+    body += pad(bytes(E[2::3]))
+    txt = '\n'.join(r[2].replace('\n', ' ') for r in N) + '\n'
+    base = os.path.dirname(os.path.abspath(OUT))
+    open(os.path.join(base, 'graph-full.bin'), 'wb').write(body)
+    open(os.path.join(base, 'graph-full.txt'), 'w').write(txt)
+    BIN = {'url': 'graph-full.bin', 'txt': 'graph-full.txt', 'bytes': len(body), 'txtBytes': len(txt.encode()), 'n': n, 'e': ne}
+    GHASH = hashlib.sha1(body).hexdigest()[:16]
+else:
+    GHASH = hashlib.sha1(json.dumps([N, E], ensure_ascii=False).encode()).hexdigest()[:16]
 graph = {
-    'types': TYPES, 'conf': CONF, 'rels': RELS, 'nodes': N, 'edges': E, 'focus': idx[FOCUS],
+    'types': TYPES, 'conf': CONF, 'rels': RELS, 'nodes': [] if FULL else N, 'edges': [] if FULL else E, 'focus': idx[FOCUS],
+    'bin': BIN, 'hash': GHASH, 'status': STATUS, 'bigDays': big_days(),
     'expand': idx[EXP], 'details': details,
     'projects': [pstats(p) for p in top],
     'themes': THEMES, 'coverage': coverage,
