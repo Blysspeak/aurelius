@@ -198,6 +198,7 @@ vec3 render(vec2 w) {
   vec2 facing = normalize(vec2(-0.42, 0.55));
   float rimL = pow(1.0 - cosi, 3.0) * (0.25 + 0.75 * abs(dot(normalize(n.xy + 1e-5), facing))) * 0.6;
   glass = vec3(rimL) + glass * (1.0 - rimL);
+  if (uAA < 0.5) glass += vec3(0.35) * pow(1.0 - cosi, 6.0); // the lens rim stays visible over empty field
   return mix(base, glass, uPresence);
 }
 void main() {

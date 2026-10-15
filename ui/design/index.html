@@ -135,6 +135,7 @@ body.nogl .glass { background: rgba(14, 16, 19, .94); box-shadow: inset 0 0 0 1p
 .plabel .act.hot { background: var(--c-work); box-shadow: 0 0 6px var(--c-work); }
 .plabel.off { opacity: 0; pointer-events: none; }
 .plabel.dim { opacity: .3; }
+.plabel.under { opacity: .12; }
 .plabel.hl .pn { color: #fff; }
 #m-card { position: absolute; left: 0; top: 0; width: 250px; padding: 16px 18px; border-radius: 12px; pointer-events: none; opacity: 0; transition: opacity var(--d-short); background: rgba(10, 15, 26, .9); box-shadow: inset 0 0 0 1px var(--line-2), 0 12px 40px rgba(0,0,0,.45); }
 #m-card.on { opacity: 1; }
@@ -200,7 +201,7 @@ body.nogl .glass { background: rgba(14, 16, 19, .94); box-shadow: inset 0 0 0 1p
 #t-detail { position: absolute; top: 20px; right: 20px; bottom: 82px; width: 430px; padding: 26px 28px; overflow: auto; }
 #t-detail h2 { font-weight: 400; font-size: var(--t20); letter-spacing: -0.4px; line-height: 1.3; margin-top: 12px; text-wrap: balance; }
 .chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px 2px 6px; border-radius: 999px; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--c) 45%, transparent); color: var(--bone); letter-spacing: .08em; }
-.chip::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--c); box-shadow: 0 0 6px var(--c); }
+
 .st-active { --c: var(--c-work); } .st-blocked { --c: var(--c-prob); } .st-done { --c: var(--c-owner); } .st-backlog { --c: var(--c-infra); } .st-cancelled { --c: #4f5b6b; }
 .tline { display: flex; gap: 14px; font-size: var(--t11); color: var(--bone-3); letter-spacing: .08em; text-transform: uppercase; }
 .dates { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 18px; position: relative; padding-top: 14px; }
@@ -346,6 +347,57 @@ table.spec { width: 100%; border-collapse: collapse; margin-top: 6px; }
 .stage.ok .num { color: var(--bone-3); }
 #ld-note { position: absolute; left: 50%; bottom: 26px; transform: translateX(-50%); font-size: var(--t11); color: var(--g4); text-align: center; }
 
+.ic { width: 16px; height: 16px; flex: none; display: inline-block; vertical-align: -3px; }
+.detail .kind .kic { width: 18px; height: 18px; }
+.detail .kind .cfm { margin-left: auto; margin-right: 34px; color: var(--bone-2); }
+.detail .kind .cfm .ic { width: 14px; height: 14px; }
+.lane h3 .lh { display: inline-flex; align-items: center; gap: 8px; }
+.lane h3 .lh .ic { width: 14px; height: 14px; }
+.lane.backlog h3 .ic { color: var(--c-infra); } .lane.active h3 .ic { color: var(--c-work); } .lane.blocked h3 .ic { color: var(--c-prob); } .lane.done h3 .ic { color: var(--c-owner); }
+.chip .ic { width: 12px; height: 12px; color: var(--c); }
+.cat .n { display: flex; align-items: center; gap: 8px; }
+.cat .n .ic { width: 14px; height: 14px; opacity: .9; }
+.kg2 { width: 14px; height: 14px; margin-top: 2px; }
+.kg2.exp { color: var(--exp); } .kg2.inc { color: var(--inc); } .kg2.exc { color: var(--exc); }
+#m-legend .lg .ic { width: 14px; height: 14px; }
+#m-legend .types .ic { width: 14px; height: 14px; }
+.isheet { display: grid; grid-template-columns: repeat(auto-fill, minmax(156px, 1fr)); gap: 6px; }
+.isheet figure { display: grid; grid-template-columns: 24px 16px 12px; align-items: end; gap: 10px; padding: 12px 12px 10px; border-radius: 8px; box-shadow: inset 0 0 0 1px var(--line); }
+.isheet .s24 { width: 24px; height: 24px; } .isheet .s16 { width: 16px; height: 16px; } .isheet .s12 { width: 12px; height: 12px; }
+.isheet figcaption { grid-column: 1 / -1; font-size: 11px; color: var(--bone-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#m-time { position: absolute; left: 50%; transform: translateX(-50%); bottom: 22px; width: min(760px, 62vw); height: 44px; display: flex; align-items: center; gap: 14px; padding: 0 16px; border-radius: 22px; background: rgba(10, 15, 26, .72); box-shadow: inset 0 0 0 1px var(--line-2); }
+#m-time .play { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; color: var(--sec); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sec) 50%, transparent); flex: none; }
+#m-time .play .ic { width: 14px; height: 14px; transform: rotate(90deg); }
+#m-time .play.on .ic { transform: none; }
+#m-time .tr { position: relative; flex: 1; height: 26px; cursor: ew-resize; }
+#m-time .tr::before { content: ''; position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: var(--line-2); }
+#m-time .fill { position: absolute; left: 0; top: 50%; height: 1px; background: var(--sec); opacity: .7; }
+#m-time .hd { position: absolute; top: 50%; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--ink); box-shadow: inset 0 0 0 1.5px var(--sec), 0 0 10px color-mix(in srgb, var(--sec) 60%, transparent); }
+#m-time .tk { position: absolute; top: 15px; transform: translateX(-50%); font-size: 10px; color: var(--g4); pointer-events: none; }
+#m-time .bd { position: absolute; top: 6px; width: 1px; height: 7px; background: var(--c-work); opacity: .8; }
+#m-time .when { width: 64px; text-align: right; font-size: 12px; color: var(--bone-2); flex: none; }
+#m-time .say { position: absolute; left: 50%; bottom: 52px; transform: translateX(-50%); font-size: 12px; color: var(--bone); white-space: nowrap; opacity: 0; transition: opacity var(--d-med); padding: 4px 10px; border-radius: 8px; background: rgba(7, 10, 18, .8); }
+#m-time .say.on { opacity: 1; }
+#cmd { bottom: 76px; }
+#s-memory #m-stats { bottom: 80px; }
+#m-chain { position: absolute; inset: 0; pointer-events: none; }
+.cstep { position: absolute; left: 0; top: 0; width: 140px; display: flex; flex-direction: column; align-items: center; gap: 2px; text-align: center; pointer-events: auto; animation: c-in 600ms var(--spring) both; animation-delay: var(--d); }
+@keyframes c-in { from { opacity: 0; } to { opacity: 1; } }
+.cstep .ic { width: 16px; height: 16px; }
+.cstep img { width: 22px; height: 22px; }
+.cstep .ct { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--bone-3); }
+.cstep .cl { font-size: 11px; line-height: 1.3; color: var(--bone-2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.cstep.me .cl { color: var(--bone); }
+.cstep.up { flex-direction: column-reverse; }
+#m-root { position: absolute; left: 0; top: 0; width: 80px; display: flex; flex-direction: column; align-items: center; gap: 2px; pointer-events: none; transition: opacity var(--d-med); }
+#m-root img { width: 18px; height: 18px; opacity: .8; }
+.chainlist { list-style: none; display: flex; flex-direction: column; gap: 2px; }
+.chainlist button { display: grid; grid-template-columns: 18px 76px 1fr auto; gap: 8px; align-items: center; width: 100%; text-align: left; padding: 4px 6px; border-radius: 6px; color: var(--bone-2); }
+.chainlist button:hover { background: rgba(232, 230, 225, .05); color: var(--bone); }
+.chainlist .me button { background: rgba(232, 230, 225, .07); color: var(--bone); }
+.chainlist .ct { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--bone-3); }
+.chainlist .cl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chainlist .cd { font-size: 11px; color: var(--bone-3); }
 #tip { position: fixed; z-index: 40; pointer-events: none; max-width: 380px; padding: 8px 11px; border-radius: 8px; background: rgba(7, 8, 10, .92); box-shadow: inset 0 0 0 1px var(--line-2); font-size: 12px; color: var(--bone); opacity: 0; transition: opacity var(--d-micro); }
 #tip .t { font-size: var(--t11); color: var(--bone-3); letter-spacing: .08em; text-transform: uppercase; display: block; margin-bottom: 2px; }
 #tip.on { opacity: 1; }
@@ -386,11 +438,14 @@ table.spec { width: 100%; border-collapse: collapse; margin-top: 6px; }
 
 <!-- MEMORY -->
 <section id="s-memory" class="screen" aria-label="Память">
-  <div id="m-lens-hint" class="stg"><span class="kbd">L</span> линза · <span class="kbd">/</span> поиск · клик раскрывает узел · <span class="kbd">Esc</span> назад</div>
+  <div id="m-lens-hint" class="stg"><span class="kbd">пробел</span> память во времени · <span class="kbd">C</span> цепочка · <span class="kbd">/</span> поиск · клик раскрывает узел · <span class="kbd">Esc</span> назад</div>
   <div id="m-stats" class="stg mono"></div>
   <div id="m-labels" class="live"></div>
   <div id="m-legend" class="live stg"></div>
   <div id="m-card"></div>
+  <div id="m-chain" class="live"></div>
+  <div id="m-root"><img class="inv" src="logo-mark.svg" alt=""><span></span></div>
+  <div id="m-time" class="live"></div>
   <div id="m-detail" class="detail glass live" data-glass="slab"></div>
 </section>
 
@@ -460,6 +515,7 @@ table.spec { width: 100%; border-collapse: collapse; margin-top: 6px; }
 <script src="../node_modules/d3-quadtree/dist/d3-quadtree.min.js"></script>
 <script src="../node_modules/d3-timer/dist/d3-timer.min.js"></script>
 <script src="../node_modules/d3-force/dist/d3-force.min.js"></script>
+<script src="icons.js"></script>
 <script src="glass.js"></script>
 <script src="graph.js"></script>
 <script src="app.js"></script>

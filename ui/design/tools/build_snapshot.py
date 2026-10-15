@@ -88,7 +88,7 @@ N = []
 for k in pick:
     x = nodes[k]
     dd = x.get('data') or {}
-    age = (datetime.datetime(2026, 10, 15, tzinfo=datetime.timezone.utc) - datetime.datetime.fromisoformat(x['created_at'][:19] + '+00:00')).days
+    age = round((datetime.datetime(2026, 10, 15, 16, 0, tzinfo=datetime.timezone.utc) - datetime.datetime.fromisoformat(x['created_at'][:19] + '+00:00')).total_seconds() / 86400, 3)
     st = dd.get('status') if ntype(x) == 'task' else None
     N.append([TI.get(ntype(x), TI['doc']), CONF.index(dd.get('confidence')) if dd.get('confidence') in CONF else 0,
               short(x['label'], 80), max(age, 0), st or 0, 1 if ntype(x) == 'problem' and k not in solved else 0])
