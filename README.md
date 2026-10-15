@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/Blysspeak/aurelius/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Blysspeak/aurelius/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   <img src="https://img.shields.io/badge/v3.8.0-stable-a6e3a1?style=flat-square" alt="v3.8.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
