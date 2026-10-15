@@ -1,0 +1,1053 @@
+// aurelius — light and glass. Design prototype, phase 1. Plain JS, no build step.
+// Data: window.AU from snapshot.js (real snapshot of the owner's database, kept out of git).
+(() => {
+  'use strict';
+  const AU = window.AU;
+  if (!AU) {
+    document.body.innerHTML = '<p style="padding:40px;max-width:60ch;color:#e8e6e1;font:15px/1.6 sans-serif">Нет snapshot.js рядом с index.html. Снимок держится вне git: репозиторий публичный, а в нём личные финансы и метки памяти. Собрать: <code>ui/design/tools/make-snapshot.sh</code>.</p>';
+    return;
+  }
+  const $ = (s, r = document) => r.querySelector(s);
+  const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+  const params = new URLSearchParams(location.search);
+  const REDUCE = matchMedia('(prefers-reduced-motion: reduce)').matches || params.has('reduce');
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const sstep = (a, b, v) => { const t = clamp((v - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+  const outExpo = (t) => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t));
+  const inOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+  const quintic = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+  const hash = (i) => { const x = Math.sin(i * 127.1 + 311.7) * 43758.5453; return x - Math.floor(x); };
+  const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const nf0 = new Intl.NumberFormat('ru-RU');
+  const nf2 = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const usd = (minor) => nf2.format(minor / 100);
+  const dmy = (iso) => { if (!iso) return '—'; const d = new Date(iso); return d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' }) + ' ' + d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }); };
+  const stripProj = (s) => String(s || '').replace(/^\[[^\]]+\]\s*/, '');
+
+  // ------------------------------------------------------------------ canvases
+  const glCanvas = $('#gl');
+  let glass = REDUCE && params.has('nogl') ? null : window.Glass.init(glCanvas);
+  if (params.has('nogl')) glass = null;
+  const scene = glass ? document.createElement('canvas') : $('#fallback');
+  if (!glass) document.body.classList.add('nogl');
+  const ctx = scene.getContext('2d');
+  let VW = 0, VH = 0, DPR = 1;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    VW = innerWidth; VH = innerHeight;
+    for (const c of [scene, glCanvas]) { c.width = Math.round(VW * DPR); c.height = Math.round(VH * DPR); }
+    fitCamera(true);
+  }
+
+  // ------------------------------------------------------------------ the mark (from ui/design/logo-mark.svg)
+  const MK = {
+    c: [512, 511.5], R: 362,
+    nodes: [[591.1, 319.1], [528.2, 393.1], [658.2, 393.1], [513.8, 497.6], [626.8, 497.7], [695.1, 497.5]],
+    edges: [[0, 1], [0, 2], [1, 3], [1, 4], [2, 3], [2, 4], [2, 5]],
+    sil: 'M4995 7648 c-206 -18 -570 -114 -655 -173 -20 -14 -44 -25 -53 -25 -10 0 -41 -12 -69 -26 -73 -37 -129 -36 -209 3 -88 43 -112 48 -133 27 -10 -10 -14 -23 -10 -33 55 -127 18 -215 -107 -256 -200 -66 -320 -180 -365 -349 -33 -122 5 -294 83 -377 58 -62 55 -82 -44 -377 -83 -246 -88 -284 -45 -368 49 -99 47 -106 -163 -563 -181 -396 -179 -388 -120 -440 35 -30 37 -31 129 -28 103 2 126 -7 169 -65 27 -36 26 -118 -2 -181 -26 -60 -27 -50 10 -92 42 -47 51 -93 33 -162 -19 -73 -22 -65 51 -136 86 -83 90 -124 24 -244 -40 -72 -40 -72 -25 -135 35 -151 77 -194 227 -233 141 -37 303 -1 709 160 185 74 201 78 253 76 38 -1 96 -57 106 -101 15 -71 0 -98 -113 -207 l-106 -101 0 -299 c0 -164 4 -304 9 -311 15 -25 86 -34 321 -39 570 -13 1071 125 1559 428 161 100 153 87 130 210 -116 623 -148 811 -142 841 3 18 36 87 73 153 189 339 234 423 310 567 90 175 110 196 203 227 152 51 218 202 151 351 -34 76 -36 126 -10 300 50 344 -44 740 -251 1055 -439 665 -1125 994 -1928 923z',
+  };
+  // one continuous stroke of light: outer ring, inner ring, profile, network
+  const strokes = [];
+  (function buildStrokes() {
+    const ring = (r) => { const p = []; for (let i = 0; i <= 220; i++) { const a = -Math.PI / 2 + (i / 220) * Math.PI * 2; p.push([MK.c[0] + Math.cos(a) * r, MK.c[1] + Math.sin(a) * r]); } return p; };
+    strokes.push(ring(338), ring(308));
+    const path = $('#sil-path'); path.setAttribute('d', MK.sil);
+    const L = path.getTotalLength(); const sil = [];
+    for (let s = 0; s <= L; s += 18) { const q = path.getPointAtLength(s); sil.push([q.x * 0.1, 1024 - q.y * 0.1]); }
+    sil.push(sil[0]);
+    strokes.push(sil);
+    for (const [a, b] of MK.edges) strokes.push([MK.nodes[a], MK.nodes[b]].map((p) => p.slice()));
+    for (const n of MK.nodes) { const p = []; for (let i = 0; i <= 24; i++) { const a = (i / 24) * Math.PI * 2; p.push([n[0] + Math.cos(a) * 16, n[1] + Math.sin(a) * 16]); } strokes.push(p); }
+    let acc = 0;
+    for (const s of strokes) { s.len = [acc]; for (let i = 1; i < s.length; i++) { acc += Math.hypot(s[i][0] - s[i - 1][0], s[i][1] - s[i - 1][1]); s.len.push(acc); } s.end = acc; }
+    strokes.total = acc;
+  })();
+  function markPoint(u) { // point at fraction u of the whole stroke, mark coords
+    const L = u * strokes.total;
+    for (const s of strokes) { if (L <= s.end) { let i = 1; while (i < s.length - 1 && s.len[i] < L) i++; const t = clamp((L - s.len[i - 1]) / Math.max(s.len[i] - s.len[i - 1], 1e-6), 0, 1); return [lerp(s[i - 1][0], s[i][0], t), lerp(s[i - 1][1], s[i][1], t)]; } }
+    const s = strokes[strokes.length - 1]; return s[s.length - 1];
+  }
+  const markXf = () => { const r = Math.min(VW, VH) * 0.2; return { cx: VW / 2, cy: VH / 2 - 20, s: r / 338 }; };
+
+  // signed distance field of the extruded mark for the glass raymarch
+  if (glass) (function markSDF() {
+    const N = 320, cv = document.createElement('canvas'); cv.width = cv.height = N;
+    const c = cv.getContext('2d'); const k = N / (2 * MK.R);
+    c.setTransform(k, 0, 0, k, N / 2 - MK.c[0] * k, N / 2 - MK.c[1] * k);
+    c.strokeStyle = '#fff'; c.fillStyle = '#fff'; c.lineCap = 'round'; c.lineJoin = 'round';
+    for (const [r, w] of [[338, 15], [308, 8]]) { c.lineWidth = w; c.beginPath(); c.arc(MK.c[0], MK.c[1], r, 0, Math.PI * 2); c.stroke(); }
+    c.save(); c.translate(0, 1024); c.scale(0.1, -0.1); c.lineWidth = 130; c.stroke(new Path2D(MK.sil)); c.restore();
+    c.lineWidth = 10; for (const [a, b] of MK.edges) { c.beginPath(); c.moveTo(...MK.nodes[a]); c.lineTo(...MK.nodes[b]); c.stroke(); }
+    for (const n of MK.nodes) { c.beginPath(); c.arc(n[0], n[1], 21, 0, Math.PI * 2); c.fill(); }
+    const px = c.getImageData(0, 0, N, N).data;
+    const INF = 1e20, fin = new Float64Array(N * N), fout = new Float64Array(N * N);
+    for (let i = 0; i < N * N; i++) { const inside = px[i * 4 + 3] > 127; fin[i] = inside ? INF : 0; fout[i] = inside ? 0 : INF; }
+    const edt = (g) => { // Felzenszwalb squared EDT, rows then columns
+      const f = new Float64Array(N), d = new Float64Array(N), v = new Int32Array(N), z = new Float64Array(N + 1);
+      const pass = (get, set) => { for (let q = 0; q < N; q++) f[q] = get(q); let k2 = 0; v[0] = 0; z[0] = -INF; z[1] = INF; for (let q = 1; q < N; q++) { let s; do { const r = v[k2]; s = (f[q] + q * q - (f[r] + r * r)) / (2 * q - 2 * r); if (s <= z[k2]) k2--; else break; } while (k2 >= 0); k2++; v[k2] = q; z[k2] = s; z[k2 + 1] = INF; } k2 = 0; for (let q = 0; q < N; q++) { while (z[k2 + 1] < q) k2++; const r = v[k2]; d[q] = (q - r) * (q - r) + f[r]; } for (let q = 0; q < N; q++) set(q, d[q]); };
+      for (let y = 0; y < N; y++) pass((x) => g[y * N + x], (x, val) => { g[y * N + x] = val; });
+      for (let x = 0; x < N; x++) pass((y) => g[y * N + x], (y, val) => { g[y * N + x] = val; });
+    };
+    edt(fin); edt(fout);
+    const out = new Float32Array(N * N);
+    for (let i = 0; i < N * N; i++) out[i] = (fout[i] > 0 ? Math.sqrt(fout[i]) - 0.5 : -(Math.sqrt(fin[i]) - 0.5)) * (2 / N);
+    glass.setMark(out, N);
+  })();
+
+  // ------------------------------------------------------------------ graph model
+  const GA = AU.graph;
+  const T = GA.types;
+  const NN = GA.nodes.length;
+  const nodes = GA.nodes.map((n, i) => ({ i, t: T[n[0]], c: n[1], label: n[2], age: n[3], st: n[4] || null, x: 0, y: 0, sx: VW / 2, sy: VH / 2, a: 0, bx: 0, by: 0, ba: 0, deg: 0, z: clamp(n[3] / 420, 0, 1) }));
+  const links = [];
+  const adj = nodes.map(() => []);
+  for (let k = 0; k < GA.edges.length; k += 3) {
+    const a = GA.edges[k], b = GA.edges[k + 1], r = GA.rels[GA.edges[k + 2]];
+    links.push({ source: a, target: b, rel: r });
+    adj[a].push([b, r, 'out']); adj[b].push([a, r, 'in']);
+    nodes[a].deg++; nodes[b].deg++;
+  }
+  const projHub = new Map(GA.projects.map(([i, label, n]) => [i, { label, n }]));
+  const typeOn = new Set(T);
+
+  // sprites: type = glyph shape, confidence = light quality, never hue
+  const BASE_R = { project: 5.2, task: 3.3, decision: 2.8, problem: 2.9, solution: 2.6, concept: 2.6, session: 3.1, user_fact: 3, work_log: 1.7 };
+  const glyphKind = (t) => ({ decision: 'diamond', problem: 'triangle', concept: 'circle', task: 'square', solution: 'plus', work_log: 'dot', session: 'ring', user_fact: 'star', project: 'double' }[t] || 'bar');
+  function drawGlyph(c, kind, x, y, r, alpha, hollow) {
+    c.fillStyle = c.strokeStyle = `rgba(232,230,225,${alpha})`;
+    c.lineWidth = Math.max(1, r * 0.42);
+    c.beginPath();
+    switch (kind) {
+      case 'diamond': c.moveTo(x, y - r * 1.25); c.lineTo(x + r, y); c.lineTo(x, y + r * 1.25); c.lineTo(x - r, y); c.closePath(); break;
+      case 'triangle': c.moveTo(x, y - r * 1.15); c.lineTo(x + r * 1.1, y + r * 0.8); c.lineTo(x - r * 1.1, y + r * 0.8); c.closePath(); break;
+      case 'square': c.rect(x - r * 0.9, y - r * 0.9, r * 1.8, r * 1.8); break;
+      case 'plus': c.rect(x - r * 1.1, y - r * 0.28, r * 2.2, r * 0.56); c.rect(x - r * 0.28, y - r * 1.1, r * 0.56, r * 2.2); break;
+      case 'dot': c.arc(x, y, r * 0.75, 0, 7); break;
+      case 'ring': c.arc(x, y, r * 0.95, 0, 7); c.stroke(); c.beginPath(); c.arc(x, y, r * 0.3, 0, 7); break;
+      case 'star': for (let i = 0; i < 8; i++) { const a = (i / 8) * Math.PI * 2 - Math.PI / 2, rr = i % 2 ? r * 0.42 : r * 1.2; c.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr); } c.closePath(); break;
+      case 'double': c.arc(x, y, r, 0, 7); c.stroke(); c.beginPath(); c.arc(x, y, r * 0.55, 0, 7); c.stroke(); c.beginPath(); c.arc(x, y, r * 0.2, 0, 7); break;
+      case 'bar': c.rect(x - r * 1.1, y - r * 0.3, r * 2.2, r * 0.6); break;
+      default: c.arc(x, y, r, 0, 7);
+    }
+    if (hollow) c.stroke(); else c.fill();
+  }
+  const CONF_LOOK = [ // [glyph alpha, halo radius x, halo alpha, hollow]
+    [0.36, 0, 0, false],   // none
+    [1.0, 2.6, 0.42, false], // measured: sharp bright point
+    [0.62, 5.0, 0.20, false], // inferred: soft halo
+    [0.42, 0, 0, false],   // reported: dim point
+    [0.5, 0, 0, true],     // unverified / stale: hollow ash ring
+  ];
+  const spriteCache = new Map();
+  function sprite(t, conf) {
+    const key = t + conf;
+    if (spriteCache.has(key)) return spriteCache.get(key);
+    const r = (BASE_R[t] || 2.3) * 2 * 2; // drawn at 4x for crisp scaling
+    const [ga, hr, ha, hol] = CONF_LOOK[conf] || CONF_LOOK[0];
+    const S = Math.ceil(r * (hr ? hr * 2.2 : 3.2));
+    const cv = document.createElement('canvas'); cv.width = cv.height = S;
+    const c = cv.getContext('2d');
+    if (hr) { const g = c.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, r * hr); g.addColorStop(0, `rgba(232,230,225,${ha})`); g.addColorStop(1, 'rgba(232,230,225,0)'); c.fillStyle = g; c.fillRect(0, 0, S, S); }
+    const kind = glyphKind(t);
+    drawGlyph(c, hol ? 'ring' : kind, S / 2, S / 2, r, hol ? 0.55 : ga, hol || kind === 'ring' || kind === 'double');
+    const o = { cv, S, r };
+    spriteCache.set(key, o);
+    return o;
+  }
+  function glyphCanvas(t, conf, css = 14) {
+    const cv = document.createElement('canvas'); cv.width = cv.height = css * 2;
+    const c = cv.getContext('2d');
+    const kind = glyphKind(t), r = css * 0.28;
+    drawGlyph(c, conf === 4 ? 'ring' : kind, css, css, r * 2, CONF_LOOK[conf][0], conf === 4 || kind === 'ring' || kind === 'double');
+    return cv;
+  }
+
+  // ------------------------------------------------------------------ layout (d3-force, real ticks drive the loader)
+  let sim, tick = 0;
+  const TICKS = 300;
+  function newSim() {
+    nodes.forEach((n, i) => { const a = i * 2.39996, r = 6 * Math.sqrt(i); n.x = Math.cos(a) * r; n.y = Math.sin(a) * r; n.vx = n.vy = 0; });
+    tick = 0;
+    sim = d3.forceSimulation(nodes)
+      .force('charge', d3.forceManyBody().strength(-16).theta(0.95).distanceMax(320))
+      .force('link', d3.forceLink(links).distance((l) => (l.rel === 'belongs_to' ? 30 : 12)).strength((l) => (l.rel === 'belongs_to' ? 0.22 : 0.7)))
+      .force('x', d3.forceX(0).strength(0.035)).force('y', d3.forceY(0).strength(0.035))
+      .stop();
+  }
+  function stepSim(n) { for (let k = 0; k < n && tick < TICKS; k++) { sim.tick(); tick++; } }
+
+  // camera
+  const cam = { x: 0, y: 0, k: 1, ox: 0, oy: 0 };
+  let camFly = null;
+  function bounds() {
+    const xs = nodes.map((n) => n.x).sort((a, b) => a - b), ys = nodes.map((n) => n.y).sort((a, b) => a - b);
+    const q = (arr, p) => arr[Math.floor(p * (arr.length - 1))];
+    return { x0: q(xs, 0.015), x1: q(xs, 0.985), y0: q(ys, 0.015), y1: q(ys, 0.985) };
+  }
+  function fitTarget() {
+    const b = bounds(); const railW = 132;
+    const detailW = state.sel != null && state.screen === 'memory' ? 440 : 0;
+    const aw = VW - railW - detailW - 80, ah = VH - 150;
+    const k = Math.min(aw / Math.max(b.x1 - b.x0, 1e-3), ah / Math.max(b.y1 - b.y0, 1e-3)) * 0.95;
+    return { x: (b.x0 + b.x1) / 2, y: (b.y0 + b.y1) / 2, k: isFinite(k) && k > 0 ? Math.min(k, 40) : 1 };
+  }
+  function fitCamera(instant) { if (!nodes.length) return; const t = fitTarget(); if (instant) Object.assign(cam, t); else fly(t); }
+  function fly(t, dur = 640) { camFly = { from: { x: cam.x, y: cam.y, k: cam.k }, to: t, t0: performance.now(), dur: REDUCE ? 1 : dur }; }
+  function originX() { const railW = 132; const detailW = state.sel != null && state.screen === 'memory' ? 440 : 0; return railW + (VW - railW - detailW) / 2; }
+  function project(n) {
+    const f = 1 - 0.2 * n.z; // age = depth: older nodes recede toward the vanishing point
+    return [cam.ox + (n.x - cam.x) * cam.k * f, cam.oy + (n.y - cam.y) * cam.k * f];
+  }
+
+  // ------------------------------------------------------------------ state
+  const state = { screen: 'memory', prev: null, morph0: 0, sel: null, hover: null, selT: 0, lens: false, loader: null, filterType: null, fin: { a: 0, b: AU.fin.months.length - 1, kind: -1, cat: -1, q: '', voided: false }, task: 'b7a7d9af' };
+
+  // ------------------------------------------------------------------ finance model
+  const F = AU.fin;
+  const months = F.months.map((m) => m.key);
+  const ENT = F.entries.map((e) => ({ id: e[0], date: e[1], m: months.indexOf(e[1].slice(0, 7)), kind: e[2], amount: e[3], cur: e[4], camt: e[5], ccur: e[6], cat: e[7], note: e[8], usd: e[9], src: e[10], units: e[11], void: e[12], reason: e[13], sx: 0, sy: 0, a: 0, fx: 0, fy: 0, fa: 0, h: 2, fh: 2, tx: 0, ty: 0, th: 2, ta: 0 }));
+  // stacked segments: within a month, income stacks up from the axis and expense down, oldest first
+  (function stack() {
+    const acc = months.map(() => [0, 0]);
+    const order = ENT.slice().sort((a, b) => (a.date < b.date ? -1 : 1));
+    for (const e of order) { if (e.void || e.kind === 2 || e.m < 0) { e.base = 0; continue; } e.base = acc[e.m][e.kind]; acc[e.m][e.kind] += e.usd; }
+    F.maxMonth = Math.max(...acc.map((x) => Math.max(x[0], x[1])));
+  })();
+  function finTotals() {
+    const { a, b } = state.fin; let exp = 0, inc = 0, n = 0;
+    for (const e of ENT) if (!e.void && e.m >= a && e.m <= b && e.kind < 2) { if (e.kind === 0) exp += e.usd; else inc += e.usd; n++; }
+    return { exp, inc, n };
+  }
+
+  // ------------------------------------------------------------------ DOM: memory
+  function buildLegend() {
+    const L = $('#m-legend');
+    const counts = Object.fromEntries(GA.full.types);
+    const order = ['decision', 'problem', 'solution', 'concept', 'task', 'session', 'work_log', 'user_fact', 'project', 'doc', 'skill', 'file'];
+    L.innerHTML = '<span class="cap h">тип — форма</span>';
+    for (const t of order) {
+      const b = document.createElement('button');
+      b.dataset.t = t;
+      b.append(glyphCanvas(t, 1));
+      const cnt = t === 'doc' ? (counts.doc || 0) + (counts['{"custom": "document"}'] || 0) : counts[t] || 0;
+      b.insertAdjacentHTML('beforeend', `<span>${t.replace('_', ' ')} <span class="mono">${nf0.format(cnt)}</span></span>`);
+      b.title = 'Показать только этот тип';
+      b.onclick = () => { state.filterType = state.filterType === t ? null : t; $$('#m-legend button').forEach((x) => x.classList.toggle('off', state.filterType && x.dataset.t !== state.filterType)); };
+      L.append(b);
+    }
+    L.insertAdjacentHTML('beforeend', '<span class="cap h">уверенность — свет</span><div id="m-conf"></div>');
+    const C = $('#m-conf');
+    const cc = Object.fromEntries(GA.full.conf);
+    for (const [ci, name, key] of [[1, 'measured', 'measured'], [2, 'inferred', 'inferred'], [3, 'reported', 'reported'], [4, 'stale / unverified', 'unverified']]) {
+      const s = document.createElement('span');
+      const cv = document.createElement('canvas'); cv.width = cv.height = 28; cv.style.width = cv.style.height = '14px';
+      const sp = sprite('concept', ci); cv.getContext('2d').drawImage(sp.cv, 0, 0, 28, 28);
+      s.append(cv); s.insertAdjacentHTML('beforeend', `${name} <span class="mono">${nf0.format(cc[key] || 0)}</span>`);
+      C.append(s);
+    }
+  }
+  function statsLine() {
+    $('#m-stats').innerHTML = `<b>${nf0.format(GA.full.nodes)}</b> узлов · <b>${nf0.format(GA.full.edges)}</b> связей<br>в прототипе ${nf0.format(NN)} узлов, ${nf0.format(links.length)} связей<br>${GA.projects.length} проектов-ядер · свет = уверенность, глубина = возраст` + (params.has('fps') ? '<br><span id="fps"></span>' : '');
+  }
+  function showNode(i) {
+    const D = $('#m-detail');
+    if (i == null) { D.classList.remove('on'); return; }
+    const n = nodes[i], d = GA.details[i];
+    const sp = glyphCanvas(n.t, n.c, 16);
+    const confName = GA.conf[n.c] || 'без оценки';
+    const nb = adj[i].slice().sort((a, b) => nodes[b[0]].deg - nodes[a[0]].deg);
+    const groups = {};
+    for (const [j, r, dir] of (d ? d.links.map(([r, j, dir]) => [j, r, dir]) : nb)) (groups[r] ||= []).push([j, dir]);
+    let links = '';
+    for (const [r, arr] of Object.entries(groups)) for (const [j, dir] of arr.slice(0, 8)) links += `<button data-n="${j}"><span class="r">${dir === 'in' ? '← ' : '→ '}${esc(r)}</span><span class="l">${esc(stripProj(nodes[j].label))}</span></button>`;
+    D.innerHTML = `<button class="close" data-close>Esc</button>
+      <div class="kind cap"></div>
+      <h2>${esc(stripProj(d ? d.label : n.label))}</h2>
+      ${d && d.claim ? `<p class="claim">${esc(d.claim)}</p>` : ''}
+      ${d && d.note ? `<p class="${d.claim ? 'note' : 'claim'}">${esc(d.note)}</p>` : ''}
+      <div class="sec"><span class="cap">происхождение</span><dl class="prov">
+        <dt>уверенность</dt><dd>${esc(confName)}</dd>
+        ${d && d.subject ? `<dt>тема</dt><dd class="mono">${esc(d.subject)}</dd>` : ''}
+        ${d && d.volatility ? `<dt>изменчивость</dt><dd>${esc(d.volatility)}</dd>` : ''}
+        <dt>создан</dt><dd class="mono">${d ? dmy(d.created_at) : n.age + ' дн. назад'}</dd>
+        ${d && d.measured_at ? `<dt>замерен</dt><dd class="mono">${dmy(d.measured_at)}</dd>` : ''}
+        ${d && d.source ? `<dt>источник</dt><dd class="mono">${esc(d.source)}</dd>` : ''}
+      </dl></div>
+      ${d && d.evidence ? `<div class="sec"><span class="cap">улики</span><div class="evidence">${esc(d.evidence)}</div></div>` : ''}
+      ${!d ? '<div class="sec"><p class="note">Заметка, claim и улики этого узла в снимок не попали; в фазе 2 их отдаёт /api/node/:id.</p></div>' : ''}
+      <div class="sec"><span class="cap">связи · ${nf0.format(adj[i].length)}</span><div class="links">${links || '<p class="note">нет связей в выборке</p>'}</div></div>`;
+    D.querySelector('.kind').append(sp, document.createTextNode(n.t.replace('_', ' ')));
+    D.classList.add('on');
+    D.scrollTop = 0;
+  }
+  $('#m-detail').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-n]'); if (b) select(+b.dataset.n, true);
+    if (e.target.closest('[data-close]')) select(null);
+  });
+  function select(i, flyTo) {
+    state.sel = i; state.selT = performance.now();
+    showNode(i);
+    if (i != null && flyTo !== false) {
+      const n = nodes[i];
+      fly({ x: n.x, y: n.y, k: Math.max(cam.k, fitTarget().k * 2.2) }, 720);
+    } else if (i == null) fitCamera(false);
+  }
+
+  // ------------------------------------------------------------------ DOM: tasks
+  const TK = AU.tasks;
+  const prByBranch = Object.fromEntries((TK.prs || []).map((p) => [p.headRefName, p]));
+  function taskRows() {
+    const list = TK.list.slice();
+    const have = new Set(list.map((t) => t.id));
+    for (const d of Object.values(TK.detail)) if (!have.has(d.id)) list.push({ id: d.id, label: d.label, status: d.data.status, priority: d.data.priority, branch: d.data.git && d.data.git.branch, worktree: d.data.git && d.data.git.worktree, criteria_total: (d.data.acceptance_criteria || []).length, criteria_met: 0, branch_state: null });
+    return list;
+  }
+  const LANES = [['backlog', 'бэклог'], ['active', 'в работе'], ['blocked', 'блок'], ['done', 'готово']];
+  const PRIO = { critical: 4, high: 3, medium: 2, low: 1 };
+  function buildLanes() {
+    const rows = taskRows();
+    const el = $('#lanes'); el.innerHTML = '';
+    LANES.forEach(([st, name], li) => {
+      const items = rows.filter((t) => (st === 'done' ? t.status === 'done' || t.status === 'cancelled' : t.status === st)).sort((a, b) => (PRIO[b.priority] || 0) - (PRIO[a.priority] || 0));
+      const lane = document.createElement('div');
+      lane.className = 'lane stg ' + st; lane.style.setProperty('--i', li);
+      lane.innerHTML = `<h3><span class="cap">${name}</span><span class="n">${items.length}</span></h3>` + (items.length ? '' : '<div class="empty">пусто — ничего не заблокировано</div>');
+      for (const t of items) {
+        const g = TK.gidx[t.id];
+        const p = PRIO[t.priority] || 0;
+        const b = document.createElement('button');
+        b.className = 'trow'; b.dataset.id = t.id;
+        b.innerHTML = `<span class="pt" ${g != null ? `data-g="${g}"` : ''}></span><span class="tt">${esc(stripProj(t.label))}</span>
+          <span class="tm"><span class="prio" title="${t.priority}">${[1, 2, 3, 4].map((k) => `<i class="${k <= p ? 'on' : ''}" style="height:${2 + k * 2}px"></i>`).join('')}</span>${t.criteria_total ? `<span>${t.criteria_met}/${t.criteria_total}</span>` : ''}${t.branch ? `<span>${esc(t.branch)}</span>` : ''}</span>`;
+        if (g == null) b.querySelector('.pt').append(glyphCanvas('task', st === 'active' ? 1 : 3, 10));
+        lane.append(b);
+      }
+      el.append(lane);
+    });
+    el.onclick = (e) => { const b = e.target.closest('.trow'); if (b) { state.task = b.dataset.id; showTask(); } };
+  }
+  function gitRail(t, d) {
+    const branch = (d && d.data.git && d.data.git.branch) || t.branch;
+    const pr = branch ? prByBranch[branch] : null;
+    const res = d && d.data.resolution;
+    const text = d ? [...d.logs.map((l) => l.text), (res && res.commit) || ''].join(' ') : '';
+    const commits = [...new Set((text.match(/\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,10}\b/g) || []))].slice(0, 7);
+    if (res && res.commit && !commits.includes(res.commit)) commits.push(res.commit);
+    const onMain = branch === 'main';
+    const n = Math.max(commits.length, 1);
+    const ticks = commits.map((c, k) => { const y = 120 - ((k + 1) / (n + 1)) * 86; return `<line x1="${onMain ? 8 : 44}" x2="${onMain ? 20 : 56}" y1="${y}" y2="${y}" stroke="#e8e6e1" stroke-width="1.5"/>`; }).join('');
+    let br = '';
+    if (!onMain && branch) {
+      br = `<path d="M14 144 C14 128 50 132 50 118 L50 40" fill="none" stroke="#e8e6e1" stroke-opacity=".8" stroke-width="1.5"/>`;
+      if (pr && pr.state === 'MERGED') br += `<path d="M50 40 C50 26 14 30 14 14" fill="none" stroke="#e8e6e1" stroke-width="1.5"/><circle cx="14" cy="14" r="4" fill="#e8e6e1"/>`;
+      else if (pr && pr.state === 'OPEN') br += `<path d="M50 40 C50 30 34 28 26 22" fill="none" stroke="#e8e6e1" stroke-width="1.5" stroke-dasharray="3 3"/><circle cx="26" cy="22" r="2.5" fill="none" stroke="#e8e6e1"/>`;
+      else br += `<line x1="50" x2="50" y1="40" y2="24" stroke="#e8e6e1" stroke-opacity=".5" stroke-dasharray="2 4"/>`;
+    }
+    const svg = `<svg viewBox="0 0 74 150" aria-hidden="true"><line x1="14" x2="14" y1="0" y2="150" stroke="#e8e6e1" stroke-opacity=".35" stroke-width="1.5"/>${br}${ticks}<text x="0" y="160" fill="#80858c" font-size="9" font-family="Geist Mono, monospace">main</text></svg>`;
+    const prTxt = pr ? `#${pr.number} ${pr.state === 'OPEN' ? 'открыт' : pr.state === 'MERGED' ? 'влит' : 'закрыт'}` : res && res.pull_request ? res.pull_request.replace(/.*\/pull\//, '#') : '—';
+    return `<div class="git">${svg}<dl>
+      <dt>ветка</dt><dd>${esc(branch || 'не привязана')}</dd>
+      <dt>состояние</dt><dd>${esc(t.branch_state || (onMain ? 'работа прямо в main' : pr ? (pr.state === 'MERGED' ? 'влита в main' : 'PR открыт, ждёт ревью') : branch ? 'ветка без PR' : '—'))}</dd>
+      ${(d && d.data.git && d.data.git.worktree) || t.worktree ? `<dt>дерево</dt><dd>${esc(((d && d.data.git.worktree) || t.worktree).replace('/home/blyss/workSpace/project/', '~/…/'))}</dd>` : ''}
+      <dt>PR</dt><dd>${esc(prTxt)}</dd>
+      <dt>коммиты</dt><dd>${commits.length ? commits.map(esc).join(' ') : '—'}</dd>
+    </dl></div>`;
+  }
+  function showTask() {
+    $$('.trow').forEach((r) => r.classList.toggle('sel', r.dataset.id.startsWith(state.task)));
+    const t = taskRows().find((x) => x.id.startsWith(state.task));
+    if (!t) return;
+    const d = Object.values(TK.detail).find((x) => x.id === t.id);
+    const crit = (d && d.data.acceptance_criteria) || [];
+    const met = t.criteria_met || 0;
+    const st = { backlog: 'бэклог', active: 'в работе', blocked: 'блок', done: 'готово', cancelled: 'отменена' }[t.status] || t.status;
+    $('#t-detail').innerHTML = `<div class="tline"><span>${st}</span><span>${esc(t.priority)}</span><span class="mono" style="letter-spacing:0">${t.id.slice(0, 8)}</span></div>
+      <h2>${esc(stripProj(t.label))}</h2>
+      ${d ? `<div class="dates"><div class="y"><span class="cap">заведена</span><span class="num">${dmy(d.created_at)}</span></div><div class="${d.data.activated_at ? 'y' : ''}"><span class="cap">взята</span><span class="num">${dmy(d.data.activated_at || d.data.started_at)}</span></div><div class="${d.data.closed_at ? 'y' : ''}"><span class="cap">закрыта</span><span class="num">${dmy(d.data.closed_at)}</span></div></div>` : ''}
+      ${d && d.note ? `<div class="sec"><p class="note" style="color:var(--bone-2);line-height:1.6;margin-top:18px">${esc(d.note.slice(0, 420))}${d.note.length > 420 ? '…' : ''}</p></div>` : ''}
+      <div class="sec" style="margin-top:22px"><span class="cap" style="display:block;margin-bottom:8px">git</span>${gitRail(t, d)}</div>
+      ${crit.length ? `<div class="sec" style="margin-top:22px"><span class="cap" style="display:block;margin-bottom:6px">критерии · ${met}/${crit.length}</span><ul class="crit">${crit.map((c, k) => `<li class="${k < met ? 'met' : ''}">${esc(c)}</li>`).join('')}</ul></div>` : `<div class="sec" style="margin-top:22px"><p class="note" style="color:var(--bone-3)">Критериев ${t.criteria_total || 0}; полная карточка в фазе 2 из /api/tasks/:id.</p></div>`}
+      ${d && d.subtasks.length ? `<div class="sec" style="margin-top:22px"><span class="cap" style="display:block;margin-bottom:6px">подзадачи</span><ul class="log">${d.subtasks.map((s) => `<li><span class="num">${esc(s.status || '')}</span><span>${esc(stripProj(s.label))}</span></li>`).join('')}</ul></div>` : ''}
+      ${d && d.logs.length ? `<div class="sec" style="margin-top:22px"><span class="cap" style="display:block;margin-bottom:6px">журнал · ${d.logs.length}</span><ul class="log">${d.logs.slice(-6).reverse().map((l) => `<li><span class="num">${dmy(l.t).slice(0, 5)} ${dmy(l.t).slice(-5)}</span><span>${esc(l.text)}</span></li>`).join('')}</ul></div>` : ''}
+      ${d && d.decisions.length ? `<div class="sec" style="margin-top:22px"><span class="cap" style="display:block;margin-bottom:6px">решения · ${d.decisions.length}</span><ul class="log">${d.decisions.slice(0, 5).map((l) => `<li><span class="num">◇</span><span>${esc(l.text)}</span></li>`).join('')}</ul></div>` : ''}`;
+    $('#t-detail').scrollTop = 0;
+  }
+
+  // ------------------------------------------------------------------ DOM: finance
+  const KIND = ['расход', 'доход', 'обмен'];
+  function buildFinance() {
+    const m = $('#f-scrub .months');
+    m.style.gridTemplateColumns = `repeat(${months.length}, 1fr)`;
+    const MN = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек'];
+    m.innerHTML = months.map((k) => `<span>${MN[+k.slice(5) - 1]}${k.slice(5) === '01' || k === months[0] ? ' ' + k.slice(2, 4) : ''}</span>`).join('');
+    // scrubber drag
+    const S = $('#f-scrub');
+    let drag = null;
+    const toIdx = (x) => { const r = S.getBoundingClientRect(); return clamp(Math.round(((x - r.left) / r.width) * months.length - 0.5), 0, months.length - 1); };
+    S.addEventListener('pointerdown', (e) => {
+      const h = e.target.closest('.h');
+      const i = toIdx(e.clientX);
+      drag = h ? h.dataset.h : Math.abs(i - state.fin.a) < Math.abs(i - state.fin.b) ? 'a' : 'b';
+      S.setPointerCapture(e.pointerId); move(e);
+    });
+    const move = (e) => { if (!drag) return; const i = toIdx(e.clientX); if (drag === 'a') state.fin.a = Math.min(i, state.fin.b); else state.fin.b = Math.max(i, state.fin.a); renderFin(); $$('.h', S).forEach((h) => h.classList.toggle('drag', h.dataset.h === drag)); };
+    S.addEventListener('pointermove', move);
+    S.addEventListener('pointerup', () => { drag = null; $$('.h', S).forEach((h) => h.classList.remove('drag')); });
+    $$('.h', S).forEach((h) => h.addEventListener('keydown', (e) => { const k = h.dataset.h; const d = e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowRight' ? 1 : 0; if (!d) return; if (k === 'a') state.fin.a = clamp(state.fin.a + d, 0, state.fin.b); else state.fin.b = clamp(state.fin.b + d, state.fin.a, months.length - 1); renderFin(); e.preventDefault(); }));
+    // filters
+    const cats = F.cats;
+    $('#f-filters').innerHTML = `<div class="seg" role="group" aria-label="Вид">${['все', 'расход', 'доход', 'обмен'].map((n, k) => `<button data-k="${k - 1}" aria-pressed="${k === 0}">${n}</button>`).join('')}</div>
+      <select id="f-cat" aria-label="Категория"><option value="-1">все категории</option>${cats.map((c, k) => `<option value="${k}">${esc(c)}</option>`).join('')}</select>
+      <input id="f-q" placeholder="заметка, сумма, #id" aria-label="Поиск по записям">
+      <label><input type="checkbox" id="f-void"> отменённые</label><span class="cnt" id="f-count"></span>`;
+    $('#f-filters .seg').onclick = (e) => { const b = e.target.closest('button'); if (!b) return; state.fin.kind = +b.dataset.k; $$('#f-filters .seg button').forEach((x) => x.setAttribute('aria-pressed', x === b)); renderRows(); };
+    $('#f-cat').onchange = (e) => { state.fin.cat = +e.target.value; renderRows(); };
+    $('#f-q').oninput = (e) => { state.fin.q = e.target.value.trim().toLowerCase(); renderRows(); };
+    $('#f-void').onchange = (e) => { state.fin.voided = e.target.checked; renderRows(); };
+    renderFin();
+  }
+  function renderFin() {
+    const { a, b } = state.fin;
+    const t = finTotals();
+    const all = a === 0 && b === months.length - 1;
+    // all-time totals come straight from au fin stats; a sub-range is the sum of per-entry USD
+    const exp = all ? Math.round(+F.usd.expense * 100) : t.exp, inc = all ? Math.round(+F.usd.income * 100) : t.inc;
+    $('#f-exp').innerHTML = `−${usd(exp)}<span class="u">USD</span>`;
+    $('#f-inc').innerHTML = `+${usd(inc)}`;
+    const net = inc - exp;
+    $('#f-net').textContent = (net >= 0 ? '+' : '−') + usd(Math.abs(net));
+    const ML = (k) => new Date(k + '-01T00:00').toLocaleDateString('ru-RU', { month: 'short', year: 'numeric' });
+    $('#f-per').textContent = all ? 'всё время' : `${ML(months[a])} — ${ML(months[b])}`;
+    $('#f-cnt').textContent = `${nf0.format(t.n)} записей · ${F.voided_excluded} отменённых вне итога`;
+    const S = $('#f-scrub'), w = 100 / months.length;
+    $('.range', S).style.left = `${(a + 0.5) * w}%`; $('.range', S).style.width = `${(b - a) * w}%`;
+    $('.h[data-h=a]', S).style.left = `${(a + 0.5) * w}%`; $('.h[data-h=b]', S).style.left = `${(b + 0.5) * w}%`;
+    $$('.months span', S).forEach((s, k) => s.classList.toggle('in', k >= a && k <= b));
+    // categories
+    const ce = new Map(), ci = new Map();
+    for (const e of ENT) if (!e.void && e.m >= a && e.m <= b && e.kind < 2) { const M = e.kind ? ci : ce; M.set(e.cat, (M.get(e.cat) || 0) + e.usd); }
+    const row = (cat, v, tot, inc) => `<div class="cat ${inc ? 'inc' : ''}"><span class="n">${esc(F.cats[cat] || 'без категории')}</span><span class="bar" data-share="${v / tot}" data-inc="${inc ? 1 : 0}"></span><span class="v">${usd(v)}</span><span class="p">${((v / tot) * 100).toFixed(1)}%</span></div>`;
+    const se = [...ce].sort((x, y) => y[1] - x[1]), si = [...ci].sort((x, y) => y[1] - x[1]);
+    $('#f-cats').innerHTML = `<h2>Категории <span class="num">USD по курсу на дату записи</span></h2><span class="cap subh" style="margin-top:0">расход · ${se.length}</span>` + se.map(([c, v]) => row(c, v, t.exp || 1, false)).join('') + `<span class="cap subh">доход · ${si.length}</span>` + si.map(([c, v]) => row(c, v, t.inc || 1, true)).join('');
+    // side: exchanges, currencies, rate sources
+    const ex = ENT.filter((e) => e.kind === 2 && !e.void && e.m >= a && e.m <= b);
+    const curs = ['BYN', 'RUB', 'USD', 'TON'];
+    const srcN = F.usd.sources, srcT = Object.values(srcN).reduce((x, y) => x + y, 0);
+    const SRCL = { nbrb: 'НБРБ', cbr: 'ЦБ РФ', usd: 'USD без пересчёта', kraken: 'Kraken' };
+    const srcs = Object.entries(srcN).sort((x, y) => y[1] - x[1]);
+    $('#f-side').innerHTML = `<h2>Обмены <span class="num">${ex.length} · отдельно от расхода и дохода</span></h2>
+      <div id="f-ex">${curs.map((c, k) => `<span class="cl" style="top:${14 + k * 52}px">${c}</span>`).join('')}</div>
+      <span class="cap subh">валюты · без пересчёта, всё время</span>
+      <table class="nat"><thead><tr><th>валюта</th><th>расход</th><th>доход</th><th>отдано</th><th>получено</th></tr></thead><tbody>${F.native.map((r) => `<tr><td>${r.currency}</td><td>${nf2.format(+r.expense)}</td><td>${nf2.format(+r.income)}</td><td>${nf2.format(+r.exchanged_out)}</td><td>${nf2.format(+r.exchanged_in)}</td></tr>`).join('')}</tbody></table>
+      <span class="cap subh">источник курса · ${nf0.format(F.usd.converted_entries)} записей пересчитано</span>
+      <div class="srcs">${srcs.map(([, v]) => `<i style="flex:${v}"></i>`).join('')}</div>
+      <div class="srcl">${srcs.map(([k, v]) => `<span>${SRCL[k] || k} ${nf0.format(v)}</span>`).join('')}<span>без курса ${F.usd.unconverted.entries}</span><span>устаревший ${F.usd.stale_entries}</span></div>`;
+    F.exView = ex; F.exCurs = curs;
+    renderRows();
+  }
+  function renderRows() {
+    const { a, b, kind, cat, q, voided } = state.fin;
+    const rows = ENT.filter((e) => e.m >= a && e.m <= b && (voided || !e.void) && (kind < 0 || e.kind === kind) && (cat < 0 || e.cat === cat) && (!q || (e.note || '').toLowerCase().includes(q) || String(e.amount).includes(q) || ('#' + e.id) === q));
+    const shown = rows.slice(0, 220);
+    $('#f-count').textContent = `${nf0.format(rows.length)} записей${rows.length > shown.length ? ` · показано ${shown.length}` : ''}`;
+    $('#f-rows').innerHTML = shown.map((e) => {
+      const amt = e.kind === 2 ? `${nf2.format(+e.amount)} ${e.cur} → ${nf2.format(+e.camt)} ${e.ccur}` : `${e.kind === 0 ? '−' : '+'}${nf2.format(+e.amount)} ${e.cur}`;
+      return `<tr class="${e.void ? 'void' : ''}" ${e.void ? `data-why="${esc(e.reason || 'причина не указана')}"` : ''}><td class="k"><span class="kg ${['exp', 'inc', 'exc'][e.kind]}" title="${KIND[e.kind]}"></span></td><td class="num">${e.date.split('-').reverse().join('.')}</td><td>${esc(F.cats[e.cat] || (e.kind === 2 ? 'обмен' : '—'))}</td><td class="note">${esc(e.note)}</td><td class="num">${amt}</td><td class="num">${e.usd ? '≈ ' + usd(e.usd) : '<span class="src">нет курса</span>'}</td><td class="src">${esc(e.src || '')} ${e.units ? '<span class="mono">' + esc(e.units) + '</span>' : ''}</td></tr>`;
+    }).join('');
+  }
+  $('#f-rows').addEventListener('pointerover', (e) => { const tr = e.target.closest('tr[data-why]'); if (tr) tip(e, 'отменена', tr.dataset.why); });
+  $('#f-rows').addEventListener('pointerout', () => tip(null));
+
+  // ------------------------------------------------------------------ tooltip
+  function tip(e, t, text) {
+    const el = $('#tip');
+    if (!e) { el.classList.remove('on'); return; }
+    el.innerHTML = `<span class="t">${esc(t)}</span>${esc(text)}`;
+    el.style.left = Math.min(e.clientX + 14, VW - 400) + 'px'; el.style.top = e.clientY + 16 + 'px';
+    el.classList.add('on');
+  }
+
+  // ------------------------------------------------------------------ screens + morphs
+  const SCREENS = { memory: '#s-memory', tasks: '#s-tasks', finance: '#s-fin', spec: '#s-spec' };
+  function setScreen(name, instant) {
+    if (!SCREENS[name]) name = 'memory';
+    const prev = state.screen;
+    if (prev === name && !instant) return;
+    state.prev = prev; state.screen = name; state.morph0 = performance.now();
+    for (const n of nodes) { n.bx = n.sx; n.by = n.sy; n.ba = n.a; }
+    for (const e of ENT) { e.fx = e.sx; e.fy = e.sy; e.fa = e.a; e.fh = e.h; }
+    if (name === 'finance' && prev !== 'finance') { // entries are born from the points of the field
+      ENT.forEach((e, k) => { const n = nodes[(k * 7) % NN]; e.fx = e.sx = n.sx; e.fy = e.sy = n.sy; e.fa = e.a = Math.min(n.a, 0.8); e.fh = e.h = 2; });
+    }
+    for (const [k, sel] of Object.entries(SCREENS)) {
+      const el = $(sel);
+      el.classList.remove('enter', 'leave');
+      if (k === name) { void el.offsetWidth; el.classList.add('on', 'enter'); }
+      else if (k === prev && !instant) { el.classList.add('leave'); el.classList.remove('on'); setTimeout(() => el.classList.remove('leave'), 320); }
+      else el.classList.remove('on');
+    }
+    $$('#rail nav button').forEach((b) => (b.dataset.go === name ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current')));
+    if (location.hash !== '#' + name) history.replaceState(null, '', location.pathname + location.search + '#' + name);
+    if (name === 'memory') fitCamera(false);
+    if (name !== 'memory' && state.lens) state.lens = false;
+    tip(null);
+  }
+
+  const MORPH = REDUCE ? 1 : 900;
+  function morphT(i, now) { // per-point progress with a stagger of up to 280 ms
+    if (REDUCE) return 1;
+    return outExpo(clamp((now - state.morph0 - hash(i) * 280) / MORPH, 0, 1));
+  }
+
+  // targets per screen
+  function memoryTarget(n, now, out) {
+    let [x, y] = project(n);
+    let a = CONF_LOOK[n.c][0] > 0.9 ? 1 : 0.85;
+    a *= 1 - 0.55 * n.z; // depth fog
+    if (state.filterType && n.t !== state.filterType && !(state.filterType === 'doc' && n.t === 'doc')) a *= 0.08;
+    const focus = state.hover != null ? state.hover : state.sel;
+    if (focus != null) {
+      const near = n.i === focus || focusSet.has(n.i);
+      a *= near ? 1.25 : 0.15; // silence around the thought
+      if (state.sel != null && focusSet.has(n.i) && n.i !== state.sel && state.hover == null) {
+        const dt = now - state.selT;
+        const w = REDUCE ? 0 : dt < 560 ? outExpo(dt / 420) : 1 - inOut(clamp((dt - 760) / 760, 0, 1));
+        if (w > 0) {
+          const s = nodes[state.sel]; const [cx, cy] = project(s);
+          const ring = focusRing.get(n.i) || 0;
+          const R = 54 + Math.min(focusSet.size, 40) * 2.2;
+          x = lerp(x, cx + Math.cos(ring) * R, w); y = lerp(y, cy + Math.sin(ring) * R, w);
+        }
+      }
+    }
+    if (state.screen === 'spec') a *= 0.07;
+    out[0] = x; out[1] = y; out[2] = clamp(a, 0, 1.3);
+  }
+  let focusSet = new Set(), focusRing = new Map(), focusOf = null;
+  function updateFocus() {
+    const f = state.hover != null ? state.hover : state.sel;
+    if (f === focusOf) return;
+    focusOf = f; focusSet = new Set(); focusRing = new Map();
+    if (f == null) return;
+    adj[f].forEach(([j], k) => { focusSet.add(j); focusRing.set(j, (k / adj[f].length) * Math.PI * 2 - Math.PI / 2); });
+  }
+  const taskTargets = new Map();
+  function readTaskTargets() {
+    taskTargets.clear();
+    for (const el of $$('#lanes .pt[data-g]')) { const r = el.getBoundingClientRect(); taskTargets.set(+el.dataset.g, [r.left + r.width / 2, r.top + r.height / 2, el.closest('.trow').classList.contains('sel'), el.closest('.lane').classList.contains('active')]); }
+  }
+  let finGeom = null;
+  function readFinGeom() {
+    const r = $('#f-cols').getBoundingClientRect();
+    const pad = 0;
+    const colW = (r.width - pad * 2) / months.length;
+    const axis = r.top + r.height / 2;
+    const scale = (r.height / 2 - 14) / F.maxMonth;
+    const bars = $$('#f-cats .bar').map((b) => { const q = b.getBoundingClientRect(); return [q.left, q.top, q.width, q.height, +b.dataset.share, +b.dataset.inc]; });
+    const exR = $('#f-ex') && $('#f-ex').getBoundingClientRect();
+    finGeom = { r, colW, axis, scale, bars, exR };
+  }
+
+  // ------------------------------------------------------------------ loader (honest stages)
+  const FULL = GA.full;
+  function startLoader() {
+    state.loader = { t0: performance.now(), phase: 'fetch', fetchP: 0, parseP: 0, layoutP: 0, done: 0 };
+    newSim();
+    $('#rail').style.opacity = 0; $('#cmd').style.opacity = 0;
+    $('#rail').style.transition = $('#cmd').style.transition = 'none';
+    for (const s of Object.values(SCREENS)) $(s).classList.remove('on', 'enter');
+    $('#loader').style.display = ''; $('#stages').style.opacity = 1;
+    $$('.stage').forEach((s) => s.classList.remove('on', 'ok'));
+    $('#ld-note').textContent = 'прототип: байты и разбор идут по замеренному темпу; раскладка — настоящие тики d3-force';
+    nodes.forEach((n, i) => { const u = hash(i * 3.1) * 0.999; n.mu = u; n.a = 0; });
+    state.sel = null; showNode(null);
+  }
+  function loaderStep(now) {
+    const L = state.loader; if (!L) return;
+    const t = now - L.t0;
+    const FETCH = REDUCE ? 400 : 2300, PARSE = REDUCE ? 300 : 1400;
+    // fetch: bytes arrive with a slow start (TCP ramp) — in phase 2 this is the ReadableStream byte count
+    L.fetchP = clamp(t / FETCH, 0, 1); L.fetchP = 1 - Math.pow(1 - L.fetchP, 1.6) * (1 - 0.25 * L.fetchP);
+    L.fetchP = clamp(L.fetchP, 0, 1);
+    if (t >= FETCH) { L.parseP = clamp((t - FETCH) / PARSE, 0, 1); }
+    if (t >= FETCH + PARSE) { stepSim(REDUCE ? TICKS : 3); L.layoutP = tick / TICKS; }
+    const set = (id, on, ok, p, txt) => { const s = $('#st-' + id); s.classList.toggle('on', on); s.classList.toggle('ok', ok); s.querySelector('.pb i').style.transform = `scaleX(${p})`; $('#st-' + id + '-n').textContent = txt; };
+    const mb = (FULL.bytes / 1e6);
+    set('fetch', true, L.fetchP >= 1, L.fetchP, `${(mb * L.fetchP).toFixed(1)} / ${mb.toFixed(1)} МБ`);
+    set('parse', L.fetchP >= 1, L.parseP >= 1, L.parseP, `${nf0.format(Math.round(FULL.nodes * L.parseP))} узлов · ${nf0.format(Math.round(FULL.edges * L.parseP))} связей`);
+    set('layout', L.parseP >= 1, L.layoutP >= 1, L.layoutP, `тик ${tick} / ${TICKS}`);
+    if (L.layoutP >= 1 && !L.done) {
+      L.done = now;
+      $('#stages').style.opacity = 0;
+      const tr = `opacity ${REDUCE ? 160 : 900}ms cubic-bezier(.16,1,.3,1)`;
+      $('#rail').style.transition = $('#cmd').style.transition = tr;
+      $('#rail').style.opacity = 1; $('#cmd').style.opacity = 1;
+      setScreen(initialScreen(), true);
+      const fs = params.get('focus');
+      if (fs === 'expand') setTimeout(() => select(GA.expand), REDUCE ? 0 : 500);
+    }
+    if (L.done && now - L.done > 1200) { state.loader = null; $('#loader').style.display = 'none'; }
+  }
+  function initialScreen() { const h = location.hash.slice(1).split('?')[0]; return SCREENS[h] ? h : 'memory'; }
+
+  // ------------------------------------------------------------------ glass object (loader mark, then the memory lens)
+  const lens = { x: VW / 2, y: VH / 2, vx: 0, vy: 0, tx: VW / 2, ty: VH / 2, st: 1, sv: 0, pres: 0 };
+  function lensStep(dt) {
+    const om = 24 * Math.pow(0.18, 0.5), z = 0.86; // FluidGlass follow spring, smoothness 0.5
+    const ax = om * om * (lens.tx - lens.x) - 2 * z * om * lens.vx, ay = om * om * (lens.ty - lens.y) - 2 * z * om * lens.vy;
+    lens.vx += ax * dt; lens.vy += ay * dt; lens.x += lens.vx * dt; lens.y += lens.vy * dt;
+    const speed = Math.hypot(lens.vx, lens.vy);
+    const target = 1 + clamp(speed / 1800, 0, 0.55) * 0.5;
+    const o2 = 13, z2 = 0.32;
+    lens.sv += (o2 * o2 * (target - lens.st) - 2 * z2 * o2 * lens.sv) * dt; lens.st += lens.sv * dt;
+    lens.pres = clamp(lens.pres + (state.lens ? dt / 0.5 : -dt / 0.3), 0, 1);
+    if (REDUCE) { lens.x = lens.tx; lens.y = lens.ty; lens.st = 1; }
+  }
+  function stretchInv(vx, vy, s) { // inverse of: stretch by s along velocity, 1/sqrt(s) across
+    const a = Math.atan2(vy, vx), c = Math.cos(a), si = Math.sin(a);
+    const p = 1 / s, q = Math.sqrt(s);
+    // R^T diag(p,q) R, column-major; GL y is up, so flip vy sign
+    const m00 = c * c * p + si * si * q, m01 = c * si * (p - q), m11 = si * si * p + c * c * q;
+    return new Float32Array([m00, -m01, 0, -m01, m11, 0, 0, 0, 1]);
+  }
+  const I3 = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+  const LENS_Z = +(params.get('lz') || 70);
+
+  // ------------------------------------------------------------------ nav pill spring
+  const pill = { y: 0, v: 0, st: 1, sv: 0, init: false };
+  function pillStep(dt) {
+    const btn = $(`#rail nav button[data-go="${state.screen === 'spec' ? '__' : state.screen}"]`);
+    const el = $('#pill');
+    if (!btn) { el.style.opacity = 0; return; }
+    el.style.opacity = 1;
+    const ty = btn.offsetTop;
+    if (!pill.init || REDUCE) { pill.y = ty; pill.v = 0; pill.init = true; }
+    const om = 16, z = 0.86;
+    pill.v += (om * om * (ty - pill.y) - 2 * z * om * pill.v) * dt; pill.y += pill.v * dt;
+    const target = 1 + clamp(Math.abs(pill.v) / 1800, 0, 0.55) * 0.9;
+    pill.sv += (169 * (target - pill.st) - 2 * 0.32 * 13 * pill.sv) * dt; pill.st += pill.sv * dt;
+    const h = 34 * pill.st, w = 100 / Math.sqrt(pill.st);
+    el.style.transform = `translateY(${pill.y - (h - 34) / 2}px)`; el.style.height = h + 'px'; el.style.width = w + 'px';
+  }
+
+  // ------------------------------------------------------------------ glass slabs from DOM
+  const SLAB = {
+    pill: { r: 17, bevel: 12, strength: 0.45, absorb: 0.15, disp: 1.0, rim: 1.0, sheen: 1.2 },
+    pillbar: { r: 22, bevel: 14, strength: 0.55, absorb: 0.5, disp: 0.8, rim: 0.9, sheen: 0.8 },
+    slab: { r: 14, bevel: 18, strength: 0.6, absorb: 0.62, disp: 0.7, rim: 0.85, sheen: 0.6 },
+    'slab-clear': { r: 14, bevel: 18, strength: 0.6, absorb: 0.22, disp: 0.7, rim: 0.85, sheen: 0.6 },
+    bar: { r: 16, bevel: 12, strength: 0.9, absorb: 0.78, disp: 0.8, rim: 1.0, sheen: 0.9 },
+  };
+  function collectSlabs() {
+    const out = [];
+    for (const el of $$('[data-glass]')) {
+      if (out.length >= 10) break;
+      const scr = el.closest('.screen');
+      let pres = 1;
+      if (scr) { if (!scr.classList.contains('on') && !scr.classList.contains('leave')) continue; pres = +getComputedStyle(scr).opacity; }
+      if (el.closest('#rail')) pres *= +$('#rail').style.opacity || 0;
+      if (el.closest('#cmd')) pres *= +$('#cmd').style.opacity || 0;
+      if (el.id === 'pill') pres *= +el.style.opacity || 0;
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || pres <= 0.01) continue;
+      const r = el.getBoundingClientRect();
+      if (r.bottom < 0 || r.top > VH || r.width < 4) continue;
+      const k = SLAB[el.dataset.glass];
+      out.push({ x: r.left, y: r.top, w: r.width, h: r.height, presence: pres, ...k, r: Math.min(k.r, r.height / 2) });
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------ render
+  const tmp = [0, 0, 0];
+  let last = performance.now(), fpsAcc = [], mouse = { x: -1e4, y: -1e4 };
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 0.05); last = now;
+    fpsAcc.push(dt); if (fpsAcc.length > 60) fpsAcc.shift();
+    if (camFly) { const p = inOut(clamp((now - camFly.t0) / camFly.dur, 0, 1)); cam.x = lerp(camFly.from.x, camFly.to.x, p); cam.y = lerp(camFly.from.y, camFly.to.y, p); cam.k = Math.exp(lerp(Math.log(camFly.from.k), Math.log(camFly.to.k), p)); if (p >= 1) camFly = null; }
+    cam.ox = lerp(cam.ox || originX(), originX(), REDUCE ? 1 : 0.12); cam.oy = VH / 2 - 10;
+    loaderStep(now);
+    updateFocus();
+    lensStep(dt); pillStep(dt);
+
+    const c = ctx;
+    c.setTransform(DPR, 0, 0, DPR, 0, 0);
+    c.globalCompositeOperation = 'source-over';
+    c.fillStyle = '#07080a'; c.fillRect(0, 0, VW, VH);
+    const L = state.loader;
+    const scr = state.screen;
+
+    // ---- graph points: targets per screen, blended by the morph
+    if (scr === 'tasks') readTaskTargets();
+    if (L && !L.done) {
+      if (L.layoutP > 0 || tick > 0) { if (!camFly) Object.assign(cam, fitTarget()); }
+      const mx = markXf();
+      for (const n of nodes) {
+        const [mx0, my0] = markPoint(n.mu);
+        const px = mx.cx + (mx0 - MK.c[0]) * mx.s, py = mx.cy + (my0 - MK.c[1]) * mx.s;
+        const born = L.parseP > n.mu ? 1 : 0;
+        const drift = L.parseP * 22 * (hash(n.i) - 0.5), drift2 = L.parseP * 22 * (hash(n.i + 91.7) - 0.5);
+        const [lx, ly] = project(n);
+        const p = REDUCE ? (L.layoutP >= 1 ? 1 : 0) : outExpo(clamp((L.layoutP - n.mu * 0.35) / 0.65, 0, 1));
+        n.sx = lerp(px + drift, lx, p); n.sy = lerp(py + drift2, ly, p);
+        n.a = born * lerp(0.28, CONF_LOOK[n.c][0] > 0.9 ? 1 : 0.85, p);
+      }
+    } else {
+      const showGraph = scr === 'memory' || scr === 'spec' || (L && L.done);
+      for (const n of nodes) {
+        if (scr === 'tasks') {
+          const tt = taskTargets.get(n.i);
+          if (tt) { tmp[0] = tt[0]; tmp[1] = tt[1]; tmp[2] = 1.3; } else { memoryTarget(n, now, tmp); tmp[2] = 0; }
+        } else if (scr === 'finance') { memoryTarget(n, now, tmp); tmp[2] = 0; }
+        else memoryTarget(n, now, tmp);
+        const p = morphT(n.i, now);
+        n.sx = lerp(n.bx, tmp[0], p); n.sy = lerp(n.by, tmp[1], p); n.a = lerp(n.ba, tmp[2], p);
+        if (!showGraph && p >= 1 && tmp[2] === 0) n.a = 0;
+      }
+    }
+
+    // ---- edges
+    const edgeA = L && !L.done ? sstep(0.5, 1, L.layoutP) : 1;
+    if (edgeA > 0) {
+      c.lineWidth = 1;
+      const focus = focusOf;
+      c.beginPath();
+      for (const l of links) { const a = l.source, b = l.target; if (a.a < 0.05 || b.a < 0.05) continue; if (focus != null && (a.i === focus || b.i === focus)) continue; c.moveTo(a.sx, a.sy); c.lineTo(b.sx, b.sy); }
+      const avgA = scr === 'memory' || scr === 'spec' || (L && !L.done) ? 1 : 0.4;
+      c.strokeStyle = `rgba(232,230,225,${(focus != null ? 0.018 : 0.05) * edgeA * avgA * (scr === 'spec' ? 0.4 : 1)})`;
+      c.stroke();
+      if (focus != null && scr === 'memory') {
+        const f = nodes[focus];
+        c.strokeStyle = 'rgba(232,230,225,0.32)'; c.beginPath();
+        for (const [j] of adj[focus]) { c.moveTo(f.sx, f.sy); c.lineTo(nodes[j].sx, nodes[j].sy); }
+        c.stroke();
+        // light pulse travelling along each hovered edge
+        c.globalCompositeOperation = 'lighter';
+        adj[focus].forEach(([j, , dir], k) => {
+          const u = ((now / 900 + k * 0.137) % 1); const a2 = dir === 'out' ? u : 1 - u;
+          const x = lerp(f.sx, nodes[j].sx, a2), y = lerp(f.sy, nodes[j].sy, a2);
+          const g = c.createRadialGradient(x, y, 0, x, y, 7); g.addColorStop(0, 'rgba(255,255,255,0.9)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+          c.fillStyle = g; c.fillRect(x - 7, y - 7, 14, 14);
+        });
+        c.globalCompositeOperation = 'source-over';
+      }
+    }
+
+    // ---- nodes (bloom only on points)
+    c.globalCompositeOperation = 'lighter';
+    const zk = clamp(Math.pow(cam.k / (fitTarget().k || 1), 0.35), 0.8, 2.4);
+    for (const n of nodes) {
+      if (n.a <= 0.01) continue;
+      const sp = sprite(n.t, n.c);
+      const inTasks = scr === 'tasks' && taskTargets.has(n.i);
+      const degS = 1 + Math.min(Math.log2(1 + n.deg) * 0.12, 0.6);
+      let s = (inTasks ? 1.25 : zk * degS * (1 - 0.3 * n.z)) / 4;
+      if (n.i === focusOf) s *= 1.8;
+      if (L && !L.done) s *= lerp(0.4, 1, sstep(0, 0.8, L.layoutP));
+      const w = sp.S * s;
+      c.globalAlpha = Math.min(n.a, 1);
+      c.drawImage(sp.cv, n.sx - w / 2, n.sy - w / 2, w, w);
+      if (inTasks) { const tt = taskTargets.get(n.i); if (tt[3] || tt[2]) { const g = c.createRadialGradient(n.sx, n.sy, 0, n.sx, n.sy, 14); g.addColorStop(0, `rgba(232,230,225,${tt[2] ? 0.5 : 0.28})`); g.addColorStop(1, 'rgba(232,230,225,0)'); c.fillStyle = g; c.fillRect(n.sx - 14, n.sy - 14, 28, 28); } }
+    }
+    c.globalAlpha = 1;
+    c.globalCompositeOperation = 'source-over';
+
+    // project labels
+    if ((scr === 'memory') && (!L || L.done)) {
+      c.font = '11px Geist, sans-serif'; c.textAlign = 'center';
+      for (const [i, p] of projHub) { const n = nodes[i]; if (n.a < 0.2) continue; c.fillStyle = `rgba(232,230,225,${0.5 * Math.min(n.a, 1)})`; c.fillText(p.label.length > 26 ? p.label.slice(0, 25) + '…' : p.label, n.sx, n.sy - 12); }
+      if (state.sel != null) { const n = nodes[state.sel]; c.fillStyle = 'rgba(232,230,225,0.95)'; c.font = '13px Geist, sans-serif'; const t = stripProj(n.label); c.fillText(t.length > 54 ? t.slice(0, 53) + '…' : t, n.sx, n.sy - 16); }
+    }
+
+    // ---- finance: columns of light built from entries
+    const finOn = scr === 'finance' || state.prev === 'finance' && now - state.morph0 < MORPH + 300;
+    if (finOn) {
+      readFinGeom();
+      const G = finGeom, { a: ra, b: rb } = state.fin;
+      c.globalCompositeOperation = 'lighter';
+      for (const e of ENT) {
+        let tx, ty, th, ta;
+        if (scr === 'finance' && e.m >= 0 && !e.void && e.kind < 2) {
+          const cx = G.r.left + G.colW * (e.m + 0.5) + (e.kind ? -6 : 6) * 0;
+          th = Math.max(e.usd * G.scale - 1, 0.6);
+          ty = e.kind === 1 ? G.axis - (e.base * G.scale) - th : G.axis + e.base * G.scale + 1;
+          tx = cx; ta = e.m >= ra && e.m <= rb ? (e.kind === 1 ? 0.78 : 0.42) : 0.08;
+        } else { tx = e.fx; ty = e.fy; th = 2; ta = 0; }
+        const p = morphT(e.id, now);
+        e.sx = lerp(e.fx, tx, p); e.sy = lerp(e.fy, ty, p); e.h = lerp(e.fh, th, p); e.a = lerp(e.fa, ta, p);
+        if (e.a < 0.01) continue;
+        const w = lerp(2, 5, p);
+        c.fillStyle = `rgba(232,230,225,${e.a})`;
+        c.fillRect(e.sx - w / 2, e.sy, w, Math.max(e.h, 1));
+      }
+      // soft column glow
+      if (scr === 'finance') {
+        const p = sstep(0.4, 1, (now - state.morph0) / MORPH);
+        for (let m = 0; m < months.length; m++) {
+          const cx = G.r.left + G.colW * (m + 0.5), on = m >= ra && m <= rb ? 1 : 0.25;
+          const mi = Math.round(+F.months[m].income * 100) * G.scale, me = Math.round(+F.months[m].expense * 100) * G.scale;
+          const g = c.createLinearGradient(cx - 18, 0, cx + 18, 0); g.addColorStop(0, 'rgba(232,230,225,0)'); g.addColorStop(0.5, `rgba(232,230,225,${0.035 * p * on})`); g.addColorStop(1, 'rgba(232,230,225,0)');
+          c.fillStyle = g; c.fillRect(cx - 18, G.axis - mi, 36, mi + me);
+        }
+        c.globalCompositeOperation = 'source-over';
+        c.fillStyle = `rgba(232,230,225,${0.25 * p})`; c.fillRect(G.r.left, G.axis, G.r.width, 1);
+        // category light bars, seen through glass
+        c.globalCompositeOperation = 'lighter';
+        for (const [x, y, w, h, share, inc] of G.bars) {
+          if (y > VH || y + h < 0) continue;
+          const bw = Math.max(w * share * p * (1 / Math.max(...G.bars.filter((q) => q[5] === inc).map((q) => q[4]))), 1.5);
+          const g = c.createLinearGradient(x, 0, x + bw, 0); g.addColorStop(0, `rgba(232,230,225,${inc ? 0.95 : 0.7})`); g.addColorStop(1, `rgba(232,230,225,${inc ? 0.55 : 0.35})`);
+          c.fillStyle = g; c.fillRect(x, y + 1, bw, h - 2);
+        }
+        // exchanges: arcs between currency lines
+        if (G.exR && G.exR.bottom > 0 && G.exR.top < VH) {
+          const R = G.exR, curs = F.exCurs, yOf = (cur) => R.top + 14 + curs.indexOf(cur) * 52;
+          c.globalCompositeOperation = 'source-over';
+          c.strokeStyle = 'rgba(232,230,225,0.14)'; c.lineWidth = 1;
+          for (const cu of curs) { c.beginPath(); c.moveTo(R.left + 40, yOf(cu)); c.lineTo(R.right, yOf(cu)); c.stroke(); }
+          c.globalCompositeOperation = 'lighter';
+          const span = months.length;
+          for (const e of F.exView || []) {
+            if (curs.indexOf(e.cur) < 0 || curs.indexOf(e.ccur) < 0) continue;
+            const day = +e.date.slice(8, 10) / 31;
+            const x = R.left + 48 + ((e.m + day) / span) * (R.width - 56);
+            const y0 = yOf(e.cur), y1 = yOf(e.ccur);
+            const bulge = 10 + Math.log10(1 + e.usd / 100) * 12;
+            c.strokeStyle = `rgba(232,230,225,${0.35 + 0.5 * p})`; c.lineWidth = 1.2;
+            c.beginPath(); c.moveTo(x, y0); c.bezierCurveTo(x + bulge, y0, x + bulge, y1, x, y1); c.stroke();
+            c.fillStyle = 'rgba(232,230,225,0.9)'; c.fillRect(x - 1, y1 - 1, 2, 2);
+          }
+        }
+        c.globalCompositeOperation = 'source-over';
+      }
+      c.globalCompositeOperation = 'source-over';
+    }
+
+    // ---- loader: one stroke of light draws the mark
+    if (L) {
+      const mx = markXf();
+      const drawP = L.fetchP, fade = 1 - sstep(0, 1, L.parseP);
+      if (fade > 0) {
+        c.save(); c.translate(mx.cx, mx.cy); c.scale(mx.s, mx.s); c.translate(-MK.c[0], -MK.c[1]);
+        const upto = drawP * strokes.total;
+        const pathTo = () => { c.beginPath(); for (const s of strokes) { if (s.len[0] > upto && s === strokes[0]) break; let started = false; for (let i = 0; i < s.length; i++) { if (s.len[i] > upto) { if (i > 0 && started) { const t = (upto - s.len[i - 1]) / (s.len[i] - s.len[i - 1]); c.lineTo(lerp(s[i - 1][0], s[i][0], t), lerp(s[i - 1][1], s[i][1], t)); } break; } if (!started) { c.moveTo(s[i][0], s[i][1]); started = true; } else c.lineTo(s[i][0], s[i][1]); } } };
+        c.globalCompositeOperation = 'lighter';
+        c.lineCap = 'round'; c.lineJoin = 'round';
+        pathTo(); c.strokeStyle = `rgba(232,230,225,${0.12 * fade})`; c.lineWidth = 9 / mx.s; c.stroke();
+        c.strokeStyle = `rgba(232,230,225,${0.95 * fade})`; c.lineWidth = 1.6 / mx.s; c.stroke();
+        c.restore();
+        if (drawP < 1) { const [hx, hy] = markPoint(drawP); const x = mx.cx + (hx - MK.c[0]) * mx.s, y = mx.cy + (hy - MK.c[1]) * mx.s; const g = c.createRadialGradient(x, y, 0, x, y, 16); g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(1, 'rgba(255,255,255,0)'); c.fillStyle = g; c.fillRect(x - 16, y - 16, 32, 32); }
+        c.globalCompositeOperation = 'source-over';
+      }
+    }
+
+    // ---- composite through glass
+    if (glass) {
+      let obj = { x: 0, y: 0, z: 0, size: 1, extent: 1.1, morph: 1, flat: 1, presence: 0, thick: 0.05, inv: I3 };
+      if (L && !REDUCE) {
+        const mx = markXf();
+        const pres = sstep(0.7, 1, L.fetchP) * (1 - sstep(0.82, 1, L.layoutP));
+        const morph = quintic(sstep(0.42, 0.72, L.layoutP));
+        const flat = 1 - 0.96 * sstep(0.7, 0.95, L.layoutP);
+        obj = { x: mx.cx, y: mx.cy, z: 0.3 * mx.s * MK.R, size: mx.s * MK.R, extent: 1.12, morph, flat, presence: pres, thick: 0.045, inv: I3 };
+      } else if (lens.pres > 0 && scr === 'memory') {
+        obj = { x: lens.x, y: lens.y, z: LENS_Z, size: 110 * (0.6 + 0.4 * lens.pres), extent: 1.12 * Math.max(lens.st, 1), morph: 1, flat: 1, presence: lens.pres, thick: 0.05, inv: stretchInv(lens.vx, lens.vy, lens.st) };
+      }
+      glass.frame({ scene, slabs: collectSlabs(), obj, vw: VW, vh: VH, ratio: DPR });
+    }
+    if (params.has('fps') && $('#fps')) { const avg = fpsAcc.reduce((x, y) => x + y, 0) / fpsAcc.length; $('#fps').textContent = `${(1 / avg).toFixed(0)} fps · ${(avg * 1000).toFixed(1)} мс/кадр`; }
+    window.__frames = (window.__frames || 0) + 1;
+    requestAnimationFrame(frame);
+  }
+
+  // ------------------------------------------------------------------ input
+  const pick = (x, y) => {
+    let best = null, bd = 14 * 14;
+    for (const n of nodes) { if (n.a < 0.1) continue; const d = (n.sx - x) ** 2 + (n.sy - y) ** 2; if (d < bd) { bd = d; best = n.i; } }
+    return best;
+  };
+  let dragC = null;
+  glCanvas.addEventListener('pointerdown', (e) => { if (state.screen !== 'memory' || state.loader) return; dragC = { x: e.clientX, y: e.clientY, cx: cam.x, cy: cam.y, moved: false }; glCanvas.setPointerCapture(e.pointerId); });
+  const onMove = (e) => {
+    mouse.x = e.clientX; mouse.y = e.clientY; lens.tx = e.clientX; lens.ty = e.clientY;
+    if (dragC) { const dx = e.clientX - dragC.x, dy = e.clientY - dragC.y; if (Math.abs(dx) + Math.abs(dy) > 3) dragC.moved = true; cam.x = dragC.cx - dx / cam.k; cam.y = dragC.cy - dy / cam.k; camFly = null; return; }
+    if (state.screen !== 'memory' || state.loader) return;
+    const h = pick(e.clientX, e.clientY);
+    if (h !== state.hover) { state.hover = h; }
+    if (h != null) tip(e, nodes[h].t.replace('_', ' ') + ' · ' + (GA.conf[nodes[h].c] || 'без оценки'), stripProj(nodes[h].label)); else tip(null);
+    glCanvas.style.cursor = h != null ? 'pointer' : 'grab';
+  };
+  glCanvas.addEventListener('pointermove', onMove);
+  window.addEventListener('pointermove', (e) => { lens.tx = e.clientX; lens.ty = e.clientY; });
+  glCanvas.addEventListener('pointerup', (e) => { const d = dragC; dragC = null; if (d && !d.moved) { const h = pick(e.clientX, e.clientY); select(h); } });
+  glCanvas.addEventListener('pointerleave', () => { state.hover = null; tip(null); });
+  glCanvas.addEventListener('wheel', (e) => {
+    if (state.screen !== 'memory') return; e.preventDefault(); camFly = null;
+    const f = Math.exp(-e.deltaY * 0.0015), wx = cam.x + (e.clientX - cam.ox) / cam.k, wy = cam.y + (e.clientY - cam.oy) / cam.k;
+    cam.k *= f; cam.x = wx - (e.clientX - cam.ox) / cam.k; cam.y = wy - (e.clientY - cam.oy) / cam.k;
+  }, { passive: false });
+
+  $$('#rail [data-go]').forEach((b) => (b.onclick = () => setScreen(b.dataset.go)));
+  $('#replay').onclick = () => startLoader();
+  const cmdIn = $('#cmd-in'), res = $('#cmd-results');
+  let hits = [], hi = 0;
+  cmdIn.addEventListener('input', () => {
+    const q = cmdIn.value.trim().toLowerCase();
+    hits = q.length < 2 ? [] : nodes.filter((n) => n.label.toLowerCase().includes(q)).sort((a, b) => b.deg - a.deg).slice(0, 7);
+    hi = 0;
+    res.innerHTML = hits.map((n, k) => `<button data-n="${n.i}" class="${k === 0 ? 'sel' : ''}"><span class="t">${n.t.replace('_', ' ')}</span><span class="l">${esc(stripProj(n.label))}</span></button>`).join('') || (q.length >= 2 ? '<button disabled><span class="l">ничего — в фазе 2 поиск идёт через /api/search по всей памяти</span></button>' : '');
+    res.classList.toggle('on', q.length >= 2);
+  });
+  res.addEventListener('click', (e) => { const b = e.target.closest('[data-n]'); if (b) go(+b.dataset.n); });
+  function go(i) { cmdIn.value = ''; res.classList.remove('on'); cmdIn.blur(); setScreen('memory'); select(i); }
+  cmdIn.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && hits[hi]) go(hits[hi].i);
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { hi = clamp(hi + (e.key === 'ArrowDown' ? 1 : -1), 0, hits.length - 1); $$('button', res).forEach((b, k) => b.classList.toggle('sel', k === hi)); e.preventDefault(); }
+    if (e.key === 'Escape') { cmdIn.value = ''; res.classList.remove('on'); cmdIn.blur(); }
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.target.closest('input, select, textarea')) return;
+    const k = e.key;
+    if (k === '1') setScreen('memory'); else if (k === '2') setScreen('tasks'); else if (k === '3') setScreen('finance'); else if (k === '0') setScreen('spec');
+    else if (k === '/') { e.preventDefault(); cmdIn.focus(); }
+    else if (k === 'l' || k === 'L' || k === 'д' || k === 'Д') { if (state.screen === 'memory') state.lens = !state.lens; }
+    else if (k === 'r' || k === 'R' || k === 'к' || k === 'К') startLoader();
+    else if (k === 'Escape') { if (state.sel != null) select(null); else if (state.screen !== 'memory') setScreen('memory'); }
+  });
+  window.addEventListener('resize', resize);
+
+  // ------------------------------------------------------------------ spec
+  function buildSpec() {
+    const sw = [['--ink', '#07080A', 'поле'], ['--g1', '#0E1013', 'глубина 1'], ['--g2', '#16191D', 'глубина 2'], ['--g3', '#2A2E34', 'линии'], ['--g4', '#5A5F66', 'тихий текст'], ['--bone', '#E8E6E1', 'текст, свет'], ['fringe', '', 'единственный цвет: кайма дисперсии']];
+    const gl = ['decision', 'problem', 'solution', 'concept', 'task', 'session', 'work_log', 'user_fact', 'project', 'doc', 'skill', 'file'];
+    $('#spec').innerHTML = `
+<h1>Свет и стекло: спецификация интерфейса aurelius</h1>
+<p class="lede">Память — карта ночного неба, свет — единственный материал. Стекло — материал, который этот свет преломляет. Всё монохромно; цвет появляется только как спектральная кайма, которую дисперсия стекла делает из белого света. Концепт «Aurum» с правкой «light and glass».</p>
+
+<h2>Знак</h2>
+<div class="marks"><figure><img class="inv" src="logo-mark.svg" alt=""><figcaption>logo-mark.svg — линия, currentColor</figcaption></figure><figure><img class="inv" src="logo-mark-solid.svg" alt=""><figcaption>logo-mark-solid.svg — крупные размеры</figcaption></figure><figure><img class="inv lock" src="logo.svg" alt=""><figcaption>logo.svg — знак и надпись</figcaption></figure></div>
+<p>Силуэт, кольца и шесть узлов сети обведены из ui/public/logo.png (маска золота, potrace); центры узлов замерены, рёбра сети повторяют оригинал. Цвета у знака нет, только currentColor. Надпись — Geist, обведена в кривые.</p>
+
+<h2>Правила «Aurum · свет и стекло»</h2>
+<ol>
+<li><b>Палитра.</b> Чернила #07080A, шаги графита #0E1013 / #16191D / #2A2E34 / #5A5F66, текст — кость #E8E6E1. Золотой акцент снят: единственный цвет на экране — спектральная кайма стекла, и только на скосах.</li>
+<li><b>Граф.</b> Уверенность — качество света: measured — резкая яркая точка, inferred — мягкий ореол, reported — тусклая точка, stale — полое пепельное кольцо. Тип — форма глифа, никогда не оттенок. Возраст — глубина: старые узлы уходят в туман к точке схода.</li>
+<li><b>Фокус.</b> Наведение высвечивает соседей, остальное падает до 15% («тишина вокруг мысли»), по связям бежит импульс света. Клик раскрывает соседей орбитой, затем они оседают в раскладку.</li>
+<li><b>Хром.</b> Почти нет: полноэкранное поле, тонкая левая колонка разделов, одна командная строка снизу («/»). Клавиши 1/2/3 — разделы, Esc — назад, L — линза, R — повтор загрузки, 0 — эта спека.</li>
+<li><b>Переходы — морф тех же точек, не смена страниц.</b> Память → Задачи: точки задач остаются и скользят в дорожки статусов, остальное гаснет. → Финансы: поле остывает, точки перестраиваются на оси времени; месяцы — вертикальные столбы света из записей. С prefers-reduced-motion — простое затухание 160 мс.</li>
+<li><b>Git задачи.</b> Ветка — тонкая вертикаль с засечками коммитов; открытый PR — линия, загибающаяся к main; влитый — сомкнутая с main.</li>
+<li><b>Финансы, «гроссбух в темноте».</b> Итог периода огромным моноширинным табличным кеглем под тонкой стеклянной планкой; доля категорий — горизонтальные полосы света, видимые сквозь стекло; обмены — дуги между линиями валют, отдельно от расхода и дохода; отменённые записи зачёркнуты пеплом, причина по наведению; период выбирается ползунком по шкале месяцев.</li>
+<li><b>Загрузка честными стадиями, без склейки.</b> fetch — знак рисуется одним штрихом света (длина штриха = доля полученных байт), знак становится стеклом; parse — штрих распадается на частицы, счётчик узлов в моно; layout — частицы летят в свои настоящие позиции раскладки, стекло плавится в плоскую линзу и растворяется — загрузчик становится графом.</li>
+<li><b>Шрифты.</b> Один гротеск (Geist) и Geist Mono для чисел, id, улик и таблиц. Шкала 11 / 13 / 15 / 20 / 32 / 64; 64 — только итоги финансов. Подписи 11px капителью, трекинг +8%.</li>
+<li><b>Фактура.</b> Плёночное зерно ~3%, свечение только на точках, туман глубины; никакого backdrop-blur.</li>
+</ol>
+
+<h3>Стекло</h3>
+<ul>
+<li><b>Объект (raymarch, FluidGlass).</b> Знак в загрузке и линза в Памяти: SDF, ior 1.5, дисперсия 0.35 (RGB расходятся только на выходе луча у края), френель, студийный контровой свет. Луч марширует только внутри ограничивающей сферы, снаружи пиксель берётся из первого прохода как есть. Морф формы 0.85 с, quintic smootherstep.</li>
+<li><b>Линза «look closer».</b> Клавиша L в Памяти. Следует за курсором пружиной (ω = 24·0.18^0.5 ≈ 10.2, затухание 0.86), растягивается по скорости: 1 + clamp(v/1800, 0, 0.55)·0.5, пружина ω 13, ζ 0.32.</li>
+<li><b>Плиты (панели узла, задачи, фильтров финансов, командная строка).</b> Дёшево, в экранном пространстве: скруглённый прямоугольник с заранее заданным профилем высоты — плоский центр, скос по краю. Смещение выборки сцены вдоль градиента SDF только на скосе, R/G/B смещаются по-разному — отсюда кайма. Контровой свет сверху-слева, без размытия (frost 0), без raymarch на пиксель.</li>
+<li><b>Пилюля раздела.</b> Маленькая стеклянная пилюля в левой колонке, скользит пружиной и вытягивается вдоль скорости.</li>
+<li><b>Текст поверх стекла не преломляется:</b> стекло гнёт только поле, текст читается всегда.</li>
+</ul>
+
+<h2>Палитра</h2>
+<div class="sw">${sw.map(([n, h, d]) => `<div>${n === 'fringe' ? '<i class="fringe"></i>' : `<i style="background:${h}"></i>`}<span>${n}</span><span>${h || 'только стекло'}</span><span>${d}</span></div>`).join('')}</div>
+<p style="margin-top:14px">Текст: кость 100% — основное, 74% — вторичное, 56% — подписи (5.0:1 на чернилах). Пепел #80858C — отменённое (4.6:1). Линии — кость 8% и 16%.</p>
+
+<h2>Шрифт</h2>
+<div class="scale">
+<div><span class="mono">64 mono</span><span class="mono" style="font-size:64px;line-height:1">−24 335,00</span></div>
+<div><span class="mono">32</span><span style="font-size:32px">Свет и стекло</span></div>
+<div><span class="mono">20</span><span style="font-size:20px">Курсы валют и цельные сводки финансов</span></div>
+<div><span class="mono">15</span><span style="font-size:15px">Claim узла и вводные абзацы</span></div>
+<div><span class="mono">13</span><span>Основной текст интерфейса, строки списков и таблиц</span></div>
+<div><span class="mono">11 caps</span><span class="cap">Подписи, заголовки дорожек, +8%</span></div>
+<div><span class="mono">12 mono</span><span class="mono" style="font-size:12px">node verify-run.mjs "cargo test" → exit 0 · 2276059</span></div>
+</div>
+<p style="margin-top:10px">Одна насыщенность (Geist Regular): иерархия держится размером и яркостью, не жирностью. Кириллица в моно падает на JetBrains Mono — в фазе 2 нужен Geist Mono с кириллицей или JetBrains Mono целиком.</p>
+
+<h2>Кодирование графа</h2>
+<div class="glyphs" id="spec-glyphs"></div>
+<p style="margin-top:12px">Размер — степень узла (log), яркость — уверенность, глубина — возраст (0…420 дней → туман до 55% и сжатие к центру на 20%). Проекты — двойные кольца с подписью.</p>
+
+<h2>Раскладка экрана</h2>
+<div class="layoutmap">
+<div style="left:8px;top:8px;bottom:8px;width:90px">колонка разделов 112px · пилюля · знак</div>
+<div style="left:112px;right:8px;top:8px;bottom:8px;box-shadow:none;color:var(--g4)">поле на весь экран (граф / дорожки / столбы)</div>
+<div style="right:16px;top:16px;bottom:48px;width:28%">стеклянная плита 420–430px: узел или задача</div>
+<div style="left:38%;width:30%;bottom:12px;height:28px">командная строка, «/»</div>
+<div style="left:120px;bottom:12px;width:150px;height:60px">легенда: форма и свет</div>
+</div>
+
+<h2>Движение</h2>
+<table class="spec"><thead><tr><th>что</th><th>длительность</th><th>кривая</th><th>как</th></tr></thead><tbody>
+<tr><td>наведение, нажатие</td><td class="mono">120 мс</td><td class="mono">out-expo</td><td>цвет текста, подложка строки</td></tr>
+<tr><td>смена содержимого плиты</td><td class="mono">220 мс</td><td class="mono">out-expo</td><td>opacity; плита не прыгает размером</td></tr>
+<tr><td>вход панели, ступени</td><td class="mono">420 мс + 45 мс шаг</td><td class="mono">cubic-bezier(.16,1,.3,1)</td><td>opacity + clip-path + translateY 10px</td></tr>
+<tr><td>смена раздела</td><td class="mono">640 мс вход / 290 мс выход</td><td class="mono">out-expo / (.5,0,.75,0)</td><td>DOM: clip-path reveal; поле: морф точек</td></tr>
+<tr><td>морф точек</td><td class="mono">900 мс + разброс до 280 мс</td><td class="mono">out-expo</td><td>позиция, яркость, высота сегмента</td></tr>
+<tr><td>камера (перелёт к узлу)</td><td class="mono">640–720 мс</td><td class="mono">in-out cubic</td><td>центр и масштаб (масштаб — в логарифме)</td></tr>
+<tr><td>орбита соседей</td><td class="mono">420 мс раскрытие, 760 мс оседание</td><td class="mono">out-expo / in-out</td><td>соседи на кольце, затем в раскладку</td></tr>
+<tr><td>пилюля, линза</td><td class="mono">пружина</td><td class="mono">ω 10–16, ζ 0.86; растяжение ω 13, ζ 0.32</td><td>позиция и растяжение вдоль скорости</td></tr>
+<tr><td>морф стекла</td><td class="mono">850 мс</td><td class="mono">quintic smootherstep</td><td>знак → линза → плоскость</td></tr>
+<tr><td>загрузка</td><td class="mono">5–8 с, сколько идёт на самом деле</td><td class="mono">по прогрессу, не по таймеру</td><td>штрих = байты, частицы = разбор, полёт = тики раскладки</td></tr>
+</tbody></table>
+<h3>Никогда не анимируется</h3>
+<ul><li>Денежные числа: никаких отсчётов «от нуля», итог меняется сразу и целиком.</li><li>Таблицы и порядок строк, перенос текста, ширина колонок.</li><li>Кодирование графа: форма и яркость не «играют» ради эффекта.</li><li>Прокрутка: никакого перехвата и параллакса страницы.</li><li>Ввод не блокируется дольше 200 мс; любой переход прерывается следующим.</li></ul>
+<h3>prefers-reduced-motion</h3>
+<p>Переходы — затухание 160 мс; точки встают на места сразу; линза и орбита выключены; загрузка показывает знак и полосы стадий без полёта; зерно стоит.</p>
+
+<h2>Навигация</h2>
+<p>Память / Задачи / Финансы — левая колонка и клавиши 1/2/3; адрес #memory, #tasks, #finance. Esc: снять выделение → вернуться в Память. «/» — командная строка: поиск по меткам памяти, Enter открывает узел. Клик по связи в плите переводит фокус на соседний узел; перелёт камеры показывает, куда ушли.</p>
+
+<h2>Компоненты</h2>
+<table class="spec"><tbody>
+<tr><td>Поле</td><td>2D-сцена точек (в фазе 2 — инстансы three.js), режимы memory / tasks / finance / dim</td></tr>
+<tr><td>Глиф узла</td><td>форма × уверенность, спрайт; кольцо фокуса; импульс по ребру</td></tr>
+<tr><td>Стеклянная плита</td><td>pill, pillbar, slab, slab-clear, bar: радиус, скос, сила преломления, поглощение, дисперсия, контровой свет</td></tr>
+<tr><td>Линза</td><td>raymarch-объект, L</td></tr>
+<tr><td>Плита узла</td><td>тип, метка, claim, заметка, происхождение (уверенность, тема, изменчивость, даты, источник), улики моно, связи по отношениям</td></tr>
+<tr><td>Легенда</td><td>фильтр по типу (сессии, навыки, документы — те же кнопки), шкала уверенности</td></tr>
+<tr><td>Дорожки задач</td><td>бэклог / в работе / блок / готово; строка: точка, заголовок в 2 строки, приоритет столбиками, критерии n/m, ветка</td></tr>
+<tr><td>Плита задачи</td><td>статус, приоритет, id; заведена → взята → закрыта; git-рельс; критерии; подзадачи; журнал; решения</td></tr>
+<tr><td>Гроссбух</td><td>столбы из записей, стеклянная планка с итогом, ползунок периода</td></tr>
+<tr><td>Категории</td><td>полосы света под стеклом, сумма, доля</td></tr>
+<tr><td>Обмены</td><td>линии валют и дуги; таблица валют без пересчёта; источники курса</td></tr>
+<tr><td>Записи</td><td>фильтры на стекле: вид, категория, поиск, отменённые; строки с курсом и источником</td></tr>
+<tr><td>Загрузчик</td><td>знак-штрих, стадии fetch / parse / layout с честными числами</td></tr>
+</tbody></table>
+<p>Напоминания и навыки (reminder_list, skill_list) в фазе 2 приходят в ту же командную строку: «/напомни», «/навыки» показывают список в плите; отдельного раздела им не нужно.</p>
+
+<h2>Фаза 2: как это ляжет на three.js WebGPU</h2>
+<ul>
+<li>Граф уже рисуется инстансами в WebGPURenderer (WebGL2 запасной). Его надо рисовать в RenderTarget того же размера, затем полноэкранный TSL-проход стекла: плиты — массив из ≤10 rect-униформ, как в glass.js FS1; объект — SDF-raymarch внутри ограничивающей сферы, как FS2. Порядок проходов тот же: поле → плиты → объект → DOM-текст поверх.</li>
+<li>Глифы — атлас-текстура 18 форм × 5 уровней света, атрибуты инстанса: тип, уверенность, возраст, степень. Морф — два буфера позиций (from/to) и униформа времени, смешивание в вершинном шейдере; разброс — hash(id).</li>
+<li>Загрузка: fetch через ReadableStream с Content-Length → длина штриха; JSON.parse в воркере с отчётом по чанкам → счётчик; тики раскладки уже в воркере → полёт частиц.</li>
+<li>Стоимость (оценка): плиты — 1 выборка сцены на пиксель + 3 на скосе, ≈0.3 мс на 1080p; линза Ø260px, 110 шагов — ≈0.5–1 мс на дискретной GPU. Узкое место прототипа — копия 2D-холста в текстуру каждый кадр; в фазе 2 её нет: граф сразу в RenderTarget.</li>
+</ul>
+`;
+    const G = $('#spec-glyphs');
+    for (const t of gl) { const s = document.createElement('span'); s.append(glyphCanvas(t, 1, 18)); s.append(document.createTextNode(t.replace('_', ' '))); G.append(s); }
+    const C = document.createElement('div'); C.className = 'glyphs'; C.style.marginTop = '12px';
+    for (const [ci, n] of [[1, 'measured — резкая точка'], [2, 'inferred — мягкий ореол'], [3, 'reported — тусклая'], [4, 'stale — полое кольцо']]) { const s = document.createElement('span'); const cv = document.createElement('canvas'); cv.width = cv.height = 36; cv.style.width = cv.style.height = '18px'; cv.getContext('2d').drawImage(sprite('concept', ci).cv, 0, 0, 36, 36); s.append(cv, document.createTextNode(n)); C.append(s); }
+    G.after(C);
+  }
+
+  // ------------------------------------------------------------------ boot
+  buildLegend(); statsLine(); buildLanes(); showTask(); buildFinance(); buildSpec();
+  resize();
+  document.fonts.ready.then(() => { if (state.screen === 'finance') renderFin(); });
+  if (params.has('skip')) {
+    newSim(); stepSim(TICKS); fitCamera(true);
+    nodes.forEach((n) => { const [x, y] = project(n); n.sx = n.bx = x; n.sy = n.by = y; n.a = n.ba = 0.8; });
+    $('#loader').style.display = 'none'; $('#rail').style.opacity = 1; $('#cmd').style.opacity = 1;
+    setScreen(initialScreen(), true);
+    if (params.get('focus') === 'expand') select(GA.expand, true);
+    if (params.has('lens')) { state.lens = true; }
+  } else startLoader();
+  if (params.has('task')) { state.task = params.get('task'); showTask(); }
+  requestAnimationFrame(frame);
+  window.__au = { state, setScreen, select, nodes, cam, lens, startLoader };
+})();
