@@ -42,6 +42,7 @@
     VW = innerWidth; VH = innerHeight;
     for (const c of [scene, glCanvas, $('#fallback')]) { c.width = Math.round(VW * DPR); c.height = Math.round(VH * DPR); }
     fitCamera(true);
+    requestAnimationFrame(measureLegend);
   }
 
   // ------------------------------------------------------------------ the mark (from ui/design/logo-mark.svg)
@@ -1265,6 +1266,7 @@
       let ang = Math.atan2(tn.tip.sy - H.sy, tn.tip.sx - H.sx);
       const mx = H.sx + (tn.tip.sx - H.sx) * 0.55, my = H.sy + (tn.tip.sy - H.sy) * 0.55;
       let deg = ang * 180 / Math.PI; if (deg > 90 || deg < -90) deg += 180; // never upside down
+      if (legendRect && mx > legendRect[0] - 40 && mx < legendRect[0] + legendRect[2] + 40 && my > legendRect[1] - 12 && my < legendRect[1] + legendRect[3] + 12) { el.classList.remove('on'); continue; }
       el.style.transform = `translate(${(mx - off).toFixed(1)}px, ${my.toFixed(1)}px) translate(-50%, -50%) rotate(${deg.toFixed(1)}deg) translateY(-9px)`;
     }
   }
@@ -1274,7 +1276,8 @@
     box.style.opacity = on ? (L ? sstep(0, 900, performance.now() - L.done) : 1) : 0;
     if (!on) return;
     gangliaGeom();
-    const placed = [];
+    updateLegend(cam.k / fitK);
+    const placed = legendRect ? [legendRect] : []; // the legend is an obstacle: no project label lands on it
     const railOff = $('#s-memory').getBoundingClientRect().left;
     const order = [...ganglia.values()].sort((a, b) => (b.info ? b.info.n : 0) - (a.info ? a.info.n : 0));
     const zr = cam.k / fitK;
@@ -1298,7 +1301,6 @@
       if (state.replay.s < 0.999) { const born = G.members.filter((m) => m.birth <= state.replay.t).length; el.classList.toggle('off', !vis || born === 0); pmEl.dataset.r = '1'; pmEl.innerHTML = `<span class="num">${nf0.format(born)}</span> в выборке к этой дате`; }
       else if (pmEl.dataset.r) { delete pmEl.dataset.r; const info = G.info; pmEl.innerHTML = info ? `<span class="num">${nf0.format(info.n)}</span> узлов <i class="act ${info.last < 7 ? 'hot' : ''}"></i>${agoTxt(info.last)}` : `<span class="num">${G.members.length}</span> в выборке`; }
     }
-    updateLegend(zr);
   }
   function showCard(G, e) {
     const c = $('#m-card');
@@ -1325,10 +1327,12 @@
     fly({ x: G.cx, y: G.cy, k: Math.min(aw, ah) / (G.rr * 2.6) }, 820);
     state.hoverProj = null; showCard(null);
   }
-  let legendMode = '';
+  let legendMode = '', legendRect = null;
+  function measureLegend() { const r = $('#m-legend').getBoundingClientRect(); legendRect = r.width ? [r.left - 8, r.top - 8, r.width + 16, r.height + 16] : null; }
   function updateLegend(zr) {
     const mode = zr < 2.6 ? 'over' : 'near';
     if (mode === legendMode) return; legendMode = mode;
+    requestAnimationFrame(measureLegend);
     const L = $('#m-legend');
     const dot = (hex, s = 8) => `<i class="sw" style="width:${s}px;height:${s}px;background:${hex};box-shadow:0 0 8px ${hex}"></i>`;
     if (mode === 'over') {

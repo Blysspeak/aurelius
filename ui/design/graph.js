@@ -144,7 +144,6 @@ void main() {
       if (want === 'f32' && !(cbf && fblend)) light = cbf || cbh ? 'f16' : 'u8';
       const FMT = { f32: [gl.RGBA32F, gl.FLOAT], f16: [gl.RGBA16F, gl.HALF_FLOAT], u8: [gl.RGBA8, gl.UNSIGNED_BYTE] }[light];
       const hdr = light !== 'u8';
-      const f32lin = !!gl.getExtension('OES_texture_float_linear');
       const pe = prog(gl, EDGE_VS, EDGE_FS), pn = prog(gl, NODE_VS, NODE_FS);
       const par = gl.getExtension('KHR_parallel_shader_compile');
       let isReady = false;
@@ -189,8 +188,9 @@ void main() {
           if (W !== w || H !== h) {
             gl.bindTexture(gl.TEXTURE_2D, tex);
             gl.texImage2D(gl.TEXTURE_2D, 0, FMT[0], W, H, 0, gl.RGBA, FMT[1], null);
-            // RGBA32F is not filterable without OES_texture_float_linear: sampled 1:1 anyway, so NEAREST is exact
-            const filt = light === 'f32' && !f32lin ? gl.NEAREST : gl.LINEAR;
+            // RGBA32F + LINEAR samples as black on ANGLE/NVIDIA even with OES_texture_float_linear (the molecule
+            // regression of f59ffa4): the buffer is sampled 1:1, so NEAREST is exact and always complete
+            const filt = light === 'f32' ? gl.NEAREST : gl.LINEAR;
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
             gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
