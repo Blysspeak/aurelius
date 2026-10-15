@@ -37,6 +37,9 @@ Released versions and what each one added. Per-release details are in [CHANGELOG
 - [x] v3.3 — Tasks addressable by an id prefix; the fitness gate reads volume stated as a number
 - [x] v3.4 — Claude Code plugin (`plugin/`), `--hook` mode inside `au` itself — no bash, no python3 — and an installer that updates instead of skipping
 - [x] v3.5 — Dense retrieval: BGE-M3 vectors, RRF fusion with a stemmed full-text index, cross-encoder rerank, one daemon owning the models (spec [011](../specs/011-dense-retrieval/)); reminders with a daemon-owned clock; `au hint --hook` brings memory in on the first edit of a file; `memory_search` reads a whole record by id and answers compactly; `au db prune` and the other dry-run-first maintenance commands; nothing is indexed or written implicitly any more — no auto-indexing, no run or dependency nodes, no default post-commit hook
+- [x] v3.6 — Reranker loaded from a folder (`AURELIUS_RERANK_MODEL`) with an EN/RU FP16 export script; `AURELIUS_RERANK=cuda` puts only the reranker on the GPU
+- [x] v3.7 — `au task list --json` and `--limit`; several active tasks per project; evidence and edits find their task by the directory's branch; the activation date is never left empty
+- [x] v3.8 — Personal finance: `fin_*` MCP tools and `au fin`, exact amounts, exchanges with both sides, totals in USD at each entry's date from NBRB, CBR, NBK, ECB and Kraken ([Personal finance](finance.md)); a record whose project is known links to its hub at write time, `au db reattach` repairs older ones; README split into topic docs
 
 ## Version bump rule
 

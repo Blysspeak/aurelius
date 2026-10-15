@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/v3.8.0-stable-a6e3a1?style=flat-square" alt="v3.8.0">
   <img src="https://img.shields.io/badge/Rust-000?logo=rust&logoColor=white&style=flat-square" alt="Rust">
   <img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white&style=flat-square" alt="SQLite">
-  <img src="https://img.shields.io/badge/MCP-45_tools-a6e3a1?style=flat-square" alt="MCP">
+  <img src="https://img.shields.io/badge/MCP-52_tools-a6e3a1?style=flat-square" alt="MCP">
 </p>
 
 <p align="center">
@@ -23,6 +23,7 @@
   <a href="docs/memory.md#search">Search</a> ·
   <a href="docs/memory.md#memory-snapshot">Snapshot</a> ·
   <a href="docs/tasks.md">Tasks</a> ·
+  <a href="docs/finance.md">Finance</a> ·
   <a href="docs/sync.md">Sync</a> ·
   <a href="docs/architecture.md#web-ui">Graph UI</a> ·
   <a href="CHANGELOG.md">Changelog</a>
@@ -30,8 +31,8 @@
 
 ---
 
-Aurelius keeps projects, decisions, problems, solutions, tasks and reminders in one local SQLite
-knowledge graph, and serves it to Claude Code as an MCP server, to you as the `au` CLI, and to the
+Aurelius keeps projects, decisions, problems, solutions, tasks, reminders and personal finance in
+one local SQLite knowledge graph, and serves it to Claude Code as an MCP server, to you as the `au` CLI, and to the
 browser as a graph UI.
 
 ## The Problem
@@ -120,8 +121,9 @@ current directory into a project. A repository enters the graph only through an 
 
 ## Features
 
-- **Knowledge graph over MCP** — 45 tools for memory, tasks, reminders, skills, web search,
-  documents and secret coordinates; 35 are listed by default. [MCP Tools](docs/mcp-tools.md)
+- **Knowledge graph over MCP** — 52 tools for memory, tasks, reminders, finance, skills, web
+  search, documents and secret coordinates; 42 are listed by default, 10 admin tools are reached by
+  name or with `AURELIUS_MCP_ADMIN=1`. [MCP Tools](docs/mcp-tools.md)
 - **Memory snapshot** — a small layered slice of the graph under a hard byte budget, with a fixed
   JSON shape for programs. [Memory](docs/memory.md#memory-snapshot)
 - **Hybrid search** — full-text plus BGE-M3 vectors, fused by RRF and optionally reranked by a
@@ -130,8 +132,11 @@ current directory into a project. A repository enters the graph only through an 
   leasing and a fitness gate. [Task Management](docs/tasks.md)
 - **Reminders** — explicit states and a journal of postponements, delivered by one daemon or at
   the next turn. [Reminders](docs/reminders.md)
-- **CLI** — the `au` binary: exit codes, provenance fields, secrets, backups and maintenance.
-  [CLI](docs/cli.md)
+- **Personal finance** — spending, income and currency exchanges logged by voice or text through
+  the agent, exact amounts, totals in USD at each entry's date from national-bank and market rates.
+  [Personal finance](docs/finance.md)
+- **CLI** — the `au` binary: every subcommand and flag, exit codes, provenance fields, secrets,
+  backups and maintenance. [CLI](docs/cli.md)
 - **Project sync** — share one project between instances over a self-hosted server.
   [Project Sync](docs/sync.md)
 - **Hooks** — a Claude Code plugin whose hooks call `au` directly. [Hooks](docs/hooks.md)
@@ -142,11 +147,12 @@ current directory into a project. A repository enters the graph only through an 
 
 | Document | What is inside |
 |----------|----------------|
-| [docs/mcp-tools.md](docs/mcp-tools.md) | Every MCP tool by group, including the admin tools hidden from `tools/list` |
+| [docs/mcp-tools.md](docs/mcp-tools.md) | All 52 MCP tools by group — purpose, parameters, returns, an example — including the 10 admin tools hidden from `tools/list` |
 | [docs/memory.md](docs/memory.md) | Memory snapshot, its JSON form, project membership, the search path and its settings |
 | [docs/tasks.md](docs/tasks.md) | Task lifecycle, timestamps, branches, evidence, closing, criteria, leasing, fitness gate, task commands |
 | [docs/reminders.md](docs/reminders.md) | Reminder model, the `au daemon` clock, reminder commands |
-| [docs/cli.md](docs/cli.md) | Command overview, exit codes, provenance, secrets, backups, maintenance |
+| [docs/finance.md](docs/finance.md) | Personal finance: entry model, currencies, rates and USD conversion, `fin_*` tools, `au fin` |
+| [docs/cli.md](docs/cli.md) | Command overview, exit codes, provenance, secrets, backups, maintenance, and a reference of every `au` subcommand and flag |
 | [docs/sync.md](docs/sync.md) | Project sync between instances and the sync commands |
 | [docs/hooks.md](docs/hooks.md) | Claude Code plugin hooks and what each one does |
 | [docs/architecture.md](docs/architecture.md) | Session lifecycle, crate layout, key design, node types, relations, Web UI |
