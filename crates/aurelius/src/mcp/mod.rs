@@ -195,6 +195,13 @@ async fn handle_tools_call(
             "reminder_show" => handlers::reminder_show(&arguments),
             "reminder_done" => handlers::reminder_done(&arguments),
             "reminder_snooze" => handlers::reminder_snooze(&arguments),
+            "fin_log" => handlers::fin_log(&arguments),
+            "fin_list" => handlers::fin_list(&arguments),
+            "fin_stats" => handlers::fin_stats(&arguments),
+            "fin_void" => handlers::fin_void(&arguments),
+            "fin_categories" => handlers::fin_categories(&arguments),
+            "fin_currencies" => handlers::fin_currencies(&arguments),
+            "fin_rate" => handlers::fin_rate(&arguments),
             "secret_list" => handlers::secret_list(&arguments),
             "search_web" => handlers::search_web(&arguments),
             "search_recall" => handlers::search_recall(&arguments),
@@ -233,13 +240,13 @@ async fn handle_tools_call(
             }),
         ),
         Ok(Err(e)) => {
-            error!("tool error: {e}");
+            error!("tool error: {e:#}");
             JsonRpcResponse::success(
                 id,
                 serde_json::json!({
                     "content": [{
                         "type": "text",
-                        "text": format!("Error: {e}")
+                        "text": format!("Error: {e:#}")
                     }],
                     "isError": true
                 }),

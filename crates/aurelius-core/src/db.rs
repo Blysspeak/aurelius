@@ -716,6 +716,73 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Финансы (`crate::finance`): справочник валют и журнал записей.
+///
+/// Нарочно НЕ версия схемы. Подъём `SCHEMA_VERSION` до 20 заставил бы каждый
+/// уже установленный бинарник (демон, MCP-сервер в открытых сессиях, хуки)
+/// отказывать на живой базе с `SchemaTooNew`, пока новая сборка не
+/// установлена везде. Две новые таблицы ничего не меняют в старых, поэтому
+/// создаются лениво при первом обращении модуля финансов: старые бинарники их
+/// просто не видят. Быстрый путь — одно чтение `sqlite_master`, без DDL и без
+/// блокировки записи.
+///
+/// Деньги — только целые минимальные единицы: `typeof(...) = 'integer'`
+/// не пускает REAL даже в обход Rust. Обмен обязан нести обе стороны, всё
+/// остальное — ни одной.
+pub fn ensure_finance_schema(conn: &Connection) -> Result<()> {
+    if object_exists(conn, "table", "fin_entries")? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS fin_currencies (
+            code    TEXT PRIMARY KEY,
+            kind    TEXT NOT NULL CHECK (kind IN ('fiat', 'crypto')),
+            scale   INTEGER NOT NULL CHECK (typeof(scale) = 'integer' AND scale BETWEEN 0 AND 8),
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1))
+        );
+        INSERT OR IGNORE INTO fin_currencies (code, kind, scale) VALUES
+            ('BYN', 'fiat', 2), ('RUB', 'fiat', 2), ('USD', 'fiat', 2),
+            ('EUR', 'fiat', 2), ('KZT', 'fiat', 2),
+            ('USDT', 'crypto', 6), ('USDC', 'crypto', 6),
+            ('BTC', 'crypto', 8), ('ETH', 'crypto', 8), ('TON', 'crypto', 8),
+            ('SOL', 'crypto', 8), ('BNB', 'crypto', 8), ('XRP', 'crypto', 8),
+            ('TRX', 'crypto', 8);
+        CREATE TABLE IF NOT EXISTS fin_entries (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind                 TEXT NOT NULL CHECK (kind IN ('expense', 'income', 'exchange')),
+            amount_minor         INTEGER NOT NULL
+                                 CHECK (typeof(amount_minor) = 'integer' AND amount_minor > 0),
+            currency             TEXT NOT NULL REFERENCES fin_currencies(code),
+            counter_amount_minor INTEGER
+                                 CHECK (counter_amount_minor IS NULL
+                                        OR (typeof(counter_amount_minor) = 'integer'
+                                            AND counter_amount_minor > 0)),
+            counter_currency     TEXT REFERENCES fin_currencies(code),
+            category             TEXT,
+            note                 TEXT,
+            occurred_at          INTEGER NOT NULL,
+            source               TEXT NOT NULL CHECK (source IN ('voice', 'text', 'manual', 'import')),
+            provenance           TEXT,
+            created_at           INTEGER NOT NULL,
+            voided_at            INTEGER,
+            void_reason          TEXT,
+            CHECK ((kind = 'exchange')
+                   = (counter_amount_minor IS NOT NULL AND counter_currency IS NOT NULL)),
+            CHECK (kind = 'exchange'
+                   OR (counter_amount_minor IS NULL AND counter_currency IS NULL)),
+            CHECK (kind = 'exchange' OR category IS NOT NULL),
+            CHECK (counter_currency IS NULL OR counter_currency <> currency),
+            CHECK ((voided_at IS NULL) = (void_reason IS NULL))
+        );
+        CREATE INDEX IF NOT EXISTS idx_fin_entries_occurred ON fin_entries(occurred_at);
+        ",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// V19 — stemmed full-text index. `nodes_fts` has no stemming, so a Russian
 /// word in another case or number missed the record. The stems go into a
 /// separate regular FTS5 table, not a column of the external-content

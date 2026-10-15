@@ -11,6 +11,8 @@ pub mod differ;
 pub mod embed;
 pub mod embed_socket;
 pub mod eval;
+pub mod finance;
+pub mod finance_rates;
 pub mod fts;
 pub mod git;
 pub mod graph;

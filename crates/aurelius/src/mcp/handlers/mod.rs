@@ -1,5 +1,6 @@
 mod crud;
 mod doc;
+mod finance;
 mod path;
 mod reminder;
 mod search;
@@ -12,6 +13,7 @@ mod task;
 
 pub use crud::*;
 pub use doc::*;
+pub use finance::*;
 pub use path::*;
 pub use reminder::*;
 pub use search::*;
