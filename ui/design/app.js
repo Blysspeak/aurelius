@@ -34,8 +34,12 @@
   const OFF = typeof OffscreenCanvas !== 'undefined';
   const scene = OFF ? new OffscreenCanvas(1, 1) : document.createElement('canvas');
   document.body.classList.add('nogl');
+  // the pre-loader canvas and the small UI canvases stay in software: a GPU-backed 2D canvas flushing while the GPU
+  // process creates the render worker's WebGL context stalled the main thread 120-175 ms (gone with this, measured).
+  // The scene keeps GPU raster: it is redrawn every frame of the loader and of Finance, too slow in software.
+  const CPU2D = { willReadFrequently: true };
   const ctx = scene.getContext('2d');
-  const fbCtx = $('#fallback').getContext('2d');
+  const fbCtx = $('#fallback').getContext('2d', CPU2D);
   let VW = 0, VH = 0, DPR = 1, vignette = null;
   let rh = null, glOK = false, glShown = false, lightMode = '', sceneDirty = true, model = false;
   function resize() {
@@ -90,7 +94,7 @@
   let preOn = !params.has('skip');
   (function pre() {
     if (!preOn) return;
-    const fb = $('#fallback'), c = fb.getContext('2d'), W = innerWidth, H = innerHeight, d = Math.min(devicePixelRatio || 1, 2);
+    const fb = $('#fallback'), c = fb.getContext('2d', CPU2D), W = innerWidth, H = innerHeight, d = Math.min(devicePixelRatio || 1, 2);
     if (fb.width !== Math.round(W * d)) { fb.width = Math.round(W * d); fb.height = Math.round(H * d); }
     document.body.classList.add('nogl');
     c.setTransform(d, 0, 0, d, 0, 0); c.fillStyle = '#070a12'; c.fillRect(0, 0, W, H);
@@ -242,13 +246,15 @@ const get = (db, k) => new Promise((res) => { try { const q = db.transaction('la
 onmessage = async (e) => {
   const { I, key, useCache } = e.data;
   const db = await idb();
-  if (db && useCache) { const c = await get(db, key); if (c && c.NT) { postMessage({ r: c, cached: true }, TR(c)); return; } }
+  if (db && useCache) { const c = await get(db, key); if (c && c.NT) { postMessage({ r: c, cached: true }, TR(c)); postMessage({ done: true }); return; } }
   I.progress = (p) => postMessage({ p });
   const t0 = performance.now();
   const r = AU_LAYOUT(I);
   const ms = performance.now() - t0;
-  if (db) { try { db.transaction('layout', 'readwrite').objectStore('layout').put(r, key); } catch (e2) { /* quota or private mode */ } }
-  postMessage({ r, ms }, TR(r));
+  let tx = null;
+  if (db) { try { tx = db.transaction('layout', 'readwrite'); tx.objectStore('layout').put(r, key); } catch (e2) { tx = null; /* quota or private mode */ } }
+  postMessage({ r, ms }, TR(r));     // put() has already cloned r, so its buffers can move to the main thread
+  if (tx) { tx.oncomplete = tx.onerror = tx.onabort = () => postMessage({ done: true }); } else postMessage({ done: true });
 };`;
   function graphHash(D) {
     if (GA.hash) return GA.hash;
@@ -264,8 +270,8 @@ onmessage = async (e) => {
     try {
       const src = AU_LAYOUT.toString() + '\nconst TR = ' + AU_LAYOUT.transfer.toString() + ';\n' + LAYOUT_WORKER;
       const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
-      r = await new Promise((res, rej) => { w.onmessage = (e) => { if (e.data.r) { LOAD.cached = !!e.data.cached; LOAD.layoutWorkerMs = Math.round(e.data.ms || 0); res(e.data.r); } else LOAD.layoutP = e.data.p; }; w.onerror = rej; w.postMessage({ I: input, key, useCache: !params.has('nocache') }, [input.typ.buffer, input.age.buffer, input.theme.buffer, input.ea.buffer, input.eb.buffer, input.er.buffer]); });
-      w.terminate();
+      r = await new Promise((res, rej) => { w.onmessage = (e) => { if (e.data.r) { LOAD.cached = !!e.data.cached; LOAD.layoutWorkerMs = Math.round(e.data.ms || 0); res(e.data.r); } else if (e.data.done) w.terminate(); else LOAD.layoutP = e.data.p; }; w.onerror = rej; w.postMessage({ I: input, key, useCache: !params.has('nocache') }, [input.typ.buffer, input.age.buffer, input.theme.buffer, input.ea.buffer, input.eb.buffer, input.er.buffer]); });
+      // the worker ends itself once the IndexedDB write has committed (terminating earlier aborted it)
     } catch (e) { console.warn('layout worker unavailable, laying out in-thread', e); r = AU_LAYOUT(input); }
     LOAD.layoutMs = Math.round(performance.now() - t0);
     return r;
@@ -425,7 +431,7 @@ onmessage = async (e) => {
     const [ga, hr, ha, hol] = CONF_LOOK[conf] || CONF_LOOK[0];
     const S = Math.ceil(r * (hr ? hr * 2.2 : 3.2));
     const cv = document.createElement('canvas'); cv.width = cv.height = S;
-    const c = cv.getContext('2d');
+    const c = cv.getContext('2d', CPU2D);
     if (hr) { const g = c.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, r * hr); g.addColorStop(0, `rgba(232,230,225,${ha})`); g.addColorStop(1, 'rgba(232,230,225,0)'); c.fillStyle = g; c.fillRect(0, 0, S, S); }
     const kind = glyphKind(t);
     drawGlyph(c, hol ? 'ring' : kind, S / 2, S / 2, r, hol ? 0.55 : ga, hol || kind === 'ring' || kind === 'double');
@@ -435,7 +441,7 @@ onmessage = async (e) => {
   }
   function glyphCanvas(t, conf, css = 14, hex) {
     const cv = document.createElement('canvas'); cv.width = cv.height = css * 2;
-    const c = cv.getContext('2d');
+    const c = cv.getContext('2d', CPU2D);
     const kind = glyphKind(t), r = css * 0.28;
     drawGlyph(c, conf === 4 ? 'ring' : kind, css, css, r * 2, CONF_LOOK[conf][0], conf === 4 || kind === 'ring' || kind === 'double');
     if (hex) { c.globalCompositeOperation = 'source-in'; c.fillStyle = hex; c.fillRect(0, 0, cv.width, cv.height); }
@@ -565,7 +571,7 @@ onmessage = async (e) => {
     for (const [ci, name, key] of [[1, 'measured', 'measured'], [2, 'inferred', 'inferred'], [3, 'reported', 'reported'], [4, 'stale / unverified', 'unverified']]) {
       const s = document.createElement('span');
       const cv = document.createElement('canvas'); cv.width = cv.height = 28; cv.style.width = cv.style.height = '14px';
-      const sp = sprite('concept', ci); cv.getContext('2d').drawImage(sp.cv, 0, 0, 28, 28);
+      const sp = sprite('concept', ci); cv.getContext('2d', CPU2D).drawImage(sp.cv, 0, 0, 28, 28);
       s.append(cv); s.insertAdjacentHTML('beforeend', `${name} <span class="mono">${nf0.format(cc[key] || 0)}</span>`);
       C.append(s);
     }
@@ -1157,7 +1163,7 @@ onmessage = async (e) => {
     drawTicks = () => {
       const r = tr.getBoundingClientRect(); trRect = r; tlDom.w = r.width; tlDom.k = '';
       const d = Math.min(devicePixelRatio || 1, 2); ssc.width = Math.round(r.width * d); ssc.height = Math.round(r.height * d);
-      const c2 = ssc.getContext('2d'); c2.setTransform(d, 0, 0, d, 0, 0); c2.fillStyle = 'rgba(232,230,225,0.196)';
+      const c2 = ssc.getContext('2d', CPU2D); c2.setTransform(d, 0, 0, d, 0, 0); c2.fillStyle = 'rgba(232,230,225,0.196)';
       for (let k = 0; k < sessS.length; k++) c2.fillRect(Math.round(sessS[k] * r.width), 9, 1, 8);
     };
     requestAnimationFrame(drawTicks);
@@ -1922,7 +1928,7 @@ onmessage = async (e) => {
     const G = $('#spec-glyphs');
     for (const t of gl) { const s = document.createElement('span'); s.append(glyphCanvas(t, 1, 18, GHEX[GROUP[t] || 'i'])); s.append(document.createTextNode(t.replace('_', ' '))); G.append(s); }
     const C = document.createElement('div'); C.className = 'glyphs'; C.style.marginTop = '12px';
-    for (const [ci, n] of [[1, 'measured — резкая точка'], [2, 'inferred — мягкий ореол'], [3, 'reported — тусклая'], [4, 'stale — полое кольцо']]) { const s = document.createElement('span'); const cv = document.createElement('canvas'); cv.width = cv.height = 36; cv.style.width = cv.style.height = '18px'; cv.getContext('2d').drawImage(sprite('concept', ci).cv, 0, 0, 36, 36); s.append(cv, document.createTextNode(n)); C.append(s); }
+    for (const [ci, n] of [[1, 'measured — резкая точка'], [2, 'inferred — мягкий ореол'], [3, 'reported — тусклая'], [4, 'stale — полое кольцо']]) { const s = document.createElement('span'); const cv = document.createElement('canvas'); cv.width = cv.height = 36; cv.style.width = cv.style.height = '18px'; cv.getContext('2d', CPU2D).drawImage(sprite('concept', ci).cv, 0, 0, 36, 36); s.append(cv, document.createTextNode(n)); C.append(s); }
     G.after(C);
   }
 
