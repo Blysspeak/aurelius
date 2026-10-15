@@ -78,6 +78,14 @@ void main() {
   o = vec4(col, 1.0);
 }`;
 
+  const FS0 = `#version 300 es
+precision highp float;
+uniform sampler2D uBg;
+uniform vec2 uView;
+uniform float uRatio;
+out vec4 o;
+void main() { o = vec4(texture(uBg, gl_FragCoord.xy / uRatio / uView).rgb, 1.0); }`;
+
   const FS2 = `#version 300 es
 precision highp float;
 uniform sampler2D uBg;
@@ -213,19 +221,24 @@ void main() {
   o = vec4(acc * 0.25, 1.0);
 }`;
 
+  // shaders compile in parallel (KHR_parallel_shader_compile): nothing here waits on the driver;
+  // finalize() runs once the driver reports completion, so the loader never stalls on a compile
   function compile(gl, type, src) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src);
     gl.compileShader(s);
-    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
     return s;
   }
   function program(gl, fs) {
     const p = gl.createProgram();
-    gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, VS));
-    gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fs));
+    const vs = compile(gl, gl.VERTEX_SHADER, VS), f = compile(gl, gl.FRAGMENT_SHADER, fs);
+    gl.attachShader(p, vs); gl.attachShader(p, f);
     gl.linkProgram(p);
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    return { p, vs, f, u: null };
+  }
+  function finalize(gl, P) {
+    if (!gl.getProgramParameter(P.p, gl.LINK_STATUS)) throw new Error(gl.getShaderInfoLog(P.f) || gl.getProgramInfoLog(P.p));
+    const p = P.p;
     const u = {};
     const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
     for (let i = 0; i < n; i++) {
@@ -233,7 +246,7 @@ void main() {
       const name = info.name.replace(/\[0\]$/, '');
       u[name] = gl.getUniformLocation(p, info.name);
     }
-    return { p, u };
+    P.u = u;
   }
   function tex(gl, filter) {
     const t = gl.createTexture();
@@ -249,8 +262,10 @@ void main() {
     init(canvas) {
       const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, premultipliedAlpha: false, preserveDrawingBuffer: true });
       if (!gl) return null;
-      let p1, p2;
-      try { p1 = program(gl, FS1); p2 = program(gl, FS2); } catch (e) { console.error(e); return null; }
+      const par = gl.getExtension('KHR_parallel_shader_compile');
+      const p1 = program(gl, FS1), p0 = program(gl, FS0), p2 = program(gl, FS2); // the heavy raymarch compiles last and is optional
+      let ready2 = false;
+      let ready = false, failed = false;
       const sceneTex = tex(gl, gl.LINEAR);
       const fbTex = tex(gl, gl.LINEAR);
       const markTex = tex(gl, gl.LINEAR);
@@ -259,12 +274,23 @@ void main() {
       let fw = 0, fh = 0;
       const rect = new Float32Array(MAX * 4), P = new Float32Array(MAX * 4), Q = new Float32Array(MAX * 4), TT = new Float32Array(MAX * 4);
       const api = {
-        gl,
+        gl, par,
+        ready() {
+          if (ready && !ready2 && (!par || gl.getProgramParameter(p2.p, par.COMPLETION_STATUS_KHR))) { try { finalize(gl, p2); ready2 = true; } catch (e) { console.error(e); } }
+          if (ready || failed) return ready;
+          if (par && !(gl.getProgramParameter(p1.p, par.COMPLETION_STATUS_KHR) && gl.getProgramParameter(p0.p, par.COMPLETION_STATUS_KHR))) return false;
+          try { finalize(gl, p1); finalize(gl, p0); ready = true; } catch (e) { console.error(e); failed = true; }
+          return ready;
+        },
+        glassReady: () => ready2,
+        failed: () => failed,
         setMark(data, n) {
+          gl.activeTexture(gl.TEXTURE1);
           gl.bindTexture(gl.TEXTURE_2D, markTex);
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, n, n, 0, gl.RED, gl.FLOAT, data);
         },
         frame(f) {
+          if (!api.ready()) return false;
           const W = canvas.width, H = canvas.height;
           if (W !== fw || H !== fh) {
             gl.bindTexture(gl.TEXTURE_2D, fbTex);
@@ -299,8 +325,15 @@ void main() {
           gl.drawArrays(gl.TRIANGLES, 0, 3);
           // pass 2
           gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-          gl.useProgram(p2.p);
           const o = f.obj;
+          if (!ready2 || o.presence <= 0) { // plain blit; the raymarch runs only while the glass object is present
+            gl.useProgram(p0.p);
+            gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbTex); gl.uniform1i(p0.u.uBg, 0);
+            gl.uniform2f(p0.u.uView, f.vw, f.vh); gl.uniform1f(p0.u.uRatio, f.ratio);
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
+            return true;
+          }
+          gl.useProgram(p2.p);
           gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, fbTex); gl.uniform1i(p2.u.uBg, 0);
           gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, markTex); gl.uniform1i(p2.u.uMark, 1);
           gl.uniform2f(p2.u.uView, f.vw, f.vh); gl.uniform1f(p2.u.uRatio, f.ratio);
@@ -313,6 +346,7 @@ void main() {
           gl.uniform1f(p2.u.uIor, 1.5); gl.uniform1f(p2.u.uDispersion, 0.35);
           gl.uniform1f(p2.u.uPresence, o.presence); gl.uniform1f(p2.u.uThick, o.thick); gl.uniform1f(p2.u.uAA, o.aa ? 1 : 0);
           gl.drawArrays(gl.TRIANGLES, 0, 3);
+          return true;
         },
       };
       return api;

@@ -1,8 +1,9 @@
 // aurelius — light and glass. Design prototype, phase 1. Plain JS, no build step.
 // Data: window.AU from snapshot.js (real snapshot of the owner's database, kept out of git).
-(() => {
+(async () => {
   'use strict';
   const AU = window.AU;
+  const yieldFrame = () => new Promise((r) => requestAnimationFrame(() => r())); // boot runs in slices between frames
   if (!AU) {
     document.body.innerHTML = '<p style="padding:40px;max-width:60ch;color:#e8e6e1;font:15px/1.6 sans-serif">Нет snapshot.js рядом с index.html. Снимок держится вне git: репозиторий публичный, а в нём личные финансы и метки памяти. Собрать: <code>ui/design/tools/make-snapshot.sh</code>.</p>';
     return;
@@ -27,16 +28,19 @@
 
   // ------------------------------------------------------------------ canvases
   const glCanvas = $('#gl');
-  let glass = REDUCE && params.has('nogl') ? null : window.Glass.init(glCanvas);
-  if (params.has('nogl')) glass = null;
-  const scene = glass ? document.createElement('canvas') : $('#fallback');
-  if (!glass) document.body.classList.add('nogl');
+  // the WebGL context is created after the first frames (context creation alone cost ~200 ms of the first task);
+  // until then, and without WebGL2, the 2D scene is shown on #fallback
+  const WANT_GL = !params.has('nogl') && !!window.WebGL2RenderingContext;
+  let glass = null;
+  const scene = document.createElement('canvas');
+  document.body.classList.add('nogl');
   const ctx = scene.getContext('2d');
+  const fbCtx = $('#fallback').getContext('2d');
   let VW = 0, VH = 0, DPR = 1;
   function resize() {
     DPR = Math.min(window.devicePixelRatio || 1, 2); vignette = null;
     VW = innerWidth; VH = innerHeight;
-    for (const c of [scene, glCanvas]) { c.width = Math.round(VW * DPR); c.height = Math.round(VH * DPR); }
+    for (const c of [scene, glCanvas, $('#fallback')]) { c.width = Math.round(VW * DPR); c.height = Math.round(VH * DPR); }
     fitCamera(true);
   }
 
@@ -52,9 +56,9 @@
   (function buildStrokes() {
     const ring = (r) => { const p = []; for (let i = 0; i <= 220; i++) { const a = -Math.PI / 2 + (i / 220) * Math.PI * 2; p.push([MK.c[0] + Math.cos(a) * r, MK.c[1] + Math.sin(a) * r]); } return p; };
     strokes.push(ring(338), ring(308));
-    const path = $('#sil-path'); path.setAttribute('d', MK.sil);
-    const L = path.getTotalLength(); const sil = [];
-    for (let s = 0; s <= L; s += 18) { const q = path.getPointAtLength(s); sil.push([q.x * 0.1, 1024 - q.y * 0.1]); }
+    // profile polyline, sampled from MK.sil every 18 path units once offline (getPointAtLength cost ~300 ms at boot)
+    const SIL = [499.5,259.2,497.7,259.4,495.9,259.6,494.1,259.8,492.3,260,490.6,260.3,488.8,260.6,487,260.9,485.2,261.2,483.5,261.5,481.7,261.8,479.9,262.2,478.2,262.6,476.4,262.9,474.7,263.3,472.9,263.7,471.1,264.1,469.4,264.5,467.6,264.9,465.9,265.4,464.1,265.8,462.4,266.3,460.7,266.7,458.9,267.2,457.2,267.7,455.5,268.2,453.7,268.7,452,269.2,450.3,269.8,448.6,270.3,446.9,270.9,445.2,271.5,443.5,272.1,441.8,272.7,440.1,273.4,438.5,274.1,436.9,274.9,435.3,275.7,433.7,276.7,432.2,277.6,430.6,278.4,428.9,279,427.1,279.3,425.4,280,423.8,280.7,422.2,281.4,420.5,282.2,418.9,282.9,417.2,283.5,415.4,283.9,413.7,284.2,411.9,284.3,410.1,284.2,408.3,283.9,406.5,283.5,404.8,283,403.1,282.3,401.5,281.6,399.9,280.8,398.3,280,396.6,279.3,395,278.6,393.3,278,391.5,277.5,389.7,277.4,388.1,278.2,386.9,279.5,386.4,281.2,387,282.9,387.6,284.6,388.2,286.3,388.6,288,388.9,289.8,389.1,291.6,389,293.4,388.8,295.2,388.4,296.9,387.7,298.6,386.8,300.2,385.7,301.6,384.4,302.9,383,304,381.5,305,379.9,305.9,378.3,306.6,376.6,307.3,374.9,307.8,373.2,308.4,371.5,309.1,369.9,309.7,368.2,310.4,366.6,311.2,365,312,363.4,312.8,361.8,313.7,360.3,314.6,358.7,315.6,357.3,316.6,355.8,317.7,354.4,318.8,353,320,351.7,321.2,350.4,322.5,349.2,323.8,348.1,325.2,346.9,326.6,345.9,328,344.9,329.6,344,331.1,343.1,332.7,342.3,334.3,341.6,335.9,340.9,337.6,340.3,339.3,339.8,341,339.3,342.8,338.9,344.5,338.6,346.3,338.4,348.1,338.3,349.9,338.2,351.7,338.2,353.5,338.3,355.3,338.5,357.1,338.7,358.8,339,360.6,339.3,362.4,339.7,364.1,340.2,365.9,340.7,367.6,341.3,369.3,342,371,342.7,372.6,343.5,374.2,344.4,375.8,345.4,377.3,346.5,378.7,347.7,380.1,348.9,381.4,350,382.8,350.8,384.4,351.4,386.1,351.5,387.9,351.4,389.7,351.2,391.5,350.9,393.3,350.5,395,350,396.8,349.5,398.5,349,400.2,348.5,402,347.9,403.7,347.4,405.4,346.8,407.1,346.3,408.8,345.7,410.5,345.2,412.2,344.6,413.9,344,415.7,343.4,417.4,342.9,419.1,342.3,420.8,341.7,422.5,341.2,424.2,340.6,425.9,340.1,427.6,339.5,429.3,339,431.1,338.5,432.8,338,434.5,337.5,436.3,337.1,438,336.7,439.8,336.4,441.5,336.2,443.3,336.1,445.1,336.2,446.9,336.5,448.7,337,450.4,337.6,452.1,338.4,453.7,339.2,455.4,339.9,457,340.6,458.7,341.1,460.4,341.4,462.2,341.4,464,341.2,465.7,340.8,467.5,340.4,469.3,339.9,471,339.3,472.7,338.7,474.4,338,476,337.3,477.7,336.7,479.4,336,481,335.3,482.7,334.5,484.3,333.8,486,333.1,487.6,332.4,489.3,331.6,490.9,330.9,492.6,330.1,494.2,329.4,495.8,328.6,497.5,327.9,499.1,327.2,500.8,326.4,502.4,325.7,504,324.9,505.7,324.1,507.3,323.4,508.9,322.6,510.6,321.9,512.2,321.2,513.9,320.4,515.5,319.7,517.1,318.9,518.8,318.2,520.4,317.4,522,316.7,523.7,315.9,525.3,315.2,527,314.4,528.6,313.7,530.2,313,531.9,312.3,533.5,311.5,535.2,310.8,536.8,310.1,538.5,309.5,540.2,308.8,541.8,308.2,543.5,307.7,545.3,307.2,547,306.9,548.8,307.1,550.6,307.8,552.2,309,553.5,310.3,554.7,311.7,555.9,313.2,556.9,314.9,557.5,316.6,557.8,318.4,557.8,320.2,557.8,322,557.7,323.8,557.7,325.6,557.7,327.4,557.7,329.2,557.8,331,558,332.8,558.3,334.5,558.9,336.1,559.7,337.5,560.9,338.7,562.2,339.8,563.6,340.9,565.1,341.5,566.7,342,568.5,342.2,570.3,342.3,572.1,342.2,573.9,342,575.6,341.7,577.4,341.2,579.2,340.7,580.9,340,582.5,339.3,584.2,338.6,585.8,338.2,587.6,339.1,589.2,340.2,590.5,341.4,591.9,342.5,593.3,343.5,594.8,344.3,596.4,344.9,598.1,345.2,599.9,345.3,601.7,345.2,603.5,344.9,605.3,344.6,607,344.1,608.8,343.7,610.5,343.3,612.3,343.4,614.1,344.1,615.7,345.2,617.1,346.5,618.4,347.8,619.6,349.1,620.9,350.4,622.2,351.6,623.4,352.8,624.8,353.9,626.2,354.9,627.7,355.7,629.3,356.2,631,356.4,632.8,356.3,634.6,356,636.4,355.5,638.1,354.8,639.8,354.1,641.4,353.3,643.1,352.5,644.6,351.6,646.2,350.7,647.8,349.9,649.4,349.1,651,348.6,652.7,348.5,654.5,348.7,656.3,349.1,658.1,349.5,659.8,350,661.6,350.4,663.3,351,665,351.5,666.7,352.2,668.4,353,670,353.8,671.6,354.8,673.1,355.9,674.5,357.2,675.8,358.6,676.9,360.1,677.9,361.7,678.8,363.3,679.6,365,680.3,366.6,680.9,368.4,681.4,370.1,682,371.8,682.4,373.6,682.9,375.3,683.2,377.1,683.5,378.9,683.7,380.7,683.8,382.5,683.8,384.3,683.8,386.1,683.7,387.9,683.6,389.7,683.4,391.5,683.1,393.2,682.8,395,682.5,396.8,682.1,398.5,681.7,400.3,681.3,402,680.8,403.8,680.4,405.5,679.9,407.2,679.4,408.9,678.9,410.7,678.3,412.4,677.8,414.1,677.2,415.8,676.6,417.5,676.1,419.2,675.5,420.9,674.9,422.6,674.3,424.3,673.7,426,673,427.7,672.4,429.3,671.8,431,671.2,432.7,670.5,434.4,669.9,436.1,669.2,437.7,668.6,439.4,667.9,441.1,667.3,442.8,666.6,444.4,665.9,446.1,665.3,447.8,664.6,449.5,663.9,451.1,663.3,452.8,662.6,454.5,662,456.2,661.4,457.9,660.7,459.6,660.2,461.3,659.7,463.1,659.2,464.8,659,466.6,658.9,468.4,658.9,470.2,659.3,471.8,660.1,473.3,661.1,474.6,662.3,475.9,663.6,477,665,477.9,666.6,478.7,668.2,479.1,669.9,479.3,671.7,479.4,673.5,479.1,675.3,478.5,677,477.7,678.6,476.7,680.1,475.5,681.5,474.4,682.9,473.1,684.2,471.9,685.5,470.6,686.7,469.3,688,468,689.3,466.7,690.5,465.4,691.8,464.1,693,462.8,694.2,461.5,695.5,460.2,696.7,458.9,698,457.6,699.2,457,700.7,457,702.5,457,704.3,457,706.1,457,707.9,457,709.7,457,711.5,457,713.3,457,715.1,457,716.9,457,718.7,457,720.5,457,722.3,457,724.1,457,725.9,457,727.7,457,729.5,457,731.3,457,733.1,457,734.9,457,736.7,457,738.5,457.1,740.3,457.1,742.1,457.1,743.9,457.1,745.7,457.2,747.5,457.2,749.3,457.3,751.1,457.3,752.9,457.4,754.7,457.5,756.5,457.6,758.3,457.7,760.1,458.6,761.6,460.3,762.4,462,762.9,463.8,763.2,465.5,763.5,467.3,763.7,469.1,763.8,470.9,764,472.7,764.1,474.5,764.2,476.3,764.3,478.1,764.4,479.9,764.4,481.7,764.5,483.5,764.5,485.3,764.6,487.1,764.6,488.9,764.7,490.7,764.7,492.5,764.7,494.3,764.8,496.1,764.8,497.9,764.8,499.7,764.8,501.5,764.8,503.3,764.7,505.1,764.7,506.9,764.6,508.7,764.6,510.5,764.5,512.3,764.4,514.1,764.3,515.9,764.2,517.7,764.1,519.5,764,521.3,763.8,523.1,763.7,524.9,763.5,526.6,763.4,528.4,763.2,530.2,763,532,762.8,533.8,762.5,535.6,762.3,537.4,762.1,539.2,761.8,540.9,761.6,542.7,761.3,544.5,761,546.3,760.7,548,760.4,549.8,760,551.6,759.7,553.3,759.4,555.1,759,556.9,758.6,558.6,758.2,560.4,757.8,562.1,757.4,563.9,757,565.6,756.6,567.4,756.1,569.1,755.7,570.8,755.2,572.6,754.7,574.3,754.2,576,753.7,577.8,753.2,579.5,752.7,581.2,752.1,582.9,751.6,584.6,751,586.3,750.4,588,749.9,589.7,749.3,591.4,748.6,593.1,748,594.8,747.4,596.5,746.7,598.2,746.1,599.8,745.4,601.5,744.7,603.2,744.1,604.8,743.4,606.5,742.6,608.1,741.9,609.8,741.2,611.4,740.5,613,739.7,614.7,738.9,616.3,738.2,617.9,737.4,619.5,736.6,621.1,735.8,622.8,735,624.4,734.2,625.9,733.3,627.5,732.5,629.1,731.6,630.7,730.8,632.3,729.9,633.9,729,635.4,728.1,637,727.2,638.5,726.3,640.1,725.4,641.6,724.5,643.2,723.6,644.7,722.6,646.2,721.7,647.8,720.7,649.3,719.8,650.8,718.8,652.4,717.9,653.9,716.9,655.4,715.9,656.8,714.8,658.2,713.7,659.3,712.3,660,710.6,660.1,708.8,660,707,659.7,705.2,659.4,703.5,659.1,701.7,658.7,699.9,658.4,698.2,658.1,696.4,657.7,694.6,657.4,692.9,657.1,691.1,656.7,689.3,656.4,687.6,656.1,685.8,655.8,684,655.4,682.2,655.1,680.5,654.8,678.7,654.5,676.9,654.1,675.2,653.8,673.4,653.5,671.6,653.2,669.9,652.8,668.1,652.5,666.3,652.2,664.5,651.9,662.8,651.5,661,651.2,659.2,650.9,657.5,650.6,655.7,650.3,653.9,649.9,652.1,649.6,650.4,649.3,648.6,649,646.8,648.7,645.1,648.4,643.3,648.1,641.5,647.8,639.7,647.5,638,647.2,636.2,646.9,634.4,646.6,632.6,646.3,630.9,646,629.1,645.7,627.3,645.5,625.5,645.2,623.7,645,622,644.8,620.2,644.6,618.4,644.7,616.6,645.3,614.9,646,613.2,646.8,611.6,647.6,610,648.4,608.3,649.2,606.7,650,605.1,650.9,603.6,651.7,602,652.6,600.4,653.5,598.8,654.4,597.3,655.2,595.7,656.1,594.1,657,592.5,657.9,591,658.7,589.4,659.6,587.8,660.5,586.3,661.4,584.7,662.2,583.1,663.1,581.5,664,580,664.8,578.4,665.7,576.8,666.6,575.2,667.5,573.7,668.3,572.1,669.2,570.5,670.1,568.9,670.9,567.3,671.8,565.8,672.6,564.2,673.5,562.6,674.4,561,675.2,559.4,676.1,557.8,676.9,556.3,677.8,554.7,678.6,553.1,679.5,551.5,680.3,549.9,681.1,548.3,682,546.7,682.8,545.1,683.7,543.5,684.5,541.9,685.3,540.3,686.2,538.8,687,537.2,687.9,535.6,688.8,534,689.8,532.5,690.7,531,691.8,529.6,692.9,528.2,694.2,526.9,695.6,525.7,697.1,524.7,698.7,523.9,700.3,523.2,702,522.5,703.7,522,705.4,521.3,707,520.6,708.6,519.7,710.1,518.8,711.6,517.7,713,516.6,714.3,515.3,715.5,514,716.6,512.6,717.6,511.1,718.5,509.5,719.2,507.9,719.8,506.2,720.3,504.4,720.7,502.7,720.9,500.9,721,499.1,721,497.3,720.8,495.5,720.5,493.7,720.2,492,719.7,490.2,719,488.5,718.4,486.9,717.7,485.2,717,483.5,716.5,481.8,716.1,480.1,715.8,478.3,715.7,476.5,715.6,474.7,715.7,472.9,715.7,471.1,715.9,469.3,716,467.5,716.2,465.7,716.4,463.9,716.7,462.1,716.9,460.4,717.2,458.6,717.4,456.8,717.7,455,717.9,453.2,718.1,451.4,718.2,449.6,718.4,447.9,718.5,446.1,718.6,444.3,718.7,442.5,718.7,440.7,718.7,438.9,718.7,437.1,718.7,435.3,718.6,433.5,718.6,431.7,718.5,429.9,718.3,428.1,718.2,426.3,718,424.5,717.9,422.7,717.7,420.9,717.4,419.1,717.2,417.3,716.9,415.6,716.6,413.8,716.3,412,716,410.2,715.7,408.5,715.3,406.7,714.9,404.9,714.5,403.2,714.1,401.4,713.6,399.7,713.2,398,712.7,396.2,712.2,394.5,711.7,392.8,711.1,391.1,710.6,389.3,710,387.6,709.4,385.9,708.8,384.3,708.1,382.6,707.5,380.9,706.8,379.2,706.1,377.6,705.4,375.9,704.7,374.2,704,372.6,703.2,371,702.4,369.4,701.6,367.7,700.8,366.1,700,364.5,699.1,362.9,698.3,361.4,697.4,359.8,696.5,358.2,695.6,356.7,694.6,355.2,693.7,353.6,692.7,352.1,691.7,350.6,690.7,349.1,689.7,347.6,688.7,346.2,687.6,344.7,686.6,343.2,685.5,341.8,684.5,340.3,683.4,338.9,682.3,337.5,681.2,336,680.1,334.6,678.9,333.2,677.8,331.8,676.6,330.4,675.5,329.1,674.3,327.7,673.1,326.3,671.9,325,670.7,323.7,669.5,322.3,668.3,321,667,319.7,665.8,318.4,664.5,317.1,663.3,315.8,662,314.6,660.7,313.3,659.4,312.1,658.1,310.9,656.7,309.6,655.4,308.4,654.1,307.2,652.7,306.1,651.3,304.9,650,303.7,648.6,302.6,647.2,301.5,645.8,300.3,644.3,299.2,642.9,298.1,641.5,297,640,296,638.6,294.9,637.1,293.9,635.6,292.9,634.1,291.8,632.6,290.8,631.1,289.9,629.6,288.9,628.1,287.9,626.6,287,625,286.1,623.5,285.1,621.9,284.2,620.3,283.3,618.8,282.5,617.2,281.6,615.6,280.8,614,280,612.4,279.1,610.8,278.3,609.2,277.6,607.5,276.8,605.9,276,604.2,275.3,602.6,274.6,600.9,273.9,599.3,273.2,597.6,272.5,595.9,271.9,594.3,271.2,592.6,270.6,590.9,270,589.2,269.4,587.5,268.8,585.8,268.2,584,267.7,582.3,267.2,580.6,266.6,578.9,266.1,577.1,265.7,575.4,265.2,573.7,264.7,571.9,264.3,570.2,263.9,568.4,263.5,566.7,263.1,564.9,262.7,563.1,262.3,561.4,262,559.6,261.7,557.8,261.4,556,261.1,554.3,260.8,552.5,260.5,550.7,260.3,548.9,260,547.1,259.8,545.3,259.6,543.6,259.4,541.8,259.2,540,259.1,538.2,258.9,536.4,258.8,534.6,258.7,532.8,258.6,531,258.5,529.2,258.4,527.4,258.3,525.6,258.3,523.8,258.3,522,258.3,520.2,258.3,518.4,258.3,516.6,258.3,514.8,258.3,513,258.4,511.2,258.4,509.4,258.5,507.6,258.6,505.8,258.7,504,258.8,502.2,259,500.4,259.1];
+    const sil = []; for (let k = 0; k < SIL.length; k += 2) sil.push([SIL[k], SIL[k + 1]]);
     sil.push(sil[0]);
     strokes.push(sil);
     for (const [a, b] of MK.edges) strokes.push([MK.nodes[a], MK.nodes[b]].map((p) => p.slice()));
@@ -69,10 +73,44 @@
     const s = strokes[strokes.length - 1]; return s[s.length - 1];
   }
   const markXf = () => { const r = Math.min(VW, VH) * 0.2; return { cx: VW / 2, cy: VH / 2 - 20, s: r / 338 }; };
+  // pre-loader: the stroke of light starts on the first frame, while the rest of the boot runs in slices
+  const PRE_T0 = performance.now();
+  let preOn = !params.has('skip');
+  (function pre() {
+    if (!preOn) return;
+    const fb = $('#fallback'), c = fb.getContext('2d'), W = innerWidth, H = innerHeight, d = Math.min(devicePixelRatio || 1, 2);
+    if (fb.width !== Math.round(W * d)) { fb.width = Math.round(W * d); fb.height = Math.round(H * d); }
+    document.body.classList.add('nogl');
+    c.setTransform(d, 0, 0, d, 0, 0); c.fillStyle = '#070a12'; c.fillRect(0, 0, W, H);
+    const t = clamp((performance.now() - PRE_T0) / 2300, 0, 1), p = clamp(1 - Math.pow(1 - t, 1.6) * (1 - 0.25 * t), 0, 1);
+    const r = Math.min(W, H) * 0.2, k = r / 338, upto = p * strokes.total;
+    c.save(); c.translate(W / 2, H / 2 - 20); c.scale(k, k); c.translate(-MK.c[0], -MK.c[1]);
+    c.beginPath(); for (const st of strokes) { let started = false; for (let i = 0; i < st.length; i++) { if (st.len[i] > upto) break; if (!started) { c.moveTo(st[i][0], st[i][1]); started = true; } else c.lineTo(st[i][0], st[i][1]); } }
+    c.strokeStyle = 'rgba(232,230,225,0.95)'; c.lineWidth = 1.6 / k; c.lineCap = 'round'; c.lineJoin = 'round'; c.stroke(); c.restore();
+    requestAnimationFrame(pre);
+  })();
+  await yieldFrame();
 
   // signed distance field of the extruded mark for the glass raymarch
-  if (glass) (function markSDF() {
-    const N = 1024, cv = document.createElement('canvas'); cv.width = cv.height = N;
+  // signed distance field of the mark, computed off the main thread (it used to block the first second of the loader)
+  const SDF_WORKER = `onmessage = (ev) => {
+    const { alpha, N } = ev.data, INF = 1e20, N2 = N * N;
+    const fin = new Float64Array(N2), fout = new Float64Array(N2);
+    for (let i = 0; i < N2; i++) { const inside = alpha[i] > 127; fin[i] = inside ? INF : 0; fout[i] = inside ? 0 : INF; }
+    const f = new Float64Array(N), d = new Float64Array(N), v = new Int32Array(N), z = new Float64Array(N + 1);
+    const pass = (g, get, set) => { for (let q = 0; q < N; q++) f[q] = get(g, q); let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF; for (let q = 1; q < N; q++) { let s; do { const r = v[k]; s = (f[q] + q * q - (f[r] + r * r)) / (2 * q - 2 * r); if (s <= z[k]) k--; else break; } while (k >= 0); k++; v[k] = q; z[k] = s; z[k + 1] = INF; } k = 0; for (let q = 0; q < N; q++) { while (z[k + 1] < q) k++; const r = v[k]; d[q] = (q - r) * (q - r) + f[r]; } for (let q = 0; q < N; q++) set(g, q, d[q]); };
+    for (const g of [fin, fout]) { for (let y = 0; y < N; y++) pass(g, (g, x) => g[y * N + x], (g, x, val) => { g[y * N + x] = val; }); for (let x = 0; x < N; x++) pass(g, (g, y) => g[y * N + x], (g, y, val) => { g[y * N + x] = val; }); }
+    const out = new Float32Array(N2), tmp = new Float32Array(N2);
+    for (let i = 0; i < N2; i++) out[i] = (fout[i] > 0 ? Math.sqrt(fout[i]) - 0.5 : -(Math.sqrt(fin[i]) - 0.5)) * (2 / N);
+    const R = Math.round(3 * N / 1024);
+    for (let p = 0; p < 2; p++) {
+      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { let a = 0, c = 0; for (let k = -R; k <= R; k++) { const xx = x + k; if (xx >= 0 && xx < N) { a += out[y * N + xx]; c++; } } tmp[y * N + x] = a / c; }
+      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { let a = 0, c = 0; for (let k = -R; k <= R; k++) { const yy = y + k; if (yy >= 0 && yy < N) { a += tmp[yy * N + x]; c++; } } out[y * N + x] = a / c; }
+    }
+    postMessage({ out, N }, [out.buffer]);
+  };`;
+  function markSDF() {
+    const N = 768, cv = document.createElement('canvas'); cv.width = cv.height = N;
     const c = cv.getContext('2d'); const k = N / (2 * MK.R);
     c.setTransform(k, 0, 0, k, N / 2 - MK.c[0] * k, N / 2 - MK.c[1] * k);
     c.strokeStyle = '#fff'; c.fillStyle = '#fff'; c.lineCap = 'round'; c.lineJoin = 'round';
@@ -80,27 +118,18 @@
     c.save(); c.translate(0, 1024); c.scale(0.1, -0.1); c.lineWidth = 130; c.stroke(new Path2D(MK.sil)); c.restore();
     c.lineWidth = 10; for (const [a, b] of MK.edges) { c.beginPath(); c.moveTo(...MK.nodes[a]); c.lineTo(...MK.nodes[b]); c.stroke(); }
     for (const n of MK.nodes) { c.beginPath(); c.arc(n[0], n[1], 21, 0, Math.PI * 2); c.fill(); }
-    const px = c.getImageData(0, 0, N, N).data;
-    const INF = 1e20, fin = new Float64Array(N * N), fout = new Float64Array(N * N);
-    for (let i = 0; i < N * N; i++) { const inside = px[i * 4 + 3] > 127; fin[i] = inside ? INF : 0; fout[i] = inside ? 0 : INF; }
-    const edt = (g) => { // Felzenszwalb squared EDT, rows then columns
-      const f = new Float64Array(N), d = new Float64Array(N), v = new Int32Array(N), z = new Float64Array(N + 1);
-      const pass = (get, set) => { for (let q = 0; q < N; q++) f[q] = get(q); let k2 = 0; v[0] = 0; z[0] = -INF; z[1] = INF; for (let q = 1; q < N; q++) { let s; do { const r = v[k2]; s = (f[q] + q * q - (f[r] + r * r)) / (2 * q - 2 * r); if (s <= z[k2]) k2--; else break; } while (k2 >= 0); k2++; v[k2] = q; z[k2] = s; z[k2 + 1] = INF; } k2 = 0; for (let q = 0; q < N; q++) { while (z[k2 + 1] < q) k2++; const r = v[k2]; d[q] = (q - r) * (q - r) + f[r]; } for (let q = 0; q < N; q++) set(q, d[q]); };
-      for (let y = 0; y < N; y++) pass((x) => g[y * N + x], (x, val) => { g[y * N + x] = val; });
-      for (let x = 0; x < N; x++) pass((y) => g[y * N + x], (y, val) => { g[y * N + x] = val; });
-    };
-    edt(fin); edt(fout);
-    const out = new Float32Array(N * N);
-    for (let i = 0; i < N * N; i++) out[i] = (fout[i] > 0 ? Math.sqrt(fout[i]) - 0.5 : -(Math.sqrt(fin[i]) - 0.5)) * (2 / N);
-    // two separable box passes (radius 3 texels) remove the stair-steps of the thresholded mask
-    const tmpB = new Float32Array(N * N);
-    for (let pass = 0; pass < 2; pass++) {
-      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { let a = 0, c2 = 0; for (let k = -3; k <= 3; k++) { const xx = x + k; if (xx >= 0 && xx < N) { a += out[y * N + xx]; c2++; } } tmpB[y * N + x] = a / c2; }
-      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) { let a = 0, c2 = 0; for (let k = -3; k <= 3; k++) { const yy = y + k; if (yy >= 0 && yy < N) { a += tmpB[yy * N + x]; c2++; } } out[y * N + x] = a / c2; }
-    }
-    glass.setMark(out, N);
-  })();
+    const px = c.getImageData(0, 0, N, N).data, alpha = new Uint8Array(N * N);
+    for (let i = 0; i < N * N; i++) alpha[i] = px[i * 4 + 3];
+    try {
+      const w = new Worker(URL.createObjectURL(new Blob([SDF_WORKER], { type: 'text/javascript' })));
+      w.onmessage = (ev) => { glass.setMark(ev.data.out, ev.data.N); w.terminate(); };
+      w.postMessage({ alpha, N }, [alpha.buffer]);
+    } catch (e) { console.warn('SDF worker unavailable', e); }
+  }
 
+  await yieldFrame();
+  if (WANT_GL) { glass = window.Glass.init(glCanvas); if (glass) markSDF(); }
+  await yieldFrame();
   // ------------------------------------------------------------------ graph model
   const GA = AU.graph;
   const T = GA.types;
@@ -201,6 +230,8 @@
     G.label = G.key === OTHER ? 'вне проектов' : projHub.get(G.key).label;
     G.info = G.key === OTHER ? null : projHub.get(G.key);
   }
+  await yieldFrame();
+  const LAYOUT_T0 = performance.now();
   // ---- project -> theme -> molecules (owner, 15.10). Sessions are time, not structure.
   const TH = GA.themes || [];
   for (const n of nodes) { n.theme = GA.nodes[n.i][6] ?? -1; n.session = n.t === 'session'; }
@@ -327,20 +358,18 @@
     return { up: up.reverse(), node: i, down, stubs, toRoot: reachesRoot(i) };
   }
 
+  const LAYOUT_MS = Math.round(performance.now() - LAYOUT_T0);
+  await yieldFrame();
   const nbLinks = [];
   for (const l of links) if (l.rel !== 'belongs_to') nbLinks.push({ source: l.source.i, target: l.target.i });
   let sim, tick = 0;
   const TICKS = 300;
   function anchorForce(alpha) { for (const n of nodes) { n.vx += (n.ax - n.x) * 0.3 * alpha; n.vy += (n.ay - n.y) * 0.3 * alpha; } }
-  function newSim() {
-    nodes.forEach((n) => { n.x = n.ax + (hash(n.i) - 0.5) * 6; n.y = n.ay + (hash(n.i + 5) - 0.5) * 6; n.vx = n.vy = 0; });
-    tick = 0;
-    sim = d3.forceSimulation(nodes)
-      .force('charge', d3.forceManyBody().strength(-1.2).theta(0.9).distanceMax(14))
-      .force('anchor', anchorForce)
-      .stop();
+  function newSim() { // the layout is analytic (themes, molecules, time): computed once at boot, no force ticks on the main thread
+    nodes.forEach((n) => { n.x = n.ax; n.y = n.ay; n.vx = n.vy = 0; });
+    tick = TICKS;
   }
-  function stepSim(n) { for (let k = 0; k < n && tick < TICKS; k++) { sim.tick(); tick++; } }
+  function stepSim() {}
 
   // camera
   const cam = { x: 0, y: 0, k: 1, ox: 0, oy: 0 };
@@ -694,8 +723,16 @@
 
   // ------------------------------------------------------------------ screens + morphs
   const SCREENS = { memory: '#s-memory', tasks: '#s-tasks', finance: '#s-fin', spec: '#s-spec' };
+  const built = {};
+  function ensureBuilt(name) { // screens build their DOM on first visit, not at boot
+    if (built[name]) return; built[name] = true;
+    if (name === 'tasks') { buildLanes(); showTask(); }
+    if (name === 'finance') buildFinance();
+    if (name === 'spec') buildSpec();
+  }
   function setScreen(name, instant) {
     if (!SCREENS[name]) name = 'memory';
+    ensureBuilt(name);
     const prev = state.screen;
     if (prev === name && !instant) return;
     state.prev = prev; state.screen = name; state.morph0 = performance.now();
@@ -790,15 +827,15 @@
   // ------------------------------------------------------------------ loader (honest stages)
   const FULL = GA.full;
   function startLoader() {
-    state.loader = { t0: performance.now(), phase: 'fetch', fetchP: 0, parseP: 0, layoutP: 0, done: 0 };
+    state.loader = { t0: preOn ? PRE_T0 : performance.now(), phase: 'fetch', fetchP: 0, parseP: 0, layoutP: 0, done: 0 };
     newSim();
     $('#rail').style.opacity = 0; $('#cmd').style.opacity = 0;
     $('#rail').style.transition = $('#cmd').style.transition = 'none';
     for (const s of Object.values(SCREENS)) $(s).classList.remove('on', 'enter');
     $('#loader').style.display = ''; $('#stages').style.opacity = 1;
     $$('.stage').forEach((s) => s.classList.remove('on', 'ok'));
-    $('#ld-note').textContent = 'прототип: байты и разбор идут по замеренному темпу; раскладка — настоящие тики d3-force';
-    nodes.forEach((n, i) => { const u = hash(i * 3.1) * 0.999; n.mu = u; n.a = 0; });
+    $('#ld-note').textContent = 'прототип: байты и разбор идут по замеренному темпу; раскладка аналитическая и считается один раз при старте';
+    nodes.forEach((n, i) => { const u = hash(i * 3.1) * 0.999; n.mu = u; n.a = 0; [n.mpx, n.mpy] = markPoint(u); }); // once, not per frame (was O(nodes x stroke points) every frame)
     state.sel = null; showNode(null);
   }
   function loaderStep(now) {
@@ -809,12 +846,12 @@
     L.fetchP = clamp(t / FETCH, 0, 1); L.fetchP = 1 - Math.pow(1 - L.fetchP, 1.6) * (1 - 0.25 * L.fetchP);
     L.fetchP = clamp(L.fetchP, 0, 1);
     if (t >= FETCH) { L.parseP = clamp((t - FETCH) / PARSE, 0, 1); }
-    if (t >= FETCH + PARSE) { stepSim(REDUCE ? TICKS : 3); L.layoutP = tick / TICKS; }
+    if (t >= FETCH + PARSE) { L.layoutP = REDUCE ? 1 : clamp((t - FETCH - PARSE) / 1500, 0, 1); }
     const set = (id, on, ok, p, txt) => { const s = $('#st-' + id); s.classList.toggle('on', on); s.classList.toggle('ok', ok); s.querySelector('.pb i').style.transform = `scaleX(${p})`; $('#st-' + id + '-n').textContent = txt; };
     const mb = (FULL.bytes / 1e6);
     set('fetch', true, L.fetchP >= 1, L.fetchP, `${(mb * L.fetchP).toFixed(1)} / ${mb.toFixed(1)} МБ`);
     set('parse', L.fetchP >= 1, L.parseP >= 1, L.parseP, `${nf0.format(Math.round(FULL.nodes * L.parseP))} узлов · ${nf0.format(Math.round(FULL.edges * L.parseP))} связей`);
-    set('layout', L.parseP >= 1, L.layoutP >= 1, L.layoutP, `тик ${tick} / ${TICKS}`);
+    set('layout', L.parseP >= 1, L.layoutP >= 1, L.layoutP, `рассчитана за ${LAYOUT_MS} мс · посадка`);
     if (L.layoutP >= 1 && !L.done) {
       L.done = now;
       $('#stages').style.opacity = 0;
@@ -1001,8 +1038,7 @@
   }
 
   // ------------------------------------------------------------------ neural field (GL)
-  const ggl = glass ? window.GraphGL.init(glass.gl) : null;
-  if (ggl) buildAtlas(ggl);
+  let ggl = null;
   const EB = new Float32Array(16000 * 20), NB = new Float32Array(16000 * 16);
   let fitK = 1, lightGain = 1;
   const pulses = [];
@@ -1313,8 +1349,11 @@
 
   // ------------------------------------------------------------------ render
   const tmp = [0, 0, 0];
+  let glShown = false; // until the GL field is up, the 2D path draws the graph
   let last = performance.now(), fpsAcc = [], mouse = { x: -1e4, y: -1e4 }, vignette = null;
+  const FPROF = params.has('prof') ? (window.__fprof = []) : null;
   function frame(now) {
+    const fT0 = FPROF ? performance.now() : 0;
     const dt = Math.min((now - last) / 1000, 0.05); last = now;
     fpsAcc.push(dt); if (fpsAcc.length > 60) fpsAcc.shift();
     if (camFly) { const p = inOut(clamp((now - camFly.t0) / camFly.dur, 0, 1)); cam.x = lerp(camFly.from.x, camFly.to.x, p); cam.y = lerp(camFly.from.y, camFly.to.y, p); cam.k = Math.exp(lerp(Math.log(camFly.from.k), Math.log(camFly.to.k), p)); if (p >= 1) camFly = null; }
@@ -1335,10 +1374,10 @@
     // ---- graph points: targets per screen, blended by the morph
     if (scr === 'tasks') readTaskTargets();
     if (L && !L.done) {
-      if (L.layoutP > 0 || tick > 0) { if (!camFly) { Object.assign(cam, fitTarget()); fitK = cam.k; } }
+      if (!L.fitDone && !camFly) { Object.assign(cam, fitTarget()); fitK = cam.k; L.fitDone = true; } // the layout is final: fit once (bounds() sorts all nodes)
       const mx = markXf();
       for (const n of nodes) {
-        const [mx0, my0] = markPoint(n.mu);
+        const mx0 = n.mpx, my0 = n.mpy;
         const px = mx.cx + (mx0 - MK.c[0]) * mx.s, py = mx.cy + (my0 - MK.c[1]) * mx.s;
         const born = L.parseP > n.mu ? 1 : 0;
         const drift = L.parseP * 22 * (hash(n.i) - 0.5), drift2 = L.parseP * 22 * (hash(n.i + 91.7) - 0.5);
@@ -1363,7 +1402,7 @@
 
     // ---- 2D fallback for the graph (no WebGL2); the GL path is buildGraph()
     const edgeA = L && !L.done ? sstep(0.5, 1, L.layoutP) : 1;
-    if (!glass && edgeA > 0) {
+    if (!glShown && edgeA > 0) {
       c.lineWidth = 1;
       const focus = focusOf;
       c.beginPath();
@@ -1388,11 +1427,12 @@
       }
     }
 
-    if (!glass) {
+    if (!glShown) {
     c.globalCompositeOperation = 'lighter';
-    const zk = clamp(Math.pow(cam.k / (fitTarget().k || 1), 0.35), 0.8, 2.4);
+    const zk = clamp(Math.pow(cam.k / (fitK || 1), 0.35), 0.8, 2.4);
     for (const n of nodes) {
       if (n.a <= 0.01) continue;
+      if (L && !L.done) { c.globalAlpha = Math.min(n.a, 1) * 0.8; c.fillStyle = GHEX[n.g] || '#e8e6e1'; c.fillRect(n.sx - 0.9, n.sy - 0.9, 1.8, 1.8); continue; } // cheap particles while GL compiles
       const sp = sprite(n.t, n.c);
       const inTasks = scr === 'tasks' && taskTargets.has(n.i);
       const degS = 1 + Math.min(Math.log2(1 + n.deg) * 0.12, 0.6);
@@ -1513,6 +1553,7 @@
     }
 
     // ---- composite through glass
+    if (!glass) { fbCtx.setTransform(1, 0, 0, 1, 0, 0); fbCtx.drawImage(scene, 0, 0); }
     if (glass) {
       let obj = { x: 0, y: 0, z: 0, size: 1, extent: 1.1, morph: 1, flat: 1, presence: 0, thick: 0.05, inv: I3 };
       if (L && !REDUCE) {
@@ -1520,13 +1561,18 @@
         const pres = sstep(0.7, 1, L.fetchP) * (1 - sstep(0.82, 1, L.layoutP));
         const morph = quintic(sstep(0.42, 0.72, L.layoutP));
         const flat = 1 - 0.96 * sstep(0.7, 0.95, L.layoutP);
-        obj = { x: mx.cx, y: mx.cy, z: 0.3 * mx.s * MK.R, size: mx.s * MK.R, extent: 1.12, morph, flat, presence: pres, thick: 0.045, inv: I3, aa: true };
+        obj = { x: mx.cx, y: mx.cy, z: 0.3 * mx.s * MK.R, size: mx.s * MK.R, extent: 1.12, morph, flat, presence: pres, thick: 0.045, inv: I3, aa: false };
       }
-      const graphTex = buildGraph(now, scr, L);
-      glass.frame({ scene, slabs: collectSlabs(), obj, vw: VW, vh: VH, ratio: DPR, graphTex, graphGain: lightGain });
+      if (!ggl && glass.ready()) { ggl = window.GraphGL.init(glass.gl); buildAtlas(ggl); if ($('#lightbuf')) $('#lightbuf').textContent = 'light buffer: ' + ggl.light; }
+      const graphTex = ggl ? buildGraph(now, scr, L) : null;
+      const shown = glass.frame({ scene, slabs: collectSlabs(), obj, vw: VW, vh: VH, ratio: DPR, graphTex, graphGain: lightGain });
+      if (!shown) { fbCtx.setTransform(1, 0, 0, 1, 0, 0); fbCtx.drawImage(scene, 0, 0); } // shaders still compiling: show the 2D scene
+      document.body.classList.toggle('nogl', !shown);
+      glShown = !!shown && !!ggl && ggl.ready();
     }
     if (params.has('fps') && $('#fps')) { const avg = fpsAcc.reduce((x, y) => x + y, 0) / fpsAcc.length; $('#fps').textContent = `${(1 / avg).toFixed(0)} fps · ${(avg * 1000).toFixed(1)} мс/кадр`; }
     window.__frames = (window.__frames || 0) + 1;
+    if (FPROF) FPROF.push([performance.now() - fT0, state.loader ? (state.loader.parseP < 1 ? (state.loader.fetchP < 1 ? 'fetch' : 'parse') : 'layout') : 'run']);
     requestAnimationFrame(frame);
   }
 
@@ -1738,9 +1784,14 @@
   }
 
   // ------------------------------------------------------------------ boot
-  buildLegend(); statsLine(); buildLabels(); buildThemeLabels(); buildTimeline();
-  if ($('#lightbuf')) $('#lightbuf').textContent = 'light buffer: ' + (ggl ? ggl.light : '2d'); buildLanes(); showTask(); buildFinance(); buildSpec();
+  await yieldFrame();
+  buildLegend(); statsLine();
+  await yieldFrame();
+  buildLabels(); buildThemeLabels(); buildTimeline();
+  if ($('#lightbuf')) $('#lightbuf').textContent = 'light buffer: ' + (glass ? '…' : '2d');
+  await yieldFrame();
   resize();
+  await yieldFrame();
   document.fonts.ready.then(() => { if (state.screen === 'finance') renderFin(); });
   if (params.has('skip')) {
     newSim(); stepSim(TICKS); fitCamera(true);
@@ -1749,7 +1800,8 @@
     setScreen(initialScreen(), true);
     if (params.get('focus') === 'expand') select(GA.expand, true);
   } else startLoader();
-  if (params.has('task')) { state.task = params.get('task'); showTask(); }
+  preOn = false;
+  if (params.has('task')) { state.task = params.get('task'); ensureBuilt('tasks'); showTask(); }
   requestAnimationFrame(frame);
   window.__au = { state, setScreen, select, nodes, cam, startLoader, enterChain, exitChain, togglePlay, setReplay: (v) => { state.replay.s = v; state.replay.playing = false; }, chainOf, ganglia, gangliaGeom, flyToGanglion, fitK: () => fitK, project, pulses, adj };
 })();

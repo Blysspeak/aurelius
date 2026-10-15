@@ -129,8 +129,8 @@ void main() {
   o = vec4(vCol.rgb * vCol.a * (body + halo) * uGain, 1.0);
 }`;
 
-  function sh(gl, type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
-  function prog(gl, vs, fs) { const p = gl.createProgram(); gl.attachShader(p, sh(gl, gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl, gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); return p; }
+  function sh(gl, type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; }
+  function prog(gl, vs, fs) { const p = gl.createProgram(); const a = sh(gl, gl.VERTEX_SHADER, vs), b = sh(gl, gl.FRAGMENT_SHADER, fs); gl.attachShader(p, a); gl.attachShader(p, b); gl.linkProgram(p); p.__fs = b; p.__vs = a; return p; } // parallel compile: checked in ready()
 
   window.GraphGL = {
     init(gl) {
@@ -146,7 +146,9 @@ void main() {
       const hdr = light !== 'u8';
       const f32lin = !!gl.getExtension('OES_texture_float_linear');
       const pe = prog(gl, EDGE_VS, EDGE_FS), pn = prog(gl, NODE_VS, NODE_FS);
-      const uE = gl.getUniformLocation(pe, 'uView'), uN = gl.getUniformLocation(pn, 'uView');
+      const par = gl.getExtension('KHR_parallel_shader_compile');
+      let isReady = false;
+      let uE, uN;
       const mkVao = (layout, stride) => {
         const vao = gl.createVertexArray(), buf = gl.createBuffer();
         gl.bindVertexArray(vao); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -156,15 +158,24 @@ void main() {
         return { vao, buf };
       };
       const E = mkVao([4, 4, 4, 4, 4], EDGE_F), N = mkVao([4, 4, 4, 4], NODE_F);
-      const uTe = gl.getUniformLocation(pe, 'uTime'), uTn = gl.getUniformLocation(pn, 'uTime');
-      const uGe = gl.getUniformLocation(pe, 'uGain'), uGn = gl.getUniformLocation(pn, 'uGain');
-      const uAt = gl.getUniformLocation(pn, 'uAtlas'), uGr = gl.getUniformLocation(pn, 'uGrid');
+      let uTe, uTn, uGe, uGn;
+      let uAt, uGr;
+      const ready = () => {
+        if (isReady) return true;
+        if (par && !(gl.getProgramParameter(pe, par.COMPLETION_STATUS_KHR) && gl.getProgramParameter(pn, par.COMPLETION_STATUS_KHR))) return false;
+        for (const p of [pe, pn]) if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getShaderInfoLog(p.__vs) + gl.getShaderInfoLog(p.__fs) + gl.getProgramInfoLog(p));
+        uE = gl.getUniformLocation(pe, 'uView'); uN = gl.getUniformLocation(pn, 'uView');
+        uTe = gl.getUniformLocation(pe, 'uTime'); uTn = gl.getUniformLocation(pn, 'uTime');
+        uGe = gl.getUniformLocation(pe, 'uGain'); uGn = gl.getUniformLocation(pn, 'uGain');
+        uAt = gl.getUniformLocation(pn, 'uAtlas'); uGr = gl.getUniformLocation(pn, 'uGrid');
+        isReady = true; return true;
+      };
       const atlas = gl.createTexture(); let grid = [1, 1, 64];
       gl.bindTexture(gl.TEXTURE_2D, atlas); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, 1, 1, 0, gl.RED, gl.FLOAT, new Float32Array([100]));
       const tex = gl.createTexture(), fb = gl.createFramebuffer();
       let w = 0, h = 0;
       return {
-        hdr, light, tex, EDGE_F, NODE_F,
+        hdr, light, tex, EDGE_F, NODE_F, ready,
         setAtlas(data, w, h, cols, rows, cell) {
           gl.bindTexture(gl.TEXTURE_2D, atlas);
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, w, h, 0, gl.RED, gl.FLOAT, data);
@@ -173,6 +184,7 @@ void main() {
           grid = [cols, rows, cell];
         },
         draw(f) {
+          if (!ready()) return null;
           const W = Math.round(f.vw * f.ratio), H = Math.round(f.vh * f.ratio);
           if (W !== w || H !== h) {
             gl.bindTexture(gl.TEXTURE_2D, tex);
