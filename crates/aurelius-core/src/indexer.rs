@@ -16,7 +16,9 @@ pub struct IndexResult {
 }
 
 pub fn index_project(conn: &rusqlite::Connection, path: &Path) -> Result<IndexResult> {
-    let path = path
+    // Рабочее дерево индексируется как основной репозиторий: проект, названный
+    // по папке worktree (`agent-…`), — мусор, который потом некуда девать.
+    let path = crate::git::main_root(path)
         .canonicalize()
         .context("Cannot canonicalize project path")?;
     let project_name = path
@@ -405,5 +407,61 @@ mod tests {
             Some("/home/blyss/workSpace/переезжающий"),
             "найденному узлу присваивается текущий путь, иначе промах повторится"
         );
+    }
+
+    /// Индексация из рабочего дерева: проект зовётся по основному репозиторию,
+    /// а не по одноразовой папке worktree (`agent-…`, `exec-ab`) — на
+    /// 13.10.2026 в графе лежали три таких проекта-мусорки.
+    #[test]
+    fn indexing_a_worktree_names_the_project_after_the_main_repository() {
+        let base = std::env::temp_dir().join(format!("aurelius-wt-{}", uuid::Uuid::new_v4()));
+        let main = base.join("настоящий-репозиторий");
+        std::fs::create_dir_all(&main).expect("mkdir");
+        let git = |args: &[&str], dir: &std::path::Path| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"], &main);
+        std::fs::write(
+            main.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write");
+        git(&["add", "."], &main);
+        git(&["commit", "-qm", "init"], &main);
+        let wt = base.join("agent-onerazovoe");
+        git(
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                wt.to_str().expect("utf8 path"),
+            ],
+            &main,
+        );
+
+        let tmp = TmpDb::new();
+        let conn = db::open(&tmp.0).expect("open temp db");
+        let result = index_project(&conn, &wt).expect("index from worktree");
+
+        assert_eq!(
+            result.project_name, "настоящий-репозиторий",
+            "проект зовётся по основному репозиторию, а не по папке worktree"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

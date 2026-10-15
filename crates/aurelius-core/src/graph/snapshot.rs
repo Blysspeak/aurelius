@@ -751,7 +751,7 @@ pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
         super::get_node(&tx, &id)?
             .ok_or_else(|| anyhow::anyhow!("дистиллят обновлён, но не читается"))?
     } else {
-        super::add_node_full(
+        let node = super::add_node_full(
             &tx,
             NodeType::Digest,
             &label,
@@ -760,7 +760,14 @@ pub fn consolidate(conn: &Connection, project: &str) -> Result<Node> {
             serde_json::json!({ "project": project, "tails_from": tails_from.to_rfc3339() }),
             MemoryKind::Semantic,
             None,
-        )?
+        )?;
+        // Дайджест носит проект в метке И в data; без ребра он числился бы
+        // записью без единой связи. Хаб при отсутствии заводится — тот же
+        // контракт, что у attach_on_write.
+        if let Some(hub) = super::crud::attach_hub(&tx, project) {
+            super::add_edge(&tx, node.id, hub, crate::models::Relation::BelongsTo, 1.0)?;
+        }
+        node
     };
     tx.commit()?;
     Ok(node)
@@ -962,8 +969,8 @@ mod tests {
     #[test]
     fn consolidate_is_idempotent_one_digest_per_project() {
         let conn = test_conn();
-        let a = consolidate(&conn, "demo").expect("first");
-        let b = consolidate(&conn, "demo").expect("second");
+        let a = consolidate(&conn, "demo").expect("find-or-create");
+        let b = consolidate(&conn, "demo").expect("find-or-create");
         assert_eq!(a.id, b.id, "должен обновляться тот же узел");
         let type_str = serde_json::to_string(&NodeType::Digest).expect("type");
         let n: i64 = conn
@@ -974,6 +981,31 @@ mod tests {
             )
             .expect("count");
         assert_eq!(n, 1);
+    }
+
+    /// Дайджест носит проект в data.project; без ребра он числился бы записью
+    /// без единой связи (60 таких в живой базе на 13.10.2026). Хаб при
+    /// отсутствии заводится — тот же контракт, что у attach_on_write.
+    #[test]
+    fn consolidate_links_the_digest_to_the_project_hub() {
+        let conn = test_conn();
+        consolidate(&conn, "demo").expect("digest");
+
+        let hub = super::super::find_project_by_label(&conn, "demo")
+            .expect("project lookup")
+            .expect("хаб, созданный консолидацией");
+        let digest = consolidate(&conn, "demo").expect("digest");
+        assert!(
+            super::super::find_edge(
+                &conn,
+                digest.id,
+                hub.id,
+                &crate::models::Relation::BelongsTo
+            )
+            .expect("edge lookup")
+            .is_some(),
+            "дайджест обязан висеть на хабе проекта"
+        );
     }
 
     /// Последовательный повтор дублей не давал никогда (тест выше зелёный с

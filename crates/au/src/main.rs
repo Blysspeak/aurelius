@@ -549,6 +549,14 @@ pub enum DbAction {
         #[arg(long)]
         apply: bool,
     },
+    /// Re-link records that name a project in data.project to that project's
+    /// hub with a belongs_to edge. Hubs that do not exist are only counted —
+    /// they need the owner's word. Dry run unless --apply
+    Reattach {
+        /// Add the missing belongs_to edges (one transaction)
+        #[arg(long)]
+        apply: bool,
+    },
     /// List backup snapshots (next to the database and in <data_dir>/backups)
     /// beyond the --keep newest; remove them with --apply
     PruneBackups {
