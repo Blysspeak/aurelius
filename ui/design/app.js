@@ -1319,6 +1319,7 @@ onmessage = async (e) => {
     const iconZ = memo && atlasReady ? sstep(4.6, 7.5, zr) : 0;
     replayOn = memo && !loaderOn && state.replay.s < 0.999;
     ne = 0; nn = 0;
+    const oa = scr === 'spec' ? 0.1 : 1; // under the spec text the overlay stays as quiet as the field
     const eBase = loaderOn ? 0.12 * sstep(0.45, 1, L.layoutP) : memo ? lerp(0.22, 0.4, sstep(1, 4, zr)) * (scr === 'spec' ? 0.15 : 1) : 0.0;
     if (eBase > 0 && !loaderOn) {
       // theme spines: each theme is one branch from the project out to its tip
@@ -1335,7 +1336,7 @@ onmessage = async (e) => {
       if (!chain) for (const G of ganglia.values()) {
         if (G.key < 0) continue;
         const H = nodes[G.key]; if (fieldA(G.key) < 0.05 && hp == null) continue;
-        const al = (hp != null && hp !== G.key ? 0.06 : 0.35) * (focus != null ? 0.3 : 1);
+        const al = (hp != null && hp !== G.key ? 0.06 : 0.35) * (focus != null ? 0.3 : 1) * oa;
         putE(H, rootN, 0.06, 1.2 + Math.log2(1 + G.members.length) * 0.35, 0, 1, GC[G.dom], al * 0.5, WHITE, al);
       }
       // focus: the node's other links as thin dashed arcs (cross-molecule solves/refines/supersedes, context); never session lines
@@ -1356,7 +1357,7 @@ onmessage = async (e) => {
       }
     }
     // action potentials: inward by default (the field converges on the root), outward on focus
-    if (memo && !loaderOn && !REDUCE) {
+    if (memo && !loaderOn && !REDUCE && scr !== 'spec') {
       if (!chain && now - lastAmbient > 170 && molE.length) {
         lastAmbient = now;
         for (let tries = 0; tries < 6; tries++) {
@@ -1377,7 +1378,7 @@ onmessage = async (e) => {
     } else pulses.length = 0;
     // the root: one soma everything converges on
     if (memo && chain && chain.pos.has(ROOT)) { const pr = chain.pos.get(ROOT), p0 = morphT(7, now); rootN.sx = lerp(rootN.bx ?? rootN.sx, pr[0], p0); rootN.sy = lerp(rootN.by ?? rootN.sy, pr[1], p0); putN(rootN.sx, rootN.sy, 8, 3.5, [0.95, 0.94, 0.92], 2.4, 3, 0, 0); }
-    if (memo && !chain) { const [rx, ry] = project(rootN); rootN.sx = rx; rootN.sy = ry; putN(rx, ry, 7 * clamp(Math.pow(zr, 0.3), 1, 2), 3.5, [0.95, 0.94, 0.92], loaderOn ? L.layoutP * 2 : 2.2, 3, 0, 0); }
+    if (memo && !chain) { const [rx, ry] = project(rootN); rootN.sx = rx; rootN.sy = ry; putN(rx, ry, 7 * clamp(Math.pow(zr, 0.3), 1, 2), 3.5, [0.95, 0.94, 0.92], (loaderOn ? L.layoutP * 2 : 2.2) * oa, 3, 0, 0); }
     // overlay nodes
     for (const i of ovl.keys()) putNode(nodes[i], scr, zr, glyphZ, iconZ, satZ, loaderOn);
     // field uniforms
@@ -1917,6 +1918,23 @@ onmessage = async (e) => {
 <li>Глифы — атлас-текстура 18 форм × 5 уровней света, атрибуты инстанса: тип, уверенность, возраст, степень. Морф — два буфера позиций (from/to) и униформа времени, смешивание в вершинном шейдере; разброс — hash(id).</li>
 <li>Загрузка: fetch через ReadableStream с Content-Length → длина штриха; JSON.parse в воркере с отчётом по чанкам → счётчик; тики раскладки уже в воркере → полёт частиц.</li>
 <li>Замер прототипа (1600×1000, RTX 5060 через ANGLE GL, 3 507 узлов, 4 374 аксона): 56–61 fps на общем плане, среднем и крупном планах, с волной активации и при воспроизведении времени. Оценка для 33k узлов и 21k аксонов: ~0.6 млн вершин полос и 33k квадов — укладывается в кадр на WebGPU, если позиции жить в storage-буфере, а не загружаться из JS каждый кадр; плиты ≈0.3 мс, линза ≈0.5–1 мс.</li>
+</ul>
+<h2>Фаза 2: производительность на полном графе</h2>
+<p>Прототип открывается на всей памяти: <code>tools/build_snapshot.py snapshot-full.js --full</code> пишет graph-full.bin (типизированные массивы, 814 КБ вместо 82 МБ JSON) и graph-full.txt (метки, по требованию), <code>index.html?full</code> по http. 33 018 узлов, 53 761 связь, 7 203 ребра молекул. Замер: CDP-трассировка через playwright в headless sway, 1600×1000, RTX 5060 через ANGLE, CPU ×1 и ×4, свет f32 и u8, load average машины записан у каждого прогона (на ней параллельно работали другие агенты: 5–45).</p>
+<table class="spec"><thead><tr><th>бюджет</th><th>до (4cb1576)</th><th>после</th></tr></thead><tbody>
+<tr><td>граф виден &lt; 2.5 с</td><td>5.8–6.3 с (×1–×4)</td><td>1.97–2.0 с ×1 · 2.13–2.21 с ×4</td></tr>
+<tr><td>интерактивен &lt; 4 с</td><td>6.8–9.2 с</td><td>то же, что «виден»: ввод открыт в момент посадки</td></tr>
+<tr><td>60 fps общий план / крупный</td><td>19–30 / 14–23 fps ×1; 11–19 / 11–14 ×4</td><td>60 / 60 ×1 и ×4</td></tr>
+<tr><td>наведение &lt; 16 мс</td><td>задержка p50 68–100 мс ×1</td><td>работа p50 0.7 мс ×1, 3–5 мс ×4; задержка до кадра p50 12 / 16 мс</td></tr>
+<tr><td>время и цепочка 60 fps</td><td>11–16 / 15–31 fps ×1</td><td>60 / 60 ×1 и ×4</td></tr>
+<tr><td>память вкладки &lt; 400 МБ</td><td>рендерер 293–344 МБ PSS</td><td>рендерер 172–224 МБ PSS, куча JS 5–8 МБ, GPU-процесс 150–194 МБ</td></tr>
+<tr><td>задач &gt; 50 мс после первого кадра</td><td>26–92 шт., до 494–615 мс ×1, до 1 867 мс ×4</td><td>0 ×1; 1–2 по 51–75 мс ×4 при старте (разбор HTML и первый кадр сцены)</td></tr>
+</tbody></table>
+<ul>
+<li><b>Что дало выигрыш.</b> Поле на GPU: все узлы и рёбра молекул загружаются один раз в мировых координатах, камера, зум, время, фокус, наведённый проект, фильтр, цепочка и переходы экранов — униформы, биты фокуса и сессии — текстура R8UI, которая обновляется только при смене фокуса. Кадр больше не обходит 33k объектов. Рендер-воркер на OffscreenCanvas снял создание контекста WebGL (110–150 мс) и все вызовы GL с главного потока. Раскладка — чистая функция в воркере, кэш в IndexedDB по хешу графа пишет и читает сам воркер. Сцена 2D уходит в текстуру только когда меняется, а не 6.4 МБ каждый кадр. Засечки сессий — один canvas вместо 1 790 элементов, ползунок времени — transform без раскладки.</li>
+<li><b>Что не понадобилось.</b> Свечение и тон-маппинг в половине разрешения: GPU держит 60 fps на ×4 и в f32, и в u8, замер не показал нужды. Тайловое отсечение на CPU: отсечение по экрану сделано в вершинном шейдере, рёбра молекул отбираются порогом важности (~850 на экране, как было).</li>
+<li><b>Эндпоинты в crates/au/src/view.rs.</b> <code>GET /api/graph.bin</code> — тот же формат AUG2: заголовок (magic, версия, N, E), затем type/confidence/status/open по u8, тема i16, возраст f32, концы рёбер u32×2, отношение u8. <code>ETag</code> = хеш графа (число узлов и рёбер плюс максимум updated_at, или хеш байт), <code>Cache-Control: no-cache</code>, на <code>If-None-Match</code> — 304. Тот же ETag — ключ кэша раскладки в IndexedDB. <code>GET /api/graph.txt</code> — метки построчно, с тем же ETag, грузится воркером после посадки. <code>GET /api/node/:id</code> — заметка, claim, улики, происхождение и связи страницами: всё, что сейчас лежит в snapshot details. <code>/api/graph</code> в JSON остаётся для совместимости.</li>
+<li><b>На three.js WebGPU.</b> Поле — один InstancedMesh на узлы и один на полосы рёбер, атрибуты через <code>instancedBufferAttribute</code> из тех же типизированных массивов; логика FNODE_VS и FEDGE_VS переносится в <code>positionNode</code>/<code>colorNode</code> на TSL, униформы — <code>uniform()</code>-узлы, биты фокуса — storage-буфер (<code>instancedArray</code>) вместо текстуры R8UI. Оверлей (импульсы, путь цепочки, точки задач) — малый <code>instancedArray</code>, который пишется каждый кадр. WebGPURenderer живёт в воркере на OffscreenCanvas, как сейчас render.js; выбор узла остаётся сеткой на CPU, без чтения GPU.</li>
 </ul>
 `;
     const SHEET = [['типы узлов', Object.keys(IC.icons).filter((k) => !/^(st|cf|fin|cat)-/.test(k)), (k) => GHEX[GROUP[k] || (k === 'module' ? 'i' : 'i')], (k) => k.replace('_', ' ')],
