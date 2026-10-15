@@ -826,19 +826,42 @@ pub struct Attached {
 /// 19.09.2026 без единого ребра лежали 182 решения, 138 понятий, 103 решения
 /// проблем и 75 проблем, почти все — записи без `project`.
 ///
-/// Узел проекта здесь не заводится — только находится: пустая заглушка
-/// проекта сама по себе мусор. С записью того же предмета, уже связанной
-/// (ребро `supersedes`/`refines` от разрешения противоречия), второе ребро не
-/// ставится. Всё fail-soft: узел к этому моменту уже записан, и отказ
-/// привязки не имеет права выглядеть отказом записи — непривязанное просто
-/// не попадает в ответ.
+/// Узел проекта при отсутствии заводится — раньше он только искался, и каждая
+/// запись с выведенным проектом без готового хаба молча повисала: на 13.10.2026
+/// таких без единого ребра 767, и только за одиннадцать дней октября — 31
+/// решение, включая префиксные `[ultra]`, для которых хаба не было вовсе.
+/// Хаб здесь не пустая заглушка: к нему в тот же момент привязывается узел.
+/// С записью того же предмета, уже связанной (ребро `supersedes`/`refines` от
+/// разрешения противоречия), второе ребро не ставится. Всё fail-soft: узел к
+/// этому моменту уже записан, и отказ привязки не имеет права выглядеть
+/// отказом записи — непривязанное просто не попадает в ответ.
+/// Найти или завести узел проекта по имени. Раньше выведенный проект
+/// (`[префикс]` метки, git-каталог записи) только искался, и запись без
+/// готового хаба молча повисала — 767 таких без единого ребра на 13.10.2026.
+/// Возвращается `None` на любом отказе: привязка fail-soft.
+pub fn attach_hub(conn: &Connection, name: &str) -> Option<Uuid> {
+    match find_project_by_label(conn, name).ok().flatten() {
+        Some(hub) => Some(hub.id),
+        None => add_node(
+            conn,
+            NodeType::Project,
+            name,
+            None,
+            "auto",
+            serde_json::json!({ "auto_created": true }),
+        )
+        .ok()
+        .map(|hub| hub.id),
+    }
+}
+
 pub fn attach_on_write(conn: &Connection, node: &Node, project: Option<&str>) -> Attached {
     let project = project.and_then(|name| {
-        let hub = find_project_by_label(conn, name).ok().flatten()?;
-        if hub.id == node.id {
+        let hub = attach_hub(conn, name)?;
+        if hub == node.id {
             return None;
         }
-        add_edge(conn, node.id, hub.id, Relation::BelongsTo, 1.0).ok()?;
+        add_edge(conn, node.id, hub, Relation::BelongsTo, 1.0).ok()?;
         Some(name.to_owned())
     });
     let subject_peer = Provenance::from_data(&node.data)
@@ -1443,18 +1466,23 @@ mod tests {
             .is_some());
     }
 
-    /// Нет узла проекта — нет ребра, нет ошибки и нет новой заглушки проекта.
+    /// Хаба проекта нет — он заводится и запись к нему привязывается. Именно
+    /// на этом молча терялись записи: выведенный проект без готового хаба.
     #[test]
-    fn attach_on_write_is_fail_soft_and_creates_no_project() {
+    fn attach_on_write_creates_the_missing_project_hub() {
         let (_tmp, conn) = setup();
         let node = knowledge(&conn, "одинокое", None);
 
         let attached = attach_on_write(&conn, &node, Some("нет-такого"));
 
-        assert_eq!(attached, Attached::default());
-        assert!(get_nodes_by_type(&conn, &NodeType::Project)
-            .expect("projects")
-            .is_empty());
+        assert_eq!(attached.project.as_deref(), Some("нет-такого"));
+        let hub = find_project_by_label(&conn, "нет-такого")
+            .expect("project lookup")
+            .expect("созданный хаб");
+        assert_eq!(hub.source, "auto");
+        assert!(find_edge(&conn, node.id, hub.id, &Relation::BelongsTo)
+            .expect("edge lookup")
+            .is_some());
     }
 
     /// Разрешённое противоречие уже связало записи — второе ребро не нужно.

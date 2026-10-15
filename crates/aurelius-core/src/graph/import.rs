@@ -119,6 +119,12 @@ fn import_locked(conn: &Connection, file: &ImportFile) -> Result<ImportReport> {
 
     for node in &file.nodes {
         let id = write_node(conn, &file.source, node, &mut report)?;
+        // Узел импорта объявляет принадлежность в data.project (build_data
+        // кладёт его туда каждому); без ребра вся партия числилась бы записью
+        // без единой связи — 83 doc-узла TypeSafe AI на 13.10.2026. Хаб уже
+        // найден в validate; повторный импорт не задваивает (INSERT OR
+        // IGNORE).
+        add_edge(conn, id, project_id, Relation::BelongsTo, 1.0)?;
         subject_ids.insert(node.subject.as_str(), id);
     }
 
@@ -496,6 +502,31 @@ mod tests {
         assert_eq!(report.nodes_unchanged, 0);
         assert_eq!(report.edges_created, 2);
         assert_eq!(report.edges_existing, 0);
+    }
+
+    // Каждый узел импорта связан ребром belongs_to с хабом проекта источника:
+    // без него партия числилась бы записью без единой связи.
+    #[test]
+    fn import_links_every_node_to_the_project() {
+        let (_tmp, conn) = setup();
+        seed_project(&conn, "xhub");
+
+        import_graph(&conn, &three_node_file()).expect("import");
+
+        let hub = find_project_by_label(&conn, "xhub")
+            .expect("project lookup")
+            .expect("seeded hub");
+        for subject in ["s1", "s2", "s3"] {
+            let node = find_node_by_data_field(&conn, "subject", subject)
+                .expect("query")
+                .expect("imported node");
+            assert!(
+                find_edge(&conn, node.id, hub.id, &Relation::BelongsTo)
+                    .expect("edge lookup")
+                    .is_some(),
+                "узел {subject} обязан быть связан с проектом"
+            );
+        }
     }
 
     // (b) same file again -> 0/0/3 nodes, 0/2 edges.

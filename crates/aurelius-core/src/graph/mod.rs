@@ -268,6 +268,103 @@ pub fn prune_plan(conn: &rusqlite::Connection) -> anyhow::Result<PrunePlan> {
     Ok(plan)
 }
 
+/// Что нашёл (и при `apply` снял) `au db reattach`.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ReattachReport {
+    /// Живых узлов, объявляющих проект в `data.project` и не связанных с его
+    /// хабом ребром `belongs_to`.
+    pub unattached: usize,
+    /// Из них привязано (или привязалось бы): хаб проекта существует.
+    pub attachable: usize,
+    /// Привязываемое по имени хаба.
+    pub by_hub: std::collections::BTreeMap<String, usize>,
+    /// `data.project`, для которых хаба нет: имя -> число узлов. Без слова
+    /// владельца хаб за таких не заводится — имя могло быть опечаткой.
+    pub missing_hubs: std::collections::BTreeMap<String, usize>,
+}
+
+/// Найти записи, объявляющие проект в `data.project` и не связанные с его
+/// хабом. 230 таких без единого ребра на 13.10.2026: импорт (import.rs
+/// складывал `project` в data без ребра), консолидация и MCP-записи до
+/// появления параметра `project`. Хабы, которых нет, только считаются.
+///
+/// # Errors
+/// Ошибка чтения `nodes` или `edges`.
+pub fn reattach_plan(conn: &rusqlite::Connection) -> anyhow::Result<ReattachReport> {
+    let mut report = ReattachReport::default();
+    let mut hubs: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for (_id, project) in reattach_rows(conn)? {
+        report.unattached += 1;
+        // Отсутствие хаба считается ровно один раз на имя.
+        let exists = *hubs.entry(project.clone()).or_insert_with(|| {
+            crud::find_project_by_label(conn, &project)
+                .ok()
+                .flatten()
+                .is_some()
+        });
+        if exists {
+            report.attachable += 1;
+            *report.by_hub.entry(project).or_default() += 1;
+        } else {
+            *report.missing_hubs.entry(project).or_default() += 1;
+        }
+    }
+    Ok(report)
+}
+
+/// Привязать то, что нашёл [`reattach_plan`] и чей хаб существует: ребро
+/// `belongs_to`, одной транзакцией, как [`prune_apply`]. Хабы из
+/// `missing_hubs` не заводятся — для них нужно слово владельца.
+///
+/// # Errors
+/// Ошибка плана или вставки ребра; тогда не привязано ничего.
+pub fn reattach_apply(conn: &rusqlite::Connection) -> anyhow::Result<ReattachReport> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let mut report = reattach_plan(&tx)?;
+    let mut hubs: std::collections::HashMap<String, Option<Uuid>> =
+        std::collections::HashMap::new();
+    for (id, project) in reattach_rows(&tx)? {
+        let Some(hub) = *hubs.entry(project.clone()).or_insert_with(|| {
+            crud::find_project_by_label(&tx, &project)
+                .ok()
+                .flatten()
+                .map(|hub| hub.id)
+        }) else {
+            continue; // missing_hubs: без слова владельца не трогается
+        };
+        crud::add_edge(&tx, id, hub, crate::models::Relation::BelongsTo, 1.0)?;
+    }
+    tx.commit()?;
+    // После применения висеть остаётся только то, чей хаб не нашёлся.
+    report.unattached -= report.attachable;
+    Ok(report)
+}
+
+/// Пары (узел, проект) для [`reattach_apply`] — та же выборка, что у
+/// [`reattach_plan`], но с UUID.
+fn reattach_rows(conn: &rusqlite::Connection) -> anyhow::Result<Vec<(uuid::Uuid, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.id, json_extract(n.data, '$.project') FROM nodes n
+          WHERE n.deleted_at IS NULL
+            AND json_extract(n.data, '$.project') IS NOT NULL
+            AND json_extract(n.data, '$.project') <> ''
+            AND NOT EXISTS (
+              SELECT 1 FROM edges e
+              JOIN nodes hub ON hub.id = e.to_id AND hub.deleted_at IS NULL
+              WHERE e.deleted_at IS NULL AND e.from_id = n.id
+                AND e.relation = 'belongs_to'
+                AND hub.label = json_extract(n.data, '$.project')
+            )",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, project) = row?;
+        out.push((uuid::Uuid::parse_str(&id)?, project));
+    }
+    Ok(out)
+}
+
 /// Снять всё, что нашёл [`prune_plan`], — мягко, как [`delete_node`]
 /// (`deleted_at`, отменяемо), одной транзакцией: план считается уже под
 /// замком записи, так что снимается ровно то, что посчитано.

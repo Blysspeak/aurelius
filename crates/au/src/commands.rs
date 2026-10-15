@@ -272,21 +272,9 @@ pub async fn note(args: NoteArgs) -> Result<()> {
         }
     }
 
-    // Названный явно проект заводится, если его ещё нет, — как и раньше.
-    // Выведенный (префикс метки, git-репозиторий каталога) — только
-    // находится: `attach_on_write` узлов проекта не заводит.
-    if let Some(proj_name) = args.project.as_deref() {
-        if graph::find_project_by_label(&conn, proj_name)?.is_none() {
-            graph::add_node(
-                &conn,
-                NodeType::Project,
-                proj_name,
-                None,
-                "auto",
-                serde_json::json!({}),
-            )?;
-        }
-    }
+    // Проект — названный явно или выведенный (префикс метки, git-репозиторий
+    // каталога) — заводится самой привязкой: `attach_on_write` больше не
+    // отпускает запись молча, когда хаба ещё нет.
     let project = args.project.clone().or_else(|| {
         graph::infer_project(&conn, &node.label, std::env::current_dir().ok().as_deref())
     });
@@ -4998,6 +4986,7 @@ pub async fn db(action: DbAction) -> Result<()> {
             Ok(())
         }
         DbAction::PruneBackups { keep, apply } => db_prune_backups_cli(&db_path(), keep, apply),
+        DbAction::Reattach { apply } => db_reattach_cli(&db::open(&db_path())?, apply),
     }
 }
 
@@ -5124,6 +5113,28 @@ fn db_prune_backups_cli(db: &std::path::Path, keep: usize, apply: bool) -> Resul
         doomed.len(),
         &format!("backup(s) beyond the {keep} newest"),
         &format!("au db prune-backups --keep {keep} --apply"),
+    );
+    Ok(())
+}
+
+/// `au db reattach`: записи, объявляющие проект в data.project, к его хабу.
+fn db_reattach_cli(conn: &rusqlite::Connection, apply: bool) -> Result<()> {
+    let report = if apply {
+        graph::reattach_apply(conn)?
+    } else {
+        graph::reattach_plan(conn)?
+    };
+    for (name, n) in &report.by_hub {
+        println!("  {name}: {n}");
+    }
+    for (name, n) in &report.missing_hubs {
+        println!("  {name}: {n} (хаба нет, без слова владельца не трогается)");
+    }
+    report_maintenance(
+        apply,
+        report.unattached,
+        "record(s) still unattached",
+        "au db reattach --apply",
     );
     Ok(())
 }

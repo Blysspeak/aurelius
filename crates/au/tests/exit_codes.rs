@@ -725,8 +725,9 @@ fn evidence_without_a_target_is_still_a_usage_error() {
 }
 
 /// Запись без `--project` привязывается к проекту своего git-репозитория в
-/// момент записи — но только к уже существующему узлу проекта: без него
-/// запись всё равно успешна, а заглушка проекта не заводится.
+/// момент записи. Узла проекта ещё нет — хаб заводится привязкой: раньше
+/// выведенный проект без готового хаба молча отпускал запись, и таких без
+/// единого ребра в живой базе лежало 767 (13.10.2026).
 #[test]
 fn a_note_is_linked_to_its_repository_project_as_it_is_written() {
     let home = TmpHome::dir("note-attach");
@@ -766,7 +767,12 @@ fn a_note_is_linked_to_its_repository_project_as_it_is_written() {
 
     let (code, _) = note_in_repo("до узла проекта");
     assert_eq!(code, 0, "нет узла проекта — не повод отказать записи");
-    assert_eq!(count(&home, projects), 0, "выведенный проект не заводится");
+    assert_eq!(
+        count(&home, projects),
+        1,
+        "хаб выведенного проекта заводится привязкой, запись не повисает"
+    );
+    assert_eq!(count(&home, linked), 1, "запись привязана к новому хабу");
 
     let (code, _) = run(
         &home,
@@ -787,8 +793,8 @@ fn a_note_is_linked_to_its_repository_project_as_it_is_written() {
     assert!(out.contains("\"project\":\"демо-репо\""), "{out}");
     assert_eq!(
         count(&home, linked),
-        2,
-        "явная и выведенная запись на проекте"
+        3,
+        "обе выведенные и явная запись — все на одном хабе"
     );
 }
 

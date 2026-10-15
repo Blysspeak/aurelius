@@ -149,6 +149,30 @@ pub(crate) fn toplevel(dir: &Path) -> Option<Repo> {
     Some(Repo { name, root })
 }
 
+/// Корень основного репозитория для каталога `dir`. Рабочее дерево (`git
+/// worktree`) носит имя своей папки — `.claude/worktrees/agent-…` — и без
+/// этого резолва проект, названный по каталогу, рождался под именем
+/// одноразового дерева. Для обычного репозитория и не-git каталога это `dir`.
+pub fn main_root(dir: &Path) -> PathBuf {
+    let Some(out) = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) else {
+        return dir.to_path_buf();
+    };
+    let common = PathBuf::from(String::from_utf8_lossy(&out).trim());
+    match common.file_name() {
+        // `…/repo/.git` — хранилище основного репозитория либо рабочего
+        // дерева; в обоих случаях основной репозиторий лежит рядом.
+        Some(name) if name == ".git" => common
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| dir.to_path_buf()),
+        // Bare-репозиторий: общее хранилище без суффикса `.git`.
+        _ => dir.to_path_buf(),
+    }
+}
+
 /// Корни проекта, записанные индексатором в `data.path` узла проекта.
 ///
 /// Это и есть ограниченный поиск: граф уже знает, где лежит каждый
