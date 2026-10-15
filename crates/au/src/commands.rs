@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::{
-    hooks, DbAction, DocAction, GraphAction, HomeAction, IdentityAction, RemindAction,
-    SecretAction, ShareAction, TaskAction,
+    hooks, DbAction, DocAction, FinAction, FinCurrencyAction, GraphAction, HomeAction,
+    IdentityAction, RemindAction, SecretAction, ShareAction, TaskAction,
 };
 
 use aurelius_core::db::db_path;
@@ -3678,6 +3678,196 @@ async fn drain_embedding_queue(
 /// Координаты секретов (спека 007, US4, T040): `au secret add / list / rm`.
 /// Значение хранится ровно так, как передал вызывающий; функция не пытается
 /// угадывать по форме, является ли строка ключом или координатой.
+/// `au fin` — тонкая оболочка над `aurelius_core::finance`: разбор флагов и
+/// печать, вся арифметика денег в ядре, общем с MCP `fin_*`.
+pub async fn fin(action: FinAction) -> Result<()> {
+    use aurelius_core::finance;
+    let conn = open_and_ensure(&db_path())?;
+    let now = chrono::Utc::now();
+    let print_json = |v: serde_json::Value| -> Result<()> {
+        println!("{}", serde_json::to_string(&v)?);
+        Ok(())
+    };
+    match action {
+        FinAction::Log {
+            kind,
+            amount,
+            currency,
+            counter_amount,
+            counter_currency,
+            category,
+            note,
+            at,
+            source,
+            provenance,
+            json: as_json,
+        } => {
+            let kind = finance::Kind::parse(&kind)
+                .with_context(|| format!("--kind '{kind}': expense | income | exchange"))?;
+            let source = finance::Source::parse(&source)
+                .with_context(|| format!("--source '{source}': voice | text | manual | import"))?;
+            let entry = finance::NewEntry {
+                kind,
+                amount,
+                currency,
+                counter_amount,
+                counter_currency,
+                category,
+                note,
+                occurred_at: at.as_deref().map(finance::parse_occurred).transpose()?,
+                source,
+                provenance,
+            };
+            let written = finance::log(&conn, &[entry], now)?;
+            if as_json {
+                return print_json(json!({ "logged": written.len(), "entries": written }));
+            }
+            for e in &written {
+                println!("{}", e.line);
+            }
+            Ok(())
+        }
+        FinAction::List {
+            period,
+            since,
+            until,
+            kind,
+            category,
+            currency,
+            all,
+            limit,
+            json: as_json,
+        } => {
+            let p = finance::resolve_period(
+                period.as_deref(),
+                since.as_deref(),
+                until.as_deref(),
+                now,
+            )?;
+            let kind = kind
+                .as_deref()
+                .map(|k| finance::Kind::parse(k).with_context(|| format!("--kind '{k}'")))
+                .transpose()?;
+            let entries = finance::list(
+                &conn,
+                &finance::ListFilter {
+                    since: p.since,
+                    until: p.until,
+                    kind,
+                    category,
+                    currency,
+                    include_voided: all,
+                    limit,
+                },
+            )?;
+            if as_json {
+                return print_json(
+                    json!({ "period": p, "count": entries.len(), "entries": entries }),
+                );
+            }
+            if entries.is_empty() {
+                println!("Записей нет ({})", p.label);
+            }
+            for e in &entries {
+                println!("{}", e.line);
+            }
+            Ok(())
+        }
+        FinAction::Stats {
+            period,
+            since,
+            until,
+            by,
+            json: as_json,
+        } => {
+            let p = finance::resolve_period(
+                period.as_deref(),
+                since.as_deref(),
+                until.as_deref(),
+                now,
+            )?;
+            let group_by = finance::GroupBy::parse(&by)
+                .with_context(|| format!("--by '{by}': category | month | currency"))?;
+            let stats = finance::stats(&conn, p.since, p.until, &p.label, group_by)?;
+            if as_json {
+                return print_json(serde_json::to_value(&stats)?);
+            }
+            println!("{}", finance::stats_text(&stats));
+            Ok(())
+        }
+        FinAction::Void {
+            id,
+            reason,
+            json: as_json,
+        } => {
+            let e = finance::void(&conn, id, &reason, now)?;
+            if as_json {
+                return print_json(json!({ "voided": true, "entry": e }));
+            }
+            println!("{}", e.line);
+            Ok(())
+        }
+        FinAction::Categories { json: as_json } => {
+            let cats = finance::categories(&conn)?;
+            if as_json {
+                return print_json(json!({ "categories": cats }));
+            }
+            if cats.is_empty() {
+                println!("Категорий ещё нет");
+            }
+            for c in &cats {
+                println!("{} — {}", c.category, c.count);
+            }
+            Ok(())
+        }
+        FinAction::Currency { action } => {
+            let (value, as_json) = match action {
+                FinCurrencyAction::List { all, json: as_json } => (
+                    json!({ "currencies": finance::currencies(&conn, all)? }),
+                    as_json,
+                ),
+                FinCurrencyAction::Add {
+                    code,
+                    kind,
+                    scale,
+                    json: as_json,
+                } => (
+                    json!({ "currency": finance::add_currency(&conn, &code, &kind, scale)? }),
+                    as_json,
+                ),
+                FinCurrencyAction::Disable {
+                    code,
+                    json: as_json,
+                } => (
+                    json!({ "currency": finance::disable_currency(&conn, &code)? }),
+                    as_json,
+                ),
+            };
+            if as_json {
+                return print_json(value);
+            }
+            let rows = value
+                .get("currencies")
+                .and_then(|c| c.as_array().cloned())
+                .unwrap_or_else(|| value.get("currency").cloned().into_iter().collect());
+            for c in rows {
+                println!(
+                    "{} {} scale={}{}",
+                    c["code"].as_str().unwrap_or(""),
+                    c["kind"].as_str().unwrap_or(""),
+                    c["scale"],
+                    if c["enabled"].as_bool() == Some(false) {
+                        " (отключена)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 pub async fn secret(action: SecretAction) -> Result<()> {
     let conn = open_and_ensure(&db_path())?;
 

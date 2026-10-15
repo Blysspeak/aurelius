@@ -883,6 +883,105 @@ pub fn tool_definitions() -> serde_json::Value {
                 }
             },
             {
+                "name": "fin_log",
+                "description": "Record the owner's personal money movements — one call per phrase, as a batch. Kinds: expense (money spent), income (money received), exchange (one currency turned into another: amount/currency = what was given, counter_amount/counter_currency = what was received; never counted as expense or income). Returns one human-readable line per entry to read back to the owner; for an exchange the line also shows the effective rate derived from the two sides. All-or-nothing: if any entry is invalid nothing is written and the error names entries[i].\n\nOwner's phrasing -> entries:\n  «потратил 25 BYN» -> expense 25 BYN\n  «потратил 30 USDT» -> expense 30 USDT\n  «перевёл 75000 рублей РФ, получил 2500 BYN» -> exchange 75000 RUB -> 2500 BYN\n  «купил 30 USD на карту КЗ с карты BYN» -> exchange ? BYN -> 30 USD — the BYN side is unknown: ask the owner how many BYN it cost. Cards, accounts and places are not stored; a card mention may go into note.\n\nRules:\n- One phrase may yield several entries — log them together in one batch.\n- If either side of an exchange is missing, do NOT fill it in from an official or market rate — ask the owner, then log.\n- Before choosing a category call fin_categories and reuse an existing one instead of inventing a near-duplicate («еда» vs «продукты»). Categories are lowercase free text; required for expense/income, optional for exchange.\n- Unknown currency code -> ask the owner; do not add currencies on your own (fin_currencies action=add only after he confirms).\n- Amounts are decimal strings in currency units (\"25\", \"11.6\"); more decimals than the currency's precision is refused, never rounded.\n- Corrections: fin_void the wrong entry with a reason, then log the right one.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "entries": {
+                            "type": "array",
+                            "description": "Entries to record, in the order spoken.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": { "type": "string", "enum": ["expense", "income", "exchange"] },
+                                    "amount": { "type": "string", "description": "Decimal amount in currency units, e.g. \"25\" or \"0.0015\". For exchange: the amount given." },
+                                    "currency": { "type": "string", "description": "Currency code, e.g. BYN, RUB, USD, USDT, TON. For exchange: the currency given." },
+                                    "counter_amount": { "type": "string", "description": "Exchange only, required there: amount received." },
+                                    "counter_currency": { "type": "string", "description": "Exchange only, required there: currency received." },
+                                    "category": { "type": "string", "description": "Lowercase free text; reuse one from fin_categories. Required for expense/income." },
+                                    "note": { "type": "string", "description": "Anything else worth keeping: card, place, counterparty." },
+                                    "occurred_at": { "type": "string", "description": "When it happened: YYYY-MM-DD, 'YYYY-MM-DD HH:MM' (local) or RFC 3339. Default: now." },
+                                    "source": { "type": "string", "enum": ["voice", "text", "manual", "import"], "description": "Overrides the batch source for this entry." },
+                                    "provenance": { "type": "string", "description": "Where the entry came from, e.g. a bot message id." }
+                                },
+                                "required": ["kind", "amount", "currency"]
+                            }
+                        },
+                        "source": {
+                            "type": "string",
+                            "enum": ["voice", "text", "manual", "import"],
+                            "description": "How the owner said it: voice message, typed text, manual entry. Default: text."
+                        }
+                    },
+                    "required": ["entries"]
+                }
+            },
+            {
+                "name": "fin_list",
+                "description": "List finance entries, newest first, each with a human-readable line. Voided entries are hidden unless include_voided=true. Period defaults to the current month.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "period": { "type": "string", "description": "today | yesterday | week | month | year | all | <N>d (last N days). Default: month." },
+                        "since": { "type": "string", "description": "Start, inclusive: YYYY-MM-DD (local midnight) or RFC 3339. Overrides the period's start." },
+                        "until": { "type": "string", "description": "End, exclusive: YYYY-MM-DD (local midnight) or RFC 3339." },
+                        "kind": { "type": "string", "enum": ["expense", "income", "exchange"] },
+                        "category": { "type": "string" },
+                        "currency": { "type": "string", "description": "Matches either side of an exchange." },
+                        "include_voided": { "type": "boolean" },
+                        "limit": { "type": "integer", "description": "Default 50." }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "fin_stats",
+                "description": "Totals for a period, per currency, with no conversion between currencies (no rates are stored). Each currency total has expense, income, exchanged_out and exchanged_in — exchanges are reported separately and never counted as expense or income. groups breaks expense/income down by category, month or currency, one row per key and currency. Voided entries are excluded and counted in voided_excluded. 'text' is a ready human summary.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "period": { "type": "string", "description": "today | yesterday | week | month | year | all | <N>d. Default: month." },
+                        "since": { "type": "string", "description": "Start, inclusive: YYYY-MM-DD or RFC 3339." },
+                        "until": { "type": "string", "description": "End, exclusive: YYYY-MM-DD or RFC 3339." },
+                        "group_by": { "type": "string", "enum": ["category", "month", "currency"], "description": "Default: category." }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "fin_void",
+                "description": "Void a finance entry: the row stays, marked with when and why, and drops out of lists and stats. There is no delete. To correct an entry, void it and fin_log the right one. Voiding an already voided entry is refused.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "Entry id (the #N in fin_log/fin_list lines)." },
+                        "reason": { "type": "string", "description": "Why it is voided, e.g. 'wrong amount, re-logged as #14'." }
+                    },
+                    "required": ["id", "reason"]
+                }
+            },
+            {
+                "name": "fin_categories",
+                "description": "Existing categories with the number of live entries and last use, most used first. Call before fin_log and reuse a category from here rather than creating a near-duplicate.",
+                "inputSchema": { "type": "object", "properties": {}, "required": [] }
+            },
+            {
+                "name": "fin_currencies",
+                "description": "Currency directory. action=list (default) shows enabled currencies with kind and scale (decimal places). action=add creates a currency or re-enables a disabled one — only after the owner confirms the code; scale of an existing currency never changes. action=disable stops new entries in it while keeping old ones in stats.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "add", "disable"] },
+                        "code": { "type": "string", "description": "Currency code, 2-10 latin letters or digits. Required for add/disable." },
+                        "kind": { "type": "string", "enum": ["fiat", "crypto"], "description": "Required for add." },
+                        "scale": { "type": "integer", "description": "Decimal places, 0-8. Required for add." },
+                        "include_disabled": { "type": "boolean", "description": "list: also show disabled currencies." }
+                    },
+                    "required": []
+                }
+            },
+            {
                 "name": "secret_list",
                 "description": "List where each project's secrets live — name, purpose, and location (env var / file path / password manager reference) — never the value itself. Aurelius refuses to store secret values (`au secret add` rejects anything that looks like one); this only reads coordinates already recorded that way. Coordinates are intentionally excluded from memory_snapshot and every other automatic dump, so this is the only MCP path to them. Adding or removing a coordinate stays CLI-only (`au secret add`/`rm`) — recording one is a deliberate human act, and an MCP write path risks a model writing the actual secret value into 'location' by mistake, caught only heuristically.",
                 "inputSchema": {

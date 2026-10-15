@@ -416,6 +416,131 @@ pub enum RemindAction {
     },
 }
 
+/// Личные финансы владельца (`aurelius_core::finance`): суммы целыми
+/// минимальными единицами, обмены отдельно от расходов, отмена вместо удаления.
+#[derive(Subcommand)]
+pub enum FinAction {
+    /// Записать одну запись. Пачки — через MCP `fin_log`
+    Log {
+        /// expense | income | exchange
+        #[arg(long)]
+        kind: String,
+        /// Сумма в единицах валюты, например `25` или `11.6`; у обмена — отданная
+        #[arg(long)]
+        amount: String,
+        /// Код валюты; у обмена — отданная
+        #[arg(long)]
+        currency: String,
+        /// Только обмен: полученная сумма
+        #[arg(long)]
+        counter_amount: Option<String>,
+        /// Только обмен: полученная валюта
+        #[arg(long)]
+        counter_currency: Option<String>,
+        /// Категория, строчными; обязательна для expense/income
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        /// Когда: `ГГГГ-ММ-ДД`, `ГГГГ-ММ-ДД ЧЧ:ММ` или RFC 3339; по умолчанию сейчас
+        #[arg(long)]
+        at: Option<String>,
+        /// voice | text | manual | import
+        #[arg(long, default_value = "manual")]
+        source: String,
+        /// Откуда запись пришла
+        #[arg(long)]
+        provenance: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Записи за период, свежие сверху
+    List {
+        /// today | yesterday | week | month | year | all | <N>d
+        #[arg(long)]
+        period: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long)]
+        currency: Option<String>,
+        /// Показать и отменённые
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Итоги по каждой валюте без пересчёта; обмены отдельно от расходов
+    Stats {
+        /// today | yesterday | week | month | year | all | <N>d; по умолчанию month
+        #[arg(long)]
+        period: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+        /// category | month | currency
+        #[arg(long = "by", default_value = "category")]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Отменить запись: строка остаётся, из сводок уходит
+    Void {
+        id: i64,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Существующие категории с числом записей
+    Categories {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Справочник валют
+    Currency {
+        #[command(subcommand)]
+        action: FinCurrencyAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FinCurrencyAction {
+    /// Включённые валюты (с `--all` — и отключённые)
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Завести валюту или включить отключённую
+    Add {
+        code: String,
+        /// fiat | crypto
+        #[arg(long)]
+        kind: String,
+        /// Знаков после запятой, 0–8
+        #[arg(long)]
+        scale: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Отключить: новые записи не принимаются, старые остаются
+    Disable {
+        code: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Координаты секретов (спека 007, US4). Хранится место, где лежит секрет —
 /// не сам секрет: FR-025 запрещает хранить значение в любом виде, включая
 /// зашифрованный.
@@ -814,6 +939,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Личные финансы: расходы, доходы, обмены по валютам
+    Fin {
+        #[command(subcommand)]
+        action: FinAction,
+    },
     /// Координаты секретов проекта — место хранения, не значение (спека 007, US4)
     Secret {
         #[command(subcommand)]
@@ -1170,6 +1300,7 @@ async fn run(cli: Cli) -> Result<()> {
             once,
             json,
         } => commands::daemon(interval, &grace, once, json).await,
+        Commands::Fin { action } => commands::fin(action).await,
         Commands::Secret { action } => commands::secret(action).await,
         Commands::Merge { source, target } => commands::merge(&source, &target).await,
         Commands::Skills { hook } => commands::skills(hook).await,
