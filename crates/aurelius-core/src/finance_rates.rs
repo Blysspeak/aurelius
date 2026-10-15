@@ -156,7 +156,11 @@ impl Ratio {
 /// чтобы не вышел «0».
 fn per_usd_text(r: Ratio) -> String {
     let inv = r.inv();
-    inv.show(if inv.num.saturating_mul(100) < inv.den { 10 } else { 4 })
+    inv.show(if inv.num.saturating_mul(100) < inv.den {
+        10
+    } else {
+        4
+    })
 }
 
 /// Положительная десятичная строка («3.0046», «80,1234», «1») -> точная дробь.
@@ -471,6 +475,59 @@ fn kraken_pair(code: &str) -> String {
     }
 }
 
+/// Почему источник не дал курс. Сеть и HTTP-статус выводят из строя весь
+/// источник до конца прохода; ошибка в теле ответа (Kraken на HTTP 200 с
+/// `EQuery:Unknown asset pair`, нет валюты в ответе) — только эту валюту.
+#[derive(Debug)]
+pub enum FetchError {
+    Network(anyhow::Error),
+    Data(anyhow::Error),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(e) | Self::Data(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+fn source_url(source: &str, code: &str, date: NaiveDate) -> Option<String> {
+    Some(match source {
+        "nbrb" => format!(
+            "https://api.nbrb.by/exrates/rates/USD?parammode=2&ondate={}",
+            date.format("%Y-%m-%d")
+        ),
+        "cbr" => format!(
+            "https://www.cbr.ru/scripts/XML_daily.asp?date_req={}",
+            date.format("%d/%m/%Y")
+        ),
+        "nbk" => format!(
+            "https://nationalbank.kz/rss/get_rates.cfm?fdate={}",
+            date.format("%d.%m.%Y")
+        ),
+        "ecb" => {
+            let key = if code == "EUR" {
+                "USD".to_owned()
+            } else {
+                format!("USD+{code}")
+            };
+            format!(
+                "https://data-api.ecb.europa.eu/service/data/EXR/D.{key}.EUR.SP00.A\
+                 ?startPeriod={}&endPeriod={}&format=csvdata&detail=dataonly",
+                (date - Duration::days(LOOKBACK_DAYS)).format("%Y-%m-%d"),
+                date.format("%Y-%m-%d")
+            )
+        }
+        "kraken" => format!(
+            "https://api.kraken.com/0/public/OHLC?pair={}&interval=1440&since={}",
+            kraken_pair(code),
+            day_start_unix(date - Duration::days(7)) - 1
+        ),
+        _ => return None,
+    })
+}
+
 /// Один запрос к источнику за курсом `code` на `date`.
 pub fn fetch(
     http: &dyn Http,
@@ -478,47 +535,18 @@ pub fn fetch(
     code: &str,
     date: NaiveDate,
     today_utc: NaiveDate,
-) -> Result<Option<Fetched>> {
+) -> Result<Option<Fetched>, FetchError> {
+    let url = source_url(source, code, date)
+        .ok_or_else(|| FetchError::Data(anyhow!("неизвестный источник курса {source}")))?;
+    let body = http.get(&url).map_err(FetchError::Network)?;
     match source {
-        "nbrb" => parse_nbrb(&http.get(&format!(
-            "https://api.nbrb.by/exrates/rates/USD?parammode=2&ondate={}",
-            date.format("%Y-%m-%d")
-        ))?)
-        .map(Some),
-        "cbr" => parse_cbr(&http.get(&format!(
-            "https://www.cbr.ru/scripts/XML_daily.asp?date_req={}",
-            date.format("%d/%m/%Y")
-        ))?)
-        .map(Some),
-        "nbk" => parse_nbk(&http.get(&format!(
-            "https://nationalbank.kz/rss/get_rates.cfm?fdate={}",
-            date.format("%d.%m.%Y")
-        ))?)
-        .map(Some),
-        "ecb" => {
-            let key = if code == "EUR" {
-                "USD".to_owned()
-            } else {
-                format!("USD+{code}")
-            };
-            let url = format!(
-                "https://data-api.ecb.europa.eu/service/data/EXR/D.{key}.EUR.SP00.A\
-                 ?startPeriod={}&endPeriod={}&format=csvdata&detail=dataonly",
-                (date - Duration::days(LOOKBACK_DAYS)).format("%Y-%m-%d"),
-                date.format("%Y-%m-%d")
-            );
-            parse_ecb(&http.get(&url)?, code, date)
-        }
-        "kraken" => {
-            let since = day_start_unix(date - Duration::days(7)) - 1;
-            let url = format!(
-                "https://api.kraken.com/0/public/OHLC?pair={}&interval=1440&since={since}",
-                kraken_pair(code)
-            );
-            parse_kraken(&http.get(&url)?, date, today_utc)
-        }
-        other => bail!("неизвестный источник курса {other}"),
+        "nbrb" => parse_nbrb(&body).map(Some),
+        "cbr" => parse_cbr(&body).map(Some),
+        "nbk" => parse_nbk(&body).map(Some),
+        "ecb" => parse_ecb(&body, code, date),
+        _ => parse_kraken(&body, date, today_utc),
     }
+    .map_err(FetchError::Data)
 }
 
 // ---------------------------------------------------------------------------
@@ -585,15 +613,19 @@ pub fn store_rate(
     ensure_rates_schema(conn)?;
     let (num, den) = ratio_i64(rate)?;
     let d = date.format("%Y-%m-%d").to_string();
-    conn.execute(
+    // Замена одной транзакцией: между DELETE и INSERT читатель не должен
+    // увидеть дату без курса.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "DELETE FROM fin_rates WHERE currency = ?1 AND source = ?2 AND date = ?3 AND entry_id IS NULL",
         params![code, source, d],
     )?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO fin_rates (date, currency, rate_num, rate_den, source, fetched_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![d, code, num, den, source, now.timestamp()],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -646,6 +678,9 @@ pub struct Conversion {
     pub rate_date: String,
     pub source: String,
     pub source_label: String,
+    /// Курс взят из кэша и старше даты операции больше чем на день (источник
+    /// на эту дату не ответил).
+    pub stale: bool,
     /// `≈ 8.32 USD (3.0046 BYN за 1 USD, НБРБ 27.08.2026)` — для строки записи.
     pub text: String,
 }
@@ -655,6 +690,8 @@ struct Found {
     rate: Ratio,
     date: NaiveDate,
     source: &'static str,
+    /// Курс из кэша, старше даты операции больше чем на день.
+    stale: bool,
 }
 
 /// Подбирает курсы для записей: кэш, ленивая подкачка с таймаутами, после
@@ -717,6 +754,7 @@ impl<'a> Rater<'a> {
                 rate: Ratio::new(i128::from(n), i128::from(den))?,
                 date: NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()?,
                 source: "dictated",
+                stale: false,
             })
         }))
     }
@@ -729,6 +767,7 @@ impl<'a> Rater<'a> {
                 rate: Ratio::one(),
                 date,
                 source: "usd",
+                stale: false,
             }));
         }
         let key = (code.to_owned(), date);
@@ -747,17 +786,28 @@ impl<'a> Rater<'a> {
         source: &'static str,
         date: NaiveDate,
     ) -> Result<Option<Found>> {
+        // Строка на саму дату — либо курс этого дня, либо закреплённый за
+        // выходным действовавший курс: свежий по определению.
         if let Some((d, rate)) = cached(self.conn, code, source, date, 0)? {
             return Ok(Some(Found {
                 rate,
                 date: d,
                 source,
+                stale: false,
             }));
         }
         let today_local = self.now.with_timezone(&Local).date_naive();
         let today_utc = self.now.date_naive();
         let mut fresh = None;
-        if !self.broken.borrow().contains(source) && Instant::now() < self.deadline {
+        if self.broken.borrow().contains(source) {
+            // Ошибка источника уже записана один раз.
+        } else if Instant::now() >= self.deadline {
+            self.errors.borrow_mut().push(format!(
+                "{}: бюджет сети {} с исчерпан, курс {code} на {date} не запрошен",
+                source_label(source),
+                NETWORK_BUDGET.as_secs()
+            ));
+        } else {
             match fetch(self.http, source, code, date.min(today_local), today_utc) {
                 Ok(Some(f)) if f.date <= date => {
                     if f.settled {
@@ -773,24 +823,34 @@ impl<'a> Rater<'a> {
                     fresh = Some(f);
                 }
                 Ok(_) => {}
-                Err(e) => {
+                Err(FetchError::Data(e)) => {
+                    self.errors
+                        .borrow_mut()
+                        .push(format!("{} {code}: {e:#}", source_label(source)));
+                }
+                Err(e @ FetchError::Network(_)) => {
                     self.broken.borrow_mut().insert(source);
                     self.errors
                         .borrow_mut()
-                        .push(format!("{}: {e:#}", source_label(source)));
+                        .push(format!("{}: {e}", source_label(source)));
                 }
             }
         }
+        // Ответ источника сам говорит, какой курс действовал на дату. Курс
+        // из кэша без такого ответа старше даты операции больше чем на день
+        // — устаревший: так его и помечаем.
         let old = cached(self.conn, code, source, date, LOOKBACK_DAYS)?;
         let best = match (fresh, old) {
-            (Some(f), Some((d, _))) if f.date >= d => Some((f.date, f.rate)),
-            (Some(f), None) => Some((f.date, f.rate)),
-            (_, old) => old,
+            (Some(f), Some((d, _))) if f.date >= d => Some((f.date, f.rate, false)),
+            (Some(f), None) => Some((f.date, f.rate, false)),
+            (_, Some((d, rate))) => Some((d, rate, date - d > Duration::days(1))),
+            (_, None) => None,
         };
-        Ok(best.map(|(d, rate)| Found {
+        Ok(best.map(|(d, rate, stale)| Found {
             rate,
             date: d,
             source,
+            stale,
         }))
     }
 
@@ -798,11 +858,11 @@ impl<'a> Rater<'a> {
         &self,
         usd_minor: i64,
         currency: &str,
-        rate: Ratio,
-        date: NaiveDate,
-        source: &str,
+        f: Found,
+        op_date: NaiveDate,
     ) -> Conversion {
         let usd_text = finance::format_amount(usd_minor, 2);
+        let rate = f.rate;
         let shown = if currency == "USD" {
             String::new()
         } else if rate.num >= rate.den {
@@ -810,10 +870,21 @@ impl<'a> Rater<'a> {
         } else {
             format!("{} {currency} за 1 USD, ", per_usd_text(rate))
         };
+        // Дата курса — только если она не дата операции; устаревший курс
+        // помечен явно.
+        let when = if f.date == op_date {
+            String::new()
+        } else {
+            format!(" на {}", f.date.format("%d.%m.%Y"))
+        };
+        let stale = if f.stale {
+            ", курс устарел"
+        } else {
+            ""
+        };
         let text = format!(
-            "≈ {usd_text} USD ({shown}{} {})",
-            source_label(source),
-            date.format("%d.%m.%Y")
+            "≈ {usd_text} USD ({shown}{}{when}{stale})",
+            source_label(f.source)
         );
         Conversion {
             usd_minor,
@@ -821,9 +892,10 @@ impl<'a> Rater<'a> {
             rate_currency: currency.to_owned(),
             usd_per_unit: rate.show(8),
             units_per_usd: per_usd_text(rate),
-            rate_date: date.format("%Y-%m-%d").to_string(),
-            source: source.to_owned(),
-            source_label: source_label(source).to_owned(),
+            rate_date: f.date.format("%Y-%m-%d").to_string(),
+            source: f.source.to_owned(),
+            source_label: source_label(f.source).to_owned(),
+            stale: f.stale,
             text,
         }
     }
@@ -841,7 +913,7 @@ impl<'a> Rater<'a> {
             return found
                 .map(|f| {
                     let usd = to_usd_minor(e.amount_minor, scale, f.rate)?;
-                    Ok(self.conversion(usd, &e.currency, f.rate, f.date, f.source))
+                    Ok(self.conversion(usd, &e.currency, f, date))
                 })
                 .transpose();
         };
@@ -866,6 +938,7 @@ impl<'a> Rater<'a> {
                         rate: Ratio::one(),
                         date,
                         source: "usd",
+                        stale: false,
                     },
                 )
             });
@@ -886,7 +959,7 @@ impl<'a> Rater<'a> {
         // Показываем курс отданной валюты, если она не USD; иначе — полученной.
         let shown = usize::from(sides[0].0 == "USD");
         if shown == i {
-            return Ok(Some(self.conversion(usd, code, f.rate, f.date, f.source)));
+            return Ok(Some(self.conversion(usd, code, f, date)));
         }
         let (o_code, o_minor, o_scale) = sides[shown];
         let value = units(minor, s)
@@ -895,9 +968,14 @@ impl<'a> Rater<'a> {
         let implied = units(o_minor, o_scale)
             .and_then(|u| value.checked_div(u))
             .ok_or_else(|| anyhow!("переполнение курса обмена"))?;
-        Ok(Some(
-            self.conversion(usd, o_code, implied, date, "exchange"),
-        ))
+        // Курс другой стороны выведен из этого — устарел он, устарел и этот.
+        let found = Found {
+            rate: implied,
+            date,
+            source: "exchange",
+            stale: f.stale,
+        };
+        Ok(Some(self.conversion(usd, o_code, found, date)))
     }
 }
 
@@ -956,7 +1034,12 @@ pub struct UsdSummary {
     /// Сколько записей пересчитано по каждому источнику курса.
     pub sources: BTreeMap<String, i64>,
     pub unconverted: Unconverted,
-    /// Сетевые ошибки при подкачке курсов — сводка всё равно построена.
+    /// Сколько записей пересчитано по устаревшему курсу (из кэша, старше
+    /// даты операции больше чем на день).
+    pub stale_entries: i64,
+    /// Самая старая дата устаревшего курса; `None`, если таких нет.
+    pub oldest_rate_date: Option<String>,
+    /// Сетевые ошибки и исчерпанный бюджет сети — сводка всё равно построена.
     pub rate_errors: Vec<String>,
 }
 
@@ -1020,6 +1103,16 @@ pub fn stats_usd(
         };
         sum.converted_entries += 1;
         *sum.sources.entry(c.source.clone()).or_default() += 1;
+        if c.stale {
+            sum.stale_entries += 1;
+            if sum
+                .oldest_rate_date
+                .as_ref()
+                .is_none_or(|d| c.rate_date < *d)
+            {
+                sum.oldest_rate_date = Some(c.rate_date.clone());
+            }
+        }
         let key = finance::group_key(e, group_by);
         let g = groups.entry(key.clone()).or_insert_with(|| UsdGroup {
             key,
@@ -1484,8 +1577,24 @@ mod tests {
         let mid = one(&conn, entry(Kind::Expense, "10", "BYN", "2026-08-27"));
         let c = convert(&conn, &mid).expect("earlier rate");
         assert_eq!((c.rate_date.as_str(), c.usd_minor), ("2026-08-25", 300));
+        assert!(
+            c.stale,
+            "two days older than the operation and no source answer"
+        );
+        assert!(c.text.contains("на 25.08.2026"), "{}", c.text);
         let exact = one(&conn, entry(Kind::Expense, "10", "BYN", "2026-08-29"));
-        assert_eq!(convert(&conn, &exact).expect("exact").usd_minor, 400);
+        let c = convert(&conn, &exact).expect("exact");
+        assert_eq!((c.usd_minor, c.stale), (400, false));
+        assert!(
+            !c.text.contains(" на "),
+            "same date is not repeated: {}",
+            c.text
+        );
+        let next_day = one(&conn, entry(Kind::Expense, "10", "BYN", "2026-08-30"));
+        assert!(
+            !convert(&conn, &next_day).expect("one day").stale,
+            "one day back is allowed"
+        );
         let before = one(&conn, entry(Kind::Expense, "10", "BYN", "2026-08-24"));
         assert!(
             convert(&conn, &before).is_none(),

@@ -1112,6 +1112,13 @@ pub fn stats_text(s: &Stats) -> String {
                 lost.join("; ")
             ));
         }
+        if u.stale_entries > 0 {
+            out.push(format!(
+                "⚠ по устаревшему курсу (источник не ответил): записей {}, самый старый курс {}",
+                u.stale_entries,
+                u.oldest_rate_date.as_deref().unwrap_or("?")
+            ));
+        }
         if !u.rate_errors.is_empty() {
             out.push(format!("курсы недоступны: {}", u.rate_errors.join("; ")));
         }
