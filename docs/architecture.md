@@ -63,7 +63,7 @@ crates/
       perplexity.rs  — Perplexity Search API client
       cache.rs       — SQLite search cache with FTS5, scoped per provider
   au/                — CLI + web UI server (+ `identity`/`share` sync commands, plugin hook modes, `au daemon`)
-ui/                  — React + TypeScript + Tailwind (graph visualization)
+ui/                  — Next.js static export + three.js WebGPU (graph visualization)
 contrib/
   claude-code/       — deprecated bash hook wrappers (superseded by plugin/)
   git-hooks/         — post-commit (mirrors commit messages as decisions; opt-in)

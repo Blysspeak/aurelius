@@ -11,8 +11,9 @@ use axum::{
 use rust_embed::Embed;
 use serde::Deserialize;
 
+// The Next.js static export (`cd ui && npm run build` writes ui/out/).
 #[derive(Embed)]
-#[folder = "../../ui/dist/"]
+#[folder = "../../ui/out/"]
 struct UiAssets;
 
 pub async fn serve(port: u16, no_open: bool) -> Result<()> {
@@ -82,7 +83,7 @@ async fn api_search(
     Ok(Json(result))
 }
 
-// Serve the built React app embedded in the binary
+// Serve the static Next.js export embedded in the binary
 async fn serve_static(uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -114,6 +115,7 @@ fn mime_from_path(path: &str) -> &'static str {
         Some("css") => "text/css; charset=utf-8",
         Some("js") => "application/javascript; charset=utf-8",
         Some("json") => "application/json",
+        Some("txt") => "text/plain; charset=utf-8",
         Some("png") => "image/png",
         Some("svg") => "image/svg+xml",
         Some("ico") => "image/x-icon",
