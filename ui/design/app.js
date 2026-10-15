@@ -115,7 +115,7 @@
     nodes[a].deg++; nodes[b].deg++;
     if (r !== 'belongs_to') { nodes[a].nd = (nodes[a].nd || 0) + 1; nodes[b].nd = (nodes[b].nd || 0) + 1; }
   }
-  const projHub = new Map(GA.projects.map(([i, label, n, last, act, open, blk]) => [i, { label, n, last, act, open, blk }]));
+  const projHub = new Map(GA.projects.map(([i, label, n, last, act, open, blk, lonely]) => [i, { label, n, last, act, open, blk, lonely }]));
   // bioluminescence by meaning: five groups, shape still names the exact type
   const GROUP = { decision: 'k', concept: 'k', solution: 'k', doc: 'k', skill: 'k', digest: 'k', task: 'w', work_log: 'w', session: 'w', reminder: 'w', problem: 'p', user_fact: 'o', person: 'o', file: 'i', dependency: 'i', server: 'i', crate: 'i', project: 'i', module: 'i', config: 'i' };
   const GHEX = { k: '#5CE1E6', w: '#FFB547', p: '#FF5C7A', o: '#7CF0A9', i: '#8FA3B8' };
@@ -201,98 +201,130 @@
     G.label = G.key === OTHER ? 'вне проектов' : projHub.get(G.key).label;
     G.info = G.key === OTHER ? null : projHub.get(G.key);
   }
-  // ---- chains of meaning: a directed tree that converges on one root (the owner).
-  // relation -> orientation: 'fwd' = source hangs on target, 'rev' = target hangs on source (aurelius_core::Relation)
-  const CHAIN = { contains: 'rev', subtask_of: 'fwd', implements: 'fwd', solves: 'fwd', blocks: 'fwd', caused_by: 'rev', refines: 'fwd', supersedes: 'rev', depends_on: 'rev', prerequisite: 'rev', next_step: 'fwd', verified_by: 'rev' };
-  const CHAIN_ORDER = ['contains', 'subtask_of', 'implements', 'solves', 'blocks', 'caused_by', 'refines', 'supersedes', 'depends_on', 'prerequisite', 'next_step', 'verified_by'];
+  // ---- project -> theme -> molecules (owner, 15.10). Sessions are time, not structure.
+  const TH = GA.themes || [];
+  for (const n of nodes) { n.theme = GA.nodes[n.i][6] ?? -1; n.session = n.t === 'session'; }
+  const themeNodes = new Map();
+  TH.forEach(([plabel, name, count], ti) => {
+    const mem = nodes.filter((n) => n.theme === ti && !n.session && !n.virtual);
+    if (!mem.length) return;
+    const cnt = { k: 0, w: 0, p: 0, o: 0, i: 0 }; mem.forEach((m) => cnt[m.g]++);
+    const tn = { i: nodes.length, t: 'theme', c: 1, label: name, age: Math.max(...mem.map((m) => m.age)), st: null, x: 0, y: 0, sx: 0, sy: 0, a: 0, bx: 0, by: 0, ba: 0, deg: 0, nd: 0, z: 0, g: Object.entries(cnt).sort((a, b) => b[1] - a[1])[0][0], shape: 8, icon: -1, hub: mem[0].hub, virtual: true, count, ti, open: false, attn: false };
+    tn.birth = -tn.age; tn.supAt = 1e9;
+    nodes.push(tn); adj.push([]); themeNodes.set(ti, tn);
+    const G0 = ganglia.get(tn.hub); if (G0) G0.members.push(tn);
+  });
+  const NT = nodes.length;
   const ROOT = -10;
-  const parent = new Int32Array(NN).fill(-1), prel = new Array(NN).fill(null);
+  // molecule links: logical relations only; "contains" only from a task or a work_log
+  const MOL = { subtask_of: 'fwd', contains: 'rev', solves: 'fwd', refines: 'fwd', supersedes: 'fwd', implements: 'fwd', blocks: 'fwd', caused_by: 'rev', depends_on: 'rev', prerequisite: 'rev', next_step: 'fwd', verified_by: 'rev' };
+  const MOL_ORDER = Object.keys(MOL);
+  const parent = new Int32Array(NT).fill(-1), prel = new Array(NT).fill(null);
   const wouldCycle = (c, p) => { for (let q = p, k = 0; q >= 0 && k < 80; q = parent[q], k++) if (q === c) return true; return false; };
-  for (const rel of CHAIN_ORDER) for (const l of links) {
+  for (const rel of MOL_ORDER) for (const l of links) {
     if (l.rel !== rel) continue;
-    const c = CHAIN[rel] === 'fwd' ? l.source.i : l.target.i, pp = CHAIN[rel] === 'fwd' ? l.target.i : l.source.i;
-    if (parent[c] !== -1 || nodes[c].t === 'project' || nodes[c].hub !== nodes[pp].hub || wouldCycle(c, pp)) continue;
+    if (rel === 'contains' && l.source.t !== 'task' && l.source.t !== 'work_log') continue;
+    const c = MOL[rel] === 'fwd' ? l.source.i : l.target.i, pp = MOL[rel] === 'fwd' ? l.target.i : l.source.i;
+    if (parent[c] !== -1 || nodes[c].session || nodes[pp].session || nodes[c].t === 'project' || nodes[pp].t === 'project' || nodes[c].hub !== nodes[pp].hub || wouldCycle(c, pp)) continue;
     parent[c] = pp; prel[c] = rel;
   }
-  const NEEDS_CHAIN = new Set(['problem', 'solution', 'work_log']); // these only make sense attached to something
+  const molRoot = (i) => { let q = i; for (let k = 0; k < 90; k++) { const p = parent[q]; if (p < 0) return q; q = p; } return q; };
+  const molSize = new Int32Array(NT);
+  for (const n of nodes) if (!n.virtual && !n.session && n.t !== 'project') { n.mol = molRoot(n.i); molSize[n.mol]++; }
   for (const n of nodes) {
+    if (n.virtual) { parent[n.i] = n.hub >= 0 ? n.hub : -1; prel[n.i] = 'theme'; continue; }
+    if (n.session) continue;
     if (n.t === 'project') { parent[n.i] = ROOT; prel[n.i] = 'belongs_to'; continue; }
-    if (parent[n.i] === -1 && n.hub >= 0 && !NEEDS_CHAIN.has(n.t)) { parent[n.i] = n.hub; prel[n.i] = 'belongs_to'; }
+    n.unlinked = molSize[n.mol] <= 1;
+    if (parent[n.i] === -1) {
+      const tn = themeNodes.get(n.theme);
+      if (n.unlinked) { n.dust = !!tn; if (tn) { parent[n.i] = tn.i; prel[n.i] = 'dust'; } }
+      else if (tn) { parent[n.i] = tn.i; prel[n.i] = 'theme'; }
+      else if (n.hub >= 0) { parent[n.i] = n.hub; prel[n.i] = 'belongs_to'; }
+    }
   }
   const kids = nodes.map(() => []);
   for (const n of nodes) if (parent[n.i] >= 0) kids[parent[n.i]].push(n.i);
   const depthOf = (i) => { let d = 0; for (let q = i; q !== ROOT && q >= 0 && d < 90; q = parent[q]) d++; return d; };
-  const leaves = new Int32Array(NN);
-  const countLeaves = (i) => { let s = kids[i].length ? 0 : 1; for (const k of kids[i]) s += countLeaves(k); leaves[i] = s; return s; };
-  const reachesRoot = (i) => { let q = i; for (let k = 0; k < 90 && q >= 0; k++) q = parent[q]; return q === ROOT; };
-  for (const n of nodes) { n.orphan = !reachesRoot(n.i); n.depth = n.orphan ? 99 : depthOf(n.i); }
+  const leaves = new Int32Array(NT);
+  const countLeaves = (i) => { let sum = kids[i].length ? 0 : 1; for (const k of kids[i]) sum += countLeaves(k); leaves[i] = sum; return sum; };
   for (const i of projHub.keys()) countLeaves(i);
-  for (const G of ganglia.values()) G.orphans = G.members.filter((m) => m.orphan).length;
-  const isWork = (c) => c.t === 'work_log' || c.t === 'session' || prel[c.i] === 'contains' && c.t === 'work_log';
-  // ---- layout: root in the middle, projects around it, each project a radial tree growing away from the root
+  const reachesRoot = (i) => { let q = i; for (let k = 0; k < 90 && q >= 0; k++) q = parent[q]; return q === ROOT; };
+  for (const n of nodes) { n.orphan = n.session || !reachesRoot(n.i); n.depth = n.orphan ? 99 : depthOf(n.i); }
+  for (const G of ganglia.values()) { const real = G.members.filter((m) => !m.virtual && !m.session); G.orphans = real.filter((m) => m.unlinked).length; G.real = real.length; }
+  const TYPE_RANK = { problem: 0, solution: 1, decision: 2, concept: 3, task: 4, work_log: 5 };
+  // ---- layout: projects around the root; each theme is a petal; molecules along it by time, oldest at the base
   (function pack() {
     const D = [...ganglia.values()].sort((a, b) => b.R - a.R);
     D.forEach((G, k) => { const a = k * 2.39996, r = 160 + 50 * Math.sqrt(k); G.x = Math.cos(a) * r; G.y = Math.sin(a) * r; });
-    const ps = d3.forceSimulation(D).force('c', d3.forceCollide((G) => G.R * 1.15 + 26).iterations(4))
-      .force('r', d3.forceRadial((G) => 90 + G.R * 1.2, 0, 0).strength(0.08)).stop();
+    const ps = d3.forceSimulation(D).force('c', d3.forceCollide((G) => G.R * 1.15 + 30).iterations(4)).force('r', d3.forceRadial((G) => 90 + G.R * 1.2, 0, 0).strength(0.08)).stop();
     for (let k = 0; k < 400; k++) ps.tick();
   })();
-  function placeTree(i, a0, a1, rStep, G, d) {
-    const n = nodes[i];
-    const am = (a0 + a1) / 2;
-    if (i !== G.key) { const r = d * rStep * (0.94 + 0.12 * hash(i * 2.7)); n.ax = G.x + Math.cos(am) * r; n.ay = G.y + Math.sin(am) * r; }
-    const ch = kids[i].slice().sort((x, y) => nodes[x].age - nodes[y].age);
-    const tot = ch.reduce((s, k) => s + leaves[k], 0) || 1;
-    let a = a0;
-    for (const k of ch) { const w = (a1 - a0) * leaves[k] / tot; placeTree(k, a, a + w, rStep, G, d + 1); a += w; }
+  const pol = (cx, cy, a, r) => [cx + Math.cos(a) * r, cy + Math.sin(a) * r];
+  function placeMol(i, x, y, dir, spread, step, d) {
+    const n = nodes[i]; n.ax = x; n.ay = y;
+    const ch = kids[i].filter((k) => !nodes[k].virtual).sort((a, b) => (TYPE_RANK[nodes[a].t] ?? 6) - (TYPE_RANK[nodes[b].t] ?? 6) || nodes[a].age - nodes[b].age);
+    const m = ch.length; if (!m) return;
+    const w = Math.min(spread / m, 0.62);
+    ch.forEach((k, j) => { const a = dir + (j - (m - 1) / 2) * w; const [cx, cy] = pol(x, y, a, step * (1 + 0.15 * (j % 2))); placeMol(k, cx, cy, a, Math.max(spread * 0.7, 0.5), step * 0.9, d + 1); });
   }
+  const tips = [];
   for (const G of ganglia.values()) {
     const hub = G.key >= 0 ? nodes[G.key] : null;
+    const out = Math.atan2(G.y, G.x);
     if (hub) { hub.ax = G.x; hub.ay = G.y; }
-    const out = Math.atan2(G.y, G.x);                 // grow away from the root, converge toward it
-    if (hub) {
-      const maxD = Math.max(2, ...G.members.filter((m) => !m.orphan).map((m) => m.depth - 1));
-      placeTree(G.key, out - Math.PI * 0.82, out + Math.PI * 0.82, G.R / maxD, G, 0);
-    }
-    const orph = G.members.filter((m) => m.orphan || !hub);
-    orph.forEach((n, k) => { const th = out + Math.PI + (k / Math.max(orph.length, 1) - 0.5) * Math.PI * 1.9; const r = G.R * (hub ? 1.12 : 0.6 * Math.sqrt((k + 0.5) / orph.length)) + (hash(n.i) - 0.5) * 6; n.ax = G.x + Math.cos(th) * r; n.ay = G.y + Math.sin(th) * r; });
-  }
-  // time: birth in days from now (<= 0); a superseded fact dims when its successor is born
-  for (const n of nodes) { n.birth = -n.age; n.supAt = 1e9; }
-  for (const l of links) if (l.rel === 'supersedes') l.target.supAt = Math.min(l.target.supAt, l.source.birth);
-  // root as a parameter: 'now' (radius = log time from now, project = angular sector) or 'owner' (radial trees)
-  const ROOT_MODE = params.get('root') === 'now' ? 'now' : 'owner';
-  const AGE_MAX = Math.max(...nodes.map((n) => n.age)) + 0.5, LOGA = Math.log1p(AGE_MAX);
-  if (ROOT_MODE === 'now') {
-    const angTree = (i, a0, a1) => { nodes[i].ang = (a0 + a1) / 2; const ch = kids[i].slice().sort((x, y) => nodes[x].age - nodes[y].age); const tot = ch.reduce((q, k) => q + leaves[k], 0) || 1; let a = a0; for (const k of ch) { const w = (a1 - a0) * leaves[k] / tot; angTree(k, a, a + w); a += w; } };
-    const order = [...ganglia.values()].sort((a, b) => b.members.length - a.members.length);
-    const tot = order.reduce((q, G) => q + Math.pow(G.members.length, 0.8), 0);
-    let a = -Math.PI / 2;
-    const RMIN = 60, RMAX = 560;
-    const ageRank = new Map(nodes.slice().sort((x, y) => x.age - y.age).map((n, k) => [n.i, k / (NN - 1)])); // monotone in time from now, evens out density
-    for (const G of order) {
-      const span = (Math.PI * 2 * Math.pow(G.members.length, 0.8)) / tot, gap = Math.min(0.05, span * 0.12);
-      G.a0 = a + gap; G.a1 = a + span - gap; a += span;
-      if (G.key >= 0) angTree(G.key, G.a0, G.a1);
-      for (const n of G.members) {
-        if (n.ang == null || n.orphan) n.ang = G.a0 + hash(n.i * 1.9) * (G.a1 - G.a0);
-        const r = n.t === 'project' ? RMIN * 0.7 : RMIN + (RMAX - RMIN) * Math.sqrt(ageRank.get(n.i)) * (0.93 + 0.14 * hash(n.i * 4.1));
-        n.ax = Math.cos(n.ang) * r; n.ay = Math.sin(n.ang) * r;
+    const petals = [...themeNodes.values()].filter((t) => t.hub === G.key);
+    const noTheme = G.members.filter((m) => !m.virtual && !m.session && !m.unlinked && parent[m.i] === G.key);
+    if (noTheme.length) petals.push({ pseudo: true, label: 'без темы', count: noTheme.length, roots: noTheme, g: 'i' });
+    const weights = petals.map((p) => Math.pow(p.pseudo ? p.roots.length * 3 : kids[p.i].length + 1, 0.7));
+    const totW = weights.reduce((a, b) => a + b, 0) || 1, maxW = Math.max(...weights, 1);
+    const SPAN = Math.min(Math.PI * 1.8, 0.7 + petals.length * 0.45);
+    let a = out - SPAN / 2;
+    petals.forEach((p, k) => {
+      const span = SPAN * weights[k] / totW, th = a + span / 2; a += span;
+      const R0 = 14, Rt = G.R * (0.55 + 0.6 * Math.sqrt(weights[k] / maxW));
+      if (!p.pseudo) { [p.ax, p.ay] = pol(G.x, G.y, th, R0 * 1.5); p.th = th; p.span = span; p.Rt = Rt; const tip = { i: -20 - tips.length, sx: 0, sy: 0, a: 1, birth: p.birth, ax: 0, ay: 0, g: p.g }; [tip.ax, tip.ay] = pol(G.x, G.y, th, Rt * 1.04); p.tip = tip; tips.push(tip); }
+      const roots = (p.pseudo ? p.roots : kids[p.i].map((kk) => nodes[kk]).filter((n) => !n.dust)).sort((x, y) => y.age - x.age);
+      const M = roots.length;
+      roots.forEach((r, j) => {
+        const t = (j + 0.5) / Math.max(M, 1);
+        const rr = R0 * 2.2 + (Rt - R0 * 2.2) * t;
+        const aa = th + span * 0.34 * Math.sin(j * 2.39996 + k);
+        const [x, y] = pol(G.x, G.y, aa, rr);
+        placeMol(r.i, x, y, aa, 1.6, 5.5 + Math.min(6, Math.sqrt(molSize[r.i])), 0);
+      });
+      if (!p.pseudo) {
+        const dust = kids[p.i].map((kk) => nodes[kk]).filter((n) => n.dust).sort((x, y) => y.age - x.age);
+        dust.forEach((n, j) => { const [x, y] = pol(G.x, G.y, th + (hash(n.i) - 0.5) * span * 0.9, R0 * 2 + (Rt - R0 * 2) * (j + 0.5) / dust.length); n.ax = x; n.ay = y; });
       }
-      const am = (G.a0 + G.a1) / 2; G.x = Math.cos(am) * RMAX * 0.4; G.y = Math.sin(am) * RMAX * 0.4;
-      G.lx = Math.cos(am) * (RMAX + 34); G.ly = Math.sin(am) * (RMAX + 34); // label outside the rim of its sector
-    }
+    });
+    // unlinked without a theme: one small pool at the project's edge
+    const pool = G.members.filter((m) => !m.virtual && !m.session && (m.orphan || (m.unlinked && !m.dust)) && m.t !== 'project');
+    const [px, py] = hub ? pol(G.x, G.y, out + Math.PI, G.R * 0.55) : [G.x, G.y];
+    pool.forEach((n, j) => { const r = 3 * Math.sqrt(j + 0.5), aa = j * 2.39996; n.ax = px + Math.cos(aa) * r; n.ay = py + Math.sin(aa) * r; n.pool = true; });
+    for (const m of G.members) if (m.session) { m.ax = G.x; m.ay = G.y; }
   }
+  for (const n of nodes) if (n.ax == null) { n.ax = 0; n.ay = 0; }
+  const isWork = (c) => c.t === 'work_log' && prel[c.i] === 'contains';
+  // time: birth in days from now (<= 0); a superseded fact dims when its successor is born
+  for (const n of nodes) { if (n.birth == null) n.birth = -n.age; if (n.supAt == null) n.supAt = 1e9; }
+  for (const l of links) if (l.rel === 'supersedes') l.target.supAt = Math.min(l.target.supAt, l.source.birth);
+  for (const tn of themeNodes.values()) if (tn.tip) tn.tip.birth = tn.birth;
+  const ROOT_MODE = 'owner';
+  const AGE_MAX = Math.max(...nodes.map((n) => n.age)) + 0.5, LOGA = Math.log1p(AGE_MAX);
   const treeEdges = [];
-  for (const n of nodes) if (parent[n.i] >= 0) treeEdges.push({ c: n, p: nodes[parent[n.i]], rel: prel[n.i], work: isWork(n), li: treeEdges.length, imp: Math.log2(1 + leaves[n.i]) + (prel[n.i] === 'solves' || prel[n.i] === 'implements' ? 1.5 : 0) + (n.age < 30 ? 0.6 : 0) });
+  for (const n of nodes) if (parent[n.i] >= 0) {
+    const kind = n.virtual ? 'spine' : prel[n.i] === 'theme' || prel[n.i] === 'belongs_to' ? 'attach' : prel[n.i] === 'dust' ? 'dust' : 'mol';
+    treeEdges.push({ c: n, p: nodes[parent[n.i]], rel: prel[n.i], kind, work: kind !== 'mol', li: treeEdges.length, imp: Math.log2(1 + leaves[n.i]) + (prel[n.i] === 'solves' || prel[n.i] === 'supersedes' ? 1.5 : 0) + (n.age < 30 ? 0.6 : 0) });
+  }
   const rootN = { i: ROOT, sx: 0, sy: 0, a: 1, g: 'i', hub: ROOT, nd: 99, t: 'root', x: 0, y: 0 };
-  function chainOf(i) { // upstream main line (deepest branch), the node, downstream to the root
+  function chainOf(i) { // the molecule path: upstream main line, the node, downstream through theme and project to the root
     const down = []; for (let q = parent[i], k = 0; q >= 0 && k < 12; q = parent[q], k++) down.push(q);
     const up = []; let cur = i;
-    for (let k = 0; k < 6 && kids[cur].length; k++) { cur = kids[cur].slice().sort((x, y) => leaves[y] - leaves[x] || nodes[x].age - nodes[y].age)[0]; up.push(cur); }
+    for (let k = 0; k < 6; k++) { const ch = kids[cur].filter((x) => !nodes[x].dust && !nodes[x].virtual); if (!ch.length) break; cur = ch.sort((x, y) => leaves[y] - leaves[x] || nodes[x].age - nodes[y].age)[0]; up.push(cur); }
     const stubs = [];
-    for (const m of [i, ...up]) for (const k of kids[m].filter((x) => !up.includes(x)).slice(0, 2)) stubs.push([k, m]);
-    return { up: up.reverse(), node: i, down, stubs, toRoot: parent[down.length ? down[down.length - 1] : i] === ROOT || nodes[i].t === 'project' };
+    for (const m of [i, ...up]) for (const k of kids[m].filter((x) => !up.includes(x) && !nodes[x].dust && !nodes[x].virtual).slice(0, 2)) stubs.push([k, m]);
+    return { up: up.reverse(), node: i, down, stubs, toRoot: reachesRoot(i) };
   }
 
   const nbLinks = [];
@@ -333,7 +365,7 @@
   }
 
   // ------------------------------------------------------------------ state
-  const state = { hoverProj: null, screen: 'memory', prev: null, morph0: 0, sel: null, hover: null, selT: 0, chain: null, loader: null, replay: { s: 1, playing: false }, filterType: null, fin: { hover: -1, a: 0, b: AU.fin.months.length - 1, kind: -1, cat: -1, q: '', voided: false }, task: 'b7a7d9af' };
+  const state = { sessHi: null, hoverProj: null, screen: 'memory', prev: null, morph0: 0, sel: null, hover: null, selT: 0, chain: null, loader: null, replay: { s: 1, playing: false }, filterType: null, fin: { hover: -1, a: 0, b: AU.fin.months.length - 1, kind: -1, cat: -1, q: '', voided: false }, task: 'b7a7d9af' };
 
   // ------------------------------------------------------------------ finance model
   const F = AU.fin;
@@ -703,6 +735,8 @@
       const [x0, y0] = project(n); out[0] = x0; out[1] = y0; out[2] = 0.08 * (CONF_LOOK[n.c][0] > 0.9 ? 1 : 0.85); return;
     }
     let [x, y] = project(n);
+    if (n.session) { out[0] = x; out[1] = y; out[2] = 0; return; }
+    if (state.sessHi != null) { out[0] = x; out[1] = y; out[2] = sessSet.has(n.i) ? 1.3 : 0.12 * (CONF_LOOK[n.c][0] > 0.9 ? 1 : 0.85); return; }
     if (state.replay.s < 0.999 && n.birth > state.replay.t + state.replay.fade) { out[0] = x; out[1] = y; out[2] = 0; return; }
     let a = CONF_LOOK[n.c][0] > 0.9 ? 1 : 0.85;
     a *= 1 - 0.4 * n.z; // older = dimmer (age also sets the radius inside the ganglion)
@@ -915,6 +949,7 @@
     const now = new Date('2026-10-15T19:00');
     let ticks = '';
     for (let m = 0; m < 7; m++) { const d = new Date(now.getFullYear(), now.getMonth() - m, 1); const age = (now - d) / 864e5; if (age > AGE_MAX) break; ticks += `<span class="tk" style="left:${(sAt(-age) * 100).toFixed(2)}%">${MN[d.getMonth()]}</span>`; }
+    ticks += nodes.filter((n) => n.session && n.age <= AGE_MAX).map((n) => `<span class="ss" data-i="${n.i}" style="left:${(sAt(-n.age) * 100).toFixed(2)}%"></span>`).join('');
     ticks += BIG_DAYS.map((b) => `<span class="bd" style="left:${(sAt(-b.age) * 100).toFixed(2)}%" title="${esc(b.label)} · ${b.n} записей"></span>`).join('');
     T2.innerHTML = `<button class="play" aria-label="Проиграть память">${ico('fin-income', 'pl')}</button><div class="tr"><div class="fill"></div>${ticks}<div class="hd" role="slider" tabindex="0" aria-label="Момент памяти"></div></div><span class="when num"></span><span class="say"></span>`;
     $('.play', T2).onclick = togglePlay;
@@ -922,7 +957,20 @@
     let drag = false;
     const setX = (x) => { const r = tr.getBoundingClientRect(); state.replay.s = clamp((x - r.left) / r.width, 0, 1); state.replay.playing = false; };
     tr.addEventListener('pointerdown', (e) => { drag = true; tr.setPointerCapture(e.pointerId); setX(e.clientX); });
-    tr.addEventListener('pointermove', (e) => { if (drag) setX(e.clientX); });
+    tr.addEventListener('pointermove', (e) => {
+      if (drag) { setX(e.clientX); return; }
+      // sessions are time: hovering a session tick lights up everything it produced, wherever it sits
+      let best = null, bd = 6;
+      for (const el of tr.querySelectorAll('.ss')) { const d = Math.abs(el.getBoundingClientRect().left - e.clientX); if (d < bd) { bd = d; best = el; } }
+      const si = best ? +best.dataset.i : null;
+      if (si !== state.sessHi) {
+        tr.querySelectorAll('.ss.on').forEach((x) => x.classList.remove('on')); if (best) best.classList.add('on');
+        state.sessHi = si; sessSet = new Set(si == null ? [] : adj[si].filter(([j, r, dir]) => dir === 'out' && (r === 'contains' || r === 'related_to')).map(([j]) => j));
+        for (const n of nodes) { n.bx = n.sx; n.by = n.sy; n.ba = n.a; } state.morph0 = performance.now() - 600;
+      }
+      if (si != null) tip(e, 'сессия · ' + sessSet.size + ' записей', stripProj(nodes[si].label)); else tip(null);
+    });
+    tr.addEventListener('pointerleave', () => { if (state.sessHi != null) { state.sessHi = null; sessSet = new Set(); tr.querySelectorAll('.ss.on').forEach((x) => x.classList.remove('on')); } tip(null); });
     tr.addEventListener('pointerup', () => { drag = false; });
     $('.hd', T2).addEventListener('keydown', (e) => { const d = e.key === 'ArrowLeft' ? -0.02 : e.key === 'ArrowRight' ? 0.02 : 0; if (d) { state.replay.s = clamp(state.replay.s + d, 0, 1); e.preventDefault(); } });
   }
@@ -932,7 +980,7 @@
     if (!R.playing && R.s >= 0.999) R.s = 0;
     R.playing = !R.playing;
   }
-  let sayT = 0;
+  let sayT = 0, sessSet = new Set();
   function replayStep(dt, now) {
     const R = state.replay;
     if (R.playing) { R.s = Math.min(1, R.s + dt / 20); if (R.s >= 1) R.playing = false; }
@@ -1025,7 +1073,7 @@
       // at rest: chain-tree edges only, work edges never, strongest first, at most ~850 on screen
       const cand = [];
       if (!chain) for (const e of treeEdges) {
-        if ((e.work || e.rel === 'belongs_to') && focus == null) continue; // membership is not a chain: no spokes
+        if (e.kind !== 'mol') continue; // at rest: short links inside molecules only; no spokes, no attachment fans
         const A = e.c, B = e.p;
         if (A.a < 0.03 || B.a < 0.03 || (!onScr(A) && !onScr(B))) continue;
         if (focus != null && A.i !== focus && B.i !== focus) { cand.push([e, e.imp * 0.1]); continue; }
@@ -1046,6 +1094,15 @@
         putE(A, B, 0.08 * (hash(e.li) - 0.5), w, 0, 1, colOf(A, sat).slice(), al * 0.55, colOf(B, sat).slice(), al);
         if (zr > 2.2 && al > 0.08) { const [x, y] = curvePt(A, B, 0.08 * (hash(e.li) - 0.5), 0.965); putN(x, y, 1.5, 2.2, colOf(B, sat), al * 1.5, 0.6, 0, 0); }
       }
+      // theme spines: each theme is one branch from the project out to its tip
+      if (!chain) for (const tn of themeNodes.values()) {
+        const H = nodes[tn.hub]; if (!H || tn.a < 0.03 || !tn.tip) continue;
+        const [tx, ty] = project({ x: tn.tip.ax, y: tn.tip.ay }); tn.tip.sx = tx; tn.tip.sy = ty;
+        const al = (hp != null && hp !== tn.hub ? 0.05 : 0.28) * Math.min(tn.a, 1) * (focus != null ? 0.35 : 1);
+        const w = 1 + Math.log2(1 + tn.count) * 0.3, c0 = GC[tn.g];
+        putE(H, tn, 0.02, w, 0, 1, c0, al * 0.6, c0, al, tn.birth);
+        putE(tn, tn.tip, 0.015, w * 0.8, 0, 1, c0, al, c0, al * 0.08, tn.birth);
+      }
       // projects feed the root: one luminous axon per ganglion
       if (!chain) for (const G of ganglia.values()) {
         if (G.key < 0) continue;
@@ -1053,13 +1110,14 @@
         const al = (hp != null && hp !== G.key ? 0.06 : 0.35) * (loaderOn ? sstep(0.6, 1, L.layoutP) : 1) * (focus != null ? 0.3 : 1);
         putE(H, rootN, 0.06, 1.2 + Math.log2(1 + G.members.length) * 0.35, 0, 1, GC[G.dom], al * 0.5, [0.91, 0.9, 0.88], al);
       }
-      // focus: every edge of the node, context included
+      // focus: the node's other links as thin dashed arcs (cross-molecule solves/refines/supersedes, context); never session lines
       if (focus != null && !chain) for (const [j, rel] of adj[focus]) {
         if (rel === 'belongs_to') continue;
         const A = nodes[focus], B = nodes[j];
-        if (parent[j] === focus || parent[focus] === j) continue; // already drawn as tree edge
-        const long = Math.hypot(A.sx - B.sx, A.sy - B.sy) > Math.min(VW, VH) * 0.35 && A.hub === B.hub;
-        putE(A, B, 0.18, 1.2, 0, 1, colOf(A, 1).slice(), long ? 0.3 : 0.7, colOf(B, 1).slice(), long ? 0.3 : 0.7);
+        if (B.session || A.session || parent[j] === focus || parent[focus] === j) continue;
+        const logical = rel === 'solves' || rel === 'refines' || rel === 'supersedes';
+        const ca = colOf(A, 1).slice(), cb = colOf(B, 1).slice(), al = logical ? 0.75 : 0.35;
+        for (let q = 0; q < 10; q++) putE(A, B, 0.22, 1.0, q / 10, q / 10 + 0.06, ca, al, cb, al); // dashes
       }
       // chain focus: the path, its stubs, and the run to the root
       if (chain) {
@@ -1114,6 +1172,8 @@
       if (isF) { size *= 1.7; I = 2.6; sat = 1; glyph = Math.max(glyph, 0.6); }
       else if (near) { I *= 1.5; sat = 1; }
       if (scr === 'spec') I *= 0.5;
+      if ((n.dust || n.pool) && !isF && !near) { I *= 0.35; size = Math.min(size, 1.3); glyph = 0; halo = 0.6; }
+      if (n.virtual) { size = 3.2 + Math.log2(1 + n.count) * 0.5; I = Math.max(I, 1.1) * Math.min(n.a, 1); glyph = 1; }
       let gl2 = glyph;
       if (iconZ > 0 && n.icon >= 0) { gl2 = glyph + iconZ; size = lerp(size, Math.max(size, 9), iconZ); ext = Math.max(ext, 2.4); } // far dot -> mid silhouette -> close icon
       putN(n.sx, n.sy, size, ext, colOf(n, sat), I, halo, n.shape, gl2, n.icon, n.birth, n.supAt);
@@ -1149,6 +1209,27 @@
       el.onpointerenter = () => { state.hoverProj = G.key; showCard(G); };
       el.onpointerleave = () => { state.hoverProj = null; showCard(null); };
       box.append(el); labelEls.set(G.key, el);
+    }
+  }
+  const themeEls = new Map();
+  function buildThemeLabels() {
+    const box = $('#m-themes'); box.innerHTML = '';
+    for (const tn of themeNodes.values()) { const el = document.createElement('span'); el.className = 'tlabel'; el.innerHTML = `${esc(tn.label)} <span class="num">${nf0.format(tn.count)}</span>`; el.style.color = GHEX[tn.g]; box.append(el); themeEls.set(tn.i, el); }
+  }
+  function updateThemeLabels(scr, L) {
+    const on = scr === 'memory' && (!L || L.done) && !state.chain && state.sessHi == null;
+    const off = $('#s-memory').getBoundingClientRect().left;
+    for (const tn of themeNodes.values()) {
+      const el = themeEls.get(tn.i); if (!el || !tn.tip) continue;
+      const H = nodes[tn.hub];
+      const len = Math.hypot(tn.tip.sx - H.sx, tn.tip.sy - H.sy);
+      const vis = on && len > 90 && tn.a > 0.2 && (state.hoverProj == null || state.hoverProj === tn.hub);
+      el.classList.toggle('on', vis);
+      if (!vis) continue;
+      let ang = Math.atan2(tn.tip.sy - H.sy, tn.tip.sx - H.sx);
+      const mx = H.sx + (tn.tip.sx - H.sx) * 0.55, my = H.sy + (tn.tip.sy - H.sy) * 0.55;
+      let deg = ang * 180 / Math.PI; if (deg > 90 || deg < -90) deg += 180; // never upside down
+      el.style.transform = `translate(${(mx - off).toFixed(1)}px, ${my.toFixed(1)}px) translate(-50%, -50%) rotate(${deg.toFixed(1)}deg) translateY(-9px)`;
     }
   }
   function updateLabels(scr, L) {
@@ -1195,7 +1276,8 @@
       <dt>открытые проблемы</dt><dd class="num">${info ? nf0.format(info.open) : '—'}</dd>
       ${info && info.blk ? `<dt>в блоке</dt><dd class="num">${info.blk}</dd>` : ''}
       <dt>активность</dt><dd>${info ? agoTxt(info.last) : '—'}</dd>
-      <dt>без связей с корнем</dt><dd class="num">${G.orphans} из ${G.members.length} в выборке</dd></dl>
+      <dt>без связей</dt><dd class="num">${info && info.lonely != null ? Math.round(100 * info.lonely / info.n) + '% проекта' : '—'}</dd>
+      <dt>тем</dt><dd class="num">${[...themeNodes.values()].filter((t) => t.hub === G.key).length}</dd></dl>
       <div class="mix">${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) => `<i style="flex:${v};background:${GHEX[k]}" title="${GNAME[k]} ${v}"></i>`).join('')}</div>
       <p>клик — приблизить проект</p>`;
     c.dataset.tint = GHEX[G.dom];
@@ -1214,11 +1296,12 @@
     const L = $('#m-legend');
     const dot = (hex, s = 8) => `<i class="sw" style="width:${s}px;height:${s}px;background:${hex};box-shadow:0 0 8px ${hex}"></i>`;
     if (mode === 'over') {
-      L.innerHTML = `<p class="lg"><span class="neb"></span>облако — проект, размер — число узлов</p>
+      L.innerHTML = `<p class="lg"><span class="axon"></span>ветка — тема проекта, у основания старое, к концу новое</p>
+        <p class="lg"><span class="neb"></span>сгусток на ветке — молекула: проблема и решения, линия версий, задача с журналом</p>
         <p class="lg"><span class="core"></span>яркое ядро — записано за 7 дней</p>
         <p class="lg">${ico('task', '', 'color:' + GHEX.w)}активная задача</p>
         <p class="lg">${ico('problem', '', 'color:' + GHEX.p)}открытая проблема</p>
-        <p class="lg ax"><span class="axon"></span>длинная линия — связь между проектами</p>
+        <p class="lg"><span class="core"></span>пыль — записи без связей; сессии — засечки на шкале времени</p>
         <div class="groups">${Object.keys(GHEX).map((k) => `<span>${dot(GHEX[k])}${GNAME[k]}</span>`).join('')}</div>`;
     } else {
       const order = ['decision', 'concept', 'solution', 'problem', 'task', 'session', 'work_log', 'user_fact', 'project', 'doc'];
@@ -1334,6 +1417,7 @@
 
     }
     updateLabels(scr, L);
+    updateThemeLabels(scr, L);
     updateChainLabels();
     { const rl = $('#m-root'); const on = scr === 'memory' && (!L || L.done) && !state.chain; rl.style.opacity = on ? 1 : 0; if (on) rl.style.transform = `translate(${(rootN.sx - $('#s-memory').getBoundingClientRect().left - 40).toFixed(1)}px, ${(rootN.sy + 14).toFixed(1)}px)`; }
 
@@ -1654,7 +1738,7 @@
   }
 
   // ------------------------------------------------------------------ boot
-  buildLegend(); statsLine(); buildLabels(); buildTimeline();
+  buildLegend(); statsLine(); buildLabels(); buildThemeLabels(); buildTimeline();
   if ($('#lightbuf')) $('#lightbuf').textContent = 'light buffer: ' + (ggl ? ggl.light : '2d'); buildLanes(); showTask(); buildFinance(); buildSpec();
   resize();
   document.fonts.ready.then(() => { if (state.screen === 'finance') renderFin(); });

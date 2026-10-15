@@ -28,10 +28,82 @@ for k, p in proj_of.items():
     members[p].append(k)
 top = sorted(members, key=lambda p: -len(members[p]))[:14]
 
+# ---- themes (owner order 15.10): theme = subject prefix (project:segment), numeric segments are spec/task numbers (#036).
+# Inheritance for nodes without a subject, in order, to a fixpoint over the FULL graph:
+#   1) from the node they solve / refine / supersede, 2) from their containing task or work_log,
+#   3) from the task their session relates to. au exposes no vectors, so the rest stays "без темы".
+import re
+def seg_theme(x, plabel):
+    sj = (x.get('data') or {}).get('subject')
+    if not sj: return None
+    seg = sj.split(':')
+    if len(seg) < 2 or not seg[1]: return None
+    if seg[0].lower() != plabel.lower() and not plabel.lower().startswith(seg[0].lower()): return None
+    t = seg[1].split('/')[0]
+    return ('#' + t) if t.isdigit() else t[:28]
+by_rel = collections.defaultdict(list)
+for e in edges:
+    if e['from_id'] in nodes and e['to_id'] in nodes:
+        by_rel[e['relation']].append((e['from_id'], e['to_id']))
+sess_task = collections.defaultdict(list)        # session -> tasks it relates to
+for a, b in by_rel['related_to']:
+    if ntype(nodes[a]) == 'session' and ntype(nodes[b]) == 'task': sess_task[a].append(b)
+    if ntype(nodes[b]) == 'session' and ntype(nodes[a]) == 'task': sess_task[b].append(a)
+contained_in = collections.defaultdict(list)
+for a, b in by_rel['contains']:
+    contained_in[b].append(a)
+theme_full, coverage = {}, {}
+for p in top:
+    plabel = nodes[p]['label']
+    mem = [k for k in members[p] if k in nodes and k != p]
+    th = {k: seg_theme(nodes[k], plabel) for k in mem}
+    before = sum(1 for v in th.values() if v)
+    mset = set(mem)
+    for _ in range(6):
+        changed = 0
+        for rel in ('solves', 'refines', 'supersedes'):
+            for a, b in by_rel[rel]:
+                if a in mset and b in mset and th.get(a) is None and th.get(b): th[a] = th[b]; changed += 1
+        for k in mem:
+            if th[k] is None:
+                for c in contained_in.get(k, []):
+                    if c in mset and ntype(nodes[c]) in ('task', 'work_log') and th.get(c): th[k] = th[c]; changed += 1; break
+        for k in mem:
+            if th[k] is None:
+                for c in contained_in.get(k, []):
+                    if ntype(nodes[c]) == 'session':
+                        t = next((th.get(t2) for t2 in sess_task.get(c, []) if th.get(t2)), None)
+                        if t: th[k] = t; changed += 1; break
+        if not changed: break
+    after = sum(1 for v in th.values() if v)
+    coverage[plabel] = [len(mem), before, after]
+    theme_full.update({k: v for k, v in th.items() if v})
+THEMES = []
+TINDEX = {}
+for p in top:
+    plabel = nodes[p]['label']
+    cnt = collections.Counter(theme_full[k] for k in members[p] if k in theme_full)
+    keep = [t for t, _ in cnt.most_common(12)]
+    for t in keep:
+        TINDEX[(p, t)] = len(THEMES); THEMES.append([plabel, t, cnt[t]])
+    rest = sum(c for t, c in cnt.items() if t not in keep)
+    if rest:
+        TINDEX[(p, '…')] = len(THEMES); THEMES.append([plabel, 'другие темы', rest])
+def theme_idx(k):
+    p = proj_of.get(k)
+    t = theme_full.get(k)
+    if p is None or t is None: return -1
+    return TINDEX.get((p, t), TINDEX.get((p, '…'), -1))
+print('coverage', json.dumps(coverage, ensure_ascii=False))
+
 adj_nb = collections.defaultdict(list)
 for e in edges:
     if e['relation'] != 'belongs_to':
         adj_nb[e['from_id']].append(e['to_id']); adj_nb[e['to_id']].append(e['from_id'])
+logic_nb = collections.defaultdict(list)
+for e in edges:
+    if e['relation'] in ('solves', 'refines', 'supersedes', 'subtask_of', 'implements', 'caused_by', 'depends_on', 'blocks') or (e['relation'] == 'contains' and e['from_id'] in nodes and ntype(nodes[e['from_id']]) in ('task', 'work_log')):
+        logic_nb[e['from_id']].append(e['to_id']); logic_nb[e['to_id']].append(e['from_id'])
 FOCUS = next(k for k in nodes if k.startswith('85f5fa07'))
 adj = collections.defaultdict(set)
 for e in edges:
@@ -52,18 +124,32 @@ BUDGET = 3400
 for p in top:
     m = members[p]
     k = max(25, int(BUDGET * len(m) / total))
-    # edge-aware: grow connected pieces over non-belongs_to edges so neurons keep their dendrites
-    mset = set(m); got = set(); seeds = random.sample(m, len(m))
-    for sd in seeds:
-        if len(got) >= k: break
-        if sd in got: continue
-        q = [sd]
-        while q and len(got) < k:
+    # per theme quota, then grow molecules over logical edges only (no session edges: sessions are time, not structure)
+    mset = set(m); got = set()
+    LOGIC = {'solves', 'refines', 'supersedes', 'subtask_of', 'contains', 'implements', 'caused_by', 'depends_on', 'blocks'}
+    def grow(seed, cap, same_theme):
+        q = [seed]
+        while q and len(got) < cap:
             u = q.pop(0)
             if u in got: continue
             got.add(u)
-            for v in adj_nb[u]:
-                if v in mset and v not in got: q.append(v)
+            for v in logic_nb[u]:
+                if v in mset and v not in got and ntype(nodes[v]) != 'session' and (not same_theme or theme_full.get(v) in (None, same_theme)): q.append(v)
+    themed = collections.defaultdict(list)
+    for x in m:
+        if theme_idx(x) >= 0 and THEMES[theme_idx(x)][1] != 'другие темы': themed[theme_full[x]].append(x)
+    tot_t = sum(len(v) for v in themed.values()) or 1
+    for t, xs in themed.items():
+        cap = len(got) + max(12, int(k * 0.8 * len(xs) / tot_t))
+        random.shuffle(xs)
+        xs.sort(key=lambda z: -len(logic_nb[z]))           # molecule cores first
+        for sd in xs:
+            if len(got) >= cap: break
+            if sd not in got: grow(sd, cap, t)
+    seeds = random.sample(m, len(m))
+    for sd in seeds:
+        if len(got) >= k: break
+        if sd not in got and ntype(nodes[sd]) != 'session': grow(sd, k, None)
     pick |= got
 tl0 = json.load(open('/tmp/aud/tasks.json'))
 pick |= {t['id'] for t in tl0}
@@ -78,7 +164,8 @@ def pstats(p):
     act = sum(1 for x in ms if ntype(x) == 'task' and (x.get('data') or {}).get('status') == 'active')
     blk = sum(1 for x in ms if ntype(x) == 'task' and (x.get('data') or {}).get('status') == 'blocked')
     opn = sum(1 for x in ms if ntype(x) == 'problem' and x['id'] not in solved)
-    return [idx[p], nodes[p]['label'], len(members[p]), round(last, 2), act, opn, blk]
+    lonely = sum(1 for x in ms if not adj_nb.get(x['id']))   # nothing but project membership
+    return [idx[p], nodes[p]['label'], len(members[p]), round(last, 2), act, opn, blk, lonely]
 
 def short(s, n=90):
     s = (s or '').replace('\n', ' ')
@@ -91,7 +178,8 @@ for k in pick:
     age = round((datetime.datetime(2026, 10, 15, 16, 0, tzinfo=datetime.timezone.utc) - datetime.datetime.fromisoformat(x['created_at'][:19] + '+00:00')).total_seconds() / 86400, 3)
     st = dd.get('status') if ntype(x) == 'task' else None
     N.append([TI.get(ntype(x), TI['doc']), CONF.index(dd.get('confidence')) if dd.get('confidence') in CONF else 0,
-              short(x['label'], 80), max(age, 0), st or 0, 1 if ntype(x) == 'problem' and k not in solved else 0])
+              short(x['label'], 80), max(age, 0), st or 0, 1 if ntype(x) == 'problem' and k not in solved else 0,
+              theme_idx(k)])
 E = []
 seen = set()
 for e in edges:
@@ -139,6 +227,7 @@ graph = {
     'types': TYPES, 'conf': CONF, 'rels': RELS, 'nodes': N, 'edges': E, 'focus': idx[FOCUS],
     'expand': idx[EXP], 'details': details,
     'projects': [pstats(p) for p in top],
+    'themes': THEMES, 'coverage': coverage,
     'full': {'nodes': len(d['nodes']), 'edges': len(edges), 'bytes': 81809155,
              'types': type_counts.most_common(), 'rels': rel_counts.most_common(), 'conf': conf_counts.most_common()},
 }
