@@ -261,7 +261,7 @@
   for (const n of nodes) { n.birth = -n.age; n.supAt = 1e9; }
   for (const l of links) if (l.rel === 'supersedes') l.target.supAt = Math.min(l.target.supAt, l.source.birth);
   // root as a parameter: 'now' (radius = log time from now, project = angular sector) or 'owner' (radial trees)
-  const ROOT_MODE = params.get('root') === 'owner' ? 'owner' : 'now';
+  const ROOT_MODE = params.get('root') === 'now' ? 'now' : 'owner';
   const AGE_MAX = Math.max(...nodes.map((n) => n.age)) + 0.5, LOGA = Math.log1p(AGE_MAX);
   if (ROOT_MODE === 'now') {
     const angTree = (i, a0, a1) => { nodes[i].ang = (a0 + a1) / 2; const ch = kids[i].slice().sort((x, y) => nodes[x].age - nodes[y].age); const tot = ch.reduce((q, k) => q + leaves[k], 0) || 1; let a = a0; for (const k of ch) { const w = (a1 - a0) * leaves[k] / tot; angTree(k, a, a + w); a += w; } };
@@ -380,7 +380,7 @@
     }
   }
   function statsLine() {
-    $('#m-stats').innerHTML = `<b>${nf0.format(GA.full.nodes)}</b> узлов · <b>${nf0.format(GA.full.edges)}</b> связей<br>в прототипе ${nf0.format(NN)} узлов, ${nf0.format(links.length)} связей<br>облако = проект · ядро = свежее · цвет = смысл` + (params.has('fps') ? '<br><span id="fps"></span>' : '');
+    $('#m-stats').innerHTML = `<b>${nf0.format(GA.full.nodes)}</b> узлов · <b>${nf0.format(GA.full.edges)}</b> связей<br>в прототипе ${nf0.format(NN)} узлов, ${nf0.format(links.length)} связей<br>облако = проект · ядро = свежее · цвет = смысл<br><span id="lightbuf"></span>` + (params.has('fps') ? '<br><span id="fps"></span>' : '');
   }
   function showNode(i) {
     const D = $('#m-detail');
@@ -472,7 +472,8 @@
   function updateChainLabels() {
     const ch = state.chain; if (!ch || !ch.labels) return;
     const off = $('#s-memory').getBoundingClientRect().left;
-    for (const [el, n, k] of ch.labels) { const x = n.sx - off, y = n.sy; el.style.transform = `translate(${(x - 70).toFixed(1)}px, ${(y + (k % 2 ? -78 : 18)).toFixed(1)}px)`; el.classList.toggle('up', k % 2 === 1); }
+    const maxX = VW - off - (state.sel != null ? 470 : 20) - 140; // never under the detail panel
+    for (const [el, n, k] of ch.labels) { const x = Math.min(n.sx - off - 70, maxX), y = n.sy; el.style.transform = `translate(${x.toFixed(1)}px, ${(y + (k % 2 ? -78 : 18)).toFixed(1)}px)`; el.classList.toggle('up', k % 2 === 1); }
   }
 
   // ------------------------------------------------------------------ DOM: tasks
@@ -955,7 +956,7 @@
   const ggl = glass ? window.GraphGL.init(glass.gl) : null;
   if (ggl) buildAtlas(ggl);
   const EB = new Float32Array(16000 * 20), NB = new Float32Array(16000 * 16);
-  let fitK = 1;
+  let fitK = 1, lightGain = 1;
   const pulses = [];
   let lastAmbient = 0;
   const nbIdx = links.filter((l) => l.rel !== 'belongs_to');
@@ -1117,7 +1118,9 @@
       if (iconZ > 0 && n.icon >= 0) { gl2 = glyph + iconZ; size = lerp(size, Math.max(size, 9), iconZ); ext = Math.max(ext, 2.4); } // far dot -> mid silhouette -> close icon
       putN(n.sx, n.sy, size, ext, colOf(n, sat), I, halo, n.shape, gl2, n.icon, n.birth, n.supAt);
     }
-    return ggl.draw({ vw: VW, vh: VH, ratio: DPR, edges: EB, nEdges: ne, nodes: NB, nNodes: nn, tNow: replayOn ? state.replay.t : 0, tFade: replayOn ? state.replay.fade : 0.001 });
+    // u8 light buffer: accumulate pre-scaled light (density-based exposure), expanded again in the tone map
+    lightGain = ggl.light === 'u8' ? clamp(0.3 * Math.sqrt(700 / Math.max(nn, 1)), 0.1, 0.3) : 1;
+    return ggl.draw({ gain: lightGain, vw: VW, vh: VH, ratio: DPR, edges: EB, nEdges: ne, nodes: NB, nNodes: nn, tNow: replayOn ? state.replay.t : 0, tFade: replayOn ? state.replay.fade : 0.001 });
   }
 
   // ganglion geometry (centroid and a robust radius), recomputed while the layout moves
@@ -1167,7 +1170,8 @@
       let x = cx - w / 2, y = cy - rpx - h - 8;
       const hit = (x0, y0) => placed.some((r) => x0 < r[0] + r[2] + 6 && x0 + w + 6 > r[0] && y0 < r[1] + r[3] + 4 && y0 + h + 4 > r[1]);
       if (hit(x, y) || y < 8) y = cy + rpx + 8;
-      const vis = !hit(x, y) && zr < 7 && (sector || rpx > 6) && x > 140 && x + w < VW - 10 && y > 6 && y + h < VH - 84 && !(state.sel != null && Math.abs(y + h - (nodes[state.sel].sy - 16)) < 30 && Math.abs(cx - nodes[state.sel].sx) < 240);
+      const chainHide = !!state.chain; // in chain mode the project is already a step on the path
+      const vis = !chainHide && !hit(x, y) && zr < 7 && (sector || rpx > 6) && x > 140 && x + w < VW - 10 && y > 6 && y + h < VH - 84 && !(state.sel != null && Math.abs(y + h - (nodes[state.sel].sy - 16)) < 30 && Math.abs(cx - nodes[state.sel].sx) < 240);
       el.style.transform = `translate(${(x - railOff).toFixed(1)}px, ${y.toFixed(1)}px)`;
       el.classList.toggle('off', !vis);
       el.classList.toggle('hl', state.hoverProj === G.key);
@@ -1435,7 +1439,7 @@
         obj = { x: mx.cx, y: mx.cy, z: 0.3 * mx.s * MK.R, size: mx.s * MK.R, extent: 1.12, morph, flat, presence: pres, thick: 0.045, inv: I3, aa: true };
       }
       const graphTex = buildGraph(now, scr, L);
-      glass.frame({ scene, slabs: collectSlabs(), obj, vw: VW, vh: VH, ratio: DPR, graphTex });
+      glass.frame({ scene, slabs: collectSlabs(), obj, vw: VW, vh: VH, ratio: DPR, graphTex, graphGain: lightGain });
     }
     if (params.has('fps') && $('#fps')) { const avg = fpsAcc.reduce((x, y) => x + y, 0) / fpsAcc.length; $('#fps').textContent = `${(1 / avg).toFixed(0)} fps · ${(avg * 1000).toFixed(1)} мс/кадр`; }
     window.__frames = (window.__frames || 0) + 1;
@@ -1650,7 +1654,8 @@
   }
 
   // ------------------------------------------------------------------ boot
-  buildLegend(); statsLine(); buildLabels(); buildTimeline(); buildLanes(); showTask(); buildFinance(); buildSpec();
+  buildLegend(); statsLine(); buildLabels(); buildTimeline();
+  if ($('#lightbuf')) $('#lightbuf').textContent = 'light buffer: ' + (ggl ? ggl.light : '2d'); buildLanes(); showTask(); buildFinance(); buildSpec();
   resize();
   document.fonts.ready.then(() => { if (state.screen === 'finance') renderFin(); });
   if (params.has('skip')) {

@@ -49,12 +49,13 @@ precision highp float;
 in vec3 vCol;
 in float vSide;
 in float vW;
+uniform float uGain;
 out vec4 o;
 void main() {
   float x = abs(vSide);
   float coreA = 1.0 - smoothstep(vW * 0.5, vW * 0.5 + 0.18, x);
   float glow = exp(-x * x * 6.0) * 0.35;
-  o = vec4(vCol * (coreA + glow), 1.0);
+  o = vec4(vCol * (coreA + glow) * uGain, 1.0);
 }`;
 
   const NODE_VS = `#version 300 es
@@ -92,6 +93,7 @@ in float vPx;
 in float vExt;
 uniform sampler2D uAtlas;
 uniform vec3 uGrid; // cols, rows, atlas px per icon cell
+uniform float uGain;
 out vec4 o;
 float sdShape(vec2 p, float s) {
   vec2 a = abs(p);
@@ -124,7 +126,7 @@ void main() {
     }
     body = mix(body, ia * 1.25 + soma * 0.12, im);
   }
-  o = vec4(vCol.rgb * vCol.a * (body + halo), 1.0);
+  o = vec4(vCol.rgb * vCol.a * (body + halo) * uGain, 1.0);
 }`;
 
   function sh(gl, type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
@@ -132,7 +134,17 @@ void main() {
 
   window.GraphGL = {
     init(gl) {
-      const hdr = !!gl.getExtension('EXT_color_buffer_float');
+      // light buffer: f32 (RGBA32F + float blending) > f16 (RGBA16F) > u8 (RGBA8, pre-scaled accumulation)
+      const want = (new URLSearchParams(location.search).get('light') || '').toLowerCase();
+      const cbf = gl.getExtension('EXT_color_buffer_float'), fblend = gl.getExtension('EXT_float_blend');
+      const cbh = gl.getExtension('EXT_color_buffer_half_float');
+      let light = cbf && fblend ? 'f32' : cbf || cbh ? 'f16' : 'u8';
+      if (want === 'f16' && (cbf || cbh)) light = 'f16';
+      if (want === 'u8') light = 'u8';
+      if (want === 'f32' && !(cbf && fblend)) light = cbf || cbh ? 'f16' : 'u8';
+      const FMT = { f32: [gl.RGBA32F, gl.FLOAT], f16: [gl.RGBA16F, gl.HALF_FLOAT], u8: [gl.RGBA8, gl.UNSIGNED_BYTE] }[light];
+      const hdr = light !== 'u8';
+      const f32lin = !!gl.getExtension('OES_texture_float_linear');
       const pe = prog(gl, EDGE_VS, EDGE_FS), pn = prog(gl, NODE_VS, NODE_FS);
       const uE = gl.getUniformLocation(pe, 'uView'), uN = gl.getUniformLocation(pn, 'uView');
       const mkVao = (layout, stride) => {
@@ -145,13 +157,14 @@ void main() {
       };
       const E = mkVao([4, 4, 4, 4, 4], EDGE_F), N = mkVao([4, 4, 4, 4], NODE_F);
       const uTe = gl.getUniformLocation(pe, 'uTime'), uTn = gl.getUniformLocation(pn, 'uTime');
+      const uGe = gl.getUniformLocation(pe, 'uGain'), uGn = gl.getUniformLocation(pn, 'uGain');
       const uAt = gl.getUniformLocation(pn, 'uAtlas'), uGr = gl.getUniformLocation(pn, 'uGrid');
       const atlas = gl.createTexture(); let grid = [1, 1, 64];
       gl.bindTexture(gl.TEXTURE_2D, atlas); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, 1, 1, 0, gl.RED, gl.FLOAT, new Float32Array([100]));
       const tex = gl.createTexture(), fb = gl.createFramebuffer();
       let w = 0, h = 0;
       return {
-        hdr, tex, EDGE_F, NODE_F,
+        hdr, light, tex, EDGE_F, NODE_F,
         setAtlas(data, w, h, cols, rows, cell) {
           gl.bindTexture(gl.TEXTURE_2D, atlas);
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, w, h, 0, gl.RED, gl.FLOAT, data);
@@ -163,8 +176,10 @@ void main() {
           const W = Math.round(f.vw * f.ratio), H = Math.round(f.vh * f.ratio);
           if (W !== w || H !== h) {
             gl.bindTexture(gl.TEXTURE_2D, tex);
-            gl.texImage2D(gl.TEXTURE_2D, 0, hdr ? gl.RGBA16F : gl.RGBA8, W, H, 0, gl.RGBA, hdr ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texImage2D(gl.TEXTURE_2D, 0, FMT[0], W, H, 0, gl.RGBA, FMT[1], null);
+            // RGBA32F is not filterable without OES_texture_float_linear: sampled 1:1 anyway, so NEAREST is exact
+            const filt = light === 'f32' && !f32lin ? gl.NEAREST : gl.LINEAR;
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
             gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
             gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
@@ -175,13 +190,13 @@ void main() {
           gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
           gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
           if (f.nEdges) {
-            gl.useProgram(pe); gl.uniform2f(uE, f.vw, f.vh); gl.uniform2f(uTe, f.tNow || 0, f.tFade || 0.01);
+            gl.useProgram(pe); gl.uniform2f(uE, f.vw, f.vh); gl.uniform2f(uTe, f.tNow || 0, f.tFade || 0.01); gl.uniform1f(uGe, f.gain || 1);
             gl.bindVertexArray(E.vao); gl.bindBuffer(gl.ARRAY_BUFFER, E.buf);
             gl.bufferData(gl.ARRAY_BUFFER, f.edges.subarray(0, f.nEdges * EDGE_F), gl.STREAM_DRAW);
             gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, (SEG + 1) * 2, f.nEdges);
           }
           if (f.nNodes) {
-            gl.useProgram(pn); gl.uniform2f(uN, f.vw, f.vh); gl.uniform2f(uTn, f.tNow || 0, f.tFade || 0.01);
+            gl.useProgram(pn); gl.uniform2f(uN, f.vw, f.vh); gl.uniform2f(uTn, f.tNow || 0, f.tFade || 0.01); gl.uniform1f(uGn, f.gain || 1);
             gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, atlas); gl.uniform1i(uAt, 3); gl.uniform3f(uGr, grid[0], grid[1], grid[2]);
             gl.bindVertexArray(N.vao); gl.bindBuffer(gl.ARRAY_BUFFER, N.buf);
             gl.bufferData(gl.ARRAY_BUFFER, f.nodes.subarray(0, f.nNodes * NODE_F), gl.STREAM_DRAW);

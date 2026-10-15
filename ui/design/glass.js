@@ -24,6 +24,7 @@ uniform vec4 uT[${MAX}];      // tint rgb, tint amount
 uniform int uCount;
 uniform sampler2D uGraph;     // half-float neural field, additive light
 uniform float uGraphOn;
+uniform float uGraphScale;  // 1 / accumulation gain (u8 light buffer stores pre-scaled light)
 out vec4 o;
 
 float sdRound(vec2 p, vec2 b, float r) {
@@ -31,7 +32,7 @@ float sdRound(vec2 p, vec2 b, float r) {
   return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }
 vec3 graphAt(vec2 uv) {
-  vec3 g = texture(uGraph, uv).rgb;
+  vec3 g = texture(uGraph, uv).rgb * uGraphScale;
   float L = dot(g, vec3(0.2126, 0.7152, 0.0722));
   float Lt = 1.0 - exp(-1.35 * L);                 // tone map on luminance, hue kept
   vec3 c = g * (Lt / max(L, 1e-5));
@@ -294,7 +295,7 @@ void main() {
           gl.uniform2f(p1.u.uView, f.vw, f.vh); gl.uniform1f(p1.u.uRatio, f.ratio);
           gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneTex); gl.uniform1i(p1.u.uScene, 0);
           gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, f.graphTex || sceneTex); gl.uniform1i(p1.u.uGraph, 2);
-          gl.uniform1f(p1.u.uGraphOn, f.graphTex ? 1 : 0);
+          gl.uniform1f(p1.u.uGraphOn, f.graphTex ? 1 : 0); gl.uniform1f(p1.u.uGraphScale, 1 / (f.graphGain || 1));
           gl.drawArrays(gl.TRIANGLES, 0, 3);
           // pass 2
           gl.bindFramebuffer(gl.FRAMEBUFFER, null);
