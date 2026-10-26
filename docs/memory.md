@@ -15,6 +15,7 @@ How Aurelius hands memory to a session (the snapshot), which nodes belong to a p
 - [Retrieval path](#retrieval-path)
 - [Embedding daemon](#embedding-daemon)
 - [Model files and settings](#model-files-and-settings)
+- [Daemon memory](#daemon-memory)
 - [Measuring search quality](#measuring-search-quality)
 
 ## Memory Snapshot
@@ -147,8 +148,37 @@ What the daemon needs on disk (nothing here is downloaded by `install.sh`):
 | `AURELIUS_EMBED_IDLE_SECS` | `0` | unload BGE-M3 after this many idle seconds; `0` keeps it resident |
 | `AURELIUS_RERANK` | `auto` | `auto`: rerank on CUDA only, and not at all when `AURELIUS_EMBED_DEVICE=cpu`. `cuda`: rerank on CUDA whatever the embed device — bge-m3 on the CPU, the reranker alone on the card. `cpu`: allow CPU (one rerank of 30 documents takes seconds there). `off`: never |
 | `AURELIUS_RERANK_MODEL` | unset | directory with a reranker to load instead of the built-in bge-reranker-v2-m3 (`model.onnx`, `tokenizer.json`, `config.json`, `special_tokens_map.json`, `tokenizer_config.json`). `scripts/export-reranker-en-ru.py` builds the FP16 English+Russian variant: 1.3 GiB of the card instead of 3.5 |
-| `AURELIUS_RERANK_IDLE_SECS` | `600` | unload the reranker after this many idle seconds; `0` keeps it resident |
+| `AURELIUS_RERANK_IDLE_SECS` | `0` | unload the reranker after this many idle seconds; `0` keeps it resident (see [Daemon memory](#daemon-memory)) |
 | `AURELIUS_MODELS_DIR` | `<data-dir>/models` | where model weights live |
+
+### Daemon memory
+
+The daemon is long-lived: it holds BGE-M3, the reranker when reranking is on, and whatever the
+allocators keep. Two allocators matter, and both hoard by default in ways that show up only after
+days.
+
+**glibc arenas.** Every thread that contends for the heap gets its own arena — 64 MiB of heap that
+glibc grows and then never returns to the OS. The daemon spawns blocking threads per socket request
+and per queue tick, and the default cap is 8 × cores (128 here). Measured 26.10.2026: a daemon up
+for 32 h held ~102 arenas; with `MALLOC_ARENA_MAX=1` the count of 64 MiB regions is 0 and RSS sits
+flat at 1.75 GB. One arena costs ~8% on a burst of 25 parallel embeds, where inference is serialized
+behind a mutex anyway.
+
+**The reranker's unload.** Dropping the CUDA session frees the video memory and nothing else: host
+RSS was 1567 MB before the drop and 1567 MB after it, because the CUDA workspaces stay in the
+process. A reload then pays 0.6–4.7 s of cold start and adds 40–300 MB on top. So the reranker is
+resident by default (`AURELIUS_RERANK_IDLE_SECS=0`); set seconds only on a machine that needs the
+card back.
+
+The drop-in the owner's unit carries, for reference:
+
+```ini
+[Service]
+Environment=MALLOC_ARENA_MAX=1
+Environment=MALLOC_MMAP_THRESHOLD_=131072
+Environment=MALLOC_TRIM_THRESHOLD_=262144
+Environment=AURELIUS_RERANK_IDLE_SECS=0
+```
 
 ### Measuring search quality
 
