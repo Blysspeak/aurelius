@@ -181,10 +181,18 @@ pub fn parse_idle_secs(raw: Option<&str>) -> Result<Option<Duration>, String> {
 }
 
 /// How long the reranker weights stay loaded with no rerank call when
-/// `AURELIUS_RERANK_IDLE_SECS` is unset. Unlike bge-m3 it is unloaded by
-/// default: with both models resident the daemon holds about 6 GB of an 8 GB
-/// GPU, and a cold reranker load only delays one search past `RERANK_TIMEOUT`.
-pub const DEFAULT_RERANK_IDLE_SECS: u64 = 600;
+/// `AURELIUS_RERANK_IDLE_SECS` is unset. `0` — never unload.
+///
+/// It used to be 600, to free the card for other work. Measured 26.10.2026:
+/// an unload frees the video memory and **nothing else** — host RSS sat at
+/// 1567 MB before the drop and 1567 MB after it, because the CUDA session's
+/// cuBLAS/cuDNN workspaces and kernels stay in the process; the next rerank
+/// call then pays a 0.6–4.7 s cold load and ratchets the process up by
+/// another 40–300 MB. Over 31.5 h that came to 18 such cycles. Resident
+/// instead: ~1.5 GB host plus 1.3 GiB of video memory, a flat line, and no
+/// search waiting on a cold load. `AURELIUS_RERANK_IDLE_SECS=<seconds>`
+/// brings the old behaviour back for a machine that needs the card.
+pub const DEFAULT_RERANK_IDLE_SECS: u64 = 0;
 
 /// `AURELIUS_RERANK_IDLE_SECS`: whole seconds, `0` = never unload (`None`).
 ///
@@ -229,12 +237,16 @@ pub fn idle_from_env() -> Option<Duration> {
     })
 }
 
-/// The reranker's idle timeout, read like `idle_from_env`.
+/// The reranker's idle timeout, read like `idle_from_env`. A bad value falls
+/// back to the default — which is "never unload", so it must fall back to
+/// `None` and not to `Some(0)`: a zero timeout would unload the reranker on
+/// the watcher's very next tick, the exact cycle this default was changed
+/// away from.
 pub fn rerank_idle_from_env() -> Option<Duration> {
     let raw = std::env::var("AURELIUS_RERANK_IDLE_SECS").ok();
     parse_rerank_idle_secs(raw.as_deref()).unwrap_or_else(|reason| {
         eprintln!("rerank: {reason}; using {DEFAULT_RERANK_IDLE_SECS}s");
-        Some(Duration::from_secs(DEFAULT_RERANK_IDLE_SECS))
+        parse_rerank_idle_secs(None).ok().flatten()
     })
 }
 
@@ -622,17 +634,15 @@ mod tests {
     }
 
     #[test]
-    fn rerank_idle_defaults_to_600_and_zero_disables_it() {
-        assert_eq!(DEFAULT_RERANK_IDLE_SECS, 600);
-        assert_eq!(
-            parse_rerank_idle_secs(None).unwrap(),
-            Some(Duration::from_secs(600))
-        );
-        assert_eq!(
-            parse_rerank_idle_secs(Some("")).unwrap(),
-            Some(Duration::from_secs(600))
-        );
+    fn rerank_idle_defaults_to_never_unload_and_seconds_bring_it_back() {
+        assert_eq!(DEFAULT_RERANK_IDLE_SECS, 0);
+        assert_eq!(parse_rerank_idle_secs(None).unwrap(), None);
+        assert_eq!(parse_rerank_idle_secs(Some("")).unwrap(), None);
         assert_eq!(parse_rerank_idle_secs(Some("0")).unwrap(), None);
+        assert_eq!(
+            parse_rerank_idle_secs(Some("600")).unwrap(),
+            Some(Duration::from_secs(600))
+        );
         assert!(parse_rerank_idle_secs(Some("5m")).is_err());
         // bge-m3 keeps its own default: resident, never unloaded.
         assert_eq!(DEFAULT_IDLE_SECS, 0);
