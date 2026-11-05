@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Один навык `aurelius` в плагине.** Раньше плагин нёс только указатель `aurelius-cards` на карточки из базы пользователя, поэтому на чистой установке с пустой базой руководства не было вовсе. Теперь `plugin/skills/aurelius/SKILL.md` — единственная точка входа: что такое Aurelius, MCP и `au` над одной базой, цикл сессии, что писать и чего не писать никогда, модели. Семь разделов в `reference/` (архитектура и грабли, чего не писать, запись факта, поиск, задачи, сессии, чекпоинт агента) читаются по требованию; примеры нейтральные, команды сверены с `au --help` 3.8.0.
+- **README: навык и модели Hugging Face.** BAAI/bge-m3 для векторов; реранкер qilowoq/bge-reranker-v2-m3-en-ru (FP16 ONNX через `scripts/export-reranker-en-ru.py`, `AURELIUS_RERANK_MODEL` и `AURELIUS_RERANK=cuda`) или встроенный rozgo/bge-reranker-v2-m3. Обе модели необязательны: без bge-m3 демон пишет `vector search off until restart`, а поиск отвечает по полнотекстовому индексу и говорит об этом в `vector_notice`.
+
+### Changed
+- **`aurelius-cards` свёрнут в раздел «Your own cards» навыка `aurelius`.** Каталог `plugin/skills/aurelius-cards` удалён; `skill_save`, `skill_list`, `skill_get` и индекс имён на SessionStart работают как раньше. На имя `aurelius-cards` не ссылались ни хуки, ни скрипты.
+
 ## [v3.8.0] — 2026-10-15
 
 Личные финансы в той же памяти, которой уже пользуется агент; записи привязываются к проекту в момент записи; README разделён на тематические документы.

@@ -45,8 +45,8 @@ Every AI session starts from zero. You re-explain your projects, your past decis
 
 ## Quick Start
 
-Aurelius ships as a [Claude Code plugin](plugin/hooks.json): seven `au` hook commands, skill cards and
-the `/pickup` command, installed with two `claude plugin` commands instead of hand-edited
+Aurelius ships as a [Claude Code plugin](plugin/hooks.json): seven `au` hook commands, the
+[`aurelius` skill](#bundled-skill) and the `/pickup` command, installed with two `claude plugin` commands instead of hand-edited
 `settings.json`. The MCP server is registered separately, user-scope, by `install.sh` (`claude mcp
 add -s user aurelius au mcp`) — a plugin-bundled server would rename every tool to
 `mcp__plugin_aurelius_aurelius__*`.
@@ -63,8 +63,8 @@ claude plugin marketplace add Blysspeak/aurelius      # or a local clone path: c
 claude plugin install aurelius@blysspeak -s user
 ```
 
-Restart Claude Code. `claude plugin list` shows `aurelius@blysspeak`, and a fresh session gets the
-skill index at start.
+Restart Claude Code. `claude plugin list` shows `aurelius@blysspeak`, and the `aurelius` skill is
+available from the first session, even with an empty database.
 
 **Existing machine (stood up by hand or by an older `install.sh`)**
 
@@ -116,6 +116,33 @@ Nothing is indexed behind your back: no `au` command and no `memory_status` call
 current directory into a project. A repository enters the graph only through an explicit
 `au reindex` (or MCP `memory_index`); `install.sh` runs it once, for the aurelius checkout itself.
 
+## Bundled skill
+
+The plugin ships one skill, [`aurelius`](plugin/skills/aurelius/SKILL.md): a short guide to using
+the memory (what Aurelius is, MCP and the `au` CLI over one database, the session loop, what to
+write and what never to write) and seven reference sections under
+[`plugin/skills/aurelius/reference/`](plugin/skills/aurelius/reference/) that Claude opens on
+demand: architecture and traps, what not to write, writing a fact, search, tasks, sessions and
+agent checkpoints. It does not depend on the database, so a fresh install has a guide from the
+first session. Cards you save yourself with `skill_save` stay in your database, and the
+SessionStart hook lists their names.
+
+## Models (optional)
+
+Vector search and reranking use models from Hugging Face. Neither ships with Aurelius and neither
+is required.
+
+| Role | Model | Setup |
+|------|-------|-------|
+| Embeddings | [BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3) | The hub-cache folder `models--BAAI--bge-m3` in `<data-dir>/models/` (`au home current` prints `<data-dir>`; `AURELIUS_MODELS_DIR` overrides it), e.g. `hf download BAAI/bge-m3 --cache-dir <data-dir>/models`. The daemon also needs ONNX Runtime: `libonnxruntime.so` in `<data-dir>/onnxruntime/` or at `ORT_DYLIB_PATH`. `AURELIUS_EMBED_DEVICE=cpu` runs it without a GPU. |
+| Reranker | [qilowoq/bge-reranker-v2-m3-en-ru](https://huggingface.co/qilowoq/bge-reranker-v2-m3-en-ru) | bge-reranker-v2-m3 with the vocabulary cut to English and Russian. `scripts/export-reranker-en-ru.py` exports it to FP16 ONNX (it traces the graph on a CUDA device); then `AURELIUS_RERANK_MODEL=<that folder>` and `AURELIUS_RERANK=cuda`. 1.3 GiB of video memory instead of 3.5. |
+| Reranker, built in | [rozgo/bge-reranker-v2-m3](https://huggingface.co/rozgo/bge-reranker-v2-m3), the ONNX build of [BAAI/bge-reranker-v2-m3](https://huggingface.co/BAAI/bge-reranker-v2-m3) | Used when `AURELIUS_RERANK_MODEL` is unset; fetched into the models folder on first load. |
+
+Only `au daemon` loads models, so these variables belong in the daemon's environment (its systemd
+unit). Without bge-m3 the daemon logs `embed: load failed, vector search off until restart` and
+`memory_search` / `au search` answer from full-text alone, with a `vector_notice` saying so. Facts,
+tasks, sessions and the snapshot never touch the models. Without a reranker, search keeps the fused
+order. Every variable: [Model files and settings](docs/memory.md#model-files-and-settings).
 
 ---
 
@@ -140,6 +167,8 @@ current directory into a project. A repository enters the graph only through an 
 - **Project sync** — share one project between instances over a self-hosted server.
   [Project Sync](docs/sync.md)
 - **Hooks** — a Claude Code plugin whose hooks call `au` directly. [Hooks](docs/hooks.md)
+- **Bundled skill** — one `aurelius` skill with a guide and reference sections, available on a
+  fresh install. [Bundled skill](#bundled-skill)
 - **Architecture and Web UI** — crate layout, design choices, node types, relations and the graph
   viewer. [Architecture](docs/architecture.md)
 
