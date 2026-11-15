@@ -1094,7 +1094,7 @@ au daemon [OPTIONS]
 | Argument / option | Default | Meaning |
 |---|---|---|
 | `--interval <INTERVAL>` | `60` | Pause between ticks, seconds |
-| `--grace <GRACE>` | `15m` | How long after the due moment a reminder waits for a live session before the out-of-session channel takes it; same delay grammar as `au remind add --in` |
+| `--grace <GRACE>` | `15m` | How long after the due moment a `both` reminder waits for a live session before the out-of-session channel takes it (`me` reminders do not wait); same delay grammar as `au remind add --in` |
 | `--once` |  | One tick instead of a loop, then exit: how the daemon is tested without sleeping, and how a systemd timer can replace the long-running service |
 | `--json` |  | Print each tick as one JSON line instead of human-readable output |
 <!-- /au -->

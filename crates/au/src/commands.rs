@@ -3351,8 +3351,8 @@ fn notify_external(text: &str) -> bool {
 }
 
 /// Один такт: берёт у `reminders::overdue_undelivered` напоминания для
-/// `Owner::Me` (в выборку попадает и `Owner::Both` — так уже устроен
-/// `select_pending` внутри `reminders.rs`, `Owner::Ai` туда не входит),
+/// `Owner::Me` (в выборку попадает и `Owner::Both`, но только после `grace`;
+/// `Me` ждать окна не обязан, `Owner::Ai` туда не входит),
 /// доставляет каждое через внешний канал и штампует `mark_delivered` ТОЛЬКО
 /// после того, как канал подтвердил успех (exit 0). Порядок нарочно обратный
 /// `hooks::remind_hook`: тот печатает в stdout, который провалиться не
