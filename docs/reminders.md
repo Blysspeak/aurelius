@@ -32,8 +32,10 @@ mkdir -p ~/.config/systemd/user && cp contrib/systemd/aurelius-remind.service ~/
 systemctl --user enable --now aurelius-remind.service
 ```
 
-Each tick reads `reminders::overdue_undelivered` for `owner: me`/`both` that outlived `--grace`
-past their due moment (default `15m`) — `owner: ai` belongs to a session and the daemon never
+Each tick reads `reminders::overdue_undelivered`: `owner: me` is taken on the first tick after its
+due moment (no session consumes it, so there is nothing to wait for), `owner: both` only once it
+outlived `--grace` past its due moment (default `15m`, the window in which a live session shows it
+first) — `owner: ai` belongs to a session and the daemon never
 touches it — and hands each one to `$AURELIUS_NOTIFY_CMD` (run through `sh -c`, reminder text
 passed as the `AURELIUS_REMINDER_TEXT` environment variable, never interpolated into the command
 string itself) or, absent that, to `notify-send` if it's on `PATH`; a reminder is stamped

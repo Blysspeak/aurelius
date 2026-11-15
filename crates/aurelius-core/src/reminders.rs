@@ -430,11 +430,13 @@ pub fn due_for_session(
     Ok(rows.filter_map(std::result::Result::ok).collect())
 }
 
-/// То же самое, но `due_at <= now - grace`. Это то, чем демон второй волны
-/// зовёт с `Some(Owner::Me)`: окно `grace` И ЕСТЬ защита от двойной
-/// доставки, потому что живая сессия, уже забравшая напоминание
-/// (`mark_delivered`), увела его из `Pending` — демону там просто нечего
-/// найти перезревшим.
+/// Созревшие напоминания для внесессионного канала демона. Для
+/// `Some(Owner::Me)` порог зависит от владельца строки: `Me` доставляется с
+/// первого такта после срока (потребителя в сессии у него нет, ждать
+/// некого), `Both` ждёт окно `grace`, `due_at <= now - grace` — это и есть
+/// защита от двойной доставки: живая сессия, уже забравшая `Both`
+/// (`mark_delivered`), увела его из `Pending`, и демону там нечего найти.
+/// Для остальных фильтров окно `grace` действует на все строки как раньше.
 pub fn overdue_undelivered(
     conn: &Connection,
     now: DateTime<Utc>,
@@ -442,7 +444,27 @@ pub fn overdue_undelivered(
     owner_filter: Option<Owner>,
     limit: usize,
 ) -> Result<Vec<Reminder>> {
-    select_pending(conn, now - grace, owner_filter, limit)
+    if owner_filter != Some(Owner::Me) {
+        return select_pending(conn, now - grace, owner_filter, limit);
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {REMINDER_COLUMNS} FROM reminders
+          WHERE state = 'pending'
+            AND ((owner = 'me' AND due_at <= ?1) OR (owner = 'both' AND due_at <= ?2))
+          ORDER BY due_at ASC LIMIT ?3"
+    ))?;
+    let rows = stmt
+        .query_map(
+            params![
+                now.timestamp(),
+                (now - grace).timestamp(),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
+            row_to_reminder,
+        )?
+        .filter_map(std::result::Result::ok)
+        .collect();
+    Ok(rows)
 }
 
 /// Момент строго позже `now`, до которого доводит `from`, шагая `delay` за
@@ -734,6 +756,47 @@ mod tests {
             project: None,
             repeat_spec: None,
         }
+    }
+
+    #[test]
+    fn overdue_undelivered_gives_me_no_grace_but_both_waits_for_it() {
+        let conn = test_conn();
+        let now = Utc::now();
+        let grace = Duration::minutes(15);
+        let me = add(
+            &conn,
+            new_reminder("me", now - Duration::minutes(1), Owner::Me),
+        )
+        .expect("me");
+        let both = add(
+            &conn,
+            new_reminder("both", now - Duration::minutes(1), Owner::Both),
+        )
+        .expect("both");
+        add(
+            &conn,
+            new_reminder("ai", now - Duration::hours(2), Owner::Ai),
+        )
+        .expect("ai");
+
+        let ids = |at: DateTime<Utc>| -> Vec<String> {
+            overdue_undelivered(&conn, at, grace, Some(Owner::Me), 10)
+                .expect("overdue")
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        };
+
+        assert_eq!(
+            ids(now),
+            vec![me.id.clone()],
+            "me at once, both still inside grace"
+        );
+        assert_eq!(
+            ids(now + Duration::minutes(15)),
+            vec![me.id.clone(), both.id.clone()],
+            "both is picked once it outlived grace; ai never"
+        );
     }
 
     #[test]
